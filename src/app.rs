@@ -12,6 +12,7 @@ mod libs_ui;
 mod logcat_ui;
 mod refactor_ui;
 mod typing;
+mod usage_filter;
 
 use crate::compose::{self, Lint, Severity, Stability};
 use crate::edit;
@@ -207,6 +208,8 @@ struct UsagesPopup {
     decl: (PathBuf, usize),
     /// The frame it opened in: that ⌘-click is not a click outside it.
     frame: u64,
+    /// The results were shown once: a filter change that leaves one usage does not jump.
+    settled: bool,
 }
 
 struct Completion {
@@ -760,6 +763,7 @@ impl App {
                 selected: 0,
                 decl: (path, at),
                 frame: self.frames,
+                settled: false,
             });
             return;
         }
@@ -2417,10 +2421,18 @@ impl App {
         let Some(p) = &self.usages_popup else {
             return Vec::new();
         };
-        self.found
-            .iter()
+        usage_filter::apply(&self.settings, &self.root(), &self.found)
+            .into_iter()
+            .map(|i| &self.found[i])
             .filter(|f| (&f.path, f.offset) != (&p.decl.0, p.decl.1))
             .collect()
+    }
+
+    fn root(&self) -> PathBuf {
+        self.project
+            .as_ref()
+            .map(|p| p.root.clone())
+            .unwrap_or_default()
     }
 
     /// ↑ ↓ Enter Esc for the usages dropdown, taken before the editor sees them.
@@ -2464,9 +2476,15 @@ impl App {
     /// at the caret. One usage jumps straight to it.
     fn usages_popup_ui(&mut self, ctx: &egui::Context) {
         let Some(p) = &self.usages_popup else { return };
+        let (word, pos, selected, settled) = (p.word.clone(), p.pos, p.selected, p.settled);
         let searching = self.find_rx.is_some();
-        let list = self.popup_usages();
-        if !searching && list.len() == 1 {
+        let list: Vec<FoundLine> = self.popup_usages().into_iter().cloned().collect();
+        let all = self
+            .found
+            .iter()
+            .filter(|f| (&f.path, f.offset) != (&p.decl.0, p.decl.1))
+            .count();
+        if !searching && !settled && list.len() == 1 {
             let (f, o) = (list[0].path.clone(), list[0].offset);
             self.usages_popup = None;
             self.open_file(&f, Some(o));
@@ -2474,28 +2492,33 @@ impl App {
         }
         let (mut chosen, mut to_panel) = (None, false);
         let title = if searching {
-            format!("Usages of `{}`  searching…", p.word)
+            format!("Usages of `{word}`  searching…")
         } else {
             let mut files: Vec<&Path> = list.iter().map(|f| f.path.as_path()).collect();
             files.dedup();
             format!(
-                "Usages of `{}`  {} in {} files",
-                p.word,
+                "Usages of `{word}`  {} in {} files",
                 list.len(),
                 files.len()
             )
         };
         let area = egui::Area::new(egui::Id::unique("usages_popup"))
-            .fixed_pos(p.pos)
+            .fixed_pos(pos)
             .order(egui::Order::Foreground)
             .constrain(true)
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_width(640.0);
                     ui.label(RichText::new(title).strong());
+                    usage_filter::bar(ui, &mut self.settings, all - list.len());
                     ui.separator();
                     if !searching && list.is_empty() {
-                        ui.label(RichText::new("No usages found").color(theme::t().weak));
+                        let why = if all > 0 {
+                            "All usages are hidden by the filters"
+                        } else {
+                            "No usages found"
+                        };
+                        ui.label(RichText::new(why).color(theme::t().weak));
                     }
                     egui::ScrollArea::vertical()
                         .max_height(320.0)
@@ -2520,8 +2543,8 @@ impl App {
                                     fmt(theme::t().weak, 12.0),
                                 );
                                 job.append(f.text.trim(), 0.0, fmt(theme::t().text, 12.5));
-                                let r = ui.selectable_label(i == p.selected, job);
-                                if i == p.selected {
+                                let r = ui.selectable_label(i == selected, job);
+                                if i == selected {
                                     r.scroll_to_me(None);
                                 }
                                 if r.clicked() {
@@ -2539,6 +2562,10 @@ impl App {
                     }
                 });
             });
+        if let Some(p) = self.usages_popup.as_mut() {
+            p.settled |= !searching;
+            p.selected = p.selected.min(list.len().saturating_sub(1));
+        }
         let opened_now = self
             .usages_popup
             .as_ref()
@@ -2843,7 +2870,8 @@ impl App {
         });
         ui.separator();
         let mut open: Option<(PathBuf, usize)> = None;
-        let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + ui.spacing().item_spacing.y;
+        // `show_rows` adds the item spacing itself; every row is drawn exactly this high
+        let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
         match self.bottom {
             Bottom::Problems => {
                 egui::ScrollArea::vertical()
@@ -2961,7 +2989,7 @@ impl App {
                     .stick_to_bottom(true)
                     .show_rows(ui, row_h, self.console.len(), |ui, range| {
                         for line in &self.console[range] {
-                            match compiler_location(line) {
+                            fixed_row(ui, row_h, |ui| match compiler_location(line) {
                                 Some((p, l, c)) => {
                                     let color = if line.starts_with("e:") { ERROR } else { WARN };
                                     if ui
@@ -2986,7 +3014,7 @@ impl App {
                                             .color(crate::theme::t().code),
                                     );
                                 }
-                            }
+                            });
                         }
                     });
             }
@@ -3002,36 +3030,41 @@ impl App {
                     .as_ref()
                     .map(|p| p.root.clone())
                     .unwrap_or_default();
+                let shown = usage_filter::apply(&self.settings, &root, &self.found);
                 if !self.found_title.is_empty() {
-                    let mut files: Vec<&Path> =
-                        self.found.iter().map(|f| f.path.as_path()).collect();
+                    let mut files: Vec<&Path> = shown
+                        .iter()
+                        .map(|&i| self.found[i].path.as_path())
+                        .collect();
                     files.dedup();
                     let busy = if self.find_rx.is_some() {
                         "  searching…"
                     } else {
                         ""
                     };
-                    ui.label(
-                        RichText::new(format!(
-                            "{}: {} in {} files{busy}",
-                            self.found_title,
-                            self.found.len(),
-                            files.len()
-                        ))
-                        .strong(),
+                    let title = format!(
+                        "{}: {} in {} files{busy}",
+                        self.found_title,
+                        shown.len(),
+                        files.len()
                     );
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(title).strong());
+                        ui.separator();
+                        usage_filter::bar(ui, &mut self.settings, self.found.len() - shown.len());
+                    });
                 }
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
-                    .show_rows(ui, row_h, self.found.len(), |ui, range| {
-                        for f in &self.found[range] {
+                    .show_rows(ui, row_h, shown.len(), |ui, range| {
+                        for f in shown[range].iter().map(|&i| &self.found[i]) {
                             let rel = f
                                 .path
                                 .strip_prefix(&root)
                                 .unwrap_or(&f.path)
                                 .display()
                                 .to_string();
-                            let r = ui.horizontal(|ui| {
+                            let r = fixed_row(ui, row_h, |ui| {
                                 let r = ui.link(
                                     RichText::new(&f.text)
                                         .monospace()
@@ -3044,7 +3077,7 @@ impl App {
                                 );
                                 r
                             });
-                            if r.inner.clicked() {
+                            if r.clicked() {
                                 open = Some((f.path.clone(), f.offset));
                             }
                         }
@@ -3352,6 +3385,23 @@ fn build_tree(p: &Project) -> Vec<(String, DirNode)> {
         node.files.push(f.clone());
     }
     out
+}
+
+/// One row of a `show_rows` list, exactly `h` high (plus the spacing `show_rows` adds itself).
+/// `show_rows` places rows by that height alone, so a taller row (a link's minimum size) made the
+/// list jump while scrolling or dragging. Wider content still widens the list for side scrolling.
+fn fixed_row<R>(ui: &mut Ui, h: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), h));
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(Align::Center)),
+    );
+    child.spacing_mut().interact_size.y = 0.0;
+    let r = add(&mut child);
+    let width = child.min_rect().width().max(rect.width());
+    ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
+    r
 }
 
 /// Git status letter by file, for colouring the tree (M modified, A / ? new).

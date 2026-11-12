@@ -15,6 +15,11 @@ pub(super) struct Settings {
     pub glass: bool,
     pub autosave: bool,
     pub lsp_heap: String,
+    /// Find usages filters (see `usage_filter`).
+    pub hide_tests: bool,
+    pub hide_imports: bool,
+    pub hide_xml: bool,
+    pub usage_path: String,
 }
 
 impl Default for Settings {
@@ -25,6 +30,10 @@ impl Default for Settings {
             glass: true,
             autosave: true,
             lsp_heap: "2g".into(),
+            hide_tests: false,
+            hide_imports: false,
+            hide_xml: false,
+            usage_path: String::new(),
         }
     }
 }
@@ -44,13 +53,18 @@ impl Settings {
             glass: v["glass"].as_bool().unwrap_or(d.glass),
             autosave: v["autosave"].as_bool().unwrap_or(d.autosave),
             lsp_heap: v["lsp_heap"].as_str().map_or(d.lsp_heap, String::from),
+            hide_tests: v["hide_tests"].as_bool().unwrap_or(d.hide_tests),
+            hide_imports: v["hide_imports"].as_bool().unwrap_or(d.hide_imports),
+            hide_xml: v["hide_xml"].as_bool().unwrap_or(d.hide_xml),
+            usage_path: v["usage_path"].as_str().map_or(d.usage_path, String::from),
         }
     }
 
     pub fn save(&self) {
         if let Some(c) = config_dir() {
             let _ = std::fs::create_dir_all(&c);
-            let v = json!({ "font_size": self.font_size, "light": self.light, "glass": self.glass, "autosave": self.autosave, "lsp_heap": self.lsp_heap });
+            let v = json!({ "font_size": self.font_size, "light": self.light, "glass": self.glass, "autosave": self.autosave, "lsp_heap": self.lsp_heap,
+                "hide_tests": self.hide_tests, "hide_imports": self.hide_imports, "hide_xml": self.hide_xml, "usage_path": self.usage_path });
             let _ = std::fs::write(
                 c.join("settings.json"),
                 serde_json::to_string_pretty(&v).unwrap_or_default(),

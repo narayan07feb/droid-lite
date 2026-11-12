@@ -801,6 +801,20 @@ fn e2e_find_references_lists_code_and_xml_not_strings() {
     );
     assert_eq!(in_file("user_card.xml"), 1, "XML is searched as text");
     h.get_by_label_contains("References to `User`");
+    // every row sits exactly one list step below the last, so scrolling never jumps
+    {
+        let font = egui::FontId::monospace(crate::theme::font_size());
+        let step =
+            h.ctx.fonts_mut(|f| f.row_height(&font)) + h.ctx.global_style().spacing.item_spacing.y;
+        let rows: Vec<f32> = h
+            .get_all_by_role(egui::accesskit::Role::Link)
+            .map(|n| n.rect().center().y)
+            .collect();
+        assert!(rows.len() >= 3, "{rows:?}");
+        for w in rows.windows(2) {
+            assert!((w[1] - w[0] - step).abs() < 0.5, "step {step}: {rows:?}");
+        }
+    }
     // clicking a result opens it
     h.get_by_label_contains("val u: User? = null").click();
     steps(&mut h, 3);
@@ -1881,7 +1895,7 @@ fn e2e_logcat_streams_filters_opens_stack_frames_and_never_clears_the_phone() {
     );
     h.get_by_label_contains("slow call");
     h.get_by_label_contains("ANR in com.other");
-    // rows are exactly the height the virtual list uses, so dragging never jumps
+    // rows are exactly the step the virtual list uses, so dragging never jumps
     {
         let row_h = h
             .ctx
@@ -1890,8 +1904,10 @@ fn e2e_logcat_streams_filters_opens_stack_frames_and_never_clears_the_phone() {
         let a = h.get_by_label_contains("fast call").rect();
         let b = h.get_by_label_contains("slow call").rect();
         let c = h.get_by_label_contains("ANR in").rect();
-        assert_eq!(b.top() - a.top(), row_h, "row step");
-        assert_eq!(c.top() - b.top(), row_h, "row step");
+        // the list places each row at row height + item spacing
+        let step = row_h + h.ctx.global_style().spacing.item_spacing.y;
+        assert_eq!(b.top() - a.top(), step, "row step");
+        assert_eq!(c.top() - b.top(), step, "row step");
         assert_eq!(a.height(), row_h);
     }
 
@@ -1954,4 +1970,39 @@ fn e2e_logcat_streams_filters_opens_stack_frames_and_never_clears_the_phone() {
     for banned in [" -c", "-G", "--clear"] {
         assert!(!log.contains(banned), "never `logcat {banned}`: {log}");
     }
+}
+
+#[test]
+fn e2e_usage_filters_hide_tests_and_imports_and_are_saved() {
+    let f = Fixture::new("usagefilter");
+    let (dest, _host) = write_destination(&f);
+    let test = f.path("app/src/test/java/com/demo/ui/StartCardTest.kt");
+    std::fs::create_dir_all(test.parent().unwrap()).unwrap();
+    std::fs::write(
+        &test,
+        "package com.demo.ui\n\nfun t(b: NavGraphBuilder) {\n    b.startCardDestination(onBack = {})\n}\n",
+    )
+    .unwrap();
+    let mut h = f.harness();
+    open(&mut h, &dest);
+    cmd_click_at(&mut h, 33.5, 2.5);
+    wait(&mut h, "usages", |a| {
+        a.find_rx.is_none() && a.usages_popup.is_some()
+    });
+    steps(&mut h, 3);
+    h.get_by_label_contains("Usages of `startCardDestination`  3 in 2 files");
+    h.get_by_label("Hide tests").click();
+    steps(&mut h, 3);
+    h.get_by_label_contains("Usages of `startCardDestination`  2 in 1 files");
+    h.get_by_label_contains("1 hidden");
+    assert!(h.query_by_label_contains("StartCardTest.kt").is_none());
+    // one usage left after a filter change: the list stays, it does not jump
+    h.get_by_label("Hide imports").click();
+    steps(&mut h, 3);
+    h.get_by_label_contains("Usages of `startCardDestination`  1 in 1 files");
+    assert!(h.state().usages_popup.is_some());
+    assert_eq!(tab(&h).path, dest);
+    // saved with the settings
+    let saved = comfort::Settings::load();
+    assert!(saved.hide_tests && saved.hide_imports);
 }

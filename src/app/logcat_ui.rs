@@ -321,7 +321,6 @@ impl App {
             .auto_shrink([false, false])
             .stick_to_bottom(!lc.scroll_lock)
             .show_rows(ui, row_h, lc.view.len(), |ui, range| {
-                ui.spacing_mut().item_spacing.y = 0.0;
                 let weak = crate::theme::t().weak;
                 for i in range {
                     let Some(e) = lc.view.get(i).and_then(|&s| lc.entry(s)) else {
