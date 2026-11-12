@@ -51,12 +51,13 @@ impl Index {
         });
         let mut index = Index::default();
         for (p, f) in scanned {
-            index.insert(p, f);
+            index.insert_scanned(p, f);
         }
         index
     }
 
-    fn insert(&mut self, path: PathBuf, syms: FileSyms) {
+    /// Adds a file whose symbols were already scanned (e.g. on a worker thread).
+    pub fn insert_scanned(&mut self, path: PathBuf, syms: FileSyms) {
         self.remove(&path);
         let mut names: Vec<&str> = syms.decls.iter().map(|d| d.name.as_str()).collect();
         names.sort_unstable();
@@ -73,7 +74,7 @@ impl Index {
 
     pub fn update(&mut self, path: &Path, src: &str) {
         if is_code(path) {
-            self.insert(path.to_path_buf(), scan(src));
+            self.insert_scanned(path.to_path_buf(), scan(src));
         }
     }
 

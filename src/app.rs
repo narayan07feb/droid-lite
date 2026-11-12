@@ -44,7 +44,11 @@ struct Tab {
     lints: Vec<Lint>,
     diagnostics: Vec<(usize, u8, String)>,
     /// Laid-out text, reused until the text, the problem marks or the zoom change.
-    cache: Option<(u64, std::sync::Arc<egui::Galley>)>,
+    cache: Option<EditorCache>,
+    /// The next layout must re-colour the whole file (set when analysis settles).
+    recolor: bool,
+    /// Text changed at this time and is not analysed yet; analysis waits for a typing pause.
+    dirty_since: Option<Instant>,
     /// Byte offset to put the cursor at (and scroll to) on the next frame.
     goto: Option<usize>,
     cursor: usize,
@@ -70,9 +74,61 @@ impl Tab {
         } else {
             Vec::new()
         };
-        self.cache = None;
+        self.recolor = true;
+        self.dirty_since = None;
     }
 }
+
+/// Times the parts of a frame. A frame over `LIMIT` is reported with its slowest part, so a
+/// freeze is never silent: it shows in the status bar and on stderr.
+struct Watchdog {
+    start: Instant,
+    stages: Vec<(&'static str, f32)>,
+}
+
+impl Watchdog {
+    const LIMIT_MS: f32 = 100.0;
+
+    fn start() -> Watchdog {
+        Watchdog {
+            start: Instant::now(),
+            stages: Vec::new(),
+        }
+    }
+
+    fn stage<R>(&mut self, name: &'static str, f: impl FnOnce() -> R) -> R {
+        let t = Instant::now();
+        let r = f();
+        self.stages.push((name, t.elapsed().as_secs_f32() * 1000.0));
+        r
+    }
+
+    /// The report for a slow frame. The first frames (fonts, first layout) are skipped.
+    fn finish(self, frame: u64) -> Option<String> {
+        let total = self.start.elapsed().as_secs_f32() * 1000.0;
+        if frame <= 3 || total < Self::LIMIT_MS {
+            return None;
+        }
+        let (name, ms) = self
+            .stages
+            .iter()
+            .cloned()
+            .fold(("", 0.0), |a, b| if b.1 > a.1 { b } else { a });
+        Some(format!(
+            "slow frame {total:.0} ms, mostly {name} ({ms:.0} ms)"
+        ))
+    }
+}
+
+/// Coloured text and its layout, reused across frames and patched while typing.
+struct EditorCache {
+    key: u64,
+    job: egui::text::LayoutJob,
+    galley: std::sync::Arc<egui::Galley>,
+}
+
+/// Analysis waits this long after the last keystroke, so typing in big files stays smooth.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
 
 #[derive(Clone, Copy, PartialEq)]
 enum SearchKind {
@@ -177,7 +233,9 @@ pub struct App {
     project: Option<Project>,
     tree: Vec<(String, DirNode)>,
     index: Index,
-    indexing: Option<Receiver<Index>>,
+    indexing: Option<Receiver<(Project, Index, Option<String>)>>,
+    /// kotlin-lsp was started (or found missing) for this project.
+    lsp_tried: bool,
     stability: HashMap<String, Stability>,
     stability_rx: Option<Receiver<HashMap<String, Stability>>>,
     lsp: Option<Lsp>,
@@ -204,6 +262,8 @@ pub struct App {
     refactor: Option<refactor_ui::Refactor>,
     undo: Option<refactor_ui::Undo>,
     watcher: Option<crate::watch::Watcher>,
+    /// Disk changes being read and scanned on worker threads.
+    disk_rx: Vec<Receiver<Vec<disk::DiskChange>>>,
     /// Liquid Glass is behind the window.
     glass: bool,
     /// Content runs under the title bar: leave room for the window buttons.
@@ -219,6 +279,9 @@ pub struct App {
     show_shortcuts: bool,
     /// What the Find tab lists, e.g. "References to `User`".
     found_title: String,
+    frames: u64,
+    /// Last slow-frame report from the watchdog, shown in the status bar for a while.
+    slow: Option<(String, Instant)>,
 }
 
 impl App {
@@ -237,6 +300,7 @@ impl App {
             tree: Vec::new(),
             index: Index::default(),
             indexing: None,
+            lsp_tried: false,
             stability: HashMap::new(),
             stability_rx: None,
             lsp: None,
@@ -262,6 +326,7 @@ impl App {
             refactor: None,
             undo: None,
             watcher: None,
+            disk_rx: Vec::new(),
             glass,
             fullsize: glass_wanted,
             git: Default::default(),
@@ -272,6 +337,8 @@ impl App {
             keymap: load_setting("keymap").map_or(Keymap::Eclipse, |s| Keymap::from_name(&s)),
             show_shortcuts: false,
             found_title: String::new(),
+            frames: 0,
+            slow: None,
         };
         if let Some(dir) = open.or_else(last_project) {
             app.open_project(&dir, &cc.egui_ctx);
@@ -295,10 +362,9 @@ impl App {
         app
     }
 
+    /// Opens a project without blocking the window: listing files, indexing and reading the git
+    /// branch run on a worker thread; `poll` installs the result.
     fn open_project(&mut self, dir: &Path, ctx: &egui::Context) {
-        let project = Project::open(dir);
-        remember_project(&project.root);
-        self.tree = build_tree(&project);
         for t in std::mem::take(&mut self.tabs) {
             self.forget_tab(&t);
         }
@@ -313,27 +379,72 @@ impl App {
         self.console.clear();
         self.git = Default::default();
         self.stability.clear();
+        self.refactor = None;
+        self.undo = None;
+        self.lsp = None;
+        self.lsp_tried = false;
+        self.watcher = None;
+        self.project = None;
+        self.tree.clear();
         let (tx, rx) = channel();
-        let files = project.files.clone();
-        let c = ctx.clone();
+        self.status = format!("Opening {}…", dir.display());
+        let (dir, c) = (dir.to_path_buf(), ctx.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(Index::build(&files));
+            let project = Project::open(&dir);
+            let index = Index::build(&project.files);
+            let branch = crate::git::branch(&project.root);
+            let _ = tx.send((project, index, branch));
             c.request_repaint();
         });
         self.indexing = Some(rx);
+    }
+
+    /// Installs a project opened in the background.
+    fn project_ready(
+        &mut self,
+        project: Project,
+        index: Index,
+        branch: Option<String>,
+        ctx: &egui::Context,
+    ) {
+        remember_project(&project.root);
+        self.tree = build_tree(&project);
+        self.index = index;
+        for t in &self.tabs {
+            self.index.update(&t.path, &t.text);
+        }
+        self.branch = branch;
         self.reload_stability(&project, ctx);
-        self.lsp = Lsp::start(&project.root, ctx.clone());
         self.watcher = crate::watch::Watcher::start(&project.root, ctx.clone());
-        self.branch = crate::git::branch(&project.root);
-        self.refactor = None;
-        self.undo = None;
         self.status = format!(
-            "Opened {} ({} modules, {} files)",
+            "Opened {} ({} modules, {} files, {} symbols)",
             project.name,
             project.modules.len(),
-            project.files.len()
+            project.files.len(),
+            self.index.symbol_count()
         );
         self.project = Some(project);
+        if self.tabs.iter().any(|t| is_code(&t.path)) {
+            self.start_lsp();
+        }
+    }
+
+    /// kotlin-lsp is a JVM that can use gigabytes, so it starts only when a code file opens,
+    /// with its heap capped (`DROID_LITE_LSP_HEAP`, default 2g).
+    fn start_lsp(&mut self) {
+        if self.lsp_tried {
+            return;
+        }
+        let (Some(p), Some(ctx)) = (&self.project, &self.ctx) else {
+            return;
+        };
+        self.lsp_tried = true;
+        self.lsp = Lsp::start(&p.root, ctx.clone());
+        if let Some(l) = self.lsp.as_mut() {
+            for t in self.tabs.iter().filter(|t| is_code(&t.path)) {
+                l.did_open(&t.path, &t.text);
+            }
+        }
     }
 
     fn reload_stability(&mut self, project: &Project, ctx: &egui::Context) {
@@ -376,6 +487,8 @@ impl App {
                 lints: Vec::new(),
                 diagnostics: Vec::new(),
                 cache: None,
+                recolor: false,
+                dirty_since: None,
                 goto: None,
                 cursor: 0,
                 selection: 0..0,
@@ -388,8 +501,12 @@ impl App {
             if let Some(l) = self.lsp.as_mut().filter(|_| is_code(path)) {
                 l.did_open(path, &tab.text);
             }
+            let start_lsp = is_code(path) && !self.lsp_tried;
             self.tabs.push(tab);
             self.active = self.tabs.len() - 1;
+            if start_lsp {
+                self.start_lsp();
+            }
         }
         let tab = &mut self.tabs[self.active];
         tab.goto = Some(offset.unwrap_or(tab.cursor));
@@ -414,6 +531,7 @@ impl App {
     }
 
     fn save(&mut self) {
+        self.settle(true);
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
@@ -478,6 +596,7 @@ impl App {
     }
 
     fn goto_definition(&mut self) {
+        self.settle(true);
         let Some((word, at)) = self.word_at_cursor() else {
             return;
         };
@@ -589,14 +708,10 @@ impl App {
 
     fn poll(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.indexing
-            && let Ok(idx) = rx.try_recv()
+            && let Ok((project, index, branch)) = rx.try_recv()
         {
-            self.index = idx;
-            for t in &self.tabs {
-                self.index.update(&t.path, &t.text);
-            }
             self.indexing = None;
-            self.status = format!("Indexed {} symbols", self.index.symbol_count());
+            self.project_ready(project, index, branch, ctx);
         }
         if let Some(rx) = &self.stability_rx
             && let Ok(s) = rx.try_recv()
@@ -699,7 +814,7 @@ impl App {
                             .into_iter()
                             .map(|(l, c, s, m)| (lsp::offset(&t.text, l, c), s, m))
                             .collect();
-                        t.cache = None;
+                        t.recolor = true;
                     }
                 }
             }
@@ -749,8 +864,28 @@ impl App {
         self.shift_down = shift;
     }
 
+    /// Analyses edited tabs once typing pauses (or now, when `force`): symbols, Compose checks,
+    /// the project index and kotlin-lsp. Commands that read them force it first.
+    fn settle(&mut self, force: bool) {
+        for t in self.tabs.iter_mut() {
+            let Some(at) = t.dirty_since else { continue };
+            if !force && at.elapsed() < SETTLE {
+                if let Some(ctx) = &self.ctx {
+                    ctx.request_repaint_after(SETTLE - at.elapsed());
+                }
+                continue;
+            }
+            t.reanalyse();
+            self.index.update(&t.path, &t.text);
+            if let Some(l) = self.lsp.as_mut() {
+                l.did_change(&t.path, &t.text);
+            }
+        }
+    }
+
     /// Runs one command, from a shortcut or a menu.
     fn run(&mut self, action: Action, ctx: &egui::Context) {
+        self.settle(true);
         let open = |kind| {
             Some(Search {
                 kind,
@@ -1180,6 +1315,15 @@ impl App {
                 ui.label(format!("{line}:{col}"));
                 ui.separator();
             }
+            if let Some((report, at)) = &self.slow
+                && at.elapsed().as_secs() < 15
+            {
+                ui.label(RichText::new(format!("{}  {report}", ic::WARNING)).color(WARN))
+                    .on_hover_text(
+                        "The window was blocked this long. The same line is printed to stderr.",
+                    );
+                ui.separator();
+            }
             ui.label(&self.status);
         });
     }
@@ -1334,6 +1478,7 @@ impl App {
         let Tab {
             text,
             cache,
+            recolor,
             goto,
             cursor,
             selection,
@@ -1350,13 +1495,24 @@ impl App {
         let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _w: f32| {
             let s = buf.as_str();
             let key = hash(s) ^ marks_key ^ u64::from(ui.ctx().pixels_per_point().to_bits());
-            if cache.as_ref().is_none_or(|(k, _)| *k != key) {
-                let job = highlight::job(s, font.clone(), &marks);
-                *cache = Some((key, ui.fonts_mut(|f| f.layout_job(job))));
+            match cache.as_mut() {
+                Some(c) if c.key == key && !*recolor => {}
+                // typing: patch the colours at the edit, re-colour fully once analysis settles
+                Some(c) if c.job.text != s && !*recolor => {
+                    highlight::patch(&mut c.job, s);
+                    c.galley = ui.fonts_mut(|f| f.layout_job(c.job.clone()));
+                    c.key = key;
+                }
+                _ => {
+                    let job = highlight::job(s, font.clone(), &marks);
+                    let galley = ui.fonts_mut(|f| f.layout_job(job.clone()));
+                    *cache = Some(EditorCache { key, job, galley });
+                    *recolor = false;
+                }
             }
             cache
                 .as_ref()
-                .map(|(_, g)| g.clone())
+                .map(|c| c.galley.clone())
                 .unwrap_or_else(|| ui.fonts_mut(|f| f.layout_job(Default::default())))
         };
         let mut changed = false;
@@ -1488,11 +1644,9 @@ impl App {
             });
         let path = tab.path.clone();
         if changed {
-            tab.reanalyse();
-            self.index.update(&path, &self.tabs[self.active].text);
-            if let Some(l) = self.lsp.as_mut() {
-                l.did_change(&path, &self.tabs[self.active].text);
-            }
+            // analysis, the index and kotlin-lsp catch up after a typing pause (see `settle`)
+            tab.rev += 1;
+            tab.dirty_since = Some(Instant::now());
             self.update_completion(false);
         }
         if cmd_click {
@@ -1554,6 +1708,12 @@ impl App {
                 });
             }
         }
+        if self.lsp.as_ref().is_some_and(|l| l.ready)
+            && self.tabs[self.active].dirty_since.is_some()
+        {
+            self.settle(true);
+        }
+        let t = &self.tabs[self.active];
         if let Some(l) = self.lsp.as_mut().filter(|l| l.ready) {
             let (line, col) = lsp::position(&t.text, t.cursor);
             l.completion(&t.path, line, col, start);
@@ -1570,6 +1730,7 @@ impl App {
     }
 
     fn accept_completion(&mut self) {
+        self.settle(true);
         let Some(c) = self.completion.take() else {
             return;
         };
@@ -2025,49 +2186,70 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.poll(&ctx);
-        self.poll_disk(&ctx);
-        self.poll_git(&ctx);
-        self.shortcuts(&ctx);
+        let mut watch = Watchdog::start();
+        watch.stage("background results", || self.poll(&ctx));
+        watch.stage("disk changes", || self.poll_disk(&ctx));
+        watch.stage("analysis", || self.settle(false));
+        watch.stage("git blame", || self.poll_git(&ctx));
+        watch.stage("shortcuts", || self.shortcuts(&ctx));
         if let Some(dropped) =
             ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()))
             && dropped.is_dir()
         {
             self.open_project(&dropped, &ctx);
         }
-        egui::Panel::top("top").show(ui, |ui| {
-            if self.fullsize {
-                ui.add_space(4.0);
-            }
-            ui.horizontal(|ui| {
+        watch.stage("toolbar", || {
+            egui::Panel::top("top").show(ui, |ui| {
                 if self.fullsize {
-                    ui.add_space(72.0); // traffic lights
+                    ui.add_space(4.0);
                 }
-                self.top_bar(ui);
-            });
+                ui.horizontal(|ui| {
+                    if self.fullsize {
+                        ui.add_space(72.0); // traffic lights
+                    }
+                    self.top_bar(ui);
+                });
+            })
         });
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
-        egui::Panel::bottom("bottom")
-            .resizable(true)
-            .default_size(180.0)
-            .show(ui, |ui| self.bottom_panel(ui));
-        egui::Panel::left("project")
-            .resizable(true)
-            .default_size(260.0)
-            .show(ui, |ui| self.project_panel(ui));
-        egui::Panel::right("compose")
-            .resizable(true)
-            .default_size(340.0)
-            .show(ui, |ui| self.compose_panel(ui));
+        watch.stage("status bar", || {
+            egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui))
+        });
+        watch.stage("bottom panel", || {
+            egui::Panel::bottom("bottom")
+                .resizable(true)
+                .default_size(180.0)
+                .show(ui, |ui| self.bottom_panel(ui))
+        });
+        watch.stage("project tree", || {
+            egui::Panel::left("project")
+                .resizable(true)
+                .default_size(260.0)
+                .show(ui, |ui| self.project_panel(ui))
+        });
+        watch.stage("compose panel", || {
+            egui::Panel::right("compose")
+                .resizable(true)
+                .default_size(340.0)
+                .show(ui, |ui| self.compose_panel(ui))
+        });
         let editor_frame =
             egui::Frame::central_panel(ui.style()).fill(crate::glass::editor_fill(self.glass));
-        egui::CentralPanel::default()
-            .frame(editor_frame)
-            .show(ui, |ui| self.editor(ui));
-        self.search_window(&ctx);
-        self.refactor_window(&ctx);
-        self.commit_window(&ctx);
-        self.shortcuts_window(&ctx);
+        watch.stage("editor", || {
+            egui::CentralPanel::default()
+                .frame(editor_frame)
+                .show(ui, |ui| self.editor(ui))
+        });
+        watch.stage("popups", || {
+            self.search_window(&ctx);
+            self.refactor_window(&ctx);
+            self.commit_window(&ctx);
+            self.shortcuts_window(&ctx);
+        });
+        self.frames += 1;
+        if let Some(report) = watch.finish(self.frames) {
+            eprintln!("droid-lite: {report}");
+            self.slow = Some((report, Instant::now()));
+        }
         if let Some((path, frames)) = self.shot.as_mut().filter(|_| self.indexing.is_none()) {
             *frames += 1;
             let wait: u32 = std::env::var("DROID_LITE_SHOT_FRAMES")

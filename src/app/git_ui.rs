@@ -1,6 +1,6 @@
 //! GitLens-style views: inline blame on the current line, a blame column, file history and commit diffs.
 
-use super::{App, FONT_SIZE, hash};
+use super::{App, FONT_SIZE};
 use crate::git::{self, Blame, Commit};
 use crate::highlight::{ERROR, INFO, TEXT};
 use egui::{Align2, Color32, FontId, Galley, Pos2, RichText, Sense, Ui};
@@ -18,7 +18,7 @@ const DEBOUNCE: Duration = Duration::from_millis(450);
 pub(super) struct TabBlame {
     pub blame: Option<Arc<Blame>>,
     rx: Option<Receiver<Option<Blame>>>,
-    /// Hash of the text the current (or running) blame is for.
+    /// Edit counter (`Tab::rev`) of the text the current (or running) blame is for.
     for_hash: u64,
     seen_hash: u64,
     seen_at: Option<Instant>,
@@ -68,7 +68,7 @@ impl App {
     /// Starts or refreshes blame for the active tab when its text settled after an edit.
     pub(super) fn poll_git(&mut self, ctx: &egui::Context) {
         if let Some(t) = self.tabs.get_mut(self.active) {
-            let h = hash(&t.text);
+            let h = t.rev; // bumped on every edit, cheaper than hashing the text each frame
             if h != t.git.seen_hash {
                 t.git.seen_hash = h;
                 // first look at a file: blame now; after a keystroke: wait for a pause

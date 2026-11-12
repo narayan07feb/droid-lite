@@ -82,8 +82,11 @@ fn path_of(uri: &str) -> PathBuf {
 impl Lsp {
     pub fn start(root: &Path, ctx: egui::Context) -> Option<Lsp> {
         let (bin, args) = find_server()?;
+        let heap = std::env::var("DROID_LITE_LSP_HEAP").unwrap_or_else(|_| "2g".into());
         let mut child = Command::new(&bin)
             .args(&args)
+            // every JVM reads JAVA_TOOL_OPTIONS, so this caps kotlin-lsp whatever its launcher does
+            .env("JAVA_TOOL_OPTIONS", format!("-Xmx{heap}"))
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

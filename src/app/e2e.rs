@@ -498,12 +498,18 @@ fn e2e_kotlin_lsp_completion_diagnostics_definition_rename() {
     // SAFETY: tests run one at a time (SERIAL), so no other thread reads the environment now.
     unsafe { std::env::set_var("DROID_LITE_LSP", format!("python3 {}", script.display())) };
     let mut h = f.harness();
-    unsafe { std::env::remove_var("DROID_LITE_LSP") };
+
+    assert!(
+        h.state().lsp.is_none(),
+        "kotlin-lsp waits until a code file opens"
+    );
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    open(&mut h, &card);
     wait(&mut h, "lsp ready", |a| {
         a.lsp.as_ref().is_some_and(|l| l.ready)
     });
-    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
-    open(&mut h, &card);
+    // SAFETY: as above; the server has started, so the variable is no longer needed
+    unsafe { std::env::remove_var("DROID_LITE_LSP") };
     wait(&mut h, "diagnostics", |a| {
         a.tabs[a.active]
             .diagnostics
@@ -744,4 +750,76 @@ fn e2e_android_studio_keymap_from_help_menu() {
     wait(&mut h, "usages", |a| {
         a.find_rx.is_none() && !a.found.is_empty()
     });
+}
+
+#[test]
+fn e2e_bulk_disk_changes_and_background_open_do_not_block() {
+    let f = Fixture::new("bulk");
+    let mut h = f.harness();
+    // opening a project returns at once; the work happens on a worker thread
+    let root = f.root.clone();
+    let ctx = h.ctx.clone();
+    let t = Instant::now();
+    h.state_mut().open_project(&root, &ctx);
+    assert!(
+        t.elapsed().as_millis() < 50,
+        "open_project blocked for {:?}",
+        t.elapsed()
+    );
+    wait(&mut h, "reopen", |a| {
+        a.project.is_some() && a.indexing.is_none()
+    });
+    // a "git checkout" of 300 files: all show up in the index, frames stay fast
+    let dir = f.path("app/src/main/java/com/demo/gen");
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..300 {
+        std::fs::write(
+            dir.join(format!("Gen{i}.kt")),
+            format!("package com.demo.gen\nclass Gen{i}\n"),
+        )
+        .unwrap();
+    }
+    let mut worst = 0u128;
+    for _ in 0..1500 {
+        let t = Instant::now();
+        h.step();
+        worst = worst.max(t.elapsed().as_millis());
+        if (0..300).all(|i| h.state().index.find_type(&format!("Gen{i}")).is_some()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        (0..300).all(|i| h.state().index.find_type(&format!("Gen{i}")).is_some()),
+        "all 300 new files indexed"
+    );
+    assert!(
+        worst < 100,
+        "a frame took {worst} ms while 300 files changed"
+    );
+    assert!(
+        h.state().slow.is_none(),
+        "watchdog saw a slow frame: {:?}",
+        h.state().slow
+    );
+    // deleting the folder drops them again
+    std::fs::remove_dir_all(&dir).unwrap();
+    wait(&mut h, "folder delete", |a| {
+        a.index.find_type("Gen0").is_none()
+    });
+}
+
+#[test]
+fn watchdog_reports_only_slow_frames() {
+    let mut w = Watchdog::start();
+    w.stage("fast", || ());
+    assert!(w.finish(10).is_none());
+    let mut w = Watchdog::start();
+    w.stage("fast", || ());
+    w.stage("editor", || std::thread::sleep(Duration::from_millis(120)));
+    let r = w.finish(10).unwrap();
+    assert!(r.contains("mostly editor"), "{r}");
+    let mut w = Watchdog::start();
+    w.stage("startup", || std::thread::sleep(Duration::from_millis(120)));
+    assert!(w.finish(1).is_none(), "first frames are skipped");
 }
