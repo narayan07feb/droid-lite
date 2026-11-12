@@ -12,6 +12,11 @@ cargo run --release -- /path/to/android/project
 
 You can also press **Open project…**, or drop a folder on the window. The last project opens again on the next start.
 
+To get a normal Mac app with the icon, run `scripts/bundle-mac.sh`, then copy `target/release/Droid Lite.app` to `/Applications`.
+
+On macOS 26 and newer the window uses Liquid Glass: the side panels and bars are see-through, and the editor stays almost opaque.
+Set `DROID_LITE_GLASS=0` for solid colours.
+
 ## Features
 
 | Area | What you get |
@@ -21,6 +26,8 @@ You can also press **Open project…**, or drop a folder on the window. The last
 | Autocomplete | Project symbols and keywords as you type (⌃Space to force). Adds the `import` for you. Type-aware items come from kotlin-lsp when it is installed |
 | Compose analyser | The UI call tree of each composable. Parameter stability from skydoves' compose-stability-analyzer (`stabilityDump`) or Compose compiler reports, with a local guess when there is neither. Compose checks: `modifier` rules, naming, `mutableStateOf` without `remember`, effects without keys, `collectAsState` vs `collectAsStateWithLifecycle`, ViewModel parameters |
 | Preview render | Runs the module's screenshot task (Google's Compose Preview Screenshot Testing, Paparazzi or Roborazzi) and shows the PNGs for the previews in the open file |
+| Refactor | Rename (⇧F6) with a preview of every change; you can untick lines. kotlin-lsp does the rename when it runs, else a code-only text search (strings and comments are skipped). It also renames `Old.kt` when the class matches the file. Extract variable (⌥⌘V), optimize imports (⌃⌥O, keeps the order), and undo the last refactoring from the Refactor menu |
+| Files on disk | The project folder is watched. An open file without edits reloads by itself; with edits you choose Reload or Keep mine. New and deleted files update the tree and the index. New stability dumps and compiler reports load by themselves |
 | Gradle | Run any task (`assembleDebug`, `installDebug`, …), see the output live, and click `e:` compiler errors to open them |
 
 ## Type-aware completion (optional)
@@ -39,8 +46,10 @@ go-to-declaration use the built-in index.
   `@Preview(...) private fun`, which Compose code uses everywhere, so the scanner works on tokens and brace depth.
 - `index.rs`: the symbol index, fuzzy search (nucleo) and definition lookup.
 - `compose.rs`: the UI tree, Compose checks and stability.
+- `refactor.rs`: rename search, optimize imports, extract variable.
+- `watch.rs`: the folder watcher. `glass.rs`: Liquid Glass.
 - `gradle.rs`, `lsp.rs`: Gradle runs and the LSP client.
-- `app.rs`: the window.
+- `app.rs`, `app/`: the window, the refactoring UI and the reload logic.
 
 `cargo test` runs the unit tests. `DROID_LITE_SHOT=out.png` saves a window screenshot once indexing is done, then quits.
 Use it with `DROID_LITE_OPEN=<file>` or `DROID_LITE_SEARCH=<query>` for UI checks.
@@ -49,5 +58,6 @@ Use it with `DROID_LITE_OPEN=<file>` or `DROID_LITE_SEARCH=<query>` for UI check
 
 - Live preview while you type is not built. The preview path renders through Gradle (a few seconds).
 - Without kotlin-lsp there is no member completion after `.`, and there are no compile errors in the editor.
-- No debugger, Layout Inspector, emulator manager or refactorings yet.
-- The editor reloads a file only when you open it again. It does not watch files that change on disk.
+- No debugger, Layout Inspector or emulator manager yet.
+- Rename without kotlin-lsp matches by name, so two different symbols with the same name both show up in the preview. Untick the wrong ones.
+- Optimize imports does not sort imports. This avoids fights with ktlint's import order.

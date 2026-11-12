@@ -113,6 +113,20 @@ impl Project {
             .max_by_key(|m| m.dir.as_os_str().len())
     }
 
+    /// Whether a file that appeared later belongs in the file list (same rules as `open`).
+    pub fn accepts(&self, path: &Path) -> bool {
+        path.strip_prefix(&self.root).is_ok_and(|rel| {
+            !crate::watch::ignored(rel)
+                && !rel
+                    .components()
+                    .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+                && path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| EXTENSIONS.contains(&e))
+        })
+    }
+
     pub fn gradlew(&self) -> PathBuf {
         self.root.join("gradlew")
     }
@@ -221,6 +235,10 @@ mod tests {
             ]
         );
         assert_eq!(p.module_of(&p.files[0]).unwrap().name, ":app");
+        assert!(p.accepts(&p.root.join("app/src/main/java/a/New.kt")));
+        assert!(!p.accepts(&p.root.join("app/build/gen/New.kt")));
+        assert!(!p.accepts(&p.root.join(".idea/misc.xml")));
+        assert!(!p.accepts(Path::new("/elsewhere/A.kt")));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

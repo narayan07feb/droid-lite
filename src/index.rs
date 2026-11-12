@@ -54,6 +54,10 @@ impl Index {
         }
     }
 
+    pub fn remove(&mut self, path: &Path) {
+        self.files.remove(path);
+    }
+
     pub fn decls(&self) -> impl Iterator<Item = (&PathBuf, &FileSyms, &Decl)> {
         self.files
             .iter()

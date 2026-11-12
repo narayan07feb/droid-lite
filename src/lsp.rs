@@ -8,12 +8,20 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 
+/// One LSP text edit: start line, start col, end line, end col (UTF-16), new text.
+pub type LspEdit = (u32, u32, u32, u32, String);
+/// Edits per file from a WorkspaceEdit.
+pub type WorkspaceEdits = Vec<(PathBuf, Vec<LspEdit>)>;
+
 pub enum Event {
     Completion {
         at: usize,
         items: Vec<(String, String, Option<String>)>,
     },
     Definition(Vec<(PathBuf, u32, u32)>),
+    /// Text edits per file from a rename: (start line, start col, end line, end col, new text).
+    /// Empty when the server failed or refused.
+    Rename(WorkspaceEdits),
     Diagnostics(PathBuf, Vec<(u32, u32, u8, String)>),
 }
 
@@ -22,6 +30,7 @@ enum Pending {
     Init,
     Completion(usize),
     Definition,
+    Rename,
 }
 
 pub struct Lsp {
@@ -202,6 +211,10 @@ impl Lsp {
         self.request("textDocument/definition", json!({ "textDocument": { "uri": uri(path) }, "position": { "line": line, "character": col } }), Pending::Definition, false);
     }
 
+    pub fn rename(&mut self, path: &Path, line: u32, col: u32, new_name: &str) {
+        self.request("textDocument/rename", json!({ "textDocument": { "uri": uri(path) }, "position": { "line": line, "character": col }, "newName": new_name }), Pending::Rename, false);
+    }
+
     pub fn poll(&mut self) -> Vec<Event> {
         let mut out = Vec::new();
         while let Ok(msg) = self.rx.try_recv() {
@@ -264,6 +277,7 @@ impl Lsp {
                                 .collect(),
                         ));
                     }
+                    Some(Pending::Rename) => out.push(Event::Rename(workspace_edits(&result))),
                     None => {}
                 }
             } else if msg.get("method").and_then(Value::as_str)
@@ -312,6 +326,48 @@ impl Drop for Lsp {
     }
 }
 
+/// Reads a WorkspaceEdit in either form: `changes` (uri → edits) or `documentChanges`.
+fn workspace_edits(v: &Value) -> WorkspaceEdits {
+    let edit = |e: &Value| {
+        let n = |p: &str| e.pointer(p).and_then(Value::as_u64).map(|x| x as u32);
+        Some((
+            n("/range/start/line")?,
+            n("/range/start/character")?,
+            n("/range/end/line")?,
+            n("/range/end/character")?,
+            e.get("newText")?.as_str()?.to_string(),
+        ))
+    };
+    let mut out = Vec::new();
+    if let Some(map) = v.get("changes").and_then(Value::as_object) {
+        for (u, edits) in map {
+            out.push((
+                path_of(u),
+                edits
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(edit)
+                    .collect(),
+            ));
+        }
+    }
+    for dc in v
+        .get("documentChanges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let (Some(u), Some(edits)) = (
+            dc.pointer("/textDocument/uri").and_then(Value::as_str),
+            dc.get("edits").and_then(Value::as_array),
+        ) {
+            out.push((path_of(u), edits.iter().filter_map(edit).collect()));
+        }
+    }
+    out
+}
+
 fn language(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("java") => "java",
@@ -347,6 +403,18 @@ pub fn offset(text: &str, line: u32, col: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_both_workspace_edit_forms() {
+        let a = json!({ "changes": { "file:///a.kt": [{ "range": { "start": { "line": 1, "character": 2 }, "end": { "line": 1, "character": 5 } }, "newText": "b" }] } });
+        assert_eq!(
+            workspace_edits(&a),
+            vec![(PathBuf::from("/a.kt"), vec![(1, 2, 1, 5, "b".to_string())])]
+        );
+        let d = json!({ "documentChanges": [{ "textDocument": { "uri": "file:///x%20y.kt", "version": 3 }, "edits": [{ "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }, "newText": "Z" }] }] });
+        assert_eq!(workspace_edits(&d)[0].0, PathBuf::from("/x y.kt"));
+        assert!(workspace_edits(&Value::Null).is_empty());
+    }
 
     #[test]
     fn positions_round_trip_with_utf16() {

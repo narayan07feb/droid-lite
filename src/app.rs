@@ -1,5 +1,8 @@
 //! The IDE window: project tree, editor tabs, search popups, completion, Compose panel, Gradle console.
 
+mod disk;
+mod refactor_ui;
+
 use crate::compose::{self, Lint, Severity, Stability, Verdict};
 use crate::gradle::{self, PreviewTool};
 use crate::highlight::{self, ERROR, INFO, TEXT, WARN};
@@ -29,6 +32,11 @@ struct Tab {
     /// Byte offset to put the cursor at (and scroll to) on the next frame.
     goto: Option<usize>,
     cursor: usize,
+    /// Selected byte range (empty when nothing is selected).
+    selection: std::ops::Range<usize>,
+    /// Changed on disk while this tab had unsaved edits.
+    disk_changed: bool,
+    deleted: bool,
 }
 
 impl Tab {
@@ -131,7 +139,6 @@ pub struct App {
     tree: Vec<(String, DirNode)>,
     index: Index,
     indexing: Option<Receiver<Index>>,
-    index_time: Option<f32>,
     stability: HashMap<String, Stability>,
     stability_rx: Option<Receiver<HashMap<String, Stability>>>,
     lsp: Option<Lsp>,
@@ -155,17 +162,29 @@ pub struct App {
     status: String,
     /// Dev check: `DROID_LITE_SHOT=out.png` saves a screenshot once indexing is done, then quits.
     shot: Option<(PathBuf, u32)>,
+    refactor: Option<refactor_ui::Refactor>,
+    undo: Option<refactor_ui::Undo>,
+    watcher: Option<crate::watch::Watcher>,
+    /// Liquid Glass is behind the window.
+    glass: bool,
+    /// Content runs under the title bar: leave room for the window buttons.
+    fullsize: bool,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext, open: Option<PathBuf>) -> App {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+    pub fn new(cc: &eframe::CreationContext, open: Option<PathBuf>, glass_wanted: bool) -> App {
+        let glass = glass_wanted && crate::glass::apply(cc);
+        if glass_wanted && !glass {
+            eprintln!(
+                "droid-lite: Liquid Glass not available (macOS 26+ needed); using solid colours"
+            );
+        }
+        cc.egui_ctx.set_visuals(crate::glass::visuals(glass));
         let mut app = App {
             project: None,
             tree: Vec::new(),
             index: Index::default(),
             indexing: None,
-            index_time: None,
             stability: HashMap::new(),
             stability_rx: None,
             lsp: None,
@@ -188,6 +207,11 @@ impl App {
             last_shift: None,
             status: String::new(),
             shot: std::env::var_os("DROID_LITE_SHOT").map(|p| (PathBuf::from(p), 0)),
+            refactor: None,
+            undo: None,
+            watcher: None,
+            glass,
+            fullsize: glass_wanted,
         };
         if let Some(dir) = open.or_else(last_project) {
             app.open_project(&dir, &cc.egui_ctx);
@@ -223,9 +247,11 @@ impl App {
             c.request_repaint();
         });
         self.indexing = Some(rx);
-        self.index_time = None;
         self.reload_stability(&project, ctx);
         self.lsp = Lsp::start(&project.root, ctx.clone());
+        self.watcher = crate::watch::Watcher::start(&project.root, ctx.clone());
+        self.refactor = None;
+        self.undo = None;
         self.status = format!(
             "Opened {} ({} modules, {} files)",
             project.name,
@@ -276,6 +302,9 @@ impl App {
                 cache: None,
                 goto: None,
                 cursor: 0,
+                selection: 0..0,
+                disk_changed: false,
+                deleted: false,
             };
             tab.reanalyse();
             if let Some(l) = self.lsp.as_mut().filter(|_| is_code(path)) {
@@ -514,6 +543,7 @@ impl App {
                         }
                     }
                 }
+                lsp::Event::Rename(edits) => self.on_lsp_rename(edits),
                 lsp::Event::Diagnostics(path, diags) => {
                     if let Some(t) = self.tabs.iter_mut().find(|t| t.path == path) {
                         t.diagnostics = diags
@@ -555,6 +585,15 @@ impl App {
             self.search = open(SearchKind::Structure);
         } else if pressed(cmd | Modifiers::SHIFT, Key::F) {
             self.search = open(SearchKind::FindInFiles);
+        }
+        if pressed(Modifiers::SHIFT, Key::F6) {
+            self.start_rename();
+        }
+        if pressed(Modifiers::CTRL | Modifiers::ALT, Key::O) {
+            self.optimize_imports();
+        }
+        if pressed(cmd | Modifiers::ALT, Key::V) {
+            self.start_extract();
         }
         if pressed(cmd, Key::B) {
             self.goto_definition();
@@ -778,6 +817,8 @@ impl App {
                 });
             }
             ui.separator();
+            self.refactor_menu(ui);
+            ui.separator();
             ui.label("Gradle:");
             ui.add(TextEdit::singleline(&mut self.gradle_task).desired_width(220.0));
             let running = self.gradle.is_some();
@@ -896,6 +937,7 @@ impl App {
             self.close_tab(i);
             return;
         }
+        self.disk_banner(ui);
         if self.tabs[self.active].dirty() {
             ui.horizontal(|ui| {
                 if ui.small_button("Save ⌘S").clicked() {
@@ -964,6 +1006,7 @@ impl App {
             cache,
             goto,
             cursor,
+            selection,
             lints,
             diagnostics,
             ..
@@ -1015,8 +1058,11 @@ impl App {
                             Some(Align::Center),
                         );
                         *cursor = target.min(text.len());
+                        *selection = *cursor..*cursor;
                     } else if let Some(r) = out.cursor_range {
                         *cursor = byte_of_char(text, r.primary.index.0);
+                        let other = byte_of_char(text, r.secondary.index.0);
+                        *selection = (*cursor).min(other)..(*cursor).max(other);
                         popup_pos = Some(
                             out.galley
                                 .pos_from_cursor(r.primary)
@@ -1485,9 +1531,18 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        if self.glass {
+            [0.0; 4]
+        } else {
+            visuals.panel_fill.to_normalized_gamma_f32()
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
+        self.poll_disk(&ctx);
         self.shortcuts(&ctx);
         if let Some(dropped) =
             ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()))
@@ -1495,7 +1550,17 @@ impl eframe::App for App {
         {
             self.open_project(&dropped, &ctx);
         }
-        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
+        egui::Panel::top("top").show(ui, |ui| {
+            if self.fullsize {
+                ui.add_space(4.0);
+            }
+            ui.horizontal(|ui| {
+                if self.fullsize {
+                    ui.add_space(72.0); // traffic lights
+                }
+                self.top_bar(ui);
+            });
+        });
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         egui::Panel::bottom("bottom")
             .resizable(true)
@@ -1509,11 +1574,20 @@ impl eframe::App for App {
             .resizable(true)
             .default_size(340.0)
             .show(ui, |ui| self.compose_panel(ui));
-        egui::CentralPanel::default().show(ui, |ui| self.editor(ui));
+        let editor_frame =
+            egui::Frame::central_panel(ui.style()).fill(crate::glass::editor_fill(self.glass));
+        egui::CentralPanel::default()
+            .frame(editor_frame)
+            .show(ui, |ui| self.editor(ui));
         self.search_window(&ctx);
+        self.refactor_window(&ctx);
         if let Some((path, frames)) = self.shot.as_mut().filter(|_| self.indexing.is_none()) {
             *frames += 1;
-            if *frames == 30 {
+            let wait: u32 = std::env::var("DROID_LITE_SHOT_FRAMES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30);
+            if *frames == wait {
                 let path = path.clone();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
                     egui::ScreenshotCallback::new(move |img| {
