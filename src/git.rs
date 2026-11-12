@@ -170,6 +170,16 @@ pub fn show(dir: &Path, sha: &str, path: Option<&Path>) -> String {
     }
 }
 
+/// The checked-out branch, or `None` outside a repository.
+pub fn branch(dir: &Path) -> Option<String> {
+    let out = git(dir)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !b.is_empty()).then_some(b)
+}
+
 /// "just now", "5 minutes ago", "3 days ago", "2 years ago".
 pub fn ago(time: i64, now: i64) -> String {
     let s = (now - time).max(0);

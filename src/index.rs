@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 #[derive(Default)]
 pub struct Index {
     pub files: HashMap<PathBuf, FileSyms>,
+    /// Files that declare each name, for lookups that do not scan every declaration.
+    by_name: HashMap<String, Vec<PathBuf>>,
+    /// Bumped on every change, so callers can cache results.
+    pub generation: u64,
 }
 
 /// One search hit.
@@ -28,7 +32,7 @@ impl Index {
         let code: Vec<&PathBuf> = paths.iter().filter(|p| is_code(p)).collect();
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
         let chunk = code.len().div_ceil(threads).max(1);
-        let files = std::thread::scope(|s| {
+        let scanned: Vec<(PathBuf, FileSyms)> = std::thread::scope(|s| {
             let jobs: Vec<_> = code
                 .chunks(chunk)
                 .map(|c| {
@@ -45,23 +49,99 @@ impl Index {
                 .flat_map(|j| j.join().unwrap_or_default())
                 .collect()
         });
-        Index { files }
+        let mut index = Index::default();
+        for (p, f) in scanned {
+            index.insert(p, f);
+        }
+        index
+    }
+
+    fn insert(&mut self, path: PathBuf, syms: FileSyms) {
+        self.remove(&path);
+        let mut names: Vec<&str> = syms.decls.iter().map(|d| d.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        for n in names {
+            self.by_name
+                .entry(n.to_string())
+                .or_default()
+                .push(path.clone());
+        }
+        self.files.insert(path, syms);
+        self.generation += 1;
     }
 
     pub fn update(&mut self, path: &Path, src: &str) {
         if is_code(path) {
-            self.files.insert(path.to_path_buf(), scan(src));
+            self.insert(path.to_path_buf(), scan(src));
         }
     }
 
     pub fn remove(&mut self, path: &Path) {
-        self.files.remove(path);
+        if let Some(old) = self.files.remove(path) {
+            for d in &old.decls {
+                if let Some(v) = self.by_name.get_mut(&d.name) {
+                    v.retain(|p| p != path);
+                    if v.is_empty() {
+                        self.by_name.remove(&d.name);
+                    }
+                }
+            }
+            self.generation += 1;
+        }
+    }
+
+    /// Drops every file under `dir` (a deleted folder).
+    pub fn remove_under(&mut self, dir: &Path) {
+        let gone: Vec<PathBuf> = self
+            .files
+            .keys()
+            .filter(|p| p.starts_with(dir))
+            .cloned()
+            .collect();
+        for p in gone {
+            self.remove(&p);
+        }
     }
 
     pub fn decls(&self) -> impl Iterator<Item = (&PathBuf, &FileSyms, &Decl)> {
         self.files
             .iter()
             .flat_map(|(p, f)| f.decls.iter().map(move |d| (p, f, d)))
+    }
+
+    /// Declarations named exactly `name`, without scanning the whole project.
+    pub fn named<'a>(
+        &'a self,
+        name: &str,
+    ) -> impl Iterator<Item = (&'a PathBuf, &'a FileSyms, &'a Decl)> + 'a {
+        self.by_name
+            .get_key_value(name)
+            .into_iter()
+            .flat_map(move |(key, paths)| {
+                paths
+                    .iter()
+                    .filter_map(move |p| self.files.get_key_value(p))
+                    .flat_map(move |(p, f)| {
+                        f.decls
+                            .iter()
+                            .filter(move |d| d.name == *key)
+                            .map(move |d| (p, f, d))
+                    })
+            })
+    }
+
+    /// Declarations whose container is `name` (members of a class).
+    pub fn members<'a>(&'a self, container: &str) -> impl Iterator<Item = &'a Decl> + 'a {
+        let key = self
+            .by_name
+            .get_key_value(container)
+            .map(|(k, _)| k.as_str());
+        self.named(container).flat_map(move |(_, f, _)| {
+            f.decls
+                .iter()
+                .filter(move |d| d.container.as_deref().is_some_and(|c| Some(c) == key))
+        })
     }
 
     pub fn symbol_count(&self) -> usize {
@@ -72,23 +152,24 @@ impl Index {
     pub fn search(&self, query: &str, types_only: bool, limit: usize) -> Vec<Hit> {
         let items = self
             .decls()
-            .filter(|(_, _, d)| !types_only || d.kind.is_type())
-            .map(|(p, f, d)| Hit {
+            .filter(|(_, _, d)| !types_only || d.kind.is_type());
+        rank_by(query, items, |(_, _, d)| &d.name, limit)
+            .into_iter()
+            .map(|(score, (p, f, d))| Hit {
                 name: d.name.clone(),
                 detail: describe(f, d),
                 path: p.clone(),
                 offset: d.offset,
-                score: 0,
-            });
-        rank(query, items, |h| h.name.clone(), limit)
+                score,
+            })
+            .collect()
     }
 
     /// Where `name` is declared. Prefers the current file, then imported and same-package declarations.
     pub fn definitions(&self, name: &str, from: &Path) -> Vec<Hit> {
         let here = self.files.get(from);
         let mut hits: Vec<Hit> = self
-            .decls()
-            .filter(|(_, _, d)| d.name == name)
+            .named(name)
             .map(|(p, f, d)| {
                 let fq = qualified(f, d);
                 let score = if p == from {
@@ -117,43 +198,41 @@ impl Index {
         hits
     }
 
-    /// Completion candidates for an identifier prefix: declarations in the project, deduplicated by name.
+    /// Completion candidates for an identifier prefix: one per name, exact-case prefix first.
     pub fn complete(&self, prefix: &str, limit: usize) -> Vec<Hit> {
-        let mut seen = std::collections::HashSet::new();
-        let items = self
-            .decls()
-            .filter(|(_, _, d)| seen.insert((d.name.clone(), d.kind == Kind::Fun)))
-            .map(|(p, f, d)| Hit {
-                name: d.name.clone(),
-                detail: describe(f, d),
-                path: p.clone(),
-                offset: d.offset,
-                score: 0,
-            });
-        let mut hits = rank(prefix, items, |h| h.name.clone(), limit * 4);
-        // exact prefix first, then fuzzy order
-        hits.sort_by_key(|h| {
-            (
-                !h.name.starts_with(prefix),
-                !h.name.to_lowercase().starts_with(&prefix.to_lowercase()),
-                u32::MAX - h.score,
-            )
-        });
-        hits.truncate(limit);
-        hits
+        let names = self.by_name.keys().map(String::as_str);
+        let mut top = rank_by(prefix, names, |n| n, limit * 4);
+        top.sort_by_key(|(score, n)| (!n.starts_with(prefix), std::cmp::Reverse(*score)));
+        top.into_iter()
+            .take(limit)
+            .filter_map(|(score, n)| {
+                let (p, f, d) = self.named(n).next()?;
+                Some(Hit {
+                    name: d.name.clone(),
+                    detail: describe(f, d),
+                    path: p.clone(),
+                    offset: d.offset,
+                    score,
+                })
+            })
+            .collect()
     }
 
-    /// Fully qualified name of a type, for adding an import.
+    /// Fully qualified name of a type or top-level declaration, for adding an import.
     pub fn import_for(&self, name: &str) -> Option<String> {
-        self.decls()
-            .find(|(_, _, d)| d.name == name && (d.kind.is_type() || d.container.is_none()))
+        self.named(name)
+            .find(|(_, _, d)| d.kind.is_type() || d.container.is_none())
             .map(|(_, f, d)| qualified(f, d))
     }
 
     pub fn find_decl(&self, name: &str, kind: Kind) -> Option<&Decl> {
-        self.decls()
+        self.named(name).map(|(_, _, d)| d).find(|d| d.kind == kind)
+    }
+
+    pub fn find_type(&self, name: &str) -> Option<&Decl> {
+        self.named(name)
             .map(|(_, _, d)| d)
-            .find(|d| d.name == name && d.kind == kind)
+            .find(|d| d.kind.is_type())
     }
 }
 
@@ -202,37 +281,42 @@ pub fn describe(f: &FileSyms, d: &Decl) -> String {
     s
 }
 
-/// Fuzzy-ranks hits by `key`. An empty query keeps the input order.
-pub fn rank(
+/// Fuzzy-ranks `items` by `key` and keeps the best `limit`, without allocating per item.
+/// Exact matches and prefix matches score higher; shorter names win ties. An empty query keeps the input order.
+pub fn rank_by<T>(
     query: &str,
-    items: impl Iterator<Item = Hit>,
-    key: impl Fn(&Hit) -> String,
+    items: impl Iterator<Item = T>,
+    key: impl Fn(&T) -> &str,
     limit: usize,
-) -> Vec<Hit> {
+) -> Vec<(u32, T)> {
     if query.is_empty() {
-        return items.take(limit).collect();
+        return items.take(limit).map(|t| (0, t)).collect();
     }
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
     let mut matcher = Matcher::new(Config::DEFAULT);
     let mut buf = Vec::new();
-    let q = query.to_lowercase();
-    let mut scored: Vec<Hit> = items
-        .filter_map(|mut h| {
-            let k = key(&h);
-            let s = pattern.score(Utf32Str::new(&k, &mut buf), &mut matcher)?;
-            let bonus = if k.eq_ignore_ascii_case(query) {
+    let mut scored: Vec<(u32, T)> = items
+        .filter_map(|t| {
+            let k = key(&t);
+            let s = pattern.score(Utf32Str::new(k, &mut buf), &mut matcher)?;
+            let prefix = k
+                .get(..query.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(query));
+            let bonus = if prefix && k.len() == query.len() {
                 10_000
-            } else if k.to_lowercase().starts_with(&q) {
+            } else if prefix {
                 1_000
             } else {
                 0
             };
-            h.score = (s + bonus).saturating_sub(k.len() as u32);
-            Some(h)
+            Some(((s + bonus).saturating_sub(k.len() as u32), t))
         })
         .collect();
-    scored.sort_by_key(|h| std::cmp::Reverse(h.score));
-    scored.truncate(limit);
+    if scored.len() > limit {
+        scored.select_nth_unstable_by_key(limit, |(s, _)| std::cmp::Reverse(*s));
+        scored.truncate(limit);
+    }
+    scored.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
     scored
 }
 
@@ -271,6 +355,22 @@ mod tests {
         let defs = index().definitions("User", Path::new("/p/ui/Card.kt"));
         assert_eq!(defs[0].path, Path::new("/p/data/User.kt"));
         assert_eq!(defs.len(), 2);
+    }
+
+    #[test]
+    fn name_map_follows_updates_and_removals() {
+        let mut i = index();
+        assert_eq!(i.named("User").count(), 2);
+        i.update(
+            Path::new("/p/other/User.kt"),
+            "package com.other\nclass Person\n",
+        );
+        assert_eq!(i.named("User").count(), 1);
+        assert_eq!(i.named("Person").count(), 1);
+        i.remove_under(Path::new("/p/data"));
+        assert_eq!(i.named("User").count(), 0);
+        assert!(i.find_type("UserRepository").is_none());
+        assert_eq!(i.members("Person").count(), 0);
     }
 
     #[test]

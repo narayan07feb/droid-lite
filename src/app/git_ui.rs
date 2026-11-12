@@ -55,6 +55,16 @@ fn commit_tooltip(ui: &mut Ui, c: &Commit, now: i64) {
 }
 
 impl App {
+    #[cfg(test)]
+    pub(super) fn git_history_len(&self) -> usize {
+        self.git.history.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn commit_lines(&self) -> Option<&[String]> {
+        self.git.commit.as_ref().map(|(_, l)| l.as_slice())
+    }
+
     /// Starts or refreshes blame for the active tab when its text settled after an edit.
     pub(super) fn poll_git(&mut self, ctx: &egui::Context) {
         if let Some(t) = self.tabs.get_mut(self.active) {
@@ -237,49 +247,77 @@ pub(super) fn paint_inline_blame(
     clicked.then(|| c.sha.clone())
 }
 
-/// The blame column: author and age at the first line of each block from the same commit.
-/// Returns the commit to open when a line is clicked.
-pub(super) fn blame_column(ui: &mut Ui, blame: Option<&Blame>, lines: usize) -> Option<String> {
-    let now = git::now();
-    let text: String = (0..lines)
-        .map(|i| match blame.and_then(|b| b.line(i)) {
-            Some(c)
-                if i == 0
-                    || blame.and_then(|b| b.lines.get(i - 1))
-                        != blame.and_then(|b| b.lines.get(i)) =>
-            {
-                let who = if c.is_uncommitted() {
-                    "You".to_string()
-                } else {
-                    c.author.chars().take(14).collect()
-                };
-                let when = if c.is_uncommitted() {
-                    "now".to_string()
-                } else {
-                    git::ago(c.time, now).replace(" ago", "")
-                };
-                format!("{who:<14} {when:>10}\n")
-            }
-            _ => format!("{:25}\n", ""),
-        })
-        .collect();
-    let r = ui.add(
-        egui::Label::new(
-            RichText::new(text)
-                .font(FontId::monospace(FONT_SIZE))
-                .color(DIM),
-        )
-        .sense(Sense::click()),
-    );
+pub(super) const COLUMN_WIDTH: f32 = 210.0;
+
+/// The blame column in `rect`: author and age at the first line of each block from the same commit,
+/// painted for visible rows only. Returns the commit to open when a line is clicked.
+pub(super) fn blame_column(
+    ui: &mut Ui,
+    blame: Option<&Blame>,
+    rect: egui::Rect,
+    galley: &Galley,
+    galley_pos: Pos2,
+    row_h: f32,
+) -> Option<String> {
     let b = blame?;
-    let row_h = (r.rect.height() / lines.max(1) as f32).max(1.0);
-    let line_at = |y: f32| ((y - r.rect.top()) / row_h) as usize;
+    let now = git::now();
+    let clip = ui.clip_rect();
+    let font = FontId::proportional(FONT_SIZE - 1.0);
+    let painter = ui.painter();
+    for (i, row) in galley.rows.iter().enumerate() {
+        let y = galley_pos.y + row.pos.y;
+        if y > clip.bottom() {
+            break;
+        }
+        if y + row_h < clip.top() {
+            continue;
+        }
+        let (Some(c), first) = (b.line(i), i == 0 || b.lines.get(i - 1) != b.lines.get(i)) else {
+            continue;
+        };
+        if !first {
+            continue;
+        }
+        let who = if c.is_uncommitted() {
+            "You".to_string()
+        } else {
+            c.author.chars().take(18).collect()
+        };
+        let when = if c.is_uncommitted() {
+            "now".to_string()
+        } else {
+            git::ago(c.time, now)
+        };
+        painter.text(
+            Pos2::new(rect.left() + 6.0, y),
+            Align2::LEFT_TOP,
+            who,
+            font.clone(),
+            DIM,
+        );
+        painter.text(
+            Pos2::new(rect.right() - 10.0, y),
+            Align2::RIGHT_TOP,
+            when,
+            font.clone(),
+            DIM,
+        );
+    }
+    let r = ui.interact(rect, ui.scope_id().with("blame-column"), Sense::click());
+    let line_at = |p: Pos2| {
+        galley
+            .rows
+            .iter()
+            .position(|row| p.y < galley_pos.y + row.pos.y + row_h)
+    };
     let mut open = None;
-    if let Some(p) = r.interact_pointer_pos().filter(|_| r.clicked()) {
-        open = b.line(line_at(p.y)).map(|c| c.sha.clone());
+    if r.clicked()
+        && let Some(p) = r.interact_pointer_pos()
+    {
+        open = line_at(p).and_then(|i| b.line(i)).map(|c| c.sha.clone());
     }
     if let Some(p) = r.hover_pos()
-        && let Some(c) = b.line(line_at(p.y))
+        && let Some(c) = line_at(p).and_then(|i| b.line(i))
     {
         r.on_hover_ui_at_pointer(|ui| commit_tooltip(ui, c, now));
     }

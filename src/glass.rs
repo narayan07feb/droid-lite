@@ -1,7 +1,7 @@
 //! macOS Liquid Glass (macOS 26+): an NSGlassEffectView behind a transparent egui window.
 //! Side panels and bars are see-through; the editor stays almost opaque so code is easy to read.
 
-use egui::{Color32, Visuals};
+use egui::Color32;
 
 /// Glass is on by default on macOS; `DROID_LITE_GLASS=0` turns it off.
 pub fn wanted() -> bool {
@@ -22,24 +22,12 @@ pub fn apply(cc: &eframe::CreationContext) -> bool {
     }
 }
 
-pub fn visuals(glass: bool) -> Visuals {
-    let mut v = Visuals::dark();
-    if glass {
-        v.panel_fill = Color32::from_rgba_unmultiplied(22, 24, 28, 110);
-        v.window_fill = Color32::from_rgba_unmultiplied(30, 32, 38, 235);
-        v.extreme_bg_color = Color32::from_rgba_unmultiplied(10, 12, 14, 150);
-        v.faint_bg_color = Color32::from_rgba_unmultiplied(255, 255, 255, 8);
-        v.window_corner_radius = 14.into();
-        v.menu_corner_radius = 10.into();
-    }
-    v
-}
-
 /// The editor background: nearly opaque on glass so text keeps its contrast.
 pub fn editor_fill(glass: bool) -> Color32 {
+    let c = crate::theme::DARK.editor_bg;
     if glass {
-        Color32::from_rgba_unmultiplied(24, 26, 30, 225)
+        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 228)
     } else {
-        Visuals::dark().panel_fill
+        c
     }
 }

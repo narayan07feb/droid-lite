@@ -63,7 +63,7 @@ impl App {
                     project.files.retain(|f| !f.starts_with(&path));
                     tree_dirty |= project.files.len() != before;
                 }
-                self.index.files.retain(|f, _| !f.starts_with(&path));
+                self.index.remove_under(&path);
                 for t in self.tabs.iter_mut().filter(|t| t.path.starts_with(&path)) {
                     t.deleted = true;
                 }

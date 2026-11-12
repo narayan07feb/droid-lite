@@ -166,11 +166,7 @@ pub fn is_ui_call(name: &str, index: &Index) -> bool {
     {
         return true;
     }
-    if index
-        .decls()
-        .any(|(_, _, d)| d.name == name && d.kind.is_type())
-        || is_value_type(name)
-    {
+    if index.find_type(name).is_some() || is_value_type(name) {
         return false;
     }
     true
@@ -683,15 +679,11 @@ pub fn guess(d: &Decl, index: &Index) -> Stability {
                     Verdict::Stable,
                     "primitive, function type or known stable Compose type".to_string(),
                 )
-            } else if let Some(c) = index
-                .decls()
-                .map(|(_, _, d)| d)
-                .find(|c| c.name == raw && c.kind.is_type())
-            {
+            } else if let Some(c) = index.find_type(raw) {
                 let marked = c.has_annotation("Immutable") || c.has_annotation("Stable");
-                let has_var = index.decls().any(|(_, _, m)| {
-                    m.container.as_deref() == Some(raw) && m.kind == Kind::Property && m.mutable
-                });
+                let has_var = index
+                    .members(raw)
+                    .any(|m| m.kind == Kind::Property && m.mutable);
                 if marked {
                     (Verdict::Stable, "marked @Stable or @Immutable".into())
                 } else if has_var {
@@ -709,11 +701,9 @@ pub fn guess(d: &Decl, index: &Index) -> Stability {
                     (Verdict::Stable, "enum or object".into())
                 } else {
                     let vals = index
-                        .decls()
-                        .filter(|(_, _, m)| {
-                            m.container.as_deref() == Some(raw) && m.kind == Kind::Property
-                        })
-                        .map(|(_, _, m)| m.ty.clone())
+                        .members(raw)
+                        .filter(|m| m.kind == Kind::Property)
+                        .map(|m| m.ty.clone())
                         .collect::<Vec<_>>();
                     if vals.iter().any(|t| {
                         matches!(

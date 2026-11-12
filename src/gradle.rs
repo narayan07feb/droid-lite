@@ -73,6 +73,16 @@ impl Run {
     }
 }
 
+impl Drop for Run {
+    /// A dropped run (new project, app quit) must not leave Gradle running or a zombie behind.
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreviewTool {
     /// Google's Compose Preview Screenshot Testing plugin (`com.android.compose.screenshot`).

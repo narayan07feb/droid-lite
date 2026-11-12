@@ -1,16 +1,20 @@
 //! The IDE window: project tree, editor tabs, search popups, completion, Compose panel, Gradle console.
 
 mod disk;
+#[cfg(test)]
+mod e2e;
 mod git_ui;
 mod refactor_ui;
 
 use crate::compose::{self, Lint, Severity, Stability, Verdict};
 use crate::gradle::{self, PreviewTool};
 use crate::highlight::{self, ERROR, INFO, TEXT, WARN};
+use crate::icons as ic;
 use crate::index::{self, Hit, Index};
 use crate::kotlin::{Decl, FileSyms, scan};
 use crate::lsp::{self, Lsp};
 use crate::project::{Project, is_code};
+use crate::theme::{self, DARK};
 use egui::text::{CCursor, CCursorRange};
 use egui::{
     Align, Align2, Color32, FontId, Key, KeyboardShortcut, Modifiers, RichText, TextEdit, Ui,
@@ -21,6 +25,16 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Instant, SystemTime};
 
 const FONT_SIZE: f32 = 13.0;
+/// Back/forward and recent-file lists are capped so a long session does not grow them forever.
+const MAX_HISTORY: usize = 200;
+const MAX_RECENT: usize = 50;
+
+fn push_capped<T>(v: &mut Vec<T>, item: T) {
+    v.push(item);
+    if v.len() > MAX_HISTORY {
+        v.remove(0);
+    }
+}
 
 struct Tab {
     path: PathBuf,
@@ -29,7 +43,8 @@ struct Tab {
     syms: FileSyms,
     lints: Vec<Lint>,
     diagnostics: Vec<(usize, u8, String)>,
-    cache: Option<(u64, egui::text::LayoutJob)>,
+    /// Laid-out text, reused until the text, the problem marks or the zoom change.
+    cache: Option<(u64, std::sync::Arc<egui::Galley>)>,
     /// Byte offset to put the cursor at (and scroll to) on the next frame.
     goto: Option<usize>,
     cursor: usize,
@@ -39,25 +54,16 @@ struct Tab {
     disk_changed: bool,
     deleted: bool,
     git: git_ui::TabBlame,
+    /// Bumped on every text change; caches key on it.
+    rev: u64,
 }
 
 impl Tab {
     fn dirty(&self) -> bool {
         self.text != self.saved
     }
-    fn title(&self) -> String {
-        let name = self
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if self.dirty() {
-            format!("● {name}")
-        } else {
-            name
-        }
-    }
     fn reanalyse(&mut self) {
+        self.rev += 1;
         self.syms = scan(&self.text);
         self.lints = if is_code(&self.path) {
             compose::lint(&self.text, &self.syms)
@@ -131,6 +137,16 @@ enum Bottom {
     Git,
 }
 
+/// What the Compose panel shows for one composable; rebuilt only when its inputs change.
+struct ComposeView {
+    key: (PathBuf, u64, u64, u64, String),
+    tree: Vec<compose::Node>,
+    stability: Stability,
+    guessed: bool,
+    tool: Option<(crate::project::Module, PreviewTool)>,
+    images: Vec<(String, PathBuf)>,
+}
+
 #[derive(Default)]
 struct DirNode {
     dirs: BTreeMap<String, DirNode>,
@@ -173,6 +189,12 @@ pub struct App {
     /// Content runs under the title bar: leave room for the window buttons.
     fullsize: bool,
     git: git_ui::GitState,
+    /// Current git branch of the project, shown in the toolbar.
+    branch: Option<String>,
+    /// Bumped when a build or a report reload may have changed previews and stability.
+    outputs_gen: u64,
+    compose_view: Option<ComposeView>,
+    ctx: Option<egui::Context>,
 }
 
 impl App {
@@ -183,7 +205,9 @@ impl App {
                 "droid-lite: Liquid Glass not available (macOS 26+ needed); using solid colours"
             );
         }
-        cc.egui_ctx.set_visuals(crate::glass::visuals(glass));
+        crate::theme::install_fonts(&cc.egui_ctx);
+        cc.egui_ctx.set_visuals(crate::theme::visuals(glass));
+        crate::theme::style(&cc.egui_ctx);
         let mut app = App {
             project: None,
             tree: Vec::new(),
@@ -217,6 +241,10 @@ impl App {
             glass,
             fullsize: glass_wanted,
             git: Default::default(),
+            branch: None,
+            outputs_gen: 0,
+            compose_view: None,
+            ctx: Some(cc.egui_ctx.clone()),
         };
         if let Some(dir) = open.or_else(last_project) {
             app.open_project(&dir, &cc.egui_ctx);
@@ -244,10 +272,20 @@ impl App {
         let project = Project::open(dir);
         remember_project(&project.root);
         self.tree = build_tree(&project);
-        self.tabs.clear();
+        for t in std::mem::take(&mut self.tabs) {
+            self.forget_tab(&t);
+        }
         self.history.clear();
+        self.forward.clear();
         self.recent.clear();
         self.index = Index::default();
+        self.gradle = None; // Drop stops a running build of the old project
+        self.compose_view = None;
+        self.textures.clear();
+        self.found.clear();
+        self.console.clear();
+        self.git = Default::default();
+        self.stability.clear();
         let (tx, rx) = channel();
         let files = project.files.clone();
         let c = ctx.clone();
@@ -259,6 +297,7 @@ impl App {
         self.reload_stability(&project, ctx);
         self.lsp = Lsp::start(&project.root, ctx.clone());
         self.watcher = crate::watch::Watcher::start(&project.root, ctx.clone());
+        self.branch = crate::git::branch(&project.root);
         self.refactor = None;
         self.undo = None;
         self.status = format!(
@@ -283,7 +322,7 @@ impl App {
 
     fn open_file(&mut self, path: &Path, offset: Option<usize>) {
         if let Some(t) = self.tabs.get(self.active) {
-            self.history.push((t.path.clone(), t.cursor));
+            push_capped(&mut self.history, (t.path.clone(), t.cursor));
             self.forward.clear();
         }
         self.show_file(path, offset);
@@ -294,6 +333,7 @@ impl App {
         self.completion = None;
         self.recent.retain(|p| p != path);
         self.recent.insert(0, path.to_path_buf());
+        self.recent.truncate(MAX_RECENT);
         if let Some(i) = self.tabs.iter().position(|t| t.path == path) {
             self.active = i;
         } else {
@@ -315,6 +355,7 @@ impl App {
                 disk_changed: false,
                 deleted: false,
                 git: Default::default(),
+                rev: 0,
             };
             tab.reanalyse();
             if let Some(l) = self.lsp.as_mut().filter(|_| is_code(path)) {
@@ -339,7 +380,7 @@ impl App {
     fn fwd(&mut self) {
         if let Some((p, o)) = self.forward.pop() {
             if let Some(t) = self.tabs.get(self.active) {
-                self.history.push((t.path.clone(), t.cursor));
+                push_capped(&mut self.history, (t.path.clone(), t.cursor));
             }
             self.show_file(&p, Some(o));
         }
@@ -371,8 +412,28 @@ impl App {
                 );
                 return;
             }
-            self.tabs.remove(i);
+            let t = self.tabs.remove(i);
+            self.forget_tab(&t);
             self.active = self.active.min(self.tabs.len().saturating_sub(1));
+        }
+    }
+
+    /// Frees what a closed tab left behind: the editor's undo history in egui memory and the LSP document.
+    fn forget_tab(&mut self, t: &Tab) {
+        // must match the editor's TextEdit id
+        let id = egui::Id::unique(("editor", &t.path));
+        if let Some(ctx) = &self.ctx {
+            ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(id));
+        }
+        if let Some(l) = self.lsp.as_mut() {
+            l.did_close(&t.path);
+        }
+        if self
+            .compose_view
+            .as_ref()
+            .is_some_and(|v| v.key.0 == t.path)
+        {
+            self.compose_view = None;
         }
     }
 
@@ -482,6 +543,7 @@ impl App {
             && let Ok(s) = rx.try_recv()
         {
             self.stability = s;
+            self.outputs_gen += 1;
             self.stability_rx = None;
         }
         if let Some(rx) = &self.find_rx
@@ -512,7 +574,7 @@ impl App {
                     })
                 ));
                 self.gradle = None;
-                self.textures.clear();
+                self.outputs_gen += 1;
                 // a build can write new stability dumps or Compose compiler reports
                 if let Some(p) = self.project.take() {
                     self.reload_stability(&p, ctx);
@@ -750,27 +812,30 @@ impl App {
             offset: 0,
             score: 0,
         };
-        let files = |q: &str| {
-            index::rank(
-                q,
-                self.project
-                    .iter()
-                    .flat_map(|p| p.files.iter())
-                    .map(file_hit),
-                |h| h.name.clone(),
-                60,
-            )
+        fn file_name<'x>(p: &'x &PathBuf) -> &'x str {
+            p.file_name().and_then(|n| n.to_str()).unwrap_or("")
+        }
+        let files = |q: &str, paths: &mut dyn Iterator<Item = &PathBuf>, limit| -> Vec<Hit> {
+            index::rank_by(q, paths, file_name, limit)
+                .into_iter()
+                .map(|(score, p)| Hit {
+                    score,
+                    ..file_hit(p)
+                })
+                .collect()
         };
         match kind {
             SearchKind::Class => self.index.search(q, true, 60),
             SearchKind::Symbol => self.index.search(q, false, 60),
-            SearchKind::File => files(q),
-            SearchKind::Recent => {
-                index::rank(q, self.recent.iter().map(file_hit), |h| h.name.clone(), 60)
-            }
+            SearchKind::File => files(q, &mut self.project.iter().flat_map(|p| p.files.iter()), 60),
+            SearchKind::Recent => files(q, &mut self.recent.iter(), 60),
             SearchKind::Everywhere => {
                 let mut v = self.index.search(q, false, 30);
-                v.extend(files(q).into_iter().take(15));
+                v.extend(files(
+                    q,
+                    &mut self.project.iter().flat_map(|p| p.files.iter()),
+                    15,
+                ));
                 v.sort_by_key(|h| std::cmp::Reverse(h.score));
                 v
             }
@@ -778,17 +843,19 @@ impl App {
                 let Some(t) = self.tabs.get(self.active) else {
                     return Vec::new();
                 };
-                let items = t.syms.decls.iter().map(|d| Hit {
-                    name: match &d.container {
-                        Some(c) => format!("{c}.{}", d.name),
-                        None => d.name.clone(),
-                    },
-                    detail: index::describe(&t.syms, d),
-                    path: t.path.clone(),
-                    offset: d.offset,
-                    score: 0,
-                });
-                index::rank(q, items, |h| h.name.clone(), 200)
+                index::rank_by(q, t.syms.decls.iter(), |d| &d.name, 200)
+                    .into_iter()
+                    .map(|(score, d)| Hit {
+                        name: match &d.container {
+                            Some(c) => format!("{c}.{}", d.name),
+                            None => d.name.clone(),
+                        },
+                        detail: index::describe(&t.syms, d),
+                        path: t.path.clone(),
+                        offset: d.offset,
+                        score,
+                    })
+                    .collect()
             }
             SearchKind::FindInFiles => Vec::new(),
         }
@@ -797,69 +864,106 @@ impl App {
     // ---------- panels ----------
 
     fn top_bar(&mut self, ui: &mut Ui) {
+        let open_search = |kind| Search {
+            kind,
+            query: String::new(),
+            hits: Vec::new(),
+            selected: 0,
+            stale: true,
+        };
         ui.horizontal(|ui| {
-            if ui.button("📂 Open project…").clicked()
+            let name = self
+                .project
+                .as_ref()
+                .map_or("Open project…".to_string(), |p| p.name.clone());
+            if ui
+                .button(RichText::new(format!("{}  {name}", ic::FOLDER_OPEN)).strong())
+                .on_hover_text("Open an Android project folder")
+                .clicked()
                 && let Some(dir) = rfd::FileDialog::new()
                     .set_title("Open an Android project folder")
                     .pick_folder()
             {
                 self.open_project(&dir, &ui.ctx().clone());
             }
-            if let Some(p) = &self.project {
-                ui.label(RichText::new(&p.name).strong());
+            if let Some(b) = &self.branch {
+                ui.label(RichText::new(format!("{}  {b}", ic::GIT_BRANCH)).color(DARK.weak));
             }
             ui.separator();
-            ui.add_enabled(!self.history.is_empty(), egui::Button::new("◀"))
-                .on_hover_text("Back (⌘[)")
-                .clicked()
-                .then(|| self.back());
-            ui.add_enabled(!self.forward.is_empty(), egui::Button::new("▶"))
-                .on_hover_text("Forward (⌘])")
-                .clicked()
-                .then(|| self.fwd());
-            if ui.button("🔍 Class").on_hover_text("⌘O").clicked() {
-                self.search = Some(Search {
-                    kind: SearchKind::Class,
-                    query: String::new(),
-                    hits: Vec::new(),
-                    selected: 0,
-                    stale: true,
-                });
-            }
-            ui.separator();
-            self.refactor_menu(ui);
-            ui.separator();
-            ui.label("Gradle:");
-            ui.add(TextEdit::singleline(&mut self.gradle_task).desired_width(220.0));
-            let running = self.gradle.is_some();
             if ui
-                .add_enabled(
-                    self.project.is_some() && !running,
-                    egui::Button::new("▶ Run"),
-                )
+                .add_enabled(!self.history.is_empty(), egui::Button::new(ic::ARROW_LEFT))
+                .on_hover_text("Back  ⌘[")
                 .clicked()
             {
-                let t = self.gradle_task.clone();
-                self.run_gradle(t, &ui.ctx().clone());
+                self.back();
             }
-            for t in ["assembleDebug", "installDebug"] {
-                if ui
+            if ui
+                .add_enabled(!self.forward.is_empty(), egui::Button::new(ic::ARROW_RIGHT))
+                .on_hover_text("Forward  ⌘]")
+                .clicked()
+            {
+                self.fwd();
+            }
+            if ui
+                .button(format!("{}  Search", ic::MAGNIFYING_GLASS))
+                .on_hover_text("Go to class  ⌘O\nGo to file  ⇧⌘O\nSearch everywhere  ⇧⇧")
+                .clicked()
+            {
+                self.search = Some(open_search(SearchKind::Everywhere));
+            }
+            self.refactor_menu(ui);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let running = self.gradle.is_some();
+                if running {
+                    if ui
+                        .button(
+                            RichText::new(format!("{}  Stop", ic::STOP))
+                                .color(crate::highlight::ERROR),
+                        )
+                        .clicked()
+                        && let Some(r) = self.gradle.as_mut()
+                    {
+                        r.stop();
+                    }
+                    ui.spinner();
+                } else if ui
                     .add_enabled(
-                        self.project.is_some() && !running,
-                        egui::Button::new(t).small(),
+                        self.project.is_some(),
+                        egui::Button::new(
+                            RichText::new(format!("{}  Run", ic::PLAY))
+                                .color(Color32::from_rgb(0x5F, 0xB8, 0x65)),
+                        ),
                     )
+                    .on_hover_text("Run the Gradle task")
                     .clicked()
                 {
-                    self.gradle_task = t.into();
-                    self.run_gradle(t.into(), &ui.ctx().clone());
+                    let t = self.gradle_task.clone();
+                    self.run_gradle(t, &ui.ctx().clone());
                 }
-            }
-            if running
-                && ui.button("■ Stop").clicked()
-                && let Some(r) = self.gradle.as_mut()
-            {
-                r.stop();
-            }
+                ui.menu_button("Tasks", |ui| {
+                    for t in [
+                        "assembleDebug",
+                        "installDebug",
+                        "testDebugUnitTest",
+                        "lint",
+                        "clean",
+                        "stabilityDump",
+                    ] {
+                        if ui.selectable_label(self.gradle_task == t, t).clicked() {
+                            self.gradle_task = t.into();
+                            ui.close();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Common Gradle tasks");
+                ui.add(
+                    TextEdit::singleline(&mut self.gradle_task)
+                        .desired_width(200.0)
+                        .hint_text("Gradle task"),
+                );
+                ui.label(RichText::new(ic::WRENCH).color(DARK.weak));
+            });
         });
     }
 
@@ -867,7 +971,7 @@ impl App {
         ui.horizontal(|ui| {
             if self.indexing.is_some() {
                 ui.spinner();
-                ui.label("Indexing…");
+                ui.label(RichText::new("Indexing…").color(DARK.weak));
             } else {
                 ui.label(format!("{} symbols", self.index.symbol_count()));
             }
@@ -900,6 +1004,7 @@ impl App {
     }
 
     fn project_panel(&mut self, ui: &mut Ui) {
+        theme::section(ui, ic::TREE_STRUCTURE, "Project");
         if self.project.is_none() {
             ui.label("Open an Android project folder (the one with settings.gradle).");
             return;
@@ -909,11 +1014,20 @@ impl App {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for (module, node) in &self.tree {
-                    egui::CollapsingHeader::new(RichText::new(format!("📦 {module}")).strong())
-                        .id_salt(module)
-                        .show(ui, |ui| {
-                            dir_ui(ui, node, module, &mut open);
-                        });
+                    let label = if module == ":" {
+                        self.project
+                            .as_ref()
+                            .map_or(module.clone(), |p| format!("{} (root)", p.name))
+                    } else {
+                        module.clone()
+                    };
+                    egui::CollapsingHeader::new(
+                        RichText::new(format!("{}  {label}", ic::PACKAGE)).strong(),
+                    )
+                    .id_salt(module)
+                    .show(ui, |ui| {
+                        dir_ui(ui, node, module, &mut open);
+                    });
                 }
             });
         if let Some(f) = open {
@@ -929,20 +1043,23 @@ impl App {
             return;
         }
         let mut close = None;
-        ui.horizontal_wrapped(|ui| {
-            for (i, t) in self.tabs.iter().enumerate() {
-                let r = ui
-                    .selectable_label(i == self.active, t.title())
-                    .on_hover_text(t.path.display().to_string());
-                if r.clicked() {
-                    self.active = i;
-                    self.completion = None;
-                }
-                if r.middle_clicked() || ui.small_button("×").clicked() {
-                    close = Some(i);
-                }
-            }
-        });
+        egui::ScrollArea::horizontal()
+            .id_salt("tabs")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for (i, t) in self.tabs.iter().enumerate() {
+                        let (clicked, closed) = tab_widget(ui, t, i == self.active);
+                        if clicked {
+                            self.active = i;
+                            self.completion = None;
+                        }
+                        if closed {
+                            close = Some(i);
+                        }
+                    }
+                });
+            });
         if let Some(i) = close {
             self.close_tab(i);
             return;
@@ -950,10 +1067,17 @@ impl App {
         self.disk_banner(ui);
         if self.tabs[self.active].dirty() {
             ui.horizontal(|ui| {
-                if ui.small_button("Save ⌘S").clicked() {
+                ui.label(RichText::new("Unsaved changes").color(DARK.weak).small());
+                if ui
+                    .small_button(format!("{}  Save  ⌘S", ic::FLOPPY_DISK))
+                    .clicked()
+                {
                     self.save();
                 }
-                if ui.small_button("Revert").clicked() {
+                if ui
+                    .small_button(format!("{}  Revert", ic::ARROW_COUNTER_CLOCKWISE))
+                    .clicked()
+                {
                     self.revert();
                 }
             });
@@ -1009,8 +1133,8 @@ impl App {
             )
         }));
         let lines = tab.text.matches('\n').count() + 1;
-        let digits = lines.to_string().len();
-        let numbers: String = (1..=lines).map(|n| format!("{n:>digits$}\n")).collect();
+        let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
+        let gutter_w = char_w * lines.to_string().len().max(3) as f32 + 18.0;
         let blame = tab.git.blame.clone();
         let show_column = self.git.show_column;
         let mut open_commit: Option<String> = None;
@@ -1024,13 +1148,23 @@ impl App {
             diagnostics,
             ..
         } = tab;
+        let marks_key = marks.iter().fold(0x9e37u64, |h, (r, c)| {
+            h.rotate_left(7)
+                ^ (r.start as u64)
+                ^ ((r.end as u64) << 20)
+                ^ u64::from(c.to_array()[0])
+        });
         let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _w: f32| {
             let s = buf.as_str();
-            let key = hash(s) ^ marks.len() as u64;
+            let key = hash(s) ^ marks_key ^ u64::from(ui.ctx().pixels_per_point().to_bits());
             if cache.as_ref().is_none_or(|(k, _)| *k != key) {
-                *cache = Some((key, highlight::job(s, font.clone(), &marks)));
+                let job = highlight::job(s, font.clone(), &marks);
+                *cache = Some((key, ui.fonts_mut(|f| f.layout_job(job))));
             }
-            ui.fonts_mut(|f| f.layout_job(cache.as_ref().unwrap().1.clone()))
+            cache
+                .as_ref()
+                .map(|(_, g)| g.clone())
+                .unwrap_or_else(|| ui.fonts_mut(|f| f.layout_job(Default::default())))
         };
         let mut changed = false;
         let mut cmd_click = false;
@@ -1040,14 +1174,20 @@ impl App {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.horizontal_top(|ui| {
-                    if show_column {
-                        open_commit = git_ui::blame_column(ui, blame.as_deref(), lines);
-                    }
-                    ui.label(
-                        RichText::new(&numbers)
-                            .font(FontId::monospace(FONT_SIZE))
-                            .color(Color32::from_gray(90)),
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    let blame_rect = show_column.then(|| {
+                        ui.allocate_exact_size(
+                            egui::vec2(git_ui::COLUMN_WIDTH, row_h * lines as f32),
+                            egui::Sense::hover(),
+                        )
+                        .0
+                    });
+                    let (gutter, _) = ui.allocate_exact_size(
+                        egui::vec2(gutter_w, row_h * lines as f32),
+                        egui::Sense::hover(),
                     );
+                    // filled in after layout, so it sits under the text
+                    let line_bg = ui.painter().add(egui::Shape::Noop);
                     let out = TextEdit::multiline(text)
                         .id(id)
                         .code_editor()
@@ -1086,8 +1226,42 @@ impl App {
                                 .left_bottom(),
                         );
                     }
+                    let cursor_line = text[..(*cursor).min(text.len())].matches('\n').count();
+                    let theme = &crate::theme::DARK;
+                    if let Some(row) = out.galley.rows.get(cursor_line) {
+                        let y = out.galley_pos.y + row.pos.y;
+                        let r = egui::Rect::from_min_max(
+                            egui::pos2(gutter.left(), y),
+                            egui::pos2(ui.clip_rect().right(), y + row_h),
+                        );
+                        ui.painter().set(
+                            line_bg,
+                            egui::Shape::rect_filled(r, 0.0, theme.current_line),
+                        );
+                    }
+                    paint_line_numbers(
+                        ui,
+                        &out.galley,
+                        out.galley_pos,
+                        gutter,
+                        cursor_line,
+                        &font,
+                        theme,
+                    );
+                    if let Some(rect) = blame_rect
+                        && let Some(sha) = git_ui::blame_column(
+                            ui,
+                            blame.as_deref(),
+                            rect,
+                            &out.galley,
+                            out.galley_pos,
+                            row_h,
+                        )
+                    {
+                        open_commit = Some(sha);
+                    }
                     if let Some(b) = &blame {
-                        let line = text[..(*cursor).min(text.len())].matches('\n').count();
+                        let line = cursor_line;
                         if let Some(sha) =
                             git_ui::paint_inline_blame(ui, b, &out.galley, out.galley_pos, line)
                         {
@@ -1282,6 +1456,7 @@ impl App {
     // ---------- Compose panel ----------
 
     fn compose_panel(&mut self, ui: &mut Ui) {
+        theme::section(ui, ic::CUBE, "Compose");
         let Some(tab) = self.tabs.get(self.active) else {
             ui.label("Open a Kotlin file to see its composables.");
             return;
@@ -1310,7 +1485,7 @@ impl App {
         let mut render = false;
         let mut dump = false;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            egui::CollapsingHeader::new(RichText::new(format!("Composables ({})", composables.len())).heading()).default_open(composables.len() <= 8).show(ui, |ui| {
+            egui::CollapsingHeader::new(RichText::new(format!("{}  Composables ({})", ic::CUBE, composables.len())).strong()).default_open(composables.len() <= 8).show(ui, |ui| {
                 egui::ScrollArea::vertical().id_salt("composables").max_height(220.0).show(ui, |ui| {
                     for d in &composables {
                         let mut label = RichText::new(&d.name).monospace();
@@ -1325,23 +1500,31 @@ impl App {
                 });
             });
             let Some(d) = composables.iter().find(|d| d.name == current) else { return };
+            let key = (tab.path.clone(), tab.rev, self.index.generation, self.outputs_gen, d.name.clone());
+            if self.compose_view.as_ref().is_none_or(|v| v.key != key) {
+                let is_ui = |n: &str| compose::is_ui_call(n, &self.index);
+                let (stability, guessed) = match self.stability.get(&d.name) {
+                    Some(s) => (s.clone(), false),
+                    None => (compose::guess(d, &self.index), true),
+                };
+                let previews: Vec<String> = tab.syms.decls.iter().filter(|d| d.is_preview()).map(|d| d.name.clone()).collect();
+                let tool = self.project.as_ref().and_then(|pr| pr.module_of(&tab.path)).and_then(|m| PreviewTool::detect(m).map(|t| (m.clone(), t)));
+                let images = tool.as_ref().map(|(m, t)| t.images(m, &previews)).unwrap_or_default();
+                self.compose_view = Some(ComposeView { key, tree: compose::tree(&tab.text, d, &is_ui), stability, guessed, tool, images });
+            }
+            let Some(view) = &self.compose_view else { return };
             ui.separator();
-            ui.heading(format!("UI tree: {}", d.name));
-            let is_ui = |n: &str| compose::is_ui_call(n, &self.index);
-            let tree = compose::tree(&tab.text, d, &is_ui);
-            if tree.is_empty() {
+            theme::section(ui, ic::TREE_STRUCTURE, &format!("UI tree · {}", d.name));
+            if view.tree.is_empty() {
                 ui.label(RichText::new("No UI calls found.").weak());
             }
-            for n in &tree {
+            for n in &view.tree {
                 node_ui(ui, n, &mut jump);
             }
 
             ui.separator();
-            ui.heading("Stability");
-            let (st, guessed) = match self.stability.get(&d.name) {
-                Some(s) => (s.clone(), false),
-                None => (compose::guess(d, &self.index), true),
-            };
+            theme::section(ui, ic::LIGHTNING, "Stability");
+            let (st, guessed) = (&view.stability, view.guessed);
             ui.horizontal(|ui| {
                 let yes_no = |b: Option<bool>| b.map_or("?", |b| if b { "yes" } else { "no" });
                 ui.label(format!("skippable: {}   restartable: {}", yes_no(st.skippable), yes_no(st.restartable)));
@@ -1366,7 +1549,7 @@ impl App {
             }
 
             ui.separator();
-            ui.heading("Previews");
+            theme::section(ui, ic::IMAGE, "Previews");
             let previews: Vec<String> = tab.syms.decls.iter().filter(|d| d.is_preview()).map(|d| d.name.clone()).collect();
             if previews.is_empty() {
                 ui.label(RichText::new("No @Preview functions in this file.").weak());
@@ -1376,30 +1559,31 @@ impl App {
                     jump = tab.syms.decls.iter().find(|d| &d.name == p).map(|d| d.offset);
                 }
             }
-            let module = self.project.as_ref().and_then(|pr| pr.module_of(&tab.path)).cloned();
-            match module.as_ref().map(|m| (m, PreviewTool::detect(m))) {
-                Some((m, Some(tool))) => {
+            match &view.tool {
+                Some((m, tool)) => {
                     ui.horizontal(|ui| {
-                        render = ui.add_enabled(self.gradle.is_none(), egui::Button::new("🖼 Render previews")).on_hover_text(tool.task(m)).clicked();
+                        render = ui.add_enabled(self.gradle.is_none(), egui::Button::new(format!("{}  Render previews", ic::IMAGE))).on_hover_text(tool.task(m)).clicked();
                         ui.label(RichText::new(format!("{tool:?}")).weak());
                     });
-                    for (name, path) in tool.images(m, &previews) {
-                        ui.label(RichText::new(&name).small());
-                        if let Some(tex) = texture(ui.ctx(), &mut self.textures, &path) {
+                    // drop textures of images no longer shown, so memory stays flat
+                    self.textures.retain(|p, _| view.images.iter().any(|(_, q)| q == p));
+                    for (name, path) in &view.images {
+                        ui.label(RichText::new(name).small());
+                        if let Some(tex) = texture(ui.ctx(), &mut self.textures, path) {
                             let size = tex.size_vec2();
                             let w = ui.available_width().min(size.x);
                             ui.image((tex.id(), egui::vec2(w, size.y * w / size.x)));
                         }
                     }
                 }
-                Some((_, None)) if !previews.is_empty() => {
+                None if !previews.is_empty() => {
                     ui.label(RichText::new(gradle::SETUP_HELP).small());
                 }
                 _ => {}
             }
 
             ui.separator();
-            ui.heading("Compose checks");
+            theme::section(ui, ic::CHECK_CIRCLE, "Compose checks");
             for l in tab.lints.iter() {
                 let line = tab.text[..l.offset].matches('\n').count() + 1;
                 let c = if l.severity == Severity::Warning { WARN } else { INFO };
@@ -1447,23 +1631,27 @@ impl App {
             ui.selectable_value(
                 &mut self.bottom,
                 Bottom::Problems,
-                format!("Problems ({problems})"),
+                format!("{}  Problems  {problems}", ic::WARNING),
             );
             ui.selectable_value(
                 &mut self.bottom,
                 Bottom::Build,
                 if self.gradle.is_some() {
-                    "Build ⏳"
+                    format!("{}  Building…", ic::CLOCK_COUNTER_CLOCKWISE)
                 } else {
-                    "Build"
+                    format!("{}  Build", ic::STACK)
                 },
             );
             ui.selectable_value(
                 &mut self.bottom,
                 Bottom::Find,
-                format!("Find ({})", self.found.len()),
+                format!("{}  Find  {}", ic::MAGNIFYING_GLASS, self.found.len()),
             );
-            ui.selectable_value(&mut self.bottom, Bottom::Git, "Git");
+            ui.selectable_value(
+                &mut self.bottom,
+                Bottom::Git,
+                format!("{}  Git", ic::GIT_COMMIT),
+            );
             if self.bottom == Bottom::Build
                 && ui.small_button("Reload stability").clicked()
                 && let Some(p) = self.project.take()
@@ -1474,85 +1662,143 @@ impl App {
         });
         ui.separator();
         let mut open: Option<(PathBuf, usize)> = None;
-        egui::ScrollArea::both()
-            .auto_shrink([false, false])
-            .stick_to_bottom(self.bottom == Bottom::Build)
-            .show(ui, |ui| match self.bottom {
-                Bottom::Problems => {
-                    if let Some(t) = self.tabs.get(self.active) {
-                        for (o, s, m) in &t.diagnostics {
-                            let line = t.text[..(*o).min(t.text.len())].matches('\n').count() + 1;
-                            if ui
-                                .link(RichText::new(format!("{line}: {m}")).color(if *s == 1 {
-                                    ERROR
-                                } else {
-                                    WARN
-                                }))
-                                .clicked()
-                            {
-                                open = Some((t.path.clone(), *o));
-                            }
-                        }
-                        for l in &t.lints {
-                            let line = t.text[..l.offset].matches('\n').count() + 1;
-                            if ui
-                                .link(
-                                    RichText::new(format!("{line}: [{}] {}", l.rule, l.message))
-                                        .color(if l.severity == Severity::Warning {
-                                            WARN
-                                        } else {
-                                            INFO
-                                        }),
+        let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + ui.spacing().item_spacing.y;
+        match self.bottom {
+            Bottom::Problems => {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let Some(t) = self.tabs.get(self.active) else {
+                            return;
+                        };
+                        let line_of =
+                            |o: usize| t.text[..o.min(t.text.len())].matches('\n').count() + 1;
+                        let rows = t
+                            .diagnostics
+                            .iter()
+                            .map(|(o, s, m)| {
+                                (
+                                    *o,
+                                    if *s == 1 {
+                                        (ic::X, ERROR)
+                                    } else {
+                                        (ic::WARNING, WARN)
+                                    },
+                                    String::new(),
+                                    m.clone(),
                                 )
-                                .clicked()
-                            {
-                                open = Some((t.path.clone(), l.offset));
-                            }
-                        }
-                    }
-                }
-                Bottom::Build => {
-                    for line in &self.console {
-                        if let Some((p, l, c)) = compiler_location(line) {
-                            if ui
-                                .link(
-                                    RichText::new(line)
-                                        .monospace()
-                                        .color(if line.starts_with("e:") { ERROR } else { WARN }),
+                            })
+                            .chain(t.lints.iter().map(|l| {
+                                (
+                                    l.offset,
+                                    if l.severity == Severity::Warning {
+                                        (ic::WARNING, WARN)
+                                    } else {
+                                        (ic::LIGHTNING, INFO)
+                                    },
+                                    l.rule.to_string(),
+                                    l.message.clone(),
                                 )
-                                .clicked()
-                                && let Ok(text) = std::fs::read_to_string(&p)
-                            {
-                                open = Some((
-                                    p,
-                                    lsp::offset(&text, l.saturating_sub(1), c.saturating_sub(1)),
-                                ));
+                            }));
+                        if t.diagnostics.is_empty() && t.lints.is_empty() {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}  No problems in this file",
+                                    ic::CHECK_CIRCLE
+                                ))
+                                .color(DARK.weak),
+                            );
+                        }
+                        for (o, (icon, color), rule, msg) in rows {
+                            let r = ui.horizontal(|ui| {
+                                ui.label(RichText::new(icon).color(color));
+                                let r = ui.link(RichText::new(&msg).color(DARK.text));
+                                if !rule.is_empty() {
+                                    ui.label(RichText::new(&rule).color(DARK.weak).small());
+                                }
+                                ui.label(
+                                    RichText::new(format!("line {}", line_of(o)))
+                                        .color(DARK.weak)
+                                        .small(),
+                                );
+                                r
+                            });
+                            if r.inner.clicked() {
+                                open = Some((t.path.clone(), o));
                             }
-                        } else {
-                            ui.label(RichText::new(line).monospace().color(TEXT));
                         }
-                    }
-                }
-                Bottom::Git => self.git_panel(ui),
-                Bottom::Find => {
-                    let root = self
-                        .project
-                        .as_ref()
-                        .map(|p| p.root.clone())
-                        .unwrap_or_default();
-                    for f in &self.found {
-                        let rel = f.path.strip_prefix(&root).unwrap_or(&f.path).display();
-                        if ui
-                            .link(
-                                RichText::new(format!("{rel}:{}  {}", f.line, f.text)).monospace(),
-                            )
-                            .clicked()
-                        {
-                            open = Some((f.path.clone(), f.offset));
+                    });
+            }
+            Bottom::Build => {
+                // only visible rows are laid out, so a 20 000-line log stays fast
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show_rows(ui, row_h, self.console.len(), |ui, range| {
+                        for line in &self.console[range] {
+                            match compiler_location(line) {
+                                Some((p, l, c)) => {
+                                    let color = if line.starts_with("e:") { ERROR } else { WARN };
+                                    if ui
+                                        .link(RichText::new(line).monospace().color(color))
+                                        .clicked()
+                                        && let Ok(text) = std::fs::read_to_string(&p)
+                                    {
+                                        open = Some((
+                                            p,
+                                            lsp::offset(
+                                                &text,
+                                                l.saturating_sub(1),
+                                                c.saturating_sub(1),
+                                            ),
+                                        ));
+                                    }
+                                }
+                                None => {
+                                    ui.label(RichText::new(line).monospace().color(TEXT));
+                                }
+                            }
                         }
-                    }
-                }
-            });
+                    });
+            }
+            Bottom::Git => {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.git_panel(ui));
+            }
+            Bottom::Find => {
+                let root = self
+                    .project
+                    .as_ref()
+                    .map(|p| p.root.clone())
+                    .unwrap_or_default();
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show_rows(ui, row_h, self.found.len(), |ui, range| {
+                        for f in &self.found[range] {
+                            let rel = f
+                                .path
+                                .strip_prefix(&root)
+                                .unwrap_or(&f.path)
+                                .display()
+                                .to_string();
+                            let r = ui.horizontal(|ui| {
+                                let r =
+                                    ui.link(RichText::new(&f.text).monospace().color(DARK.text));
+                                ui.label(
+                                    RichText::new(format!("{rel}:{}", f.line))
+                                        .color(DARK.weak)
+                                        .small(),
+                                );
+                                r
+                            });
+                            if r.inner.clicked() {
+                                open = Some((f.path.clone(), f.offset));
+                            }
+                        }
+                    });
+            }
+        }
         if let Some((p, o)) = open {
             self.open_file(&p, Some(o));
         }
@@ -1640,6 +1886,41 @@ impl eframe::App for App {
 }
 
 // ---------- helpers ----------
+
+/// Paints the numbers of the visible rows only, right-aligned; the cursor's line is brighter.
+fn paint_line_numbers(
+    ui: &Ui,
+    galley: &egui::Galley,
+    galley_pos: egui::Pos2,
+    gutter: egui::Rect,
+    current: usize,
+    font: &FontId,
+    theme: &crate::theme::Theme,
+) {
+    let clip = ui.clip_rect();
+    let painter = ui.painter();
+    for (i, row) in galley.rows.iter().enumerate() {
+        let y = galley_pos.y + row.pos.y;
+        if y > clip.bottom() {
+            break;
+        }
+        if y + row.rect().height() < clip.top() {
+            continue;
+        }
+        let color = if i == current {
+            theme.text
+        } else {
+            theme.gutter
+        };
+        painter.text(
+            egui::pos2(gutter.right() - 12.0, y),
+            Align2::RIGHT_TOP,
+            (i + 1).to_string(),
+            font.clone(),
+            color,
+        );
+    }
+}
 
 fn hash(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -1781,7 +2062,7 @@ fn dir_ui(ui: &mut Ui, node: &DirNode, id: &str, open: &mut Option<PathBuf>) {
             c = next;
         }
         let key = format!("{id}/{label}");
-        egui::CollapsingHeader::new(format!("📁 {label}"))
+        egui::CollapsingHeader::new(format!("{}  {label}", ic::FOLDER_SIMPLE))
             .id_salt(&key)
             .show(ui, |ui| dir_ui(ui, c, &key, open));
     }
@@ -1790,23 +2071,98 @@ fn dir_ui(ui: &mut Ui, node: &DirNode, id: &str, open: &mut Option<PathBuf>) {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let icon = match f.extension().and_then(|e| e.to_str()) {
-            Some("kt") => "🟣",
-            Some("java") => "☕",
-            Some("xml") => "📄",
-            Some("kts" | "gradle") => "🐘",
-            _ => "·",
+        let (icon, color) = file_icon(f);
+        let mut job = egui::text::LayoutJob::default();
+        let fmt = |color| egui::TextFormat {
+            font_id: FontId::proportional(13.0),
+            color,
+            ..Default::default()
         };
-        if ui
-            .selectable_label(false, format!("{icon} {name}"))
-            .clicked()
-        {
+        job.append(icon, 0.0, fmt(color));
+        job.append(&format!("  {name}"), 0.0, fmt(DARK.text));
+        if ui.selectable_label(false, job).clicked() {
             *open = Some(f.clone());
         }
     }
 }
 
+/// Icon and tint for a file in the tree and on tabs.
+fn file_icon(path: &Path) -> (&'static str, Color32) {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("kt") => (ic::FILE_CODE, Color32::from_rgb(0xA9, 0x7B, 0xFF)),
+        Some("java") => (ic::FILE_CODE, Color32::from_rgb(0xE7, 0x8A, 0x4E)),
+        Some("xml") => (ic::FILE_TEXT, Color32::from_rgb(0x5F, 0xB8, 0x65)),
+        Some("kts" | "gradle") => (ic::WRENCH, Color32::from_rgb(0x58, 0x9D, 0xF6)),
+        _ => (ic::FILE, DARK.weak),
+    }
+}
+
+/// One editor tab: file icon, name (● when unsaved), close button, accent line when active.
+/// Returns (clicked, close clicked). Middle-click closes too.
+fn tab_widget(ui: &mut Ui, t: &Tab, active: bool) -> (bool, bool) {
+    let (icon, tint) = file_icon(&t.path);
+    let name = t
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let fill = if active {
+        DARK.editor_bg
+    } else {
+        Color32::TRANSPARENT
+    };
+    let mut close = false;
+    let inner = egui::Frame::new()
+        .fill(fill)
+        .corner_radius(egui::CornerRadius {
+            nw: 6,
+            ne: 6,
+            sw: 0,
+            se: 0,
+        })
+        .inner_margin(egui::Margin::symmetric(10, 5))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(RichText::new(icon).color(tint));
+                let color = if active { DARK.text } else { DARK.weak };
+                ui.label(
+                    RichText::new(if t.dirty() {
+                        format!("{name} ●")
+                    } else {
+                        name.clone()
+                    })
+                    .color(color),
+                );
+                close = ui
+                    .add(
+                        egui::Button::new(RichText::new(ic::X).size(11.0).color(DARK.weak))
+                            .frame(false),
+                    )
+                    .on_hover_text("Close  ⌘W")
+                    .clicked();
+            });
+        });
+    let r = inner
+        .response
+        .interact(egui::Sense::click())
+        .on_hover_text(t.path.display().to_string());
+    if active {
+        let rect = r.rect;
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom() - 1.0,
+            egui::Stroke::new(2.0, DARK.accent),
+        );
+    }
+    (r.clicked() && !close, close || r.middle_clicked())
+}
+
 fn config_file() -> Option<PathBuf> {
+    // tests must never read or overwrite the user's saved project
+    if cfg!(test) {
+        return None;
+    }
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/droid-lite/last-project"))
 }
 

@@ -63,6 +63,13 @@ pub(super) struct Undo {
     moved: Option<(PathBuf, PathBuf)>,
 }
 
+impl Preview {
+    #[cfg(test)]
+    pub(super) fn source_name(&self) -> &str {
+        self.source
+    }
+}
+
 fn edit_line(text: &str, range: Range<usize>, new_text: String) -> EditLine {
     let ls = text[..range.start].rfind('\n').map_or(0, |i| i + 1);
     let le = text[range.end..]

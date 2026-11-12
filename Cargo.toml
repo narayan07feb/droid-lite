@@ -19,3 +19,6 @@ window-vibrancy = "0.8.1"
 
 [profile.release]
 lto = "thin"
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["eframe", "wgpu", "snapshot"] }

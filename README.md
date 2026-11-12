@@ -22,7 +22,7 @@ Set `DROID_LITE_GLASS=0` for solid colours.
 | Area | What you get |
 |------|--------------|
 | Navigation | ⌘O class, ⇧⌘O file, ⌥⌘O symbol, ⇧⇧ search everywhere, ⌘E recent files, ⌘F12 file structure, ⌘B or ⌘-click go to declaration, ⌘[ / ⌘] back and forward, ⌥F7 find usages, ⇧⌘F find in files |
-| Editing | Kotlin/Java colours, line numbers, tabs, ⌘S save, ⌘W close tab |
+| Editing | Kotlin/Java colours, SF Mono, line numbers, current-line highlight, tabs, ⌘S save, ⌘W close tab |
 | Autocomplete | Project symbols and keywords as you type (⌃Space to force). Adds the `import` for you. Type-aware items come from kotlin-lsp when it is installed |
 | Compose analyser | The UI call tree of each composable. Parameter stability from skydoves' compose-stability-analyzer (`stabilityDump`) or Compose compiler reports, with a local guess when there is neither. Compose checks: `modifier` rules, naming, `mutableStateOf` without `remember`, effects without keys, `collectAsState` vs `collectAsStateWithLifecycle`, ViewModel parameters |
 | Preview render | Runs the module's screenshot task (Google's Compose Preview Screenshot Testing, Paparazzi or Roborazzi) and shows the PNGs for the previews in the open file |
@@ -53,7 +53,13 @@ go-to-declaration use the built-in index.
 - `gradle.rs`, `lsp.rs`: Gradle runs and the LSP client.
 - `app.rs`, `app/`: the window, the refactoring UI and the reload logic.
 
-`cargo test` runs the unit tests. `DROID_LITE_SHOT=out.png` saves a window screenshot once indexing is done, then quits.
+`cargo test -- --test-threads=1` runs the unit tests and 12 end-to-end tests. The end-to-end tests drive the real
+app with key presses and clicks (egui_kittest) on a fixture project with git history, a fake `gradlew` and a fake
+Kotlin LSP (`tests/fixtures/fake_lsp.py`). They cover navigation, completion with imports, save, the Compose panel,
+preview render, Gradle errors, rename/extract/optimize imports and undo, reload on disk change, git blame and history,
+LSP completion/diagnostics/rename, and a memory test that repeats real work 15 times and fails if the live heap grows.
+
+`droid-lite --bench <project>` times opening, indexing and each search. `DROID_LITE_SHOT=out.png` saves a window screenshot once indexing is done, then quits.
 Use it with `DROID_LITE_OPEN=<file>`, `DROID_LITE_SEARCH=<query>` or `DROID_LITE_BLAME=1` for UI checks.
 
 ## Limits (v0.1)

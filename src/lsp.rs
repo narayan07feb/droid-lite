@@ -162,6 +162,10 @@ impl Lsp {
         if self.ready || now {
             self.write(&msg);
         } else {
+            // a server that never finishes starting must not make this grow forever
+            if self.queued.len() >= 500 {
+                self.queued.remove(0);
+            }
             self.queued.push(msg);
         }
     }
@@ -193,6 +197,15 @@ impl Lsp {
         *v += 1;
         let v = *v;
         self.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri(path), "version": v }, "contentChanges": [{ "text": text }] }));
+    }
+
+    pub fn did_close(&mut self, path: &Path) {
+        if self.versions.remove(path).is_some() {
+            self.notify(
+                "textDocument/didClose",
+                json!({ "textDocument": { "uri": uri(path) } }),
+            );
+        }
     }
 
     pub fn did_save(&mut self, path: &Path) {
@@ -323,6 +336,7 @@ impl Lsp {
 impl Drop for Lsp {
     fn drop(&mut self) {
         let _ = self.child.kill();
+        let _ = self.child.wait(); // reap it, so no zombie process stays behind
     }
 }
 

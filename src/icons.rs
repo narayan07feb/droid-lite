@@ -1,0 +1,27 @@
+//! Phosphor icons (MIT, github.com/amPerl/egui-phosphor), regular weight. Only the icons the IDE uses.
+
+pub const FOLDER_OPEN: &str = "\u{E256}";
+pub const FOLDER_SIMPLE: &str = "\u{E25A}";
+pub const FILE_CODE: &str = "\u{E914}";
+pub const FILE: &str = "\u{E230}";
+pub const FILE_TEXT: &str = "\u{E23A}";
+pub const PACKAGE: &str = "\u{E390}";
+pub const MAGNIFYING_GLASS: &str = "\u{E30C}";
+pub const ARROW_LEFT: &str = "\u{E058}";
+pub const ARROW_RIGHT: &str = "\u{E06C}";
+pub const PLAY: &str = "\u{E3D0}";
+pub const STOP: &str = "\u{E46C}";
+pub const GIT_BRANCH: &str = "\u{E278}";
+pub const GIT_COMMIT: &str = "\u{E27A}";
+pub const WARNING: &str = "\u{E4E0}";
+pub const X: &str = "\u{E4F6}";
+pub const TREE_STRUCTURE: &str = "\u{E67C}";
+pub const IMAGE: &str = "\u{E2CA}";
+pub const LIGHTNING: &str = "\u{E2DE}";
+pub const CHECK_CIRCLE: &str = "\u{E184}";
+pub const CLOCK_COUNTER_CLOCKWISE: &str = "\u{E1A0}";
+pub const FLOPPY_DISK: &str = "\u{E248}";
+pub const ARROW_COUNTER_CLOCKWISE: &str = "\u{E038}";
+pub const STACK: &str = "\u{E466}";
+pub const WRENCH: &str = "\u{E5D4}";
+pub const CUBE: &str = "\u{E1DA}";
