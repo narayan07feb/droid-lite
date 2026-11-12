@@ -22,6 +22,13 @@ Set `DROID_LITE_GLASS=0` for solid colours.
 | Area | What you get |
 |------|--------------|
 | Keymaps | **Eclipse (macOS)** by default, or Android Studio (macOS): Help → Keymap. Help → Keyboard shortcuts lists every key. Eclipse: ⇧⌘T open type, ⇧⌘R open file, ⌘O outline, ⌘3 search everywhere, ⌘E recent, F3 or ⌘-click declaration, ⇧⌘G references, ⌃H find in files, ⌘L go to line, ⌘[ / ⌘] back and forward, ⌥⌘R rename, ⌥⌘L extract variable, ⇧⌘O organize imports, ⌘/ comment, ⌘D delete line, ⌥⌘↓ duplicate, ⌥↑/↓ move line, ⌃Space complete |
+| Find / replace | ⌘F bar above the editor: case and whole-word toggles, Enter / ⇧Enter (Eclipse ⌘K / ⇧⌘K, Android Studio ⌘G / ⇧⌘G) step through matches, Replace and Replace all, all matches highlighted |
+| Smart typing | Enter keeps the indent (one level more after `{` `(` `->`), brackets and quotes close themselves, typing a closer steps over it, Backspace removes an empty pair, the matching bracket is highlighted |
+| ⌘ / Ctrl hover | Underlines the name and shows its declaration and "N usages in M files" with the first usage lines |
+| Gutter | Android Studio style icons: implemented-by (green, down) and implements / overrides (blue, up); click to jump or pick. Go to implementations: Eclipse ⌘T, Android Studio ⌥⌘B. Right-click menu on any name |
+| Compose stability | Inline badge after each `@Composable` (✓ skippable / ⚠ N unstable / ? unknown); hover for each parameter and the reason |
+| Compile errors | Build (Eclipse ⌘B, Android Studio ⌘F9) compiles the file's module; errors and warnings from any Gradle run show as underlines in the editor and in Problems (all files) |
+| Git changes | Git tab: uncommitted files (stage, unstage, commit), the files the current branch / pull request changed against its base (`gh` gives the PR and its real base), diffs, branch switch |
 | Find references | kotlin-lsp when it runs; otherwise every code reference in the project (strings and comments skipped) plus XML layouts and the manifest, with a count per file |
 | Editing | Kotlin/Java colours, SF Mono, line numbers, current-line highlight, tabs, ⌘S save, ⌘W close tab |
 | Autocomplete | Project symbols and keywords as you type (⌃Space to force). Adds the `import` for you. Type-aware items come from kotlin-lsp when it is installed |
@@ -54,7 +61,7 @@ go-to-declaration use the built-in index.
 - `gradle.rs`, `lsp.rs`: Gradle runs and the LSP client.
 - `app.rs`, `app/`: the window, the refactoring UI and the reload logic.
 
-`cargo test -- --test-threads=1` runs the unit tests and 12 end-to-end tests. The end-to-end tests drive the real
+`cargo test -- --test-threads=1` runs the unit tests and end-to-end tests. The end-to-end tests drive the real
 app with key presses and clicks (egui_kittest) on a fixture project with git history, a fake `gradlew` and a fake
 Kotlin LSP (`tests/fixtures/fake_lsp.py`). They cover navigation, completion with imports, save, the Compose panel,
 preview render, Gradle errors, rename/extract/optimize imports and undo, reload on disk change, git blame and history,

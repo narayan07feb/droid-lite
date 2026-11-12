@@ -3,9 +3,11 @@
 mod disk;
 #[cfg(test)]
 mod e2e;
+mod find;
 mod git_ui;
 mod gutter;
 mod refactor_ui;
+mod typing;
 
 use crate::compose::{self, Lint, Severity, Stability};
 use crate::edit;
@@ -60,6 +62,12 @@ struct Tab {
     deleted: bool,
     git: git_ui::TabBlame,
     annotations: Option<gutter::Annotations>,
+    /// Selection to set with the next `goto` (a find match).
+    select: Option<std::ops::Range<usize>>,
+    /// Cursor to set without scrolling the view (after an edit command).
+    caret: Option<usize>,
+    /// Matching-bracket pair for (rev, cursor).
+    bracket: (u64, usize, Option<(usize, usize)>),
     /// Bumped on every text change; caches key on it.
     rev: u64,
 }
@@ -68,6 +76,12 @@ impl Tab {
     fn dirty(&self) -> bool {
         self.text != self.saved
     }
+    /// The text changed: caches key on `rev`; analysis follows after a typing pause.
+    fn mark_edited(&mut self) {
+        self.rev += 1;
+        self.dirty_since = Some(Instant::now());
+    }
+
     fn reanalyse(&mut self) {
         self.rev += 1;
         self.syms = scan(&self.text);
@@ -213,7 +227,7 @@ struct FoundLine {
     text: String,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 enum Bottom {
     Problems,
     Build,
@@ -229,6 +243,9 @@ struct ComposeView {
     images: Vec<(String, PathBuf)>,
 }
 
+/// A project opened on a worker thread: files, index, git branch and the tree.
+type Opened = (Project, Index, Option<String>, Vec<(String, DirNode)>);
+
 #[derive(Default)]
 struct DirNode {
     dirs: BTreeMap<String, DirNode>,
@@ -239,7 +256,7 @@ pub struct App {
     project: Option<Project>,
     tree: Vec<(String, DirNode)>,
     index: Index,
-    indexing: Option<Receiver<(Project, Index, Option<String>, Vec<(String, DirNode)>)>>,
+    indexing: Option<Receiver<Opened>>,
     /// kotlin-lsp was started (or found missing) for this project.
     lsp_tried: bool,
     stability: HashMap<String, Stability>,
@@ -286,6 +303,12 @@ pub struct App {
     /// What the Find tab lists, e.g. "References to `User`".
     found_title: String,
     frames: u64,
+    find: Option<find::FindBar>,
+    /// ⌘-hover usage lists by name: (index generation, result once counted).
+    usages: HashMap<String, (u64, Option<Vec<FoundLine>>)>,
+    usages_rx: Vec<Receiver<(String, u64, Vec<FoundLine>)>>,
+    /// Compile errors and warnings from the last Gradle run: file → (line, column, severity, message).
+    build_problems: HashMap<PathBuf, Vec<(u32, u32, u8, String)>>,
     /// Last slow-frame report from the watchdog, shown in the status bar for a while.
     slow: Option<(String, Instant)>,
 }
@@ -344,6 +367,10 @@ impl App {
             show_shortcuts: false,
             found_title: String::new(),
             frames: 0,
+            find: None,
+            usages: HashMap::new(),
+            usages_rx: Vec::new(),
+            build_problems: HashMap::new(),
             slow: None,
         };
         if let Some(dir) = open.or_else(last_project) {
@@ -505,6 +532,9 @@ impl App {
                 git: Default::default(),
                 rev: 0,
                 annotations: None,
+                select: None,
+                caret: None,
+                bracket: (u64::MAX, 0, None),
             };
             tab.reanalyse();
             if let Some(l) = self.lsp.as_mut().filter(|_| is_code(path)) {
@@ -693,6 +723,62 @@ impl App {
         self.bottom = Bottom::Find;
     }
 
+    /// Compiles the active file's module, so compile errors show in the editor and Problems.
+    fn build_module(&mut self, ctx: &egui::Context) {
+        let Some(p) = &self.project else { return };
+        let file = self.tabs.get(self.active).map(|t| t.path.clone());
+        let module = file
+            .as_ref()
+            .and_then(|f| p.module_of(f))
+            .or_else(|| p.modules.iter().find(|m| m.name != ":"))
+            .cloned();
+        let Some(m) = module else { return };
+        let build = ["build.gradle.kts", "build.gradle"]
+            .iter()
+            .find_map(|f| std::fs::read_to_string(m.dir.join(f)).ok())
+            .unwrap_or_default();
+        let prefix = if m.name == ":" {
+            String::new()
+        } else {
+            m.name.clone()
+        };
+        let task = if build.contains("com.android") || build.contains("android {") {
+            "compileDebugKotlin"
+        } else {
+            "compileKotlin"
+        };
+        self.run_gradle(format!("{prefix}:{task}"), ctx);
+    }
+
+    /// After a Gradle run: compiler errors and warnings become editor marks and Problems rows.
+    fn collect_build_problems(&mut self) {
+        self.build_problems.clear();
+        for line in &self.console {
+            if let Some((p, l, c, sev, msg)) = compiler_problem(line) {
+                self.build_problems
+                    .entry(p)
+                    .or_default()
+                    .push((l, c, sev, msg));
+            }
+        }
+        let errors: usize = self
+            .build_problems
+            .values()
+            .flatten()
+            .filter(|p| p.2 == 1)
+            .count();
+        if errors > 0 {
+            self.status = format!(
+                "Build: {errors} compile errors in {} files",
+                self.build_problems.len()
+            );
+            self.bottom = Bottom::Problems;
+        }
+        for t in self.tabs.iter_mut() {
+            t.recolor = true;
+        }
+    }
+
     fn run_gradle(&mut self, task: String, ctx: &egui::Context) {
         let Some(p) = &self.project else { return };
         if let Some(r) = self.gradle.as_mut() {
@@ -753,6 +839,7 @@ impl App {
                 ));
                 self.gradle = None;
                 self.outputs_gen += 1;
+                self.collect_build_problems();
                 // a build can write new stability dumps or Compose compiler reports
                 if let Some(p) = self.project.take() {
                     self.reload_stability(&p, ctx);
@@ -915,6 +1002,11 @@ impl App {
             Action::GotoDefinition => self.goto_definition(),
             Action::References => self.find_references(ctx),
             Action::Implementations => self.goto_implementations(),
+            Action::Find | Action::Replace => self.open_find(),
+            Action::FindNext | Action::FindPrev if self.find.is_none() => self.open_find(),
+            Action::FindNext => self.find_step(true),
+            Action::FindPrev => self.find_step(false),
+            Action::Build => self.build_module(ctx),
             Action::Back => self.back(),
             Action::Forward => self.fwd(),
             Action::Complete => {
@@ -950,7 +1042,7 @@ impl App {
             return;
         };
         t.text = text;
-        t.goto = Some(cursor.min(t.text.len()));
+        t.caret = Some(cursor.min(t.text.len()));
         t.reanalyse();
         let (path, text) = (t.path.clone(), t.text.clone());
         self.index.update(&path, &text);
@@ -1468,6 +1560,8 @@ impl App {
         if accept {
             self.accept_completion();
         }
+        self.editor_keys(ui);
+        self.find_bar(ui);
 
         let font = FontId::monospace(FONT_SIZE);
         let row_h = ui.fonts_mut(|f| f.row_height(&font));
@@ -1487,12 +1581,63 @@ impl App {
                 )
             })
             .collect();
+        let build: Vec<(usize, u8, String)> = self
+            .build_problems
+            .get(&tab.path)
+            .into_iter()
+            .flatten()
+            .map(|(l, c, sev, m)| {
+                (
+                    lsp::offset(&tab.text, l.saturating_sub(1), c.saturating_sub(1)),
+                    *sev,
+                    m.clone(),
+                )
+            })
+            .collect();
+        marks.extend(build.iter().map(|(o, s, _)| {
+            (
+                *o..word_bounds(&tab.text, *o).1.max(o + 1),
+                if *s == 1 { ERROR } else { WARN },
+            )
+        }));
         marks.extend(tab.diagnostics.iter().map(|(o, s, _)| {
             (
                 *o..*o + word_bounds(&tab.text, *o).1.saturating_sub(*o).max(1),
                 if *s == 1 { ERROR } else { WARN },
             )
         }));
+        // background highlights: find matches and the bracket pair at the cursor
+        let mut bg: Vec<(std::ops::Range<usize>, Color32)> = Vec::new();
+        if let Some(bar) = &self.find {
+            for (i, m) in bar.matches.iter().enumerate() {
+                bg.push((
+                    m.clone(),
+                    if i == bar.current {
+                        Color32::from_rgba_unmultiplied(0xE0, 0xA0, 0x30, 120)
+                    } else {
+                        Color32::from_rgba_unmultiplied(0xE0, 0xA0, 0x30, 50)
+                    },
+                ));
+            }
+        }
+        if tab.bracket.0 != tab.rev || tab.bracket.1 != tab.cursor {
+            tab.bracket = (
+                tab.rev,
+                tab.cursor,
+                edit::matching_bracket(&tab.text, tab.cursor),
+            );
+        }
+        if let Some((a, b)) = tab.bracket.2 {
+            bg.push((
+                a..a + 1,
+                Color32::from_rgba_unmultiplied(0x58, 0x9D, 0xF6, 70),
+            ));
+            bg.push((
+                b..b + 1,
+                Color32::from_rgba_unmultiplied(0x58, 0x9D, 0xF6, 70),
+            ));
+        }
+        bg.sort_by_key(|(r, _)| r.start);
         let lines = tab.text.matches('\n').count() + 1;
         let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
         let gutter_w = char_w * lines.to_string().len().max(3) as f32 + 18.0;
@@ -1504,6 +1649,8 @@ impl App {
             cache,
             recolor,
             goto,
+            caret,
+            select,
             cursor,
             selection,
             lints,
@@ -1511,7 +1658,7 @@ impl App {
             annotations,
             ..
         } = tab;
-        let marks_key = marks.iter().fold(0x9e37u64, |h, (r, c)| {
+        let marks_key = marks.iter().chain(bg.iter()).fold(0x9e37u64, |h, (r, c)| {
             h.rotate_left(7)
                 ^ (r.start as u64)
                 ^ ((r.end as u64) << 20)
@@ -1529,7 +1676,7 @@ impl App {
                     c.key = key;
                 }
                 _ => {
-                    let job = highlight::job(s, font.clone(), &marks);
+                    let job = highlight::job(s, font.clone(), &marks, &bg);
                     let galley = ui.fonts_mut(|f| f.layout_job(job.clone()));
                     *cache = Some(EditorCache { key, job, galley });
                     *recolor = false;
@@ -1541,6 +1688,7 @@ impl App {
                 .unwrap_or_else(|| ui.fonts_mut(|f| f.layout_job(Default::default())))
         };
         let mut changed = false;
+        let mut hover_word: Option<(String, egui::Response)> = None;
         let mut cmd_click = false;
         let mut popup_pos = None;
         egui::ScrollArea::both()
@@ -1576,11 +1724,30 @@ impl App {
                         .desired_rows(lines.max(30))
                         .layouter(&mut layouter)
                         .show(ui);
-                    if let Some(target) = goto.take() {
-                        let ci = text[..target.min(text.len())].chars().count();
+                    if let Some(c) = caret.take() {
+                        // after an edit command: move the cursor, let the editor keep it in view
+                        let c = c.min(text.len());
                         let mut st = out.state.clone();
                         st.cursor
-                            .set_char_range(Some(CCursorRange::one(CCursor::new(ci))));
+                            .set_char_range(Some(CCursorRange::one(CCursor::new(
+                                text[..c].chars().count(),
+                            ))));
+                        st.store(ui.ctx(), id);
+                        out.response.request_focus();
+                        *cursor = c;
+                        *selection = c..c;
+                    } else if let Some(target) = goto.take() {
+                        let ci = text[..target.min(text.len())].chars().count();
+                        let mut st = out.state.clone();
+                        let picked = select.take();
+                        let range = match &picked {
+                            Some(r) => CCursorRange::two(
+                                CCursor::new(text[..r.start.min(text.len())].chars().count()),
+                                CCursor::new(ci),
+                            ),
+                            None => CCursorRange::one(CCursor::new(ci)),
+                        };
+                        st.cursor.set_char_range(Some(range));
                         st.store(ui.ctx(), id);
                         out.response.request_focus();
                         let r = out
@@ -1592,7 +1759,9 @@ impl App {
                             Some(Align::Center),
                         );
                         *cursor = target.min(text.len());
-                        *selection = *cursor..*cursor;
+                        // a find match stays selected; a plain jump has no selection
+                        *selection =
+                            picked.map_or(*cursor..*cursor, |r| r.start.min(*cursor)..*cursor);
                     } else if let Some(r) = out.cursor_range {
                         *cursor = byte_of_char(text, r.primary.index.0);
                         let other = byte_of_char(text, r.secondary.index.0);
@@ -1702,6 +1871,27 @@ impl App {
                             .collect();
                         if !msgs.is_empty() {
                             out.response.response.clone().on_hover_text(msgs.join("\n"));
+                        } else if ui.input(|i| i.modifiers.command || i.modifiers.ctrl)
+                            && let Some((a, w)) = typing::word_at(text, b)
+                        {
+                            // ⌘ / Ctrl held: the name becomes a link with a card about it
+                            let chars = |o: usize| CCursor::new(text[..o].chars().count());
+                            let r0 = out
+                                .galley
+                                .pos_from_cursor(chars(a))
+                                .translate(out.galley_pos.to_vec2());
+                            let r1 = out
+                                .galley
+                                .pos_from_cursor(chars(w))
+                                .translate(out.galley_pos.to_vec2());
+                            ui.painter().hline(
+                                r0.left()..=r1.left(),
+                                r0.bottom() - 1.0,
+                                egui::Stroke::new(1.5, DARK.accent),
+                            );
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            hover_word =
+                                Some((text[a..w].to_string(), out.response.response.clone()));
                         }
                     }
                 });
@@ -1709,9 +1899,11 @@ impl App {
         let path = tab.path.clone();
         if changed {
             // analysis, the index and kotlin-lsp catch up after a typing pause (see `settle`)
-            tab.rev += 1;
-            tab.dirty_since = Some(Instant::now());
+            tab.mark_edited();
             self.update_completion(false);
+        }
+        if let Some((word, resp)) = hover_word {
+            resp.on_hover_ui_at_pointer(|ui| self.hover_card(ui, &word));
         }
         if cmd_click {
             self.goto_definition();
@@ -2072,7 +2264,8 @@ impl App {
             let problems = self
                 .tabs
                 .get(self.active)
-                .map_or(0, |t| t.lints.len() + t.diagnostics.len());
+                .map_or(0, |t| t.lints.len() + t.diagnostics.len())
+                + self.build_problems.values().map(Vec::len).sum::<usize>();
             ui.selectable_value(
                 &mut self.bottom,
                 Bottom::Problems,
@@ -2113,6 +2306,44 @@ impl App {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        // compile errors from the last build, every file
+                        let root = self
+                            .project
+                            .as_ref()
+                            .map(|p| p.root.clone())
+                            .unwrap_or_default();
+                        let mut files: Vec<&PathBuf> = self.build_problems.keys().collect();
+                        files.sort();
+                        for f in files {
+                            let rel = f.strip_prefix(&root).unwrap_or(f).display().to_string();
+                            for (l, c, sev, msg) in &self.build_problems[f] {
+                                let r = ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(if *sev == 1 { ic::X } else { ic::WARNING })
+                                            .color(if *sev == 1 { ERROR } else { WARN }),
+                                    );
+                                    let r = ui.link(RichText::new(msg).color(DARK.text));
+                                    ui.label(
+                                        RichText::new(format!("{rel}:{l}:{c}"))
+                                            .color(DARK.weak)
+                                            .small(),
+                                    );
+                                    r
+                                });
+                                if r.inner.clicked()
+                                    && let Ok(text) = std::fs::read_to_string(f)
+                                {
+                                    open = Some((
+                                        f.clone(),
+                                        lsp::offset(
+                                            &text,
+                                            l.saturating_sub(1),
+                                            c.saturating_sub(1),
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
                         let Some(t) = self.tabs.get(self.active) else {
                             return;
                         };
@@ -2145,7 +2376,10 @@ impl App {
                                     l.message.clone(),
                                 )
                             }));
-                        if t.diagnostics.is_empty() && t.lints.is_empty() {
+                        if t.diagnostics.is_empty()
+                            && t.lints.is_empty()
+                            && self.build_problems.is_empty()
+                        {
                             ui.label(
                                 RichText::new(format!(
                                     "{}  No problems in this file",
@@ -2285,6 +2519,7 @@ impl eframe::App for App {
         watch.stage("disk changes", || self.poll_disk(&ctx));
         watch.stage("analysis", || self.settle(false));
         watch.stage("git blame", || self.poll_git(&ctx));
+        self.poll_usages();
         watch.stage("shortcuts", || self.shortcuts(&ctx));
         if let Some(dropped) =
             ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()))
@@ -2460,6 +2695,17 @@ fn import_position(s: &str) -> usize {
 }
 
 /// `e: file:///path/File.kt:12:5 message` from the Kotlin compiler.
+/// A Kotlin compiler line: `e: file:///path/File.kt:12:5 message` → (path, line, column, severity, message).
+fn compiler_problem(line: &str) -> Option<(PathBuf, u32, u32, u8, String)> {
+    let (p, l, c) = compiler_location(line)?;
+    let msg = line
+        .split_once(&format!(":{l}:{c} "))
+        .map_or("", |(_, m)| m)
+        .trim()
+        .to_string();
+    Some((p, l, c, if line.starts_with("e:") { 1 } else { 2 }, msg))
+}
+
 fn compiler_location(line: &str) -> Option<(PathBuf, u32, u32)> {
     if !(line.starts_with("e:") || line.starts_with("w:")) {
         return None;

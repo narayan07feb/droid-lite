@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub const UNCOMMITTED: &str = "0000000000000000000000000000000000000000";
@@ -196,6 +196,206 @@ pub fn branch(dir: &Path) -> Option<String> {
     (out.status.success() && !b.is_empty()).then_some(b)
 }
 
+/// One changed file: `code` is git's letter (M, A, D, R, ? for untracked), `staged` for the index.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Change {
+    pub path: PathBuf,
+    pub code: char,
+    pub staged: bool,
+}
+
+/// What the Git tab shows: uncommitted work, and what this branch changed against its base.
+#[derive(Clone, Debug, Default)]
+pub struct Changes {
+    pub working: Vec<Change>,
+    pub branch: Vec<Change>,
+    /// The base the branch is compared with, e.g. `origin/develop`.
+    pub base: Option<String>,
+    /// "#6120 Fix login crash" when `gh` knows a pull request for this branch.
+    pub pr: Option<String>,
+    pub branches: Vec<String>,
+}
+
+/// `git status --porcelain -z`: staged and unstaged changes and untracked files.
+pub fn status(root: &Path) -> Vec<Change> {
+    let Ok(out) = git(root)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut parts = text.split('\0').filter(|p| !p.is_empty());
+    let mut v = Vec::new();
+    while let Some(entry) = parts.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let (x, y) = (entry.as_bytes()[0] as char, entry.as_bytes()[1] as char);
+        let path = root.join(&entry[3..]);
+        if x == 'R' || x == 'C' {
+            parts.next(); // the old name of a rename
+        }
+        if x == '?' {
+            v.push(Change {
+                path,
+                code: '?',
+                staged: false,
+            });
+            continue;
+        }
+        if x != ' ' {
+            v.push(Change {
+                path: path.clone(),
+                code: x,
+                staged: true,
+            });
+        }
+        if y != ' ' {
+            v.push(Change {
+                path,
+                code: y,
+                staged: false,
+            });
+        }
+    }
+    v
+}
+
+/// The branch the current one is compared with: the PR's base when `gh` answers, else
+/// `origin/HEAD`, else the first of origin/develop, origin/main, origin/master that exists.
+pub fn base_branch(root: &Path) -> (Option<String>, Option<String>) {
+    if let Ok(out) = Command::new("gh")
+        .args(["pr", "view", "--json", "number,title,baseRefName"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        && out.status.success()
+        && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        && let Some(base) = v["baseRefName"].as_str()
+    {
+        let pr = format!("#{} {}", v["number"], v["title"].as_str().unwrap_or(""));
+        return (Some(format!("origin/{base}")), Some(pr));
+    }
+    let ok = |r: &str| {
+        git(root)
+            .args(["rev-parse", "--verify", "--quiet", r])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if let Ok(out) = git(root)
+        .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        .output()
+        && out.status.success()
+    {
+        let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !b.is_empty() {
+            return (Some(b), None);
+        }
+    }
+    (
+        ["origin/develop", "origin/main", "origin/master"]
+            .into_iter()
+            .find(|b| ok(b))
+            .map(String::from),
+        None,
+    )
+}
+
+/// Files this branch changed since it left `base` (what a pull request shows).
+pub fn branch_changes(root: &Path, base: &str) -> Vec<Change> {
+    let Ok(out) = git(root)
+        .args(["diff", "--name-status", "-M", &format!("{base}...HEAD")])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            let code = f.next()?.chars().next()?;
+            let path = f.next_back()?; // the new name for renames
+            Some(Change {
+                path: root.join(path),
+                code,
+                staged: false,
+            })
+        })
+        .collect()
+}
+
+pub fn branches(root: &Path) -> Vec<String> {
+    git(root)
+        .args(["branch", "--format=%(refname:short)"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn changes(root: &Path) -> Changes {
+    let (base, pr) = base_branch(root);
+    let branch = base
+        .as_deref()
+        .map(|b| branch_changes(root, b))
+        .unwrap_or_default();
+    Changes {
+        working: status(root),
+        branch,
+        base,
+        pr,
+        branches: branches(root),
+    }
+}
+
+/// The diff of one file: against `base...HEAD` for branch changes, else the uncommitted change.
+pub fn file_diff(root: &Path, path: &Path, base: Option<&str>, staged: bool) -> String {
+    let mut c = git(root);
+    c.arg("diff");
+    match base {
+        Some(b) => {
+            c.arg(format!("{b}...HEAD"));
+        }
+        None if staged => {
+            c.arg("--cached");
+        }
+        None => {}
+    }
+    c.arg("--").arg(path);
+    let out = c
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    if out.is_empty() && base.is_none() {
+        // untracked: the whole file is new
+        return std::fs::read_to_string(path)
+            .map(|t| t.lines().map(|l| format!("+{l}\n")).collect())
+            .unwrap_or_default();
+    }
+    out
+}
+
+/// Runs a git command that changes the repository (stage, unstage, commit, checkout).
+/// Returns git's error text when it fails.
+pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
+    let out = git(root)
+        .args(args)
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 /// "just now", "5 minutes ago", "3 days ago", "2 years ago".
 pub fn ago(time: i64, now: i64) -> String {
     let s = (now - time).max(0);
@@ -286,6 +486,64 @@ mod tests {
             )
             .is_none()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn status_branch_changes_stage_and_commit() {
+        let dir =
+            std::env::temp_dir().join(format!("droid-lite-git-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let g = |args: &[&str]| run(&dir, args).unwrap();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.name", "T"]);
+        g(&["config", "user.email", "t@example.com"]);
+        std::fs::write(dir.join("A.kt"), "a\n").unwrap();
+        std::fs::write(dir.join("B.kt"), "b\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "base"]);
+        g(&["checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.join("A.kt"), "a2\n").unwrap();
+        g(&["commit", "-q", "-am", "change A"]);
+        // uncommitted: B modified and staged, C new
+        std::fs::write(dir.join("B.kt"), "b2\n").unwrap();
+        g(&["add", "B.kt"]);
+        std::fs::write(dir.join("C kt.kt"), "c\n").unwrap();
+        let st = status(&dir);
+        assert!(
+            st.contains(&Change {
+                path: dir.join("B.kt"),
+                code: 'M',
+                staged: true
+            }),
+            "{st:?}"
+        );
+        assert!(
+            st.contains(&Change {
+                path: dir.join("C kt.kt"),
+                code: '?',
+                staged: false
+            }),
+            "{st:?}"
+        );
+        let br = branch_changes(&dir, "main");
+        assert_eq!(
+            br,
+            vec![Change {
+                path: dir.join("A.kt"),
+                code: 'M',
+                staged: false
+            }]
+        );
+        assert!(file_diff(&dir, &dir.join("A.kt"), Some("main"), false).contains("+a2"));
+        assert!(file_diff(&dir, &dir.join("B.kt"), None, true).contains("+b2"));
+        assert_eq!(file_diff(&dir, &dir.join("C kt.kt"), None, false), "+c\n");
+        assert_eq!(branches(&dir), vec!["feature", "main"]);
+        g(&["commit", "-q", "-m", "B"]);
+        assert!(status(&dir).iter().all(|c| c.code == '?'));
+        assert!(run(&dir, &["checkout", "nope"]).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

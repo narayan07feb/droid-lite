@@ -52,6 +52,7 @@ impl App {
             Err(_) => false,
         });
         if !ready.is_empty() {
+            self.git.changes_stale = true; // the Git tab's lists may have changed
             self.apply_disk_changes(ready, ctx);
         }
     }

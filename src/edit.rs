@@ -146,6 +146,158 @@ pub fn line_offset(text: &str, spec: &str) -> Option<usize> {
     Some(start.min(text.len()) + (col.max(1) - 1).min(line_len))
 }
 
+/// Every match of `query`, optionally case-sensitive and whole-word only.
+pub fn find_all(text: &str, query: &str, case: bool, whole: bool) -> Vec<Range<usize>> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    let (hay, needle) = if case {
+        (text.to_string(), query.to_string())
+    } else {
+        (text.to_lowercase(), query.to_lowercase())
+    };
+    // lowercasing can change byte lengths for some scripts; fall back to exact search then
+    let (hay, needle) = if hay.len() == text.len() && needle.len() == query.len() {
+        (hay, needle)
+    } else {
+        (text.to_string(), query.to_string())
+    };
+    hay.match_indices(&needle)
+        .map(|(i, m)| i..i + m.len())
+        .filter(|r| {
+            !whole || (!word(text[..r.start].chars().last()) && !word(text[r.end..].chars().next()))
+        })
+        .collect()
+}
+
+/// Enter: a new line with the current line's indent, one level more after `{` `(` `[` or `->`,
+/// and the closing bracket moved to its own line when the cursor sits between a pair.
+pub fn newline(text: &str, sel: Range<usize>) -> (String, usize) {
+    let line_start = text[..sel.start].rfind('\n').map_or(0, |i| i + 1);
+    let indent: String = text[line_start..]
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
+    let before = text[line_start..sel.start].trim_end();
+    let opens = before.ends_with(['{', '(', '[']) || before.ends_with("->");
+    let inner = if opens {
+        format!("{indent}    ")
+    } else {
+        indent.clone()
+    };
+    let next = text[sel.end..]
+        .trim_start_matches([' ', '\t'])
+        .chars()
+        .next();
+    let closes = opens
+        && matches!(
+            (before.chars().last(), next),
+            (Some('{'), Some('}')) | (Some('('), Some(')')) | (Some('['), Some(']'))
+        );
+    let insert = if closes {
+        format!("\n{inner}\n{indent}")
+    } else {
+        format!("\n{inner}")
+    };
+    let cursor = sel.start + 1 + inner.len();
+    let rest = if closes {
+        text[sel.end..].trim_start_matches([' ', '\t'])
+    } else {
+        &text[sel.end..]
+    };
+    (format!("{}{}{}", &text[..sel.start], insert, rest), cursor)
+}
+
+const PAIRS: [(char, char); 5] = [('(', ')'), ('[', ']'), ('{', '}'), ('"', '"'), ('\'', '\'')];
+
+/// Typing one character with auto-closing pairs. `None` means: let the editor insert it normally.
+/// - an opening bracket or quote also inserts its closer (quotes only before space, a closer or the end)
+/// - typing a closer that is already next to the cursor just steps over it
+/// - with a selection, brackets and quotes wrap it
+pub fn type_char(text: &str, sel: Range<usize>, ch: char) -> Option<(String, usize)> {
+    let next = text[sel.end..].chars().next();
+    if sel.start == sel.end && next == Some(ch) && PAIRS.iter().any(|(_, c)| *c == ch) {
+        return Some((text.to_string(), sel.end + ch.len_utf8()));
+    }
+    let close = PAIRS.iter().find(|(o, _)| *o == ch).map(|(_, c)| *c)?;
+    if sel.start != sel.end {
+        let wrapped = format!("{ch}{}{close}", &text[sel.clone()]);
+        return Some((
+            format!("{}{}{}", &text[..sel.start], wrapped, &text[sel.end..]),
+            sel.start + wrapped.len(),
+        ));
+    }
+    let free_after = next.is_none_or(|c| c.is_whitespace() || ")]},;".contains(c));
+    let quote = ch == '"' || ch == '\'';
+    let prev = text[..sel.start].chars().last();
+    if !free_after || (quote && prev.is_some_and(|c| c.is_alphanumeric())) {
+        return None;
+    }
+    Some((
+        format!("{}{ch}{close}{}", &text[..sel.start], &text[sel.end..]),
+        sel.start + ch.len_utf8(),
+    ))
+}
+
+/// Backspace between an empty pair `(|)` removes both. `None` means: normal backspace.
+pub fn backspace_pair(text: &str, cursor: usize) -> Option<(String, usize)> {
+    let prev = text[..cursor].chars().last()?;
+    let next = text[cursor..].chars().next()?;
+    PAIRS.contains(&(prev, next)).then(|| {
+        (
+            format!(
+                "{}{}",
+                &text[..cursor - prev.len_utf8()],
+                &text[cursor + next.len_utf8()..]
+            ),
+            cursor - prev.len_utf8(),
+        )
+    })
+}
+
+/// The bracket next to the cursor and its partner, skipping brackets in strings and comments.
+pub fn matching_bracket(text: &str, cursor: usize) -> Option<(usize, usize)> {
+    use crate::lexer::{Tok, lex};
+    let toks: Vec<_> = lex(text)
+        .into_iter()
+        .filter(|t| {
+            t.kind == Tok::Punct && t.range.len() == 1 && "()[]{}".contains(&text[t.range.clone()])
+        })
+        .collect();
+    let at = toks
+        .iter()
+        .position(|t| t.range.start == cursor)
+        .or_else(|| toks.iter().position(|t| t.range.end == cursor))?;
+    let c = text[toks[at].range.clone()].chars().next()?;
+    let (open, close, forward) = match c {
+        '(' => ('(', ')', true),
+        '[' => ('[', ']', true),
+        '{' => ('{', '}', true),
+        ')' => ('(', ')', false),
+        ']' => ('[', ']', false),
+        _ => ('{', '}', false),
+    };
+    let mut depth = 0i32;
+    let order: Box<dyn Iterator<Item = usize>> = if forward {
+        Box::new(at..toks.len())
+    } else {
+        Box::new((0..=at).rev())
+    };
+    for i in order {
+        let t = text[toks[i].range.clone()].chars().next()?;
+        if t == open {
+            depth += if forward { 1 } else { -1 };
+        } else if t == close {
+            depth += if forward { -1 } else { 1 };
+        }
+        if depth == 0 {
+            return Some((toks[at].range.start, toks[i].range.start));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +349,71 @@ mod tests {
         assert_eq!(line_offset(T, "3:5"), Some(12));
         assert_eq!(line_offset(T, "99"), Some(T.len()));
         assert_eq!(line_offset(T, "x"), None);
+    }
+
+    #[test]
+    fn find_options() {
+        let t = "User user USER users";
+        assert_eq!(find_all(t, "user", false, false).len(), 4);
+        assert_eq!(find_all(t, "user", true, false).len(), 2);
+        assert_eq!(find_all(t, "user", false, true).len(), 3);
+        assert_eq!(find_all(t, "user", true, true), vec![5..9]);
+        assert!(find_all(t, "", false, false).is_empty());
+    }
+
+    #[test]
+    fn enter_indents() {
+        let t = "fun a() {}";
+        assert_eq!(newline(t, 9..9), ("fun a() {\n    \n}".to_string(), 14));
+        let t = "    val x = 1";
+        assert_eq!(newline(t, 13..13), ("    val x = 1\n    ".to_string(), 18));
+        let t = "    list.map { it ->";
+        assert_eq!(
+            newline(t, t.len()..t.len()).0,
+            "    list.map { it ->\n        "
+        );
+        let t = "f(a)";
+        assert_eq!(
+            newline(t, 2..2),
+            ("f(\n    a)".to_string(), 7),
+            "not between an empty pair: no extra line"
+        );
+    }
+
+    #[test]
+    fn pairs_close_step_over_wrap_and_delete() {
+        assert_eq!(type_char("f", 1..1, '('), Some(("f()".to_string(), 2)));
+        assert_eq!(
+            type_char("f()", 2..2, ')'),
+            Some(("f()".to_string(), 3)),
+            "step over"
+        );
+        assert_eq!(
+            type_char("ab", 0..1, '"'),
+            Some(("\"a\"b".to_string(), 3)),
+            "wrap selection"
+        );
+        assert_eq!(type_char("ab", 1..1, '('), None, "no pair before a letter");
+        assert_eq!(
+            type_char("it", 2..2, '\''),
+            None,
+            "no quote pair after a letter"
+        );
+        assert_eq!(type_char("x", 1..1, 'a'), None);
+        assert_eq!(backspace_pair("f()", 2), Some(("f".to_string(), 1)));
+        assert_eq!(backspace_pair("f(a)", 3), None);
+    }
+
+    #[test]
+    fn brackets_match_outside_strings() {
+        let t = "f(a, \"(\", g[1]) { }";
+        assert_eq!(matching_bracket(t, 1), Some((1, 14)));
+        assert_eq!(
+            matching_bracket(t, 15),
+            Some((14, 1)),
+            "cursor right after the closer"
+        );
+        assert_eq!(matching_bracket(t, 16), Some((16, 18)));
+        assert_eq!(matching_bracket(t, 3), None);
     }
 }

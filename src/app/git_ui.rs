@@ -33,6 +33,12 @@ pub(super) struct GitState {
     /// Open commit window: title and `git show` output.
     commit: Option<(String, Vec<String>)>,
     commit_rx: Option<Receiver<(String, String)>>,
+    /// Uncommitted files and the branch's changes (refreshed in the background).
+    pub changes: Option<git::Changes>,
+    changes_rx: Option<Receiver<git::Changes>>,
+    /// Set by file-system events and git commands; the next Git tab frame refreshes.
+    pub changes_stale: bool,
+    commit_message: String,
 }
 
 pub(super) fn commit_line(c: &Commit, now: i64) -> String {
@@ -129,7 +135,232 @@ impl App {
     }
 
     /// The Git tab: history of the active file.
+    /// Shows a diff (of a commit or a file) in the diff window.
+    fn show_diff(&mut self, title: String, text: String) {
+        self.git.commit = Some((title, text.lines().map(String::from).collect()));
+    }
+
+    fn refresh_changes(&mut self, ctx: &egui::Context) {
+        let Some(root) = self.project.as_ref().map(|p| p.root.clone()) else {
+            return;
+        };
+        if self.git.changes_rx.is_none() && (self.git.changes.is_none() || self.git.changes_stale) {
+            self.git.changes_stale = false;
+            let (tx, rx) = channel();
+            let c = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(git::changes(&root)); // gh may use the network: never on the UI thread
+                c.request_repaint();
+            });
+            self.git.changes_rx = Some(rx);
+        }
+        if let Some(rx) = &self.git.changes_rx
+            && let Ok(ch) = rx.try_recv()
+        {
+            self.git.changes = Some(ch);
+            self.git.changes_rx = None;
+        }
+    }
+
+    fn git_command(&mut self, args: &[&str]) {
+        let Some(root) = self.project.as_ref().map(|p| p.root.clone()) else {
+            return;
+        };
+        match git::run(&root, args) {
+            Ok(()) => self.status = format!("git {} done", args.join(" ")),
+            Err(e) => self.status = format!("git {}: {e}", args[0]),
+        }
+        self.git.changes_stale = true;
+        if args[0] == "checkout" {
+            self.branch = git::branch(&root);
+        }
+    }
+
+    /// The Git tab: uncommitted changes (stage, commit), the branch / pull request's files,
+    /// branch switch, and the open file's history.
     pub(super) fn git_panel(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        self.refresh_changes(&ctx);
+        let root = self
+            .project
+            .as_ref()
+            .map(|p| p.root.clone())
+            .unwrap_or_default();
+        let mut command: Option<Vec<String>> = None;
+        let mut diff: Option<(PathBuf, Option<String>, bool)> = None;
+        let mut open_file: Option<PathBuf> = None;
+        let code_color = |c: char| match c {
+            'A' => Color32::from_rgb(0x5F, 0xB8, 0x65),
+            'D' => ERROR,
+            'R' => Color32::from_rgb(0xA9, 0x7B, 0xFF),
+            '?' => crate::theme::DARK.weak,
+            _ => Color32::from_rgb(0x58, 0x9D, 0xF6),
+        };
+        ui.horizontal(|ui| {
+            let branch = self.branch.clone().unwrap_or_else(|| "(no branch)".into());
+            ui.menu_button(format!("{}  {branch}", crate::icons::GIT_BRANCH), |ui| {
+                for b in self
+                    .git
+                    .changes
+                    .as_ref()
+                    .map(|c| c.branches.clone())
+                    .unwrap_or_default()
+                {
+                    if ui
+                        .selectable_label(Some(&b) == self.branch.as_ref(), &b)
+                        .clicked()
+                    {
+                        command = Some(vec!["checkout".into(), b]);
+                        ui.close();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Switch branch");
+            if ui.button("Refresh").clicked() {
+                self.git.changes_stale = true;
+            }
+            if self.git.changes_rx.is_some() {
+                ui.spinner();
+            }
+            ui.checkbox(&mut self.git.show_column, "Blame column");
+        });
+        if let Some(ch) = self.git.changes.clone() {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("Uncommitted changes ({})", ch.working.len())).strong(),
+                );
+                if ch.working.iter().any(|c| !c.staged) && ui.small_button("Stage all").clicked() {
+                    command = Some(vec!["add".into(), "-A".into()]);
+                }
+            });
+            if ch.working.is_empty() {
+                ui.label(RichText::new("Working tree clean").weak());
+            }
+            for c in &ch.working {
+                let rel = c
+                    .path
+                    .strip_prefix(&root)
+                    .unwrap_or(&c.path)
+                    .display()
+                    .to_string();
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(c.code.to_string())
+                            .monospace()
+                            .strong()
+                            .color(code_color(c.code)),
+                    );
+                    if ui.link(&rel).on_hover_text("Show the diff").clicked() {
+                        diff = Some((c.path.clone(), None, c.staged));
+                    }
+                    ui.label(
+                        RichText::new(if c.staged { "staged" } else { "" })
+                            .weak()
+                            .small(),
+                    );
+                    if c.code != 'D' && ui.small_button("Open").clicked() {
+                        open_file = Some(c.path.clone());
+                    }
+                    let p = c.path.to_string_lossy().into_owned();
+                    if c.staged {
+                        if ui.small_button("Unstage").clicked() {
+                            command =
+                                Some(vec!["restore".into(), "--staged".into(), "--".into(), p]);
+                        }
+                    } else if ui.small_button("Stage").clicked() {
+                        command = Some(vec!["add".into(), "--".into(), p]);
+                    }
+                });
+            }
+            if ch.working.iter().any(|c| c.staged) {
+                ui.horizontal(|ui| {
+                    let label = ui.label("Commit message");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.git.commit_message)
+                            .hint_text("what changed")
+                            .desired_width(420.0),
+                    )
+                    .labelled_by(label.id);
+                    let ok = !self.git.commit_message.trim().is_empty();
+                    if ui
+                        .add_enabled(ok, egui::Button::new("Commit staged"))
+                        .clicked()
+                    {
+                        command = Some(vec![
+                            "commit".into(),
+                            "-m".into(),
+                            self.git.commit_message.trim().to_string(),
+                        ]);
+                        self.git.commit_message.clear();
+                    }
+                });
+            }
+            ui.separator();
+            let base = ch.base.clone().unwrap_or_else(|| "?".into());
+            let title = match &ch.pr {
+                Some(pr) => format!("Pull request {pr}: {} files vs {base}", ch.branch.len()),
+                None => format!("This branch: {} files changed vs {base}", ch.branch.len()),
+            };
+            ui.label(RichText::new(title).strong());
+            if ch.base.is_none() {
+                ui.label(
+                    RichText::new(
+                        "No base branch found (no origin/HEAD, develop, main or master).",
+                    )
+                    .weak(),
+                );
+            }
+            for c in &ch.branch {
+                let rel = c
+                    .path
+                    .strip_prefix(&root)
+                    .unwrap_or(&c.path)
+                    .display()
+                    .to_string();
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(c.code.to_string())
+                            .monospace()
+                            .strong()
+                            .color(code_color(c.code)),
+                    );
+                    if ui
+                        .link(&rel)
+                        .on_hover_text("Show the diff against the base")
+                        .clicked()
+                    {
+                        diff = Some((c.path.clone(), ch.base.clone(), false));
+                    }
+                    if c.code != 'D' && ui.small_button("Open").clicked() {
+                        open_file = Some(c.path.clone());
+                    }
+                });
+            }
+        }
+        ui.separator();
+        if let Some(args) = command {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            self.git_command(&args);
+        }
+        if let Some((p, base, staged)) = diff {
+            let text = git::file_diff(&root, &p, base.as_deref(), staged);
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.show_diff(
+                format!(
+                    "Diff: {name}{}",
+                    base.map(|b| format!(" vs {b}")).unwrap_or_default()
+                ),
+                text,
+            );
+        }
+        if let Some(p) = open_file {
+            self.open_file(&p, None);
+        }
         let Some(path) = self.tabs.get(self.active).map(|t| t.path.clone()) else {
             ui.label("Open a file to see its history.");
             return;
@@ -145,7 +376,6 @@ impl App {
             self.git.history_for = Some(path.clone());
         }
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.git.show_column, "Blame column");
             if self.git.history_rx.is_some() {
                 ui.spinner();
             }
@@ -183,7 +413,7 @@ impl App {
         let Some((title, lines)) = &self.git.commit else {
             return;
         };
-        let mut open = true;
+        let mut open = !ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         egui::Window::new(title.clone())
             .open(&mut open)
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])

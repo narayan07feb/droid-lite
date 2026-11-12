@@ -45,7 +45,7 @@ impl Fixture {
         write("build.gradle.kts", "");
         write(
             "app/build.gradle.kts",
-            "plugins { id(\"app.cash.paparazzi\") }\n",
+            "plugins { id(\"com.android.application\"); id(\"app.cash.paparazzi\") }\n",
         );
         write("app/src/main/java/com/demo/data/User.kt", USER_KT);
         write("app/src/main/java/com/demo/ui/UserCard.kt", CARD_KT);
@@ -53,7 +53,7 @@ impl Fixture {
         write(
             "gradlew",
             &format!(
-                "#!/bin/sh\necho \"> Task $1\"\ncase \"$1\" in\n  *recordPaparazziDebug) mkdir -p app/src/test/snapshots/images && cp '{}' app/src/test/snapshots/images/com.demo.ui_UserCardKt_UserCardPreview.png; echo 'BUILD SUCCESSFUL';;\n  *failingTask) echo \"e: file://$PWD/app/src/main/java/com/demo/ui/UserCard.kt:7:9 Unresolved reference 'oops'.\"; echo 'BUILD FAILED'; exit 1;;\n  *) echo 'BUILD SUCCESSFUL';;\nesac\n",
+                "#!/bin/sh\necho \"> Task $1\"\ncase \"$1\" in\n  *recordPaparazziDebug) mkdir -p app/src/test/snapshots/images && cp '{}' app/src/test/snapshots/images/com.demo.ui_UserCardKt_UserCardPreview.png; echo 'BUILD SUCCESSFUL';;\n  *compileDebugKotlin) echo \"w: file://$PWD/app/src/main/java/com/demo/ui/UserCard.kt:6:18 Parameter 'user' is never used\"; echo \"e: file://$PWD/app/src/main/java/com/demo/data/User.kt:3:40 Unresolved reference 'Intt'.\"; echo 'BUILD FAILED'; exit 1;;\n  *failingTask) echo \"e: file://$PWD/app/src/main/java/com/demo/ui/UserCard.kt:7:9 Unresolved reference 'oops'.\"; echo 'BUILD FAILED'; exit 1;;\n  *) echo 'BUILD SUCCESSFUL';;\nesac\n",
                 png.display()
             ),
         );
@@ -973,4 +973,275 @@ fn e2e_right_click_menu_runs_commands() {
         "{}",
         tab(&h).text
     );
+}
+
+#[test]
+fn e2e_find_replace_bar() {
+    let f = Fixture::new("findbar");
+    let mut h = f.harness();
+    open(&mut h, &f.path("app/src/main/java/com/demo/ui/UserCard.kt"));
+    key(&mut h, Modifiers::COMMAND, Key::F);
+    assert!(h.state().find.is_some());
+    type_text(&mut h, "User");
+    steps(&mut h, 2);
+    assert_eq!(
+        h.state().find.as_ref().unwrap().matches.len(),
+        8,
+        "case-insensitive: user, User, UserCard…"
+    );
+    h.get_by_label("Aa").click();
+    h.get_by_label("W").click();
+    steps(&mut h, 2);
+    assert_eq!(
+        h.state().find.as_ref().unwrap().matches.len(),
+        3,
+        "whole word, case: import, parameter type, constructor"
+    );
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    let sel = tab(&h).selection.clone();
+    assert_eq!(&tab(&h).text[sel], "User", "Enter selects the next match");
+    // replace all
+    let replace = h
+        .get_by_role_and_label(egui::accesskit::Role::TextInput, "Replace with")
+        .rect()
+        .center();
+    click_at(&mut h, replace, egui::PointerButton::Primary);
+    type_text(&mut h, "Person");
+    h.get_by_label("Replace all").click();
+    steps(&mut h, 3);
+    assert_eq!(tab(&h).text.matches("Person").count(), 3);
+    assert!(
+        tab(&h).text.contains("fun UserCard("),
+        "whole word kept UserCard"
+    );
+    key(&mut h, Modifiers::COMMAND, Key::F); // focus the bar, then Esc closes it
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert!(h.state().find.is_none());
+}
+
+#[test]
+fn e2e_smart_typing_enter_and_pairs() {
+    let f = Fixture::new("typing");
+    let mut h = f.harness();
+    open(&mut h, &f.path("app/src/main/java/com/demo/ui/UserCard.kt"));
+    place_cursor(&mut h, "        Text(user.name)", 23);
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    type_text(&mut h, "f");
+    type_text(&mut h, "(");
+    assert!(
+        tab(&h)
+            .text
+            .contains("        Text(user.name)\n        f()"),
+        "{}",
+        tab(&h).text
+    );
+    type_text(&mut h, ")");
+    assert!(
+        !tab(&h).text.contains("f())"),
+        "typing the closer steps over it"
+    );
+    key(&mut h, Modifiers::NONE, Key::ArrowLeft);
+    key(&mut h, Modifiers::NONE, Key::Backspace);
+    assert!(
+        tab(&h).text.contains("        f\n"),
+        "Backspace removes the empty pair: {}",
+        tab(&h).text
+    );
+    type_text(&mut h, " ");
+    type_text(&mut h, "{");
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    assert!(
+        tab(&h)
+            .text
+            .contains("        f {\n            \n        }"),
+        "{}",
+        tab(&h).text
+    );
+}
+
+#[test]
+fn e2e_cmd_hover_shows_declaration_and_usages() {
+    let f = Fixture::new("hover");
+    let mut h = f.harness();
+    open(&mut h, &f.path("app/src/main/java/com/demo/ui/UserCard.kt"));
+    let editor = h
+        .get_by_role(egui::accesskit::Role::MultilineTextInput)
+        .rect();
+    let ctx = h.ctx.clone();
+    let font = egui::FontId::monospace(FONT_SIZE);
+    let (row_h, char_w) = ctx.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
+    // "fun UserCard(user: User" : hover the type `User` at column 20 of line 6 with ⌘ held
+    let pos = egui::pos2(editor.left() + char_w * 21.5, editor.top() + row_h * 5.5);
+    h.event(Event::PointerMoved(pos));
+    h.event(Event::ModifiersChanged(Modifiers::COMMAND));
+    for _ in 0..80 {
+        h.step();
+        if h.state().usages.get("User").is_some_and(|u| u.1.is_some()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    steps(&mut h, 30); // tooltips appear after a short delay
+    let found = h
+        .state()
+        .usages
+        .get("User")
+        .and_then(|u| u.1.clone())
+        .expect("usages counted");
+    assert_eq!(found.len(), 5, "User.kt: 2, UserCard.kt: 3");
+    h.get_by_label_contains("5 usages in 2 files");
+    h.get_by_label_contains("data class User(");
+    h.event(Event::ModifiersChanged(Modifiers::NONE));
+}
+
+#[test]
+fn e2e_build_shows_compile_errors_in_editor_and_problems() {
+    let f = Fixture::new("build");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    key(&mut h, Modifiers::COMMAND, Key::B); // Eclipse: Build
+    wait(&mut h, "build", |a| {
+        a.gradle.is_none() && !a.build_problems.is_empty()
+    });
+    assert!(
+        h.state()
+            .console
+            .iter()
+            .any(|l| l == "> Task :app:compileDebugKotlin")
+    );
+    assert_eq!(
+        h.state().build_problems[&user],
+        vec![(3, 40, 1, "Unresolved reference 'Intt'.".to_string())]
+    );
+    assert_eq!(h.state().bottom, Bottom::Problems);
+    h.get_by_label("Unresolved reference 'Intt'.").click();
+    steps(&mut h, 3);
+    assert_eq!(tab(&h).path, user);
+    assert_eq!(
+        edit::line_offset(&tab(&h).text, "3:40"),
+        Some(tab(&h).cursor)
+    );
+}
+
+#[test]
+fn e2e_git_tab_lists_changes_stage_commit_and_branch() {
+    let f = Fixture::new("gitchanges");
+    let mut h = f.harness();
+    let git = |args: &[&str]| {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&f.root)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        )
+    };
+    // a branch with one committed change, plus uncommitted work
+    let base = String::from_utf8(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&f.root)
+            .args(["branch", "--show-current"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    git(&["checkout", "-q", "-b", "feature"]);
+    std::fs::write(
+        f.path("app/src/main/java/com/demo/data/User.kt"),
+        USER_KT.replace("var age", "val age"),
+    )
+    .unwrap();
+    git(&["commit", "-q", "-am", "age is val"]);
+    git(&["update-ref", &format!("refs/remotes/origin/{base}"), &base]); // stand-in for the remote base
+    std::fs::write(
+        f.path("app/src/main/java/com/demo/ui/UserCard.kt"),
+        CARD_KT.replace("count", "clicks"),
+    )
+    .unwrap();
+    std::fs::write(
+        f.path("app/src/main/java/com/demo/ui/New.kt"),
+        "package com.demo.ui\n",
+    )
+    .unwrap();
+    h.get_by_label(&format!("{}  Git", ic::GIT_COMMIT)).click();
+    wait(&mut h, "changes", |a| {
+        a.git
+            .changes
+            .as_ref()
+            .is_some_and(|c| c.working.len() == 2 && c.branch.len() == 1)
+    });
+    h.get_by_label("Uncommitted changes (2)");
+    h.get_by_label_contains("This branch: 1 files changed vs origin/");
+    // the diff of the branch file
+    h.get_by_label("app/src/main/java/com/demo/data/User.kt")
+        .scroll_to_me();
+    steps(&mut h, 3);
+    h.get_by_label("app/src/main/java/com/demo/data/User.kt")
+        .click();
+    wait(&mut h, "diff", |a| {
+        a.commit_lines().is_some_and(|l| {
+            l.iter()
+                .any(|l| l.contains("+data class User(val name: String, val age: Int)"))
+        })
+    });
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert!(h.state().commit_lines().is_none(), "Esc closes the diff");
+    steps(&mut h, 2);
+    // stage one file and commit it
+    h.get_by_label("app/src/main/java/com/demo/ui/UserCard.kt")
+        .scroll_to_me();
+    steps(&mut h, 3);
+    let row = h
+        .get_by_label("app/src/main/java/com/demo/ui/UserCard.kt")
+        .rect();
+    let stage = h
+        .get_all_by_label("Stage")
+        .find(|n| (n.rect().center().y - row.center().y).abs() < 4.0)
+        .unwrap()
+        .rect()
+        .center();
+    click_at(&mut h, stage, egui::PointerButton::Primary);
+    wait(&mut h, "staged", |a| {
+        a.git
+            .changes
+            .as_ref()
+            .is_some_and(|c| c.working.iter().any(|w| w.staged))
+    });
+    h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Commit message")
+        .scroll_to_me();
+    steps(&mut h, 3);
+    let msg = h
+        .get_by_role_and_label(egui::accesskit::Role::TextInput, "Commit message")
+        .rect()
+        .center();
+    click_at(&mut h, msg, egui::PointerButton::Primary);
+    type_text(&mut h, "Rename count");
+    h.get_by_label("Commit staged").scroll_to_me();
+    steps(&mut h, 2);
+    h.get_by_label("Commit staged").click();
+    wait(&mut h, "committed", |a| {
+        a.git
+            .changes
+            .as_ref()
+            .is_some_and(|c| c.working.len() == 1 && c.branch.len() == 2)
+    });
+    let log = String::from_utf8(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&f.root)
+            .args(["log", "-1", "--format=%s"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(log.trim(), "Rename count");
 }

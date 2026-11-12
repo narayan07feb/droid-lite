@@ -18,7 +18,12 @@ pub const ERROR: Color32 = Color32::from_rgb(0xE0, 0x50, 0x50);
 pub const INFO: Color32 = Color32::from_rgb(0x70, 0x90, 0xB0);
 
 /// `marks` are byte ranges to underline with a colour (lints, diagnostics).
-pub fn job(text: &str, font: FontId, marks: &[(Range<usize>, Color32)]) -> LayoutJob {
+pub fn job(
+    text: &str,
+    font: FontId,
+    marks: &[(Range<usize>, Color32)],
+    bg: &[(Range<usize>, Color32)],
+) -> LayoutJob {
     let mut job = LayoutJob::default();
     let plain = TextFormat {
         font_id: font.clone(),
@@ -29,7 +34,7 @@ pub fn job(text: &str, font: FontId, marks: &[(Range<usize>, Color32)]) -> Layou
     let mut at = 0;
     for (i, t) in toks.iter().enumerate() {
         if t.range.start > at {
-            job.append(&text[at..t.range.start], 0.0, plain.clone());
+            append(&mut job, text, at..t.range.start, &plain, bg);
         }
         let w = &text[t.range.clone()];
         let next_is_call = toks
@@ -57,14 +62,49 @@ pub fn job(text: &str, font: FontId, marks: &[(Range<usize>, Color32)]) -> Layou
         {
             f.underline = Stroke::new(1.5, *c);
         }
-        job.append(w, 0.0, f);
+        append(&mut job, text, t.range.clone(), &f, bg);
         at = t.range.end;
     }
     if at < text.len() {
-        job.append(&text[at..], 0.0, plain);
+        append(&mut job, text, at..text.len(), &plain, bg);
     }
     job.wrap.max_width = f32::INFINITY;
     job
+}
+
+/// Appends `text[r]` with format `f`, split where background ranges (find matches, the matching
+/// bracket) start and end.
+fn append(
+    job: &mut LayoutJob,
+    text: &str,
+    r: Range<usize>,
+    f: &TextFormat,
+    bg: &[(Range<usize>, Color32)],
+) {
+    let mut at = r.start;
+    for (b, color) in bg
+        .iter()
+        .filter(|(b, _)| b.start < r.end && r.start < b.end)
+    {
+        let (s, e) = (b.start.max(at), b.end.min(r.end));
+        if s > at {
+            job.append(&text[at..s], 0.0, f.clone());
+        }
+        if e > s {
+            job.append(
+                &text[s..e],
+                0.0,
+                TextFormat {
+                    background: *color,
+                    ..f.clone()
+                },
+            );
+        }
+        at = at.max(e);
+    }
+    if at < r.end {
+        job.append(&text[at..r.end], 0.0, f.clone());
+    }
 }
 
 /// Applies one contiguous edit to a coloured job without re-colouring the file: sections before
@@ -150,10 +190,26 @@ pub fn patch(job: &mut LayoutJob, new: &str) {
 }
 
 #[cfg(test)]
+mod bg_tests {
+    #[test]
+    fn background_ranges_split_tokens() {
+        let bg = [(4..9, egui::Color32::RED)];
+        let job = super::job("val count = 1", egui::FontId::monospace(13.0), &[], &bg);
+        let painted: String = job
+            .sections
+            .iter()
+            .filter(|s| s.format.background == egui::Color32::RED)
+            .map(|s| &job.text[s.byte_range.start.0..s.byte_range.end.0])
+            .collect();
+        assert_eq!(painted, "count");
+    }
+}
+
+#[cfg(test)]
 mod patch_tests {
     fn check(old: &str, new: &str) {
         let font = egui::FontId::monospace(13.0);
-        let mut job = super::job(old, font, &[]);
+        let mut job = super::job(old, font, &[], &[]);
         super::patch(&mut job, new);
         assert_eq!(job.text, new);
         let mut at = 0;
@@ -206,14 +262,14 @@ mod perf {
             })
             .collect();
         let font = egui::FontId::monospace(13.0);
-        let mut job = super::job(&text, font.clone(), &[]);
+        let mut job = super::job(&text, font.clone(), &[], &[]);
         let ctx = egui::Context::default();
         let _ = ctx.run_ui(Default::default(), |ui| {
             let mut t = text.clone();
             for round in 0..3 {
                 t.insert(t.len() / 2, 'x');
                 let a = std::time::Instant::now();
-                let _full = super::job(&t, font.clone(), &[]);
+                let _full = super::job(&t, font.clone(), &[], &[]);
                 let b = std::time::Instant::now();
                 super::patch(&mut job, &t);
                 let c = std::time::Instant::now();
