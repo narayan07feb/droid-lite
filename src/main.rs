@@ -112,6 +112,7 @@ fn bench(dir: &std::path::Path) {
     time("watch the project folder", &mut || {
         usize::from(watch::Watcher::start(&p.root, egui::Context::default()).is_some())
     });
+    time("project tree (Android view)", &mut || app::bench_tree(&p));
     time("module of every file", &mut || {
         p.files.iter().filter(|f| p.module_of(f).is_some()).count()
     });

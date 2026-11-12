@@ -1,6 +1,6 @@
 //! Reacts to files that change on disk (git checkout, another editor, Gradle-generated reports).
 
-use super::{App, build_tree};
+use super::{App, tree};
 use crate::highlight::WARN;
 use crate::kotlin::FileSyms;
 use crate::project::is_code;
@@ -120,7 +120,7 @@ impl App {
             }
         }
         if tree_dirty && let Some(p) = &self.project {
-            self.tree = build_tree(p);
+            self.tree = tree::build(p, self.tree_view);
         }
         if reports && let Some(p) = self.project.take() {
             self.reload_stability(&p, ctx);

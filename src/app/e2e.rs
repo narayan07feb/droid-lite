@@ -191,9 +191,9 @@ fn e2e_open_project_tree_and_index() {
     let h = f.harness();
     let app = h.state();
     assert_eq!(app.project.as_ref().unwrap().name, "Demo");
-    assert!(app.tree.iter().any(|(m, _)| m == ":app"));
+    assert!(app.tree.iter().any(|n| n.label == "app"));
     assert!(app.index.find_type("UserRepository").is_some());
-    h.get_by_label_contains(":app"); // the module row is on screen
+    h.get_by_label(&format!("{}  app", ic::PACKAGE)); // the module row is on screen
     assert_eq!(
         app.branch.as_deref().map(|b| b == "main" || b == "master"),
         Some(true)
@@ -2005,4 +2005,108 @@ fn e2e_usage_filters_hide_tests_and_imports_and_are_saved() {
     // saved with the settings
     let saved = comfort::Settings::load();
     assert!(saved.hide_tests && saved.hide_imports);
+}
+
+#[test]
+fn e2e_tree_android_and_project_views_nested_modules_and_filter() {
+    let f = Fixture::new("treeviews");
+    std::fs::write(
+        f.path("settings.gradle.kts"),
+        "rootProject.name = \"Demo\"\ninclude(\":app\")\ninclude(\":feature:card:data\")\n",
+    )
+    .unwrap();
+    let write = |rel: &str, text: &str| {
+        let p = f.path(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    };
+    write("feature/card/data/build.gradle.kts", "");
+    write(
+        "feature/card/data/src/main/kotlin/com/demo/card/data/CardRepo.kt",
+        "package com.demo.card.data\nclass CardRepo\n",
+    );
+    let test = f.path("feature/card/data/src/test/kotlin/com/demo/card/data/CardRepoTest.kt");
+    write(
+        "feature/card/data/src/test/kotlin/com/demo/card/data/CardRepoTest.kt",
+        "package com.demo.card.data\nclass CardRepoTest\n",
+    );
+    let mut h = f.harness();
+    // Android view: feature › card › data (a module), with kotlin and kotlin (test)
+    {
+        let tree = &h.state().tree;
+        let feature = tree
+            .iter()
+            .find(|n| n.label == "feature")
+            .expect("feature group");
+        let data = &feature
+            .dirs
+            .iter()
+            .find(|n| n.label == "card")
+            .unwrap()
+            .dirs[0];
+        assert_eq!(data.label, "data");
+        let groups: Vec<&str> = data.dirs.iter().map(|n| n.label.as_str()).collect();
+        assert_eq!(groups, ["kotlin", "kotlin (test)"]);
+        assert_eq!(data.dirs[0].dirs[0].label, "com.demo.card.data");
+    }
+    // locating the test file opens feature › card › data › kotlin (test) › package
+    open(&mut h, &test);
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::W);
+    steps(&mut h, 25);
+    h.get_by_label_contains("kotlin (test)");
+    h.get_by_label_contains("com.demo.card.data");
+    if let Ok(dir) = std::env::var("DROID_LITE_SNAPSHOT_DIR") {
+        h.render()
+            .unwrap()
+            .save(Path::new(&dir).join("e2e-tree.png"))
+            .unwrap();
+    }
+
+    // Project view: source sets under the module, src/ left out; remembered for the project
+    h.get_by_label("Project").click();
+    steps(&mut h, 3);
+    assert_eq!(h.state().tree_view, tree::View::Project);
+    {
+        let feature = h
+            .state()
+            .tree
+            .iter()
+            .find(|n| n.label == "feature")
+            .unwrap();
+        let data = &feature.dirs[0].dirs[0];
+        let sets: Vec<&str> = data.dirs.iter().map(|n| n.label.as_str()).collect();
+        assert_eq!(sets, ["main", "test"]);
+        assert_eq!(data.dirs[0].dirs[0].label, "kotlin · com.demo.card.data");
+    }
+    drop(h);
+    let mut h = f.harness();
+    steps(&mut h, 3);
+    assert_eq!(
+        h.state().tree_view,
+        tree::View::Project,
+        "restored for this project"
+    );
+
+    // the filter box lists matching files with their folder
+    let input = h
+        .get_all_by_role(egui::accesskit::Role::TextInput)
+        .map(|n| n.rect())
+        .min_by(|a, b| a.left().total_cmp(&b.left()))
+        .expect("filter field");
+    click_at(&mut h, input.center(), egui::PointerButton::Primary);
+    steps(&mut h, 2);
+    type_text(&mut h, "cardrepo");
+    steps(&mut h, 3);
+    h.get_by_label_contains("CardRepo.kt");
+    h.get_by_label_contains("feature/card/data/src/main/kotlin/com/demo/card/data");
+    // the test file is also open in a tab (restored session); click the row in the Project panel
+    let row = h
+        .get_all_by_label_contains("CardRepoTest.kt")
+        .map(|n| n.rect())
+        .min_by(|a, b| a.left().total_cmp(&b.left()))
+        .unwrap();
+    open(&mut h, &f.path("app/src/main/java/com/demo/data/User.kt"));
+    click_at(&mut h, row.center(), egui::PointerButton::Primary);
+    steps(&mut h, 3);
+    assert_eq!(tab(&h).path, test);
 }

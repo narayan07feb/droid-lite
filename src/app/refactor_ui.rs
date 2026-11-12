@@ -1,6 +1,6 @@
 //! Rename (with a preview), optimize imports, extract variable, and undo of the last refactoring.
 
-use super::{App, build_tree, word_bounds};
+use super::{App, tree, word_bounds};
 use crate::lsp;
 use crate::project::is_code;
 use crate::refactor;
@@ -297,7 +297,7 @@ impl App {
             p.files.retain(|f| f != from);
             p.files.push(to.to_path_buf());
             p.files.sort();
-            self.tree = build_tree(p);
+            self.tree = tree::build(p, self.tree_view);
         }
         self.index.remove(from);
         if let Ok(text) = std::fs::read_to_string(to) {

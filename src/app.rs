@@ -11,6 +11,7 @@ mod gutter;
 mod libs_ui;
 mod logcat_ui;
 mod refactor_ui;
+mod tree;
 mod typing;
 mod usage_filter;
 
@@ -27,7 +28,7 @@ use crate::project::{Project, is_code};
 use crate::theme;
 use egui::text::{CCursor, CCursorRange};
 use egui::{Align, Align2, Color32, FontId, Key, Modifiers, RichText, TextEdit, Ui};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Instant, SystemTime};
@@ -270,32 +271,16 @@ type Opened = (
     Project,
     Index,
     Option<String>,
-    Vec<(String, DirNode)>,
+    Vec<tree::Node>,
     crate::resources::Resources,
 );
 
-#[derive(Default)]
-struct DirNode {
-    dirs: BTreeMap<String, DirNode>,
-    files: Vec<PathBuf>,
-}
-
-impl DirNode {
-    fn contains(&self, f: &Path) -> bool {
-        self.files.iter().any(|p| p == f) || self.dirs.values().any(|d| d.contains(f))
-    }
-}
-
-/// The tree's selected file and the file being located, if any.
-#[derive(Clone, Copy)]
-struct Sel<'a> {
-    active: Option<&'a Path>,
-    locate: Option<&'a Path>,
-}
-
 pub struct App {
     project: Option<Project>,
-    tree: Vec<(String, DirNode)>,
+    tree: Vec<tree::Node>,
+    tree_view: tree::View,
+    /// The Project panel's file filter.
+    tree_filter: String,
     /// File to show in the Project tree, and the frames left to keep it scrolled into view.
     locate: Option<(PathBuf, u8)>,
     index: Index,
@@ -394,6 +379,8 @@ impl App {
         let mut app = App {
             project: None,
             tree: Vec::new(),
+            tree_view: tree::View::default(),
+            tree_filter: String::new(),
             locate: None,
             index: Index::default(),
             indexing: None,
@@ -505,12 +492,12 @@ impl App {
         self.tree.clear();
         let (tx, rx) = channel();
         self.status = format!("Opening {}…", dir.display());
-        let (dir, c) = (dir.to_path_buf(), ctx.clone());
+        let (dir, c, view) = (dir.to_path_buf(), ctx.clone(), self.tree_view);
         std::thread::spawn(move || {
             let project = Project::open(&dir);
             let index = Index::build(&project.files);
             let branch = crate::git::branch(&project.root);
-            let tree = build_tree(&project);
+            let tree = tree::build(&project, view);
             let res = crate::resources::Resources::scan(&project.root);
             let _ = tx.send((project, index, branch, tree, res));
             c.request_repaint();
@@ -1727,12 +1714,21 @@ impl App {
         });
     }
 
+    /// Switches the Project tree between the Android and the folder view (saved per project).
+    fn set_tree_view(&mut self, v: tree::View) {
+        self.tree_view = v;
+        if let Some(p) = &self.project {
+            self.tree = tree::build(p, v);
+        }
+        self.save_session(true);
+    }
+
     /// Opens the folders down to the active file in the Project tree, selects it and scrolls to it.
     fn locate_file(&mut self) {
         let Some(f) = self.tabs.get(self.active).map(|t| t.path.clone()) else {
             return;
         };
-        if self.tree.iter().any(|(_, n)| n.contains(&f)) {
+        if self.tree.iter().any(|n| n.contains(&f)) {
             self.locate = Some((f, 20));
         } else {
             self.status = format!("{} is not in this project's tree", f.display());
@@ -1764,38 +1760,79 @@ impl App {
             ui.label("Open an Android project folder (the one with settings.gradle).");
             return;
         }
-        let status: StatusMap = self
+        let status: tree::StatusMap = self
             .git
             .changes
             .as_ref()
             .map(|c| c.working.iter().map(|w| (w.path.clone(), w.code)).collect())
             .unwrap_or_default();
+        // view switch and file filter
+        ui.horizontal(|ui| {
+            for v in [tree::View::Android, tree::View::Project] {
+                if ui.selectable_label(self.tree_view == v, v.name()).clicked()
+                    && self.tree_view != v
+                {
+                    self.set_tree_view(v);
+                }
+            }
+        });
+        ui.add(
+            egui::TextEdit::singleline(&mut self.tree_filter)
+                .desired_width(f32::INFINITY)
+                .hint_text(format!("{}  Filter files", ic::MAGNIFYING_GLASS)),
+        );
         let mut open = None;
         let active = self.tabs.get(self.active).map(|t| t.path.clone());
         let locate = self.locate.as_ref().map(|(f, _)| f.clone());
+        let sel = tree::Sel {
+            active: active.as_deref(),
+            locate: locate.as_deref(),
+            status: &status,
+        };
+        let root = self.root();
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let sel = Sel {
-                    active: active.as_deref(),
-                    locate: locate.as_deref(),
-                };
-                for (module, node) in &self.tree {
-                    let label = if module == ":" {
-                        self.project
-                            .as_ref()
-                            .map_or(module.clone(), |p| format!("{} (root)", p.name))
-                    } else {
-                        module.clone()
+                if self.tree_filter.trim().is_empty() {
+                    tree::show(ui, &self.tree, sel, &mut open);
+                    return;
+                }
+                // a flat list of matching files, like Android Studio's speed search
+                let files = self
+                    .project
+                    .as_ref()
+                    .map_or(&[][..], |p| p.files.as_slice());
+                let hits = tree::filter(files, self.tree_filter.trim(), 300);
+                if hits.is_empty() {
+                    ui.label(RichText::new("No file matches").color(theme::t().weak));
+                }
+                for f in hits {
+                    let dir = f
+                        .parent()
+                        .and_then(|d| d.strip_prefix(&root).ok())
+                        .map(|d| d.display().to_string())
+                        .unwrap_or_default();
+                    let name = f
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let (icon, tint) = file_icon(f);
+                    let mut job = egui::text::LayoutJob::default();
+                    let fmt = |color| egui::TextFormat {
+                        font_id: FontId::proportional(13.0),
+                        color,
+                        ..Default::default()
                     };
-                    egui::CollapsingHeader::new(
-                        RichText::new(format!("{}  {label}", ic::PACKAGE)).strong(),
-                    )
-                    .id_salt(module)
-                    .open(sel.locate.filter(|f| node.contains(f)).map(|_| true))
-                    .show(ui, |ui| {
-                        dir_ui(ui, node, module, &mut open, &status, sel);
+                    job.append(icon, 0.0, fmt(tint));
+                    job.append(&format!("  {name}"), 0.0, fmt(theme::t().text));
+                    let r = ui.horizontal(|ui| {
+                        let r = ui.selectable_label(sel.active == Some(f.as_path()), job);
+                        ui.label(RichText::new(dir).color(theme::t().weak).small());
+                        r
                     });
+                    if r.inner.clicked() {
+                        open = Some(f.clone());
+                    }
                 }
             });
         // the folders open with an animation, so keep scrolling to the file until it ends
@@ -3361,30 +3398,9 @@ fn node_ui(ui: &mut Ui, n: &compose::Node, jump: &mut Option<usize>) {
     }
 }
 
-/// Module → directory tree. Files that belong to a nested module are left out of the parent.
-fn build_tree(p: &Project) -> Vec<(String, DirNode)> {
-    let mut out: Vec<(String, DirNode)> = p
-        .modules
-        .iter()
-        .map(|m| (m.name.clone(), DirNode::default()))
-        .collect();
-    for f in &p.files {
-        let Some(m) = p.module_of(f) else { continue };
-        let Some(slot) = out.iter_mut().find(|(n, _)| *n == m.name) else {
-            continue;
-        };
-        let rel = f.strip_prefix(&m.dir).unwrap_or(f);
-        let mut node = &mut slot.1;
-        let comps: Vec<String> = rel
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect();
-        for c in &comps[..comps.len().saturating_sub(1)] {
-            node = node.dirs.entry(c.clone()).or_default();
-        }
-        node.files.push(f.clone());
-    }
-    out
+/// For `--bench`: builds the Project tree (Android view, as the app does), returns its top-level rows.
+pub fn bench_tree(p: &Project) -> usize {
+    tree::build(p, tree::View::Android).len()
 }
 
 /// One row of a `show_rows` list, exactly `h` high (plus the spacing `show_rows` adds itself).
@@ -3402,62 +3418,6 @@ fn fixed_row<R>(ui: &mut Ui, h: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     let width = child.min_rect().width().max(rect.width());
     ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
     r
-}
-
-/// Git status letter by file, for colouring the tree (M modified, A / ? new).
-type StatusMap = HashMap<PathBuf, char>;
-
-fn dir_ui(
-    ui: &mut Ui,
-    node: &DirNode,
-    id: &str,
-    open: &mut Option<PathBuf>,
-    status: &StatusMap,
-    sel: Sel,
-) {
-    for (name, child) in &node.dirs {
-        // compact single-child chains, like Android Studio's package view: src/main/java/com/app
-        let mut label = name.clone();
-        let mut c = child;
-        while c.files.is_empty() && c.dirs.len() == 1 {
-            let (n, next) = c.dirs.iter().next().unwrap();
-            label = format!("{label}/{n}");
-            c = next;
-        }
-        let key = format!("{id}/{label}");
-        egui::CollapsingHeader::new(format!("{}  {label}", ic::FOLDER_SIMPLE))
-            .id_salt(&key)
-            .open(sel.locate.filter(|f| c.contains(f)).map(|_| true))
-            .show(ui, |ui| dir_ui(ui, c, &key, open, status, sel));
-    }
-    for f in &node.files {
-        let name = f
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let (icon, color) = file_icon(f);
-        let mut job = egui::text::LayoutJob::default();
-        let fmt = |color| egui::TextFormat {
-            font_id: FontId::proportional(13.0),
-            color,
-            ..Default::default()
-        };
-        job.append(icon, 0.0, fmt(color));
-        // like Android Studio: modified files blue, new files green
-        let name_color = match status.get(f) {
-            Some('M' | 'R') => Color32::from_rgb(0x58, 0x9D, 0xF6),
-            Some('A' | '?') => Color32::from_rgb(0x5F, 0xB8, 0x65),
-            _ => crate::theme::t().text,
-        };
-        job.append(&format!("  {name}"), 0.0, fmt(name_color));
-        let r = ui.selectable_label(sel.active == Some(f.as_path()), job);
-        if sel.locate == Some(f.as_path()) {
-            r.scroll_to_me(Some(egui::Align::Center));
-        }
-        if r.clicked() {
-            *open = Some(f.clone());
-        }
-    }
 }
 
 /// Icon and tint for a file in the tree and on tabs.

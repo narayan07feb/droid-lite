@@ -18,6 +18,8 @@ pub const X: &str = "\u{E4F6}";
 pub const TREE_STRUCTURE: &str = "\u{E67C}";
 pub const CROSSHAIR: &str = "\u{E1D6}";
 pub const TERMINAL: &str = "\u{E47E}";
+/// A package in the Android view.
+pub const PACKAGE_SMALL: &str = "\u{E8F8}"; // folder-dotted
 pub const IMAGE: &str = "\u{E2CA}";
 pub const LIGHTNING: &str = "\u{E2DE}";
 pub const CHECK_CIRCLE: &str = "\u{E184}";

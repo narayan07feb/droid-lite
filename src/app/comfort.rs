@@ -184,7 +184,7 @@ impl App {
             .iter()
             .map(|t| json!({ "path": t.path.to_string_lossy(), "cursor": t.cursor }))
             .collect();
-        let v = json!({ "tabs": tabs, "active": self.active });
+        let v = json!({ "tabs": tabs, "active": self.active, "tree_view": self.tree_view.name() });
         let text = v.to_string();
         let h = hash(&text);
         if h == self.session_saved.0 || (!force && self.session_saved.1.elapsed().as_secs() < 1) {
@@ -208,6 +208,16 @@ impl App {
         else {
             return;
         };
+        let view = match v["tree_view"].as_str() {
+            Some("Project") => super::tree::View::Project,
+            _ => super::tree::View::Android,
+        };
+        if view != self.tree_view {
+            self.tree_view = view;
+            if let Some(p) = &self.project {
+                self.tree = super::tree::build(p, view);
+            }
+        }
         for t in v["tabs"].as_array().into_iter().flatten() {
             let (Some(p), cursor) = (
                 t["path"].as_str(),
