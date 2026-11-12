@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod alloc_count;
 mod app;
+mod catalog;
 mod compose;
 mod edit;
 mod git;
@@ -15,6 +16,7 @@ mod lexer;
 mod lsp;
 mod project;
 mod refactor;
+mod resources;
 mod theme;
 mod watch;
 

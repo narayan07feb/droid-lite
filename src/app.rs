@@ -1,5 +1,6 @@
 //! The IDE window: project tree, editor tabs, search popups, completion, Compose panel, Gradle console.
 
+mod android;
 mod comfort;
 mod disk;
 #[cfg(test)]
@@ -244,7 +245,13 @@ struct ComposeView {
 }
 
 /// A project opened on a worker thread: files, index, git branch and the tree.
-type Opened = (Project, Index, Option<String>, Vec<(String, DirNode)>);
+type Opened = (
+    Project,
+    Index,
+    Option<String>,
+    Vec<(String, DirNode)>,
+    crate::resources::Resources,
+);
 
 #[derive(Default)]
 struct DirNode {
@@ -296,6 +303,11 @@ pub struct App {
     branch: Option<String>,
     /// Bumped when a build or a report reload may have changed previews and stability.
     outputs_gen: u64,
+    /// Android resources of the project (values, files, ids).
+    res: crate::resources::Resources,
+    res_rx: Option<Receiver<crate::resources::Resources>>,
+    /// A file under `res/` changed: rescan resources.
+    res_stale: bool,
     compose_view: Option<ComposeView>,
     ctx: Option<egui::Context>,
     keymap: Keymap,
@@ -370,6 +382,9 @@ impl App {
             git: Default::default(),
             branch: None,
             outputs_gen: 0,
+            res: Default::default(),
+            res_rx: None,
+            res_stale: false,
             compose_view: None,
             ctx: Some(cc.egui_ctx.clone()),
             keymap: load_setting("keymap").map_or(Keymap::Eclipse, |s| Keymap::from_name(&s)),
@@ -443,7 +458,8 @@ impl App {
             let index = Index::build(&project.files);
             let branch = crate::git::branch(&project.root);
             let tree = build_tree(&project);
-            let _ = tx.send((project, index, branch, tree));
+            let res = crate::resources::Resources::scan(&project.root);
+            let _ = tx.send((project, index, branch, tree, res));
             c.request_repaint();
         });
         self.indexing = Some(rx);
@@ -466,11 +482,12 @@ impl App {
         self.reload_stability(&project, ctx);
         self.watcher = crate::watch::Watcher::start(&project.root, ctx.clone());
         self.status = format!(
-            "Opened {} ({} modules, {} files, {} symbols)",
+            "Opened {} ({} modules, {} files, {} symbols, {} resources)",
             project.name,
             project.modules.len(),
             project.files.len(),
-            self.index.symbol_count()
+            self.index.symbol_count(),
+            self.res.len()
         );
         self.project = Some(project);
         if self.tabs.is_empty() {
@@ -660,6 +677,9 @@ impl App {
             return;
         };
         let path = self.tabs[self.active].path.clone();
+        if self.goto_android_reference(&word, at) {
+            return;
+        }
         if let Some(l) = self.lsp.as_mut().filter(|l| l.ready) {
             let (line, col) = lsp::position(&self.tabs[self.active].text, at);
             l.definition(&path, line, col);
@@ -817,10 +837,11 @@ impl App {
 
     fn poll(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.indexing
-            && let Ok((project, index, branch, tree)) = rx.try_recv()
+            && let Ok((project, index, branch, tree, res)) = rx.try_recv()
         {
             self.indexing = None;
             self.tree = tree;
+            self.res = res;
             self.project_ready(project, index, branch, ctx);
         }
         if let Some(rx) = &self.stability_rx
@@ -1792,7 +1813,7 @@ impl App {
                 .unwrap_or_else(|| ui.fonts_mut(|f| f.layout_job(Default::default())))
         };
         let mut changed = false;
-        let mut hover_word: Option<(String, egui::Response)> = None;
+        let mut hover_word: Option<(String, Option<(String, String)>, egui::Response)> = None;
         let mut cmd_click = false;
         let mut popup_pos = None;
         egui::ScrollArea::both()
@@ -1999,8 +2020,11 @@ impl App {
                                 egui::Stroke::new(1.5, crate::theme::t().accent),
                             );
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                            hover_word =
-                                Some((text[a..w].to_string(), out.response.response.clone()));
+                            hover_word = Some((
+                                text[a..w].to_string(),
+                                crate::resources::reference_at(text, a, w),
+                                out.response.response.clone(),
+                            ));
                         }
                     }
                 });
@@ -2011,8 +2035,11 @@ impl App {
             tab.mark_edited();
             self.update_completion(false);
         }
-        if let Some((word, resp)) = hover_word {
-            resp.on_hover_ui_at_pointer(|ui| self.hover_card(ui, &word));
+        if let Some((word, res_ref, resp)) = hover_word {
+            resp.on_hover_ui_at_pointer(|ui| match res_ref {
+                Some((kind, name)) => self.resource_card(ui, &kind, &name),
+                None => self.hover_card(ui, &word),
+            });
         }
         if cmd_click {
             self.goto_definition();
@@ -2646,6 +2673,7 @@ impl eframe::App for App {
         watch.stage("analysis", || self.settle(false));
         watch.stage("git blame", || self.poll_git(&ctx));
         self.poll_usages();
+        self.rescan_resources(&ctx);
         self.watch_focus(&ctx);
         self.save_session(false);
         watch.stage("shortcuts", || self.shortcuts(&ctx));

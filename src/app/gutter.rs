@@ -37,6 +37,8 @@ pub(super) struct Annotations {
     key: (u64, u64, u64),
     pub(super) marks: Vec<Mark>,
     pub(super) badges: Vec<Badge>,
+    /// Colour squares for lines that write a colour (`Color(0xFF…)`, `#RRGGBB`, `R.color.x`).
+    pub(super) swatches: Vec<(usize, Color32)>,
 }
 
 /// What a click in the gutter or the context menu asks for, run after the editor is drawn.
@@ -160,8 +162,29 @@ impl App {
                 });
             }
         }
+        let mut swatches = Vec::new();
+        for (line, text) in t.text.lines().enumerate() {
+            let mut colors = crate::resources::literal_colors(text);
+            for pat in ["R.color.", "@color/"] {
+                for (i, _) in text.match_indices(pat) {
+                    let name: String = text[i + pat.len()..]
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    colors.extend(self.res.color(&name));
+                }
+            }
+            if let Some(c) = colors.first() {
+                swatches.push((line, *c));
+            }
+        }
         if let Some(t) = self.tabs.get_mut(self.active) {
-            t.annotations = Some(Annotations { key, marks, badges });
+            t.annotations = Some(Annotations {
+                key,
+                marks,
+                badges,
+                swatches,
+            });
         }
     }
 
@@ -231,6 +254,30 @@ pub(super) fn paint_marks(
 ) -> Option<Request> {
     let clip = ui.clip_rect();
     let mut out = None;
+    for (line, color) in &a.swatches {
+        let Some(row) = galley.rows.get(*line) else {
+            continue;
+        };
+        let y = galley_pos.y + row.pos.y;
+        if y > clip.bottom()
+            || y + row.rect().height() < clip.top()
+            || a.marks.iter().any(|m| m.line == *line)
+        {
+            continue;
+        }
+        let h = row.rect().height();
+        let r = Rect::from_center_size(
+            Pos2::new(column.left() + ICON_WIDTH * 0.5, y + h * 0.5),
+            egui::vec2(10.0, 10.0),
+        );
+        ui.painter().rect_filled(r, 2.0, *color);
+        ui.painter().rect_stroke(
+            r,
+            2.0,
+            egui::Stroke::new(1.0, crate::theme::t().border),
+            egui::StrokeKind::Outside,
+        );
+    }
     for m in &a.marks {
         let Some(row) = galley.rows.get(m.line) else {
             continue;

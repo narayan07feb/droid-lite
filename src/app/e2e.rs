@@ -1393,3 +1393,93 @@ fn e2e_session_restore_history_autosave_and_settings() {
     let saved = std::fs::read_to_string(f.config.join("settings.json")).unwrap();
     assert!(saved.contains("\"light\": true"), "{saved}");
 }
+
+#[test]
+fn e2e_android_resources_catalog_and_swatches() {
+    let f = Fixture::new("android");
+    let w = |rel: &str, text: &str| {
+        let p = f.path(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    };
+    w(
+        "app/src/main/res/values/strings.xml",
+        "<resources>\n    <string name=\"app_name\">Shop</string>\n</resources>\n",
+    );
+    w(
+        "app/src/main/res/values/colors.xml",
+        "<resources>\n    <color name=\"brand\">#6200EE</color>\n</resources>\n",
+    );
+    w(
+        "app/src/main/res/values-night/colors.xml",
+        "<resources>\n    <color name=\"brand\">#BB86FC</color>\n</resources>\n",
+    );
+    w(
+        "app/src/main/res/layout/main.xml",
+        "<TextView android:id=\"@+id/title\" android:text=\"@string/app_name\"/>\n",
+    );
+    w(
+        "gradle/libs.versions.toml",
+        "[versions]\ncore = \"1.13\"\n\n[libraries]\nandroidx-core-ktx = { module = \"androidx.core:core-ktx\", version.ref = \"core\" }\n",
+    );
+    w(
+        "app/build.gradle.kts",
+        "plugins { id(\"com.android.application\") }\ndependencies {\n    implementation(libs.androidx.core.ktx)\n}\n",
+    );
+    w(
+        "app/src/main/java/com/demo/ui/Res.kt",
+        "package com.demo.ui\n\nfun res() {\n    val name = stringResource(R.string.app_name)\n    val brand = colorResource(R.color.brand)\n    val purple = Color(0xFF6200EE)\n}\n",
+    );
+    let mut h = f.harness();
+    wait(&mut h, "resources", |a| a.res.len() >= 3);
+    let res_kt = f.path("app/src/main/java/com/demo/ui/Res.kt");
+    open(&mut h, &res_kt);
+    steps(&mut h, 3);
+    // swatches on the R.color line and the Color(0x…) line
+    let sw: Vec<usize> = tab(&h)
+        .annotations
+        .as_ref()
+        .unwrap()
+        .swatches
+        .iter()
+        .map(|(l, _)| *l)
+        .collect();
+    assert_eq!(sw, vec![4, 5]);
+    // F3 on R.string.app_name opens strings.xml at the name
+    place_cursor(&mut h, "app_name)", 2);
+    key(&mut h, Modifiers::NONE, Key::F3);
+    assert!(tab(&h).path.ends_with("values/strings.xml"));
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("app_name\""));
+    // R.color.brand exists twice (default and night): a picker
+    open(&mut h, &res_kt);
+    place_cursor(&mut h, "brand)", 1);
+    key(&mut h, Modifiers::NONE, Key::F3);
+    assert_eq!(h.state().search.as_ref().map(|s| s.hits.len()), Some(2));
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    // XML: @string/app_name in a layout
+    open(&mut h, &f.path("app/src/main/res/layout/main.xml"));
+    place_cursor(&mut h, "@string/app_name", 10);
+    key(&mut h, Modifiers::NONE, Key::F3);
+    assert!(tab(&h).path.ends_with("values/strings.xml"));
+    // the catalog: libs.androidx.core.ktx in the build script
+    open(&mut h, &f.path("app/build.gradle.kts"));
+    place_cursor(&mut h, "core.ktx", 1);
+    key(&mut h, Modifiers::NONE, Key::F3);
+    assert!(tab(&h).path.ends_with("gradle/libs.versions.toml"));
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("androidx-core-ktx = "));
+    // ⌘-hover on R.string.app_name shows its value
+    open(&mut h, &res_kt);
+    let editor = h
+        .get_by_role(egui::accesskit::Role::MultilineTextInput)
+        .rect();
+    let ctx = h.ctx.clone();
+    let font = egui::FontId::monospace(crate::theme::font_size());
+    let (row_h, char_w) = ctx.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
+    let col = "    val name = stringResource(R.string.".len() as f32 + 2.0;
+    let pos = egui::pos2(editor.left() + char_w * col, editor.top() + row_h * 3.5);
+    h.event(Event::ModifiersChanged(Modifiers::COMMAND));
+    h.event(Event::PointerMoved(pos));
+    steps(&mut h, 30);
+    h.get_by_label_contains("default:  Shop");
+    h.event(Event::ModifiersChanged(Modifiers::NONE));
+}
