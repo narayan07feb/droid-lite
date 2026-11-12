@@ -1690,24 +1690,19 @@ fn write_destination(f: &Fixture) -> (PathBuf, PathBuf) {
     (dest, host)
 }
 
-#[test]
-fn e2e_cmd_click_on_a_declaration_lists_its_usages() {
-    let f = Fixture::new("declusages");
-    let (dest, host) = write_destination(&f);
-    let mut h = f.harness();
-    open(&mut h, &dest);
+/// ⌘-clicks the name at (column, row) of the open editor.
+fn cmd_click_at(h: &mut Harness<'static, App>, col: f32, row: f32) {
     let editor = h
         .get_by_role(egui::accesskit::Role::MultilineTextInput)
         .rect();
     let ctx = h.ctx.clone();
     let font = egui::FontId::monospace(crate::theme::font_size());
     let (row_h, char_w) = ctx.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
-    // `startCardDestination` in "internal fun NavGraphBuilder.startCardDestination(" on line 3
-    let pos = egui::pos2(editor.left() + char_w * 33.5, editor.top() + row_h * 2.5);
+    let pos = egui::pos2(editor.left() + char_w * col, editor.top() + row_h * row);
     let mods = Modifiers::COMMAND;
     h.event(Event::ModifiersChanged(mods));
     h.event(Event::PointerMoved(pos));
-    steps(&mut h, 2);
+    steps(h, 2);
     for pressed in [true, false] {
         h.event(Event::PointerButton {
             pos,
@@ -1715,27 +1710,92 @@ fn e2e_cmd_click_on_a_declaration_lists_its_usages() {
             pressed,
             modifiers: mods,
         });
-        steps(&mut h, 1);
+        steps(h, 1);
     }
     h.event(Event::ModifiersChanged(Modifiers::NONE));
+}
+
+#[test]
+fn e2e_cmd_click_on_a_declaration_shows_a_usages_dropdown() {
+    let f = Fixture::new("declusages");
+    let (dest, host) = write_destination(&f);
+    let mut h = f.harness();
+    open(&mut h, &dest);
+    let bottom = h.state().bottom;
+    // `startCardDestination` in "internal fun NavGraphBuilder.startCardDestination(" on line 3
+    cmd_click_at(&mut h, 33.5, 2.5);
     wait(&mut h, "usages", |a| {
         a.find_rx.is_none() && !a.found.is_empty()
     });
-    assert_eq!(tab(&h).path, dest, "the declaration stays open");
-    assert_eq!(h.state().bottom, Bottom::Find);
-    let in_host: Vec<&str> = h
-        .state()
-        .found
-        .iter()
-        .filter(|f| f.path == host)
-        .map(|f| f.text.as_str())
-        .collect();
-    assert_eq!(in_host.len(), 2, "import and call: {in_host:?}");
-    h.get_by_label_contains("References to `startCardDestination`");
-    // a result opens the caller
-    h.get_by_label_contains("b.startCardDestination(onBack = {})")
-        .click();
     steps(&mut h, 3);
+    assert!(
+        h.state().usages_popup.is_some(),
+        "the dropdown stays open after the click"
+    );
+    assert_eq!(tab(&h).path, dest, "the declaration stays open");
+    assert_eq!(
+        h.state().bottom,
+        bottom,
+        "the Find panel is not forced open"
+    );
+    // import and call, not the declaration
+    h.get_by_label_contains("Usages of `startCardDestination`  2 in 1 files");
+    h.get_by_label_contains("StartCardFragment.kt:6");
+    assert!(
+        h.query_by_label_contains("StartCardDestination.kt:3")
+            .is_none()
+    );
+    // ↓ then Enter opens the second row: the call
+    key(&mut h, Modifiers::NONE, Key::ArrowDown);
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    steps(&mut h, 3);
+    assert!(h.state().usages_popup.is_none());
+    assert_eq!(tab(&h).path, host);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("startCardDestination(onBack"));
+    assert!(
+        tab(&h).text.contains("b.startCardDestination"),
+        "the editor text is unchanged"
+    );
+
+    // Esc closes it; the footer link opens the Find panel
+    open(&mut h, &dest);
+    cmd_click_at(&mut h, 33.5, 2.5);
+    wait(&mut h, "usages", |a| {
+        a.find_rx.is_none() && a.usages_popup.is_some()
+    });
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    steps(&mut h, 2);
+    assert!(h.state().usages_popup.is_none());
+    cmd_click_at(&mut h, 33.5, 2.5);
+    wait(&mut h, "usages", |a| {
+        a.find_rx.is_none() && a.usages_popup.is_some()
+    });
+    steps(&mut h, 2);
+    h.get_by_label_contains("Open in Find panel").click();
+    steps(&mut h, 3);
+    assert_eq!(h.state().bottom, Bottom::Find);
+    assert!(h.state().usages_popup.is_none());
+}
+
+#[test]
+fn e2e_cmd_click_on_a_declaration_with_one_usage_jumps_to_it() {
+    let f = Fixture::new("oneusage");
+    let dest = f.path("app/src/main/java/com/demo/ui/Single.kt");
+    let host = f.path("app/src/main/java/com/demo/ui/SingleUser.kt");
+    std::fs::write(&dest, "package com.demo.ui\n\nfun singleUseHelper() {}\n").unwrap();
+    std::fs::write(
+        &host,
+        "package com.demo.ui\n\nfun caller() {\n    singleUseHelper()\n}\n",
+    )
+    .unwrap();
+    let mut h = f.harness();
+    open(&mut h, &dest);
+    // `singleUseHelper` in "fun singleUseHelper() {}" on line 3
+    cmd_click_at(&mut h, 6.5, 2.5);
+    wait(&mut h, "jump", |a| {
+        a.tabs[a.active].path.ends_with("SingleUser.kt")
+    });
+    assert!(h.state().usages_popup.is_none());
     assert_eq!(tab(&h).path, host);
 }
 

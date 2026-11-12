@@ -198,6 +198,16 @@ struct Search {
     title: Option<String>,
 }
 
+/// The usages dropdown: the name, where it opens, the selected row and the declaration to leave out.
+struct UsagesPopup {
+    word: String,
+    pos: egui::Pos2,
+    selected: usize,
+    decl: (PathBuf, usize),
+    /// The frame it opened in: that ⌘-click is not a click outside it.
+    frame: u64,
+}
+
 struct Completion {
     start: usize,
     items: Vec<Item>,
@@ -304,6 +314,10 @@ pub struct App {
     find_rx: Option<Receiver<Vec<FoundLine>>>,
     /// kotlin-lsp references that came back before the project search ended.
     lsp_found: Option<Vec<FoundLine>>,
+    /// Android Studio style usages dropdown at the caret (⌘-click on a declaration).
+    usages_popup: Option<UsagesPopup>,
+    /// The caret's screen position last frame, where popups open.
+    caret_pos: Option<egui::Pos2>,
     bottom: Bottom,
     selected_composable: Option<String>,
     textures: HashMap<PathBuf, (SystemTime, egui::TextureHandle)>,
@@ -394,6 +408,8 @@ impl App {
             found: Vec::new(),
             find_rx: None,
             lsp_found: None,
+            usages_popup: None,
+            caret_pos: None,
             bottom: Bottom::Problems,
             selected_composable: None,
             textures: HashMap::new(),
@@ -731,7 +747,16 @@ impl App {
         if defs.iter().any(|d| d.path == path && d.offset == at)
             && let Some(ctx) = self.ctx.clone()
         {
+            let bottom = self.bottom;
             self.find_references(&ctx);
+            self.bottom = bottom; // the dropdown shows them; the Find panel stays one click away
+            self.usages_popup = Some(UsagesPopup {
+                word,
+                pos: self.caret_pos.unwrap_or(egui::pos2(200.0, 200.0)),
+                selected: 0,
+                decl: (path, at),
+                frame: self.frames,
+            });
             return;
         }
         if let Some(l) = self.lsp.as_mut().filter(|l| l.ready) {
@@ -2253,6 +2278,9 @@ impl App {
         if let Some(r) = request {
             self.handle(r, &ui.ctx().clone());
         }
+        if popup_pos.is_some() {
+            self.caret_pos = popup_pos;
+        }
         self.completion_popup(ui, popup_pos);
     }
 
@@ -2377,6 +2405,149 @@ impl App {
         self.index.update(&path, &self.tabs[self.active].text);
         if let Some(l) = self.lsp.as_mut() {
             l.did_change(&path, &self.tabs[self.active].text);
+        }
+    }
+
+    /// The usages the dropdown lists: every found line except the declaration itself.
+    fn popup_usages(&self) -> Vec<&FoundLine> {
+        let Some(p) = &self.usages_popup else {
+            return Vec::new();
+        };
+        self.found
+            .iter()
+            .filter(|f| (&f.path, f.offset) != (&p.decl.0, p.decl.1))
+            .collect()
+    }
+
+    /// ↑ ↓ Enter Esc for the usages dropdown, taken before the editor sees them.
+    fn usages_popup_keys(&mut self, ctx: &egui::Context) {
+        if self.usages_popup.is_none() {
+            return;
+        }
+        let key = |k| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
+        let (esc, down, up, enter) = (
+            key(Key::Escape),
+            key(Key::ArrowDown),
+            key(Key::ArrowUp),
+            key(Key::Enter),
+        );
+        let n = self.popup_usages().len();
+        let chosen = enter
+            .then(|| self.usages_popup.as_ref().map(|p| p.selected))
+            .flatten()
+            .and_then(|i| {
+                self.popup_usages()
+                    .get(i)
+                    .map(|f| (f.path.clone(), f.offset))
+            });
+        if let Some(p) = self.usages_popup.as_mut() {
+            if down {
+                p.selected = (p.selected + 1).min(n.saturating_sub(1));
+            }
+            if up {
+                p.selected = p.selected.saturating_sub(1);
+            }
+        }
+        if esc || chosen.is_some() {
+            self.usages_popup = None;
+        }
+        if let Some((f, o)) = chosen {
+            self.open_file(&f, Some(o));
+        }
+    }
+
+    /// Android Studio's "Show usages" dropdown: one row per usage (file:line and the code),
+    /// at the caret. One usage jumps straight to it.
+    fn usages_popup_ui(&mut self, ctx: &egui::Context) {
+        let Some(p) = &self.usages_popup else { return };
+        let searching = self.find_rx.is_some();
+        let list = self.popup_usages();
+        if !searching && list.len() == 1 {
+            let (f, o) = (list[0].path.clone(), list[0].offset);
+            self.usages_popup = None;
+            self.open_file(&f, Some(o));
+            return;
+        }
+        let (mut chosen, mut to_panel) = (None, false);
+        let title = if searching {
+            format!("Usages of `{}`  searching…", p.word)
+        } else {
+            let mut files: Vec<&Path> = list.iter().map(|f| f.path.as_path()).collect();
+            files.dedup();
+            format!(
+                "Usages of `{}`  {} in {} files",
+                p.word,
+                list.len(),
+                files.len()
+            )
+        };
+        let area = egui::Area::new(egui::Id::unique("usages_popup"))
+            .fixed_pos(p.pos)
+            .order(egui::Order::Foreground)
+            .constrain(true)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_width(640.0);
+                    ui.label(RichText::new(title).strong());
+                    ui.separator();
+                    if !searching && list.is_empty() {
+                        ui.label(RichText::new("No usages found").color(theme::t().weak));
+                    }
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            for (i, f) in list.iter().enumerate() {
+                                let (icon, tint) = file_icon(&f.path);
+                                let name = f
+                                    .path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                let mut job = egui::text::LayoutJob::default();
+                                let fmt = |color, size| egui::TextFormat {
+                                    font_id: FontId::monospace(size),
+                                    color,
+                                    ..Default::default()
+                                };
+                                job.append(icon, 0.0, fmt(tint, 12.0));
+                                job.append(
+                                    &format!(" {name}:{}  ", f.line),
+                                    0.0,
+                                    fmt(theme::t().weak, 12.0),
+                                );
+                                job.append(f.text.trim(), 0.0, fmt(theme::t().text, 12.5));
+                                let r = ui.selectable_label(i == p.selected, job);
+                                if i == p.selected {
+                                    r.scroll_to_me(None);
+                                }
+                                if r.clicked() {
+                                    chosen = Some((f.path.clone(), f.offset));
+                                }
+                            }
+                        });
+                    ui.separator();
+                    let more = format!(
+                        "Open in Find panel  {}",
+                        keymap::text(self.keymap, Action::References)
+                    );
+                    if ui.link(RichText::new(more).small()).clicked() {
+                        to_panel = true;
+                    }
+                });
+            });
+        let opened_now = self
+            .usages_popup
+            .as_ref()
+            .is_some_and(|p| p.frame == self.frames);
+        let clicked_away = !opened_now && area.response.clicked_elsewhere();
+        if chosen.is_some() || to_panel || clicked_away {
+            self.usages_popup = None;
+        }
+        if to_panel {
+            self.bottom = Bottom::Find;
+        }
+        if let Some((f, o)) = chosen {
+            self.open_file(&f, Some(o));
         }
     }
 
@@ -2906,6 +3077,7 @@ impl eframe::App for App {
         self.watch_focus(&ctx);
         self.save_session(false);
         watch.stage("shortcuts", || self.shortcuts(&ctx));
+        self.usages_popup_keys(&ctx);
         if let Some(dropped) =
             ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()))
             && dropped.is_dir()
@@ -2955,6 +3127,7 @@ impl eframe::App for App {
         });
         watch.stage("popups", || {
             self.search_window(&ctx);
+            self.usages_popup_ui(&ctx);
             self.refactor_window(&ctx);
             self.commit_window(&ctx);
             self.shortcuts_window(&ctx);
