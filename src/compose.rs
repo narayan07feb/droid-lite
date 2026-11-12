@@ -285,7 +285,7 @@ pub fn lint(src: &str, syms: &FileSyms) -> Vec<Lint> {
         let private = d
             .modifiers
             .iter()
-            .any(|m| m == "private" || m == "internal");
+            .any(|m| matches!(&**m, "private" | "internal"));
         let upper = d.name.starts_with(|c: char| c.is_ascii_uppercase());
         let unit = returns(d, src);
         if unit == Some(true) && !upper {
@@ -695,7 +695,7 @@ pub fn guess(d: &Decl, index: &Index) -> Stability {
                 } else if c.kind == Kind::Interface
                     || c.modifiers
                         .iter()
-                        .any(|m| m == "abstract" || m == "open" || m == "sealed")
+                        .any(|m| matches!(&**m, "abstract" | "open" | "sealed"))
                 {
                     (
                         Verdict::Unknown,

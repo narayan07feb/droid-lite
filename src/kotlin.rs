@@ -49,11 +49,11 @@ pub struct Param {
 pub struct Decl {
     pub name: String,
     pub kind: Kind,
-    pub container: Option<String>,
+    pub container: Option<Atom>,
     /// Byte offset of the name.
     pub offset: usize,
-    pub annotations: Vec<String>,
-    pub modifiers: Vec<String>,
+    pub annotations: Vec<Atom>,
+    pub modifiers: Vec<Atom>,
     pub params: Vec<Param>,
     /// Return type of a fun, or the declared type of a property.
     pub ty: String,
@@ -66,8 +66,11 @@ pub struct Decl {
 }
 
 impl Decl {
+    pub fn has_modifier(&self, m: &str) -> bool {
+        self.modifiers.iter().any(|x| &**x == m)
+    }
     pub fn has_annotation(&self, name: &str) -> bool {
-        self.annotations.iter().any(|a| a == name)
+        self.annotations.iter().any(|a| &**a == name)
     }
     pub fn is_composable(&self) -> bool {
         self.kind == Kind::Fun && self.has_annotation("Composable")
@@ -81,10 +84,14 @@ impl Decl {
     }
 }
 
+/// A shared, immutable string: names that repeat across declarations and files (imports,
+/// modifiers, annotations, container names) are stored once.
+pub type Atom = std::sync::Arc<str>;
+
 #[derive(Clone, Debug, Default)]
 pub struct FileSyms {
     pub package: String,
-    pub imports: Vec<String>,
+    pub imports: Vec<Atom>,
     pub decls: Vec<Decl>,
 }
 
@@ -297,10 +304,10 @@ pub fn scan(src: &str) -> FileSyms {
     let mut s = Scanner { src, t, i: 0 };
     let mut out = FileSyms::default();
     // Brace frames: Some(container) for a body that holds members, None for code blocks.
-    let mut frames: Vec<Option<Option<String>>> = Vec::new();
-    let mut pending_body: Option<String> = None;
-    let mut annotations: Vec<String> = Vec::new();
-    let mut modifiers: Vec<String> = Vec::new();
+    let mut frames: Vec<Option<Option<Atom>>> = Vec::new();
+    let mut pending_body: Option<Atom> = None;
+    let mut annotations: Vec<Atom> = Vec::new();
+    let mut modifiers: Vec<Atom> = Vec::new();
 
     while s.i < s.t.len() {
         let recording = frames.last().is_none_or(|f| f.is_some());
@@ -310,7 +317,7 @@ pub fn scan(src: &str) -> FileSyms {
 
         if kind == Some(Tok::Annotation) {
             let name = w.trim_start_matches('@');
-            let name = name.rsplit('.').next().unwrap_or(name).to_string();
+            let name: Atom = name.rsplit('.').next().unwrap_or(name).into();
             let glued =
                 s.t.get(s.i + 1)
                     .is_some_and(|n| n.range.start == s.t[s.i].range.end);
@@ -343,7 +350,7 @@ pub fn scan(src: &str) -> FileSyms {
             continue;
         }
         if MODIFIERS.contains(&w) && kind == Some(Tok::Keyword) {
-            modifiers.push(w.to_string());
+            modifiers.push(w.into());
             s.i += 1;
             continue;
         }
@@ -355,7 +362,7 @@ pub fn scan(src: &str) -> FileSyms {
             }
             "import" if frames.is_empty() => {
                 s.i += 1;
-                out.imports.push(s.dotted());
+                out.imports.push(s.dotted().into());
             }
             "class" | "interface" | "object" if prev != ":" && prev != "." => {
                 let decl_kw = w;
@@ -364,7 +371,7 @@ pub fn scan(src: &str) -> FileSyms {
                     let n = s.text(s.i).to_string();
                     s.i += 1;
                     Some(n)
-                } else if decl_kw == "object" && modifiers.iter().any(|m| m == "companion") {
+                } else if decl_kw == "object" && modifiers.iter().any(|m| &**m == "companion") {
                     Some("Companion".to_string())
                 } else {
                     None // object expression
@@ -394,14 +401,14 @@ pub fn scan(src: &str) -> FileSyms {
                 let kind = match decl_kw {
                     "interface" => Kind::Interface,
                     "object" => Kind::Object,
-                    _ if modifiers.iter().any(|m| m == "enum") => Kind::Enum,
+                    _ if modifiers.iter().any(|m| &**m == "enum") => Kind::Enum,
                     _ => Kind::Class,
                 };
                 for p in params.iter().filter(|p| p.mutable.is_some()) {
                     out.decls.push(Decl {
                         name: p.name.clone(),
                         kind: Kind::Property,
-                        container: Some(name.clone()),
+                        container: Some(name.as_str().into()),
                         offset,
                         annotations: Vec::new(),
                         modifiers: Vec::new(),
@@ -461,7 +468,7 @@ pub fn scan(src: &str) -> FileSyms {
                 }
                 out.decls[class_idx].supers = supers;
                 if s.is(s.i, "{") {
-                    pending_body = Some(name);
+                    pending_body = Some(name.into());
                 }
             }
             "fun" => {
@@ -631,7 +638,7 @@ pub fn scan(src: &str) -> FileSyms {
                     && out
                         .decls
                         .iter()
-                        .any(|d| &d.name == c && d.kind == Kind::Enum)
+                        .any(|d| *d.name == **c && d.kind == Kind::Enum)
                     && matches!(prev, "{" | ",")
                 {
                     out.decls.push(Decl {
@@ -642,7 +649,7 @@ pub fn scan(src: &str) -> FileSyms {
                         annotations: Vec::new(),
                         modifiers: Vec::new(),
                         params: Vec::new(),
-                        ty: c.clone(),
+                        ty: c.to_string(),
                         mutable: false,
                         body: None,
                         supers: Vec::new(),
@@ -714,7 +721,7 @@ typealias Users = List<User>
         let f = scan(SAMPLE);
         assert_eq!(f.package, "com.example.ui");
         assert_eq!(
-            f.imports,
+            f.imports.iter().map(|s| &**s).collect::<Vec<_>>(),
             vec![
                 "androidx.compose.runtime.Composable",
                 "androidx.compose.ui.Modifier"
@@ -754,7 +761,10 @@ typealias Users = List<User>
         let f = scan(SAMPLE);
         let p = find(&f, "UserCardPreview");
         assert!(p.is_preview() && p.is_composable());
-        assert_eq!(p.modifiers, vec!["private"]);
+        assert_eq!(
+            p.modifiers.iter().map(|s| &**s).collect::<Vec<_>>(),
+            ["private"]
+        );
         let card = find(&f, "UserCard");
         assert!(card.is_composable() && !card.is_preview());
         assert_eq!(card.params.len(), 3);

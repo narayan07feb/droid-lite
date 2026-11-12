@@ -2307,7 +2307,7 @@ impl App {
         }
         let mut items: Vec<Item> = Vec::new();
         if !after_dot {
-            let imported: Vec<&str> = t.syms.imports.iter().map(|s| s.as_str()).collect();
+            let imported: Vec<&str> = t.syms.imports.iter().map(|s| &**s).collect();
             for h in self.index.complete(prefix, 40) {
                 let fq = self.index.import_for(&h.name);
                 let pkg = fq

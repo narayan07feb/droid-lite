@@ -412,11 +412,7 @@ fn read_sources(libs: &mut Libraries, jar: &Path, artifact: &str) {
         }
         let syms = crate::kotlin::scan(&text);
         for d in syms.decls.iter().filter(|d| {
-            d.container.is_none()
-                && !d
-                    .modifiers
-                    .iter()
-                    .any(|m| m == "private" || m == "internal")
+            d.container.is_none() && !d.has_modifier("private") && !d.has_modifier("internal")
         }) {
             libs.syms.push(LibSym {
                 name: d.name.clone(),

@@ -1,19 +1,23 @@
 //! Project-wide symbol index: declarations of every Kotlin/Java file, fuzzy search, definitions, completion.
 
-use crate::kotlin::{Decl, FileSyms, Kind, scan};
+use crate::kotlin::{Atom, Decl, FileSyms, Kind, scan};
 use crate::project::is_code;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Default)]
 pub struct Index {
     pub files: HashMap<PathBuf, FileSyms>,
     /// Files that declare each name, for lookups that do not scan every declaration.
-    by_name: HashMap<String, Vec<PathBuf>>,
+    by_name: HashMap<String, Vec<Arc<Path>>>,
     /// Files with a class that names each supertype, for "implemented by" lookups.
-    subtypes: HashMap<String, Vec<PathBuf>>,
+    subtypes: HashMap<String, Vec<Arc<Path>>>,
+    /// One shared copy of each file's path for the maps above (a copy per name cost ~20 MB on a
+    /// 12k-file project).
+    shared: HashMap<PathBuf, Arc<Path>>,
     /// Bumped on every change, so callers can cache results.
     pub generation: u64,
 }
@@ -39,9 +43,12 @@ impl Index {
                 .chunks(chunk)
                 .map(|c| {
                     s.spawn(move || {
+                        let mut seen = HashSet::new();
                         c.iter()
                             .filter_map(|p| {
-                                Some(((*p).clone(), scan(&std::fs::read_to_string(p).ok()?)))
+                                let mut f = scan(&std::fs::read_to_string(p).ok()?);
+                                share(&mut f, &mut seen);
+                                Some(((*p).clone(), f))
                             })
                             .collect::<Vec<_>>()
                     })
@@ -61,14 +68,16 @@ impl Index {
     /// Adds a file whose symbols were already scanned (e.g. on a worker thread).
     pub fn insert_scanned(&mut self, path: PathBuf, syms: FileSyms) {
         self.remove(&path);
+        let shared: Arc<Path> = Arc::from(path.as_path());
         for (map, keys) in [
             (&mut self.by_name, names_of(&syms)),
             (&mut self.subtypes, supers_of(&syms)),
         ] {
             for k in keys {
-                map.entry(k).or_default().push(path.clone());
+                map.entry(k).or_default().push(shared.clone());
             }
         }
+        self.shared.insert(path.clone(), shared);
         self.files.insert(path, syms);
         self.generation += 1;
     }
@@ -83,13 +92,14 @@ impl Index {
         let Some(old) = self.files.remove(path) else {
             return;
         };
+        self.shared.remove(path);
         for (map, keys) in [
             (&mut self.by_name, names_of(&old)),
             (&mut self.subtypes, supers_of(&old)),
         ] {
             for k in keys {
                 if let Some(v) = map.get_mut(&k) {
-                    v.retain(|p| p != path);
+                    v.retain(|p| **p != *path);
                     if v.is_empty() {
                         map.remove(&k);
                     }
@@ -129,7 +139,7 @@ impl Index {
             .flat_map(move |(key, paths)| {
                 paths
                     .iter()
-                    .filter_map(move |p| self.files.get_key_value(p))
+                    .filter_map(move |p| self.files.get_key_value(&**p))
                     .flat_map(move |(p, f)| {
                         f.decls
                             .iter()
@@ -184,7 +194,7 @@ impl Index {
                     3
                 } else if here.is_some_and(|h| {
                     h.imports.iter().any(|i| {
-                        *i == fq || i.ends_with(".*") && fq.starts_with(i.trim_end_matches('*'))
+                        **i == *fq || i.ends_with(".*") && fq.starts_with(i.trim_end_matches('*'))
                     })
                 }) {
                     2
@@ -240,7 +250,9 @@ impl Index {
         let mut queue = std::collections::VecDeque::from([name.to_string()]);
         while let Some(n) = queue.pop_front() {
             for p in self.subtypes.get(&n).into_iter().flatten() {
-                let Some(f) = self.files.get(p) else { continue };
+                let Some((p, f)) = self.files.get_key_value(&**p) else {
+                    continue;
+                };
                 for d in f
                     .decls
                     .iter()
@@ -308,7 +320,7 @@ impl Index {
             .flat_map(|c| {
                 let class = c.name.rsplit('.').next().unwrap_or(&c.name).to_string();
                 self.members_named(&class, member)
-                    .filter(|(_, _, d)| d.modifiers.iter().any(|m| m == "override"))
+                    .filter(|(_, _, d)| d.has_modifier("override"))
                     .map(|(p, f, d)| hit(p, f, d))
                     .collect::<Vec<_>>()
             })
@@ -323,6 +335,25 @@ impl Index {
         self.named(name)
             .map(|(_, _, d)| d)
             .find(|d| d.kind.is_type())
+    }
+}
+
+/// Points repeated strings (imports, annotations, modifiers, container names) at one copy per
+/// worker: on a 12k-file project most imports repeat in hundreds of files.
+fn share(f: &mut FileSyms, seen: &mut HashSet<Atom>) {
+    let mut one = |a: &mut Atom| match seen.get(a) {
+        Some(x) => *a = x.clone(),
+        None => {
+            seen.insert(a.clone());
+        }
+    };
+    f.imports.iter_mut().for_each(&mut one);
+    for d in &mut f.decls {
+        d.annotations.iter_mut().for_each(&mut one);
+        d.modifiers.iter_mut().for_each(&mut one);
+        if let Some(c) = &mut d.container {
+            one(c);
+        }
     }
 }
 
@@ -392,7 +423,7 @@ pub fn describe(f: &FileSyms, d: &Decl) -> String {
         s.push_str(&format!(": {}", d.ty));
     }
     let place = match &d.container {
-        Some(c) if f.package.is_empty() => c.clone(),
+        Some(c) if f.package.is_empty() => c.to_string(),
         Some(c) => format!("{}.{}", f.package, c),
         None => f.package.clone(),
     };
@@ -443,7 +474,37 @@ pub fn rank_by<T>(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+
+    #[test]
+    fn files_scanned_together_share_repeated_strings() {
+        let dir = std::env::temp_dir().join(format!("droid-lite-share-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "package a\nimport androidx.compose.runtime.Composable\nclass A {\n    private fun f() {}\n}\n";
+        // enough files that the first two go to the same worker (64 files, at most 32 workers)
+        let files: Vec<PathBuf> = (0..64)
+            .map(|i| {
+                let p = dir.join(format!("F{i}.kt"));
+                std::fs::write(&p, src.replace("class A", &format!("class A{i}"))).unwrap();
+                p
+            })
+            .collect();
+        let idx = Index::build(&files);
+        let (a, b) = (&files[0], &files[1]);
+        let (fa, fb) = (&idx.files[a], &idx.files[b]);
+        assert!(
+            std::sync::Arc::ptr_eq(&fa.imports[0], &fb.imports[0]),
+            "one copy of the import"
+        );
+        let m =
+            |f: &FileSyms| f.decls.iter().find(|d| &*d.name == "f").unwrap().modifiers[0].clone();
+        assert!(
+            std::sync::Arc::ptr_eq(&m(fa), &m(fb)),
+            "one copy of `private`"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn index() -> Index {
         let mut i = Index::default();

@@ -107,7 +107,7 @@ impl App {
             } else if let Some(c) = &d.container
                 && matches!(d.kind, Kind::Fun | Kind::Property)
             {
-                if d.modifiers.iter().any(|m| m == "override") {
+                if d.has_modifier("override") {
                     if let Some(h) = self.index.overridden(c, &d.name) {
                         marks.push(Mark {
                             line,
@@ -221,7 +221,7 @@ impl App {
         let containers: Vec<String> = self
             .index
             .named(&word)
-            .filter_map(|(_, _, d)| d.container.clone())
+            .filter_map(|(_, _, d)| d.container.as_deref().map(String::from))
             .collect();
         for c in containers {
             hits.extend(self.index.member_implementations(&c, &word));
