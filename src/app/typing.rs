@@ -3,7 +3,6 @@
 use super::{App, FoundLine, found_line, word_bounds};
 use crate::edit;
 use crate::project::is_code;
-use crate::theme::DARK;
 use egui::{Event, Key, Modifiers, RichText, Ui};
 use std::path::PathBuf;
 use std::sync::mpsc::channel;
@@ -141,19 +140,20 @@ impl App {
                         .display()
                         .to_string(),
                 )
-                .color(DARK.weak)
+                .color(crate::theme::t().weak)
                 .small(),
             );
         }
         if defs.is_empty() {
             ui.label(
-                RichText::new(format!("`{word}` is not declared in this project")).color(DARK.weak),
+                RichText::new(format!("`{word}` is not declared in this project"))
+                    .color(crate::theme::t().weak),
             );
         }
         ui.separator();
         match self.usages_of(word) {
             None => {
-                ui.label(RichText::new("Counting usages…").color(DARK.weak));
+                ui.label(RichText::new("Counting usages…").color(crate::theme::t().weak));
             }
             Some(found) => {
                 let mut files: Vec<&std::path::Path> =
@@ -178,7 +178,7 @@ impl App {
                 if found.len() > 8 {
                     ui.label(
                         RichText::new(format!("… {} more", found.len() - 8))
-                            .color(DARK.weak)
+                            .color(crate::theme::t().weak)
                             .small(),
                     );
                 }
@@ -186,7 +186,7 @@ impl App {
         }
         ui.label(
             RichText::new("⌘-click: declaration    right-click: more")
-                .color(DARK.weak)
+                .color(crate::theme::t().weak)
                 .small(),
         );
     }

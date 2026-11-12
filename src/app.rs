@@ -1,5 +1,6 @@
 //! The IDE window: project tree, editor tabs, search popups, completion, Compose panel, Gradle console.
 
+mod comfort;
 mod disk;
 #[cfg(test)]
 mod e2e;
@@ -12,14 +13,14 @@ mod typing;
 use crate::compose::{self, Lint, Severity, Stability};
 use crate::edit;
 use crate::gradle::{self, PreviewTool};
-use crate::highlight::{self, ERROR, INFO, TEXT, WARN};
+use crate::highlight::{self, ERROR, INFO, WARN};
 use crate::icons as ic;
 use crate::index::{self, Hit, Index};
 use crate::keymap::{self, Action, Keymap};
 use crate::kotlin::{Decl, FileSyms, scan};
 use crate::lsp::{self, Lsp};
 use crate::project::{Project, is_code};
-use crate::theme::{self, DARK};
+use crate::theme;
 use egui::text::{CCursor, CCursorRange};
 use egui::{Align, Align2, Color32, FontId, Key, Modifiers, RichText, TextEdit, Ui};
 use std::collections::{BTreeMap, HashMap};
@@ -27,7 +28,6 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Instant, SystemTime};
 
-const FONT_SIZE: f32 = 13.0;
 /// Back/forward and recent-file lists are capped so a long session does not grow them forever.
 const MAX_HISTORY: usize = 200;
 const MAX_RECENT: usize = 50;
@@ -309,6 +309,14 @@ pub struct App {
     usages_rx: Vec<Receiver<(String, u64, Vec<FoundLine>)>>,
     /// Compile errors and warnings from the last Gradle run: file → (line, column, severity, message).
     build_problems: HashMap<PathBuf, Vec<(u32, u32, u8, String)>>,
+    settings: comfort::Settings,
+    /// The window had focus last frame (auto-save runs when it loses it).
+    window_focused: bool,
+    show_settings: bool,
+    /// Hash of the last saved session, and when it was written.
+    session_saved: (u64, Instant),
+    /// File whose local history window is open.
+    history_for: Option<PathBuf>,
     /// Last slow-frame report from the watchdog, shown in the status bar for a while.
     slow: Option<(String, Instant)>,
 }
@@ -322,7 +330,8 @@ impl App {
             );
         }
         crate::theme::install_fonts(&cc.egui_ctx);
-        cc.egui_ctx.set_visuals(crate::theme::visuals(glass));
+        let settings = comfort::Settings::load();
+        settings.apply(&cc.egui_ctx, glass);
         crate::theme::style(&cc.egui_ctx);
         let mut app = App {
             project: None,
@@ -371,6 +380,11 @@ impl App {
             usages: HashMap::new(),
             usages_rx: Vec::new(),
             build_problems: HashMap::new(),
+            settings,
+            window_focused: true,
+            show_settings: false,
+            session_saved: (0, Instant::now()),
+            history_for: None,
             slow: None,
         };
         if let Some(dir) = open.or_else(last_project) {
@@ -459,6 +473,9 @@ impl App {
             self.index.symbol_count()
         );
         self.project = Some(project);
+        if self.tabs.is_empty() {
+            self.restore_session();
+        }
         if self.tabs.iter().any(|t| is_code(&t.path)) {
             self.start_lsp();
         }
@@ -474,7 +491,7 @@ impl App {
             return;
         };
         self.lsp_tried = true;
-        self.lsp = Lsp::start(&p.root, ctx.clone());
+        self.lsp = Lsp::start(&p.root, ctx.clone(), &self.settings.lsp_heap);
         if let Some(l) = self.lsp.as_mut() {
             for t in self.tabs.iter().filter(|t| is_code(&t.path)) {
                 l.did_open(&t.path, &t.text);
@@ -574,6 +591,9 @@ impl App {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
+        if tab.text != tab.saved || !tab.path.exists() {
+            comfort::record_history(&tab.path);
+        }
         match std::fs::write(&tab.path, &tab.text) {
             Ok(()) => {
                 tab.saved = tab.text.clone();
@@ -976,6 +996,64 @@ impl App {
         }
     }
 
+    /// The path of the open file and the declaration around the cursor, like Android Studio's
+    /// navigation bar: `app › src › … › UserCard.kt › UserCard`. Click a declaration to jump to it.
+    fn breadcrumb(&mut self, ui: &mut Ui) -> egui::Id {
+        let Some(t) = self.tabs.get(self.active) else {
+            return ui.next_auto_id();
+        };
+        let root = self
+            .project
+            .as_ref()
+            .map(|p| p.root.clone())
+            .unwrap_or_default();
+        let rel = t.path.strip_prefix(&root).unwrap_or(&t.path);
+        let parts: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        // long paths keep the module, "…", and the last two folders
+        let shown: Vec<String> = if parts.len() > 5 {
+            [
+                parts[..1].to_vec(),
+                vec!["…".into()],
+                parts[parts.len() - 3..].to_vec(),
+            ]
+            .concat()
+        } else {
+            parts
+        };
+        let mut text = shown.join(" › ");
+        let inside: Vec<&crate::kotlin::Decl> = t
+            .syms
+            .decls
+            .iter()
+            .filter(|d| d.body.as_ref().is_some_and(|b| b.contains(&t.cursor)))
+            .collect();
+        let mut jump = None;
+        let r = ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for d in inside.iter().filter_map(|d| d.container.as_ref()).take(1) {
+                text.push_str(&format!(" › {d}"));
+            }
+            let label = ui.label(RichText::new(&text).small().color(theme::t().weak));
+            for d in &inside {
+                if ui
+                    .link(RichText::new(format!("› {}", d.name)).small())
+                    .clicked()
+                {
+                    jump = Some(d.offset);
+                }
+            }
+            label.id
+        });
+        if let Some(o) = jump {
+            let p = t.path.clone();
+            self.open_file(&p, Some(o));
+        }
+        r.inner
+    }
+
     /// Runs one command, from a shortcut or a menu.
     fn run(&mut self, action: Action, ctx: &egui::Context) {
         self.settle(true);
@@ -1007,6 +1085,10 @@ impl App {
             Action::FindNext => self.find_step(true),
             Action::FindPrev => self.find_step(false),
             Action::Build => self.build_module(ctx),
+            Action::Settings => self.show_settings = true,
+            Action::LocalHistory => {
+                self.history_for = self.tabs.get(self.active).map(|t| t.path.clone())
+            }
             Action::Back => self.back(),
             Action::Forward => self.fwd(),
             Action::Complete => {
@@ -1060,6 +1142,16 @@ impl App {
     fn help_menu(&mut self, ui: &mut Ui) {
         ui.menu_button("Help", |ui| {
             if ui
+                .add(
+                    egui::Button::new("Settings…")
+                        .shortcut_text(keymap::text(self.keymap, Action::Settings)),
+                )
+                .clicked()
+            {
+                self.show_settings = true;
+                ui.close();
+            }
+            if ui
                 .button(format!(
                     "{}  Keyboard shortcuts   {}",
                     ic::KEYBOARD,
@@ -1071,7 +1163,11 @@ impl App {
                 ui.close();
             }
             ui.separator();
-            ui.label(RichText::new("Keymap").color(DARK.weak).small());
+            ui.label(
+                RichText::new("Keymap")
+                    .color(crate::theme::t().weak)
+                    .small(),
+            );
             for km in [Keymap::Eclipse, Keymap::AndroidStudio] {
                 if ui.radio(self.keymap == km, km.name()).clicked() {
                     self.set_keymap(km);
@@ -1103,12 +1199,16 @@ impl App {
                             ui.label(
                                 RichText::new(keymap::text(self.keymap, action))
                                     .monospace()
-                                    .color(DARK.accent),
+                                    .color(crate::theme::t().accent),
                             );
                             ui.end_row();
                         }
                         ui.label("Go to declaration");
-                        ui.label(RichText::new("⌘-click").monospace().color(DARK.accent));
+                        ui.label(
+                            RichText::new("⌘-click")
+                                .monospace()
+                                .color(crate::theme::t().accent),
+                        );
                         ui.end_row();
                     });
             });
@@ -1315,7 +1415,9 @@ impl App {
                 self.open_project(&dir, &ui.ctx().clone());
             }
             if let Some(b) = &self.branch {
-                ui.label(RichText::new(format!("{}  {b}", ic::GIT_BRANCH)).color(DARK.weak));
+                ui.label(
+                    RichText::new(format!("{}  {b}", ic::GIT_BRANCH)).color(crate::theme::t().weak),
+                );
             }
             ui.separator();
             if ui
@@ -1391,7 +1493,7 @@ impl App {
                         .desired_width(200.0)
                         .hint_text("Gradle task"),
                 );
-                ui.label(RichText::new(ic::WRENCH).color(DARK.weak));
+                ui.label(RichText::new(ic::WRENCH).color(crate::theme::t().weak));
             });
         });
     }
@@ -1400,7 +1502,7 @@ impl App {
         ui.horizontal(|ui| {
             if self.indexing.is_some() {
                 ui.spinner();
-                ui.label(RichText::new("Indexing…").color(DARK.weak));
+                ui.label(RichText::new("Indexing…").color(crate::theme::t().weak));
             } else {
                 ui.label(format!("{} symbols", self.index.symbol_count()));
             }
@@ -1411,10 +1513,7 @@ impl App {
                 }
                 Some(l) => ui.label(format!("{} starting…", l.name)),
                 None => ui
-                    .label(
-                        RichText::new("No Kotlin LSP: brew install JetBrains/utils/kotlin-lsp")
-                            .weak(),
-                    )
+                    .label(RichText::new("No Kotlin LSP (install: see README)").weak())
                     .on_hover_text("Without it, completion and go-to use the built-in index only."),
             };
             ui.separator();
@@ -1493,7 +1592,7 @@ impl App {
                 .map(|a| format!("{}  {}", a.label(), keymap::text(km, *a)))
                 .collect::<Vec<_>>()
                 .join("\n");
-                ui.label(RichText::new(line).color(DARK.weak));
+                ui.label(RichText::new(line).color(crate::theme::t().weak));
             });
             return;
         }
@@ -1519,10 +1618,15 @@ impl App {
             self.close_tab(i);
             return;
         }
+        let crumb_id = self.breadcrumb(ui);
         self.disk_banner(ui);
         if self.tabs[self.active].dirty() {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Unsaved changes").color(DARK.weak).small());
+                ui.label(
+                    RichText::new("Unsaved changes")
+                        .color(crate::theme::t().weak)
+                        .small(),
+                );
                 if ui
                     .small_button(format!("{}  Save  ⌘S", ic::FLOPPY_DISK))
                     .clicked()
@@ -1563,7 +1667,7 @@ impl App {
         self.editor_keys(ui);
         self.find_bar(ui);
 
-        let font = FontId::monospace(FONT_SIZE);
+        let font = FontId::monospace(crate::theme::font_size());
         let row_h = ui.fonts_mut(|f| f.row_height(&font));
         let tab = &mut self.tabs[self.active];
         let id = egui::Id::unique(("editor", &tab.path));
@@ -1724,6 +1828,8 @@ impl App {
                         .desired_rows(lines.max(30))
                         .layouter(&mut layouter)
                         .show(ui);
+                    // the breadcrumb names the editor for screen readers
+                    let _ = out.response.response.clone().labelled_by(crumb_id);
                     if let Some(c) = caret.take() {
                         // after an edit command: move the cursor, let the editor keep it in view
                         let c = c.min(text.len());
@@ -1774,7 +1880,7 @@ impl App {
                         );
                     }
                     let cursor_line = text[..(*cursor).min(text.len())].matches('\n').count();
-                    let theme = &crate::theme::DARK;
+                    let theme = crate::theme::t();
                     if let Some(row) = out.galley.rows.get(cursor_line) {
                         let y = out.galley_pos.y + row.pos.y;
                         let r = egui::Rect::from_min_max(
@@ -1890,7 +1996,7 @@ impl App {
                             ui.painter().hline(
                                 r0.left()..=r1.left(),
                                 r0.bottom() - 1.0,
-                                egui::Stroke::new(1.5, DARK.accent),
+                                egui::Stroke::new(1.5, crate::theme::t().accent),
                             );
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                             hover_word =
@@ -2325,10 +2431,11 @@ impl App {
                                         RichText::new(if *sev == 1 { ic::X } else { ic::WARNING })
                                             .color(if *sev == 1 { ERROR } else { WARN }),
                                     );
-                                    let r = ui.link(RichText::new(msg).color(DARK.text));
+                                    let r =
+                                        ui.link(RichText::new(msg).color(crate::theme::t().text));
                                     ui.label(
                                         RichText::new(format!("{rel}:{l}:{c}"))
-                                            .color(DARK.weak)
+                                            .color(crate::theme::t().weak)
                                             .small(),
                                     );
                                     r
@@ -2388,19 +2495,21 @@ impl App {
                                     "{}  No problems in this file",
                                     ic::CHECK_CIRCLE
                                 ))
-                                .color(DARK.weak),
+                                .color(crate::theme::t().weak),
                             );
                         }
                         for (o, (icon, color), rule, msg) in rows {
                             let r = ui.horizontal(|ui| {
                                 ui.label(RichText::new(icon).color(color));
-                                let r = ui.link(RichText::new(&msg).color(DARK.text));
+                                let r = ui.link(RichText::new(&msg).color(crate::theme::t().text));
                                 if !rule.is_empty() {
-                                    ui.label(RichText::new(&rule).color(DARK.weak).small());
+                                    ui.label(
+                                        RichText::new(&rule).color(crate::theme::t().weak).small(),
+                                    );
                                 }
                                 ui.label(
                                     RichText::new(format!("line {}", line_of(o)))
-                                        .color(DARK.weak)
+                                        .color(crate::theme::t().weak)
                                         .small(),
                                 );
                                 r
@@ -2437,7 +2546,11 @@ impl App {
                                     }
                                 }
                                 None => {
-                                    ui.label(RichText::new(line).monospace().color(TEXT));
+                                    ui.label(
+                                        RichText::new(line)
+                                            .monospace()
+                                            .color(crate::theme::t().code),
+                                    );
                                 }
                             }
                         }
@@ -2484,11 +2597,14 @@ impl App {
                                 .display()
                                 .to_string();
                             let r = ui.horizontal(|ui| {
-                                let r =
-                                    ui.link(RichText::new(&f.text).monospace().color(DARK.text));
+                                let r = ui.link(
+                                    RichText::new(&f.text)
+                                        .monospace()
+                                        .color(crate::theme::t().text),
+                                );
                                 ui.label(
                                     RichText::new(format!("{rel}:{}", f.line))
-                                        .color(DARK.weak)
+                                        .color(crate::theme::t().weak)
                                         .small(),
                                 );
                                 r
@@ -2507,6 +2623,13 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self) {
+        self.save_session(true);
+        if self.settings.autosave {
+            self.autosave();
+        }
+    }
+
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         if self.glass {
             [0.0; 4]
@@ -2523,6 +2646,8 @@ impl eframe::App for App {
         watch.stage("analysis", || self.settle(false));
         watch.stage("git blame", || self.poll_git(&ctx));
         self.poll_usages();
+        self.watch_focus(&ctx);
+        self.save_session(false);
         watch.stage("shortcuts", || self.shortcuts(&ctx));
         if let Some(dropped) =
             ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()))
@@ -2576,6 +2701,8 @@ impl eframe::App for App {
             self.refactor_window(&ctx);
             self.commit_window(&ctx);
             self.shortcuts_window(&ctx);
+            self.settings_window(&ctx);
+            self.history_window(&ctx);
         });
         self.frames += 1;
         if let Some(report) = watch.finish(self.frames) {
@@ -2814,7 +2941,7 @@ fn dir_ui(ui: &mut Ui, node: &DirNode, id: &str, open: &mut Option<PathBuf>) {
             ..Default::default()
         };
         job.append(icon, 0.0, fmt(color));
-        job.append(&format!("  {name}"), 0.0, fmt(DARK.text));
+        job.append(&format!("  {name}"), 0.0, fmt(crate::theme::t().text));
         if ui.selectable_label(false, job).clicked() {
             *open = Some(f.clone());
         }
@@ -2828,7 +2955,7 @@ fn file_icon(path: &Path) -> (&'static str, Color32) {
         Some("java") => (ic::FILE_CODE, Color32::from_rgb(0xE7, 0x8A, 0x4E)),
         Some("xml") => (ic::FILE_TEXT, Color32::from_rgb(0x5F, 0xB8, 0x65)),
         Some("kts" | "gradle") => (ic::WRENCH, Color32::from_rgb(0x58, 0x9D, 0xF6)),
-        _ => (ic::FILE, DARK.weak),
+        _ => (ic::FILE, crate::theme::t().weak),
     }
 }
 
@@ -2842,7 +2969,7 @@ fn tab_widget(ui: &mut Ui, t: &Tab, active: bool) -> (bool, bool) {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let fill = if active {
-        DARK.editor_bg
+        crate::theme::t().editor_bg
     } else {
         Color32::TRANSPARENT
     };
@@ -2860,7 +2987,11 @@ fn tab_widget(ui: &mut Ui, t: &Tab, active: bool) -> (bool, bool) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(RichText::new(icon).color(tint));
-                let color = if active { DARK.text } else { DARK.weak };
+                let color = if active {
+                    crate::theme::t().text
+                } else {
+                    crate::theme::t().weak
+                };
                 ui.label(
                     RichText::new(if t.dirty() {
                         format!("{name} ●")
@@ -2871,8 +3002,12 @@ fn tab_widget(ui: &mut Ui, t: &Tab, active: bool) -> (bool, bool) {
                 );
                 close = ui
                     .add(
-                        egui::Button::new(RichText::new(ic::X).size(11.0).color(DARK.weak))
-                            .frame(false),
+                        egui::Button::new(
+                            RichText::new(ic::X)
+                                .size(11.0)
+                                .color(crate::theme::t().weak),
+                        )
+                        .frame(false),
                     )
                     .on_hover_text("Close  ⌘W")
                     .clicked();
@@ -2887,7 +3022,7 @@ fn tab_widget(ui: &mut Ui, t: &Tab, active: bool) -> (bool, bool) {
         ui.painter().hline(
             rect.x_range(),
             rect.bottom() - 1.0,
-            egui::Stroke::new(2.0, DARK.accent),
+            egui::Stroke::new(2.0, crate::theme::t().accent),
         );
     }
     (r.clicked() && !close, close || r.middle_clicked())
@@ -2897,12 +3032,26 @@ fn config_file() -> Option<PathBuf> {
     setting_file("last-project")
 }
 
-/// `~/.config/droid-lite/<name>`. Tests never read or write the user's settings.
-fn setting_file(name: &str) -> Option<PathBuf> {
+/// `~/.config/droid-lite` (or `$DROID_LITE_CONFIG_DIR`). Tests never touch the user's folder:
+/// without the variable they get no config folder at all.
+/// Liquid Glass is wanted when the environment allows it and Settings has it on (dark theme only).
+pub fn glass_setting() -> bool {
+    let s = comfort::Settings::load();
+    crate::glass::wanted() && s.glass && !s.light
+}
+
+fn config_dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("DROID_LITE_CONFIG_DIR") {
+        return Some(PathBuf::from(d));
+    }
     if cfg!(test) {
         return None;
     }
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/droid-lite").join(name))
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/droid-lite"))
+}
+
+fn setting_file(name: &str) -> Option<PathBuf> {
+    config_dir().map(|d| d.join(name))
 }
 
 fn load_setting(name: &str) -> Option<String> {

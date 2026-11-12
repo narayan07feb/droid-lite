@@ -60,7 +60,7 @@ fn macos(cc: &eframe::CreationContext) -> Option<()> {
 
 /// The editor background: nearly opaque on glass so text keeps its contrast.
 pub fn editor_fill(glass: bool) -> Color32 {
-    let c = crate::theme::DARK.editor_bg;
+    let c = crate::theme::t().editor_bg;
     if glass {
         Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 228)
     } else {

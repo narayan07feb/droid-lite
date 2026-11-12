@@ -31,7 +31,7 @@ fn main() -> eframe::Result {
         .nth(1)
         .map(std::path::PathBuf::from)
         .filter(|p| p.is_dir());
-    let glass = glass::wanted();
+    let glass = app::glass_setting();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Droid Lite")

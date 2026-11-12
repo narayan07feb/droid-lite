@@ -1,8 +1,8 @@
 //! GitLens-style views: inline blame on the current line, a blame column, file history and commit diffs.
 
-use super::{App, FONT_SIZE};
+use super::App;
 use crate::git::{self, Blame, Commit};
-use crate::highlight::{ERROR, INFO, TEXT};
+use crate::highlight::{ERROR, INFO};
 use egui::{Align2, Color32, FontId, Galley, Pos2, RichText, Sense, Ui};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -136,7 +136,7 @@ impl App {
 
     /// The Git tab: history of the active file.
     /// Shows a diff (of a commit or a file) in the diff window.
-    fn show_diff(&mut self, title: String, text: String) {
+    pub(super) fn show_diff_text(&mut self, title: String, text: String) {
         self.git.commit = Some((title, text.lines().map(String::from).collect()));
     }
 
@@ -193,7 +193,7 @@ impl App {
             'A' => Color32::from_rgb(0x5F, 0xB8, 0x65),
             'D' => ERROR,
             'R' => Color32::from_rgb(0xA9, 0x7B, 0xFF),
-            '?' => crate::theme::DARK.weak,
+            '?' => crate::theme::t().weak,
             _ => Color32::from_rgb(0x58, 0x9D, 0xF6),
         };
         ui.horizontal(|ui| {
@@ -350,7 +350,7 @@ impl App {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            self.show_diff(
+            self.show_diff_text(
                 format!(
                     "Diff: {name}{}",
                     base.map(|b| format!(" vs {b}")).unwrap_or_default()
@@ -420,13 +420,15 @@ impl App {
             .default_size([900.0, 620.0])
             .resizable(true)
             .show(ctx, |ui| {
-                let row_h = ui.fonts_mut(|f| f.row_height(&FontId::monospace(FONT_SIZE - 1.0)));
+                let row_h = ui.fonts_mut(|f| {
+                    f.row_height(&FontId::monospace(crate::theme::font_size() - 1.0))
+                });
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .show_rows(ui, row_h, lines.len(), |ui, range| {
                         for l in &lines[range] {
                             let color = if l.starts_with("+++") || l.starts_with("---") {
-                                TEXT
+                                crate::theme::t().code
                             } else if l.starts_with('+') {
                                 Color32::from_rgb(0x6A, 0xB0, 0x6A)
                             } else if l.starts_with('-') {
@@ -434,12 +436,12 @@ impl App {
                             } else if l.starts_with("@@") {
                                 INFO
                             } else {
-                                TEXT
+                                crate::theme::t().code
                             };
                             ui.label(
                                 RichText::new(l)
                                     .monospace()
-                                    .size(FONT_SIZE - 1.0)
+                                    .size(crate::theme::font_size() - 1.0)
                                     .color(color),
                             );
                         }
@@ -472,7 +474,7 @@ pub(super) fn paint_inline_blame(
         pos,
         Align2::LEFT_TOP,
         commit_line(c, now),
-        FontId::proportional(FONT_SIZE - 1.0),
+        FontId::proportional(crate::theme::font_size() - 1.0),
         DIM,
     );
     let r = ui.interact(rect, ui.scope_id().with("inline-blame"), Sense::click());
@@ -496,7 +498,7 @@ pub(super) fn blame_column(
     let b = blame?;
     let now = git::now();
     let clip = ui.clip_rect();
-    let font = FontId::proportional(FONT_SIZE - 1.0);
+    let font = FontId::proportional(crate::theme::font_size() - 1.0);
     let painter = ui.painter();
     for (i, row) in galley.rows.iter().enumerate() {
         let y = galley_pos.y + row.pos.y;

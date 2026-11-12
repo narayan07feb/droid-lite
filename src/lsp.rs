@@ -58,7 +58,9 @@ pub fn find_server() -> Option<(PathBuf, Vec<String>)> {
     let dirs = path
         .split(':')
         .map(PathBuf::from)
-        .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
+        .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from))
+        // the manual kotlin-lsp install lives here; apps opened from Finder lack the shell PATH
+        .chain(std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/bin")));
     let dirs: Vec<PathBuf> = dirs.collect();
     for (bin, args) in [
         ("kotlin-lsp", vec!["--stdio".to_string()]),
@@ -80,9 +82,9 @@ fn path_of(uri: &str) -> PathBuf {
 }
 
 impl Lsp {
-    pub fn start(root: &Path, ctx: egui::Context) -> Option<Lsp> {
+    pub fn start(root: &Path, ctx: egui::Context, heap: &str) -> Option<Lsp> {
         let (bin, args) = find_server()?;
-        let heap = std::env::var("DROID_LITE_LSP_HEAP").unwrap_or_else(|_| "2g".into());
+        let heap = std::env::var("DROID_LITE_LSP_HEAP").unwrap_or_else(|_| heap.to_string());
         let mut child = Command::new(&bin)
             .args(&args)
             // every JVM reads JAVA_TOOL_OPTIONS, so this caps kotlin-lsp whatever its launcher does

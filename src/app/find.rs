@@ -4,7 +4,6 @@ use super::App;
 use crate::edit;
 use crate::icons as ic;
 use crate::keymap::{self, Action};
-use crate::theme::DARK;
 use egui::{Key, Modifiers, RichText, TextEdit, Ui};
 use std::ops::Range;
 use std::path::PathBuf;
@@ -132,8 +131,10 @@ impl App {
             return;
         };
         ui.horizontal(|ui| {
-            let find_label =
-                ui.label(RichText::new(format!("{}  Find", ic::MAGNIFYING_GLASS)).color(DARK.weak));
+            let find_label = ui.label(
+                RichText::new(format!("{}  Find", ic::MAGNIFYING_GLASS))
+                    .color(crate::theme::t().weak),
+            );
             let q = ui
                 .add(
                     TextEdit::singleline(&mut bar.query)
@@ -177,7 +178,7 @@ impl App {
                 if bar.matches.is_empty() && !bar.query.is_empty() {
                     crate::highlight::ERROR
                 } else {
-                    DARK.weak
+                    crate::theme::t().weak
                 },
             ));
             prev |= ui
@@ -195,7 +196,7 @@ impl App {
                 ))
                 .clicked();
             ui.separator();
-            let with = ui.label(RichText::new("Replace with").color(DARK.weak));
+            let with = ui.label(RichText::new("Replace with").color(crate::theme::t().weak));
             ui.add(
                 TextEdit::singleline(&mut bar.replace)
                     .desired_width(180.0)

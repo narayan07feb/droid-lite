@@ -2,14 +2,13 @@
 //! the line numbers, inline Compose stability badges after `@Composable` declarations, and the
 //! right-click menu.
 
-use super::{App, FONT_SIZE, Search, SearchKind};
+use super::{App, Search, SearchKind};
 use crate::compose::{self, Stability, Verdict};
 use crate::highlight::{ERROR, WARN};
 use crate::icons as ic;
 use crate::index::Hit;
 use crate::keymap::{self, Action};
 use crate::kotlin::Kind;
-use crate::theme::DARK;
 use egui::{Align2, Color32, FontId, Galley, Pos2, Rect, RichText, Sense, Ui};
 
 pub(super) const ICON_WIDTH: f32 = 18.0;
@@ -149,7 +148,7 @@ impl App {
                         format!("{}  stable parameters", ic::CHECK),
                         Color32::from_rgb(0x5F, 0xB8, 0x65),
                     ),
-                    (0, n) => (format!("?  {n} unknown"), DARK.weak),
+                    (0, n) => (format!("?  {n} unknown"), crate::theme::t().weak),
                     (n, _) => (format!("{}  {n} unstable", ic::WARNING), WARN),
                 };
                 badges.push(Badge {
@@ -255,7 +254,7 @@ pub(super) fn paint_marks(
             pos,
             Align2::LEFT_TOP,
             icon,
-            FontId::proportional(FONT_SIZE),
+            FontId::proportional(crate::theme::font_size()),
             color,
         );
         let r = ui.interact(
@@ -305,7 +304,7 @@ pub(super) fn paint_badges(
             continue;
         }
         let pos = galley_pos + row.rect().right_top().to_vec2() + egui::vec2(24.0, 0.0);
-        let font = FontId::proportional(FONT_SIZE - 1.0);
+        let font = FontId::proportional(crate::theme::font_size() - 1.0);
         let galley_b = ui.painter().layout_no_wrap(b.text.clone(), font, b.color);
         let rect = Rect::from_min_size(pos, galley_b.size()).expand2(egui::vec2(6.0, 1.0));
         ui.painter()
@@ -340,7 +339,7 @@ fn stability_tooltip(ui: &mut Ui, st: &Stability, guessed: bool) {
                     Verdict::Stable => ("STABLE", Color32::from_rgb(0x5F, 0xB8, 0x65)),
                     Verdict::Unstable => ("UNSTABLE", ERROR),
                     Verdict::Runtime => ("RUNTIME", WARN),
-                    Verdict::Unknown => ("UNKNOWN", DARK.weak),
+                    Verdict::Unknown => ("UNKNOWN", crate::theme::t().weak),
                 };
                 ui.label(RichText::new(&p.name).monospace());
                 ui.label(RichText::new(txt).color(color).strong());
@@ -385,5 +384,6 @@ pub(super) fn context_menu(
     item(ui, Action::DuplicateLine);
     ui.separator();
     item(ui, Action::OptimizeImports);
+    item(ui, Action::LocalHistory);
     out
 }

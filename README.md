@@ -39,15 +39,20 @@ Set `DROID_LITE_GLASS=0` for solid colours.
 | Git (GitLens-style) | Grey "author, time • summary" after the cursor's line; hover for the full commit, click for its diff. A blame column with author and age per block (Git tab → Blame column). The Git tab lists every commit that changed the open file (follows renames). Blame uses the editor text, so unsaved lines show "Not committed yet" |
 | Gradle | Run any task (`assembleDebug`, `installDebug`, …), see the output live, and click `e:` compiler errors to open them |
 
-## Type-aware completion (optional)
+## kotlin-lsp (live errors, type-aware completion)
+
+Droid Lite starts JetBrains' kotlin-lsp when it finds one (`kotlin-lsp` on the PATH, in
+`/opt/homebrew/bin`, or in `~/.local/bin`), with its heap capped (Settings, default 2g).
+`DROID_LITE_LSP="cmd args"` picks another server.
+
+Install with `brew install JetBrains/utils/kotlin-lsp`. If Homebrew refuses (it needs the newest
+Xcode command line tools), install the standalone build instead:
 
 ```sh
-brew install JetBrains/utils/kotlin-lsp
+# from https://github.com/Kotlin/kotlin-lsp/releases: the macOS arm64 .sit (a zip), checksum checked
+unzip kotlin-server-<version>-aarch64.sit -d ~/.local/share/kotlin-lsp
+ln -sf ~/.local/share/kotlin-lsp/kotlin-server-<version>/bin/intellij-server ~/.local/bin/kotlin-lsp
 ```
-
-Droid Lite starts `kotlin-lsp --stdio` (or `kotlin-language-server`) when it finds one.
-Set `DROID_LITE_LSP="cmd args"` to use another server. Without a server, completion and
-go-to-declaration use the built-in index.
 
 ## How it works
 

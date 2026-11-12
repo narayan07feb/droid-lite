@@ -43,6 +43,8 @@ pub enum Action {
     FindNext,
     FindPrev,
     Build,
+    Settings,
+    LocalHistory,
     Back,
     Forward,
     Complete,
@@ -78,6 +80,8 @@ impl Action {
             Action::FindNext => "Find next",
             Action::FindPrev => "Find previous",
             Action::Build => "Build module (show compile errors)",
+            Action::Settings => "Settings",
+            Action::LocalHistory => "Local history of this file",
             Action::Back => "Back",
             Action::Forward => "Forward",
             Action::Complete => "Autocomplete",
@@ -140,6 +144,7 @@ pub fn bindings(km: Keymap) -> Vec<(Action, KeyboardShortcut)> {
             (Save, sc(CMD, Key::S)),
             (CloseTab, sc(CMD, Key::W)),
             (Shortcuts, sc(CMD | SHIFT, Key::L)),
+            (Settings, sc(CMD, Key::Comma)),
         ],
         Keymap::AndroidStudio => vec![
             (GotoClass, sc(CMD, Key::O)),
@@ -171,6 +176,7 @@ pub fn bindings(km: Keymap) -> Vec<(Action, KeyboardShortcut)> {
             (Save, sc(CMD, Key::S)),
             (CloseTab, sc(CMD, Key::W)),
             (Shortcuts, sc(CMD | SHIFT, Key::Slash)),
+            (Settings, sc(CMD, Key::Comma)),
         ],
     };
     v.sort_by_key(|(_, s)| std::cmp::Reverse(count(s.modifiers)));

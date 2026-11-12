@@ -269,6 +269,7 @@ impl App {
 
     /// Writes a file and keeps the open tab, the index and kotlin-lsp in step.
     fn write_file(&mut self, path: &Path, text: &str) -> bool {
+        super::comfort::record_history(path);
         if let Err(e) = std::fs::write(path, text) {
             self.status = format!("Cannot write {}: {e}", path.display());
             return false;

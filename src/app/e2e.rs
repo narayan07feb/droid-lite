@@ -16,14 +16,28 @@ static SERIAL: Mutex<()> = Mutex::new(());
 const USER_KT: &str = "package com.demo.data\n\ndata class User(val name: String, var age: Int)\n\nclass UserRepository {\n    fun load(): List<User> = emptyList()\n}\n";
 const CARD_KT: &str = "package com.demo.ui\n\nimport com.demo.data.User\n\n@Composable\nfun UserCard(user: User, modifier: Modifier) {\n    val count = mutableStateOf(0)\n    Column(modifier) {\n        Text(user.name)\n    }\n}\n\n@Preview\n@Composable\nprivate fun UserCardPreview() {\n    UserCard(User(\"a\", 1), Modifier)\n}\n";
 
+/// Points the settings folder at a fresh temp folder for a unit test (serialised with the e2e tests).
+pub(super) fn config_guard() -> MutexGuard<'static, ()> {
+    let lock = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("droid-lite-cfg-unit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // SAFETY: the SERIAL lock is held, so no other test reads the environment meanwhile.
+    unsafe { std::env::set_var("DROID_LITE_CONFIG_DIR", &dir) };
+    lock
+}
+
 struct Fixture {
     root: PathBuf,
+    config: PathBuf,
     _lock: MutexGuard<'static, ()>,
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
+        let _ = std::fs::remove_dir_all(&self.config);
+        crate::theme::set_light(false);
+        crate::theme::set_font_size(13.0);
     }
 }
 
@@ -81,7 +95,19 @@ impl Fixture {
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "Initial commit"]);
         let root = root.canonicalize().unwrap();
-        Fixture { root, _lock: lock }
+        // every fixture gets its own settings folder (sessions, history, settings.json)
+        let config =
+            std::env::temp_dir().join(format!("droid-lite-cfg-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        // SAFETY: the SERIAL lock is held, so no other test reads the environment meanwhile.
+        unsafe { std::env::set_var("DROID_LITE_CONFIG_DIR", &config) };
+        // tests never start the kotlin-lsp installed on this Mac; the LSP test sets the fake one
+        unsafe { std::env::set_var("DROID_LITE_LSP", "/nonexistent/droid-lite-no-lsp") };
+        Fixture {
+            root,
+            config,
+            _lock: lock,
+        }
     }
 
     fn path(&self, rel: &str) -> PathBuf {
@@ -637,6 +663,21 @@ fn e2e_snapshot_for_review() {
             .save(Path::new(&dir).join("e2e-gutter.png"))
             .unwrap();
     }
+    // the same screen in the light theme
+    let ctx = h.ctx.clone();
+    comfort::Settings {
+        light: true,
+        ..Default::default()
+    }
+    .apply(&ctx, false);
+    h.state_mut().tabs.iter_mut().for_each(|t| t.recolor = true);
+    steps(&mut h, 5);
+    if let Ok(dir) = std::env::var("DROID_LITE_SNAPSHOT_DIR") {
+        h.render()
+            .unwrap()
+            .save(Path::new(&dir).join("e2e-light.png"))
+            .unwrap();
+    }
 }
 
 #[test]
@@ -882,7 +923,7 @@ fn icon_pos(h: &mut Harness<'static, App>, line: usize) -> egui::Pos2 {
         .get_by_role(egui::accesskit::Role::MultilineTextInput)
         .rect();
     let ctx = h.ctx.clone();
-    let font = egui::FontId::monospace(FONT_SIZE);
+    let font = egui::FontId::monospace(crate::theme::font_size());
     let (row_h, char_w) = ctx.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
     let lines = tab(h).text.matches('\n').count() + 1;
     let gutter_w = char_w * lines.to_string().len().max(3) as f32 + 18.0;
@@ -951,7 +992,8 @@ fn e2e_right_click_menu_runs_commands() {
         .get_by_role(egui::accesskit::Role::MultilineTextInput)
         .rect();
     let ctx = h.ctx.clone();
-    let row_h = ctx.fonts_mut(|f| f.row_height(&egui::FontId::monospace(FONT_SIZE)));
+    let row_h =
+        ctx.fonts_mut(|f| f.row_height(&egui::FontId::monospace(crate::theme::font_size())));
     // right-click on line 9 (`Text(user.name)`) moves the cursor there and opens the menu
     click_at(
         &mut h,
@@ -1068,7 +1110,7 @@ fn e2e_cmd_hover_shows_declaration_and_usages() {
         .get_by_role(egui::accesskit::Role::MultilineTextInput)
         .rect();
     let ctx = h.ctx.clone();
-    let font = egui::FontId::monospace(FONT_SIZE);
+    let font = egui::FontId::monospace(crate::theme::font_size());
     let (row_h, char_w) = ctx.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
     // "fun UserCard(user: User" : hover the type `User` at column 20 of line 6 with ⌘ held
     let pos = egui::pos2(editor.left() + char_w * 21.5, editor.top() + row_h * 5.5);
@@ -1258,7 +1300,7 @@ fn e2e_ctrl_and_cmd_click_open_the_declaration() {
             .get_by_role(egui::accesskit::Role::MultilineTextInput)
             .rect();
         let ctx = h.ctx.clone();
-        let font = egui::FontId::monospace(FONT_SIZE);
+        let font = egui::FontId::monospace(crate::theme::font_size());
         let (row_h, char_w) = ctx.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
         // the type `User` in "fun UserCard(user: User, …)" on line 6
         let pos = egui::pos2(editor.left() + char_w * 21.5, editor.top() + row_h * 5.5);
@@ -1287,4 +1329,67 @@ fn e2e_ctrl_and_cmd_click_open_the_declaration() {
             "{mods:?}: cursor on the declaration"
         );
     }
+}
+
+#[test]
+fn e2e_session_restore_history_autosave_and_settings() {
+    let f = Fixture::new("comfort");
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    {
+        let mut h = f.harness();
+        open(&mut h, &user);
+        open(&mut h, &card);
+        place_cursor(&mut h, "Column(", 0);
+        h.state_mut().save_session(true);
+    }
+    // a new window on the same project reopens both tabs, the cursor where it was
+    let mut h = f.harness();
+    wait(&mut h, "session", |a| a.tabs.len() == 2);
+    assert_eq!(tab(&h).path, card);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("Column("));
+    // edits saved twice: two versions in local history
+    type_text(&mut h, "// one\n");
+    key(&mut h, Modifiers::COMMAND, Key::S);
+    type_text(&mut h, "// two\n");
+    key(&mut h, Modifiers::COMMAND, Key::S);
+    let versions = comfort::history(&card);
+    assert_eq!(versions.len(), 2, "the original and the first save");
+    assert_eq!(std::fs::read_to_string(&versions[1].file).unwrap(), CARD_KT);
+    // the History window restores the original into the editor
+    h.state_mut().history_for = Some(card.clone());
+    steps(&mut h, 3);
+    h.get_by_label_contains("Local history: UserCard.kt");
+    let restore = h
+        .get_all_by_label("Restore")
+        .last()
+        .unwrap()
+        .rect()
+        .center();
+    click_at(&mut h, restore, egui::PointerButton::Primary);
+    assert_eq!(tab(&h).text, CARD_KT);
+    assert!(tab(&h).dirty(), "restored text waits for ⌘S");
+    // auto-save when the window loses focus
+    h.input_mut().focused = true;
+    steps(&mut h, 2);
+    h.input_mut().focused = false; // the user switches to another app
+    steps(&mut h, 3);
+    assert_eq!(
+        std::fs::read_to_string(&card).unwrap(),
+        CARD_KT,
+        "auto-saved"
+    );
+    assert!(!tab(&h).dirty());
+    h.input_mut().focused = true;
+    steps(&mut h, 2);
+    // ⌘, Settings: the light theme applies at once and is saved
+    key(&mut h, Modifiers::COMMAND, Key::Comma);
+    assert!(h.state().show_settings, "⌘, opens Settings");
+    h.get_by_label("Light").click();
+    steps(&mut h, 2);
+    assert!(h.state().settings.light, "the Light option is chosen");
+    steps(&mut h, 3);
+    assert!(std::ptr::eq(crate::theme::t(), &crate::theme::LIGHT));
+    let saved = std::fs::read_to_string(f.config.join("settings.json")).unwrap();
+    assert!(saved.contains("\"light\": true"), "{saved}");
 }
