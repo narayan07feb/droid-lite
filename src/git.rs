@@ -45,7 +45,10 @@ fn git(dir: &Path) -> Command {
     c.arg("-C")
         .arg(dir)
         .stdin(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        // background status/blame must never take index.lock: the user's own git commands
+        // ("Another git process seems to be running") would fail while Droid Lite refreshes
+        .env("GIT_OPTIONAL_LOCKS", "0");
     c
 }
 

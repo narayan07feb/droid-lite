@@ -528,6 +528,8 @@ fn e2e_git_blame_history_and_commit_diff() {
     let sha = crate::git::history(&f.path("app/src/main/java/com/demo/data/User.kt"), 1)[0]
         .short()
         .to_string();
+    h.get_by_label(&sha).scroll_to_me();
+    steps(&mut h, 3);
     h.get_by_label(&sha).click();
     wait(&mut h, "commit window", |a| {
         a.commit_lines()
@@ -1178,16 +1180,17 @@ fn e2e_git_tab_lists_changes_stage_commit_and_branch() {
     let f = Fixture::new("gitchanges");
     let mut h = f.harness();
     let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&f.root)
+            .args(args)
+            .output()
+            .unwrap();
         assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(&f.root)
-                .args(args)
-                .output()
-                .unwrap()
-                .status
-                .success()
-        )
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     // a branch with one committed change, plus uncommitted work
     let base = String::from_utf8(
