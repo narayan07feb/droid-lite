@@ -4,6 +4,7 @@ mod app;
 mod catalog;
 mod classfile;
 mod compose;
+mod device;
 mod edit;
 mod git;
 mod glass;

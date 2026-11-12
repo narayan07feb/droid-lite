@@ -11,6 +11,7 @@ mod gutter;
 mod libs_ui;
 mod logcat_ui;
 mod refactor_ui;
+mod run_ui;
 mod tree;
 mod typing;
 mod usage_filter;
@@ -307,6 +308,7 @@ pub struct App {
     /// Android Studio style usages dropdown at the caret (⌘-click on a declaration).
     usages_popup: Option<UsagesPopup>,
     logcat: logcat_ui::LogcatView,
+    run: run_ui::RunState,
     /// The caret's screen position last frame, where popups open.
     caret_pos: Option<egui::Pos2>,
     bottom: Bottom,
@@ -403,6 +405,7 @@ impl App {
             lsp_found: None,
             usages_popup: None,
             logcat: Default::default(),
+            run: Default::default(),
             caret_pos: None,
             bottom: Bottom::Problems,
             selected_composable: None,
@@ -936,13 +939,19 @@ impl App {
     }
 
     fn run_gradle(&mut self, task: String, ctx: &egui::Context) {
+        self.run.pending = None; // a plain task never starts the app afterwards
+        self.run_gradle_on(task, None, ctx);
+    }
+
+    /// Runs a Gradle task; `serial` makes install tasks target that device.
+    fn run_gradle_on(&mut self, task: String, serial: Option<&str>, ctx: &egui::Context) {
         let Some(p) = &self.project else { return };
         if let Some(r) = self.gradle.as_mut() {
             r.stop();
         }
         self.console.clear();
         self.console.push(format!("> ./gradlew {task}"));
-        match gradle::Run::start(p, &task, ctx.clone()) {
+        match gradle::Run::start_on(p, &task, serial, ctx.clone()) {
             Ok(r) => self.gradle = Some(r),
             Err(e) => self.console.push(format!("Could not start Gradle: {e}")),
         }
@@ -998,6 +1007,7 @@ impl App {
                     })
                 ));
                 self.gradle = None;
+                self.after_install(code == Some(0), ctx);
                 self.outputs_gen += 1;
                 self.collect_build_problems();
                 // a build can write new stability dumps or Compose compiler reports
@@ -1618,6 +1628,8 @@ impl App {
             self.refactor_menu(ui);
             self.help_menu(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.run_controls(ui);
+                ui.separator();
                 let running = self.gradle.is_some();
                 if running {
                     if ui
@@ -1635,7 +1647,7 @@ impl App {
                     .add_enabled(
                         self.project.is_some(),
                         egui::Button::new(
-                            RichText::new(format!("{}  Run", ic::PLAY))
+                            RichText::new(format!("{}  Run task", ic::PLAY))
                                 .color(Color32::from_rgb(0x5F, 0xB8, 0x65)),
                         ),
                     )
@@ -3152,6 +3164,7 @@ impl eframe::App for App {
         watch.stage("git blame", || self.poll_git(&ctx));
         self.poll_usages();
         self.poll_logcat(&ctx);
+        self.poll_launch();
         self.rescan_resources(&ctx);
         self.poll_libs();
         self.refresh_changes(&ctx); // git status for tree colours, not only the Git tab

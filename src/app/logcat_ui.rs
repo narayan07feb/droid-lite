@@ -79,6 +79,52 @@ impl LogcatView {
         self.entries.get(seq.checked_sub(self.first)? as usize)
     }
 
+    /// adb, looked up once.
+    pub(super) fn adb_path(&mut self) -> Option<PathBuf> {
+        self.adb.get_or_insert_with(logcat::adb).clone()
+    }
+
+    pub(super) fn devices(&self) -> &[Device] {
+        &self.devices
+    }
+
+    /// Reads `adb devices` now (a quick local call), keeping the picked device if it is still there.
+    pub(super) fn refresh_devices_now(&mut self) {
+        if let Some(adb) = self.adb_path() {
+            self.devices = logcat::devices(&adb);
+            self.devices_at = Some(Instant::now());
+        }
+        if self.device.is_none() {
+            self.device = self
+                .devices
+                .iter()
+                .find(|d| d.online)
+                .map(|d| d.serial.clone());
+        }
+    }
+
+    /// Picks a device: the log of the old one is dropped and its stream stops.
+    pub(super) fn select_device(&mut self, serial: String) {
+        if self.device.as_ref() == Some(&serial) {
+            return;
+        }
+        self.stop();
+        self.resume_after = None;
+        self.entries.clear();
+        self.view.clear();
+        self.procs.clear();
+        self.device = Some(serial);
+    }
+
+    /// Shows the app's lines (after Run), unless the user typed a filter of their own.
+    pub(super) fn show_mine(&mut self) {
+        if self.query.trim().is_empty() {
+            self.query = "package:mine".into();
+            self.filter = Filter::parse(&self.query, &self.mine);
+            self.rebuild_view();
+        }
+    }
+
     /// Stops streaming (tab hidden, device changed); the lines stay.
     fn stop(&mut self) {
         if self.stream.take().is_some() {
@@ -250,7 +296,7 @@ impl App {
                     || lc.device.clone().unwrap_or_else(|| "No device".into()),
                     |d| d.label.clone(),
                 );
-            egui::ComboBox::from_id_salt("logcat_device")
+            let combo = egui::ComboBox::from_id_salt("logcat_device")
                 .selected_text(current)
                 .width(220.0)
                 .show_ui(ui, |ui| {
@@ -261,17 +307,12 @@ impl App {
                         if ui
                             .selectable_label(lc.device.as_ref() == Some(&d.serial), &d.label)
                             .clicked()
-                            && lc.device.as_ref() != Some(&d.serial)
                         {
-                            lc.stop();
-                            lc.resume_after = None;
-                            lc.entries.clear();
-                            lc.view.clear();
-                            lc.procs.clear();
-                            lc.device = Some(d.serial);
+                            lc.select_device(d.serial);
                         }
                     }
                 });
+            super::run_ui::name_combo(&combo.response, "Logcat device");
             let r = ui.add(
                 egui::TextEdit::singleline(&mut lc.query)
                     .desired_width(ui.available_width() - 230.0)

@@ -17,8 +17,14 @@ pub struct Run {
 }
 
 impl Run {
-    /// Starts `./gradlew <args> --console=plain` in the project root. Output arrives through `poll`.
-    pub fn start(project: &Project, args: &str, ctx: egui::Context) -> std::io::Result<Run> {
+    /// Starts `./gradlew <args> --console=plain` in the project root; output arrives through
+    /// `poll`. `serial` makes install tasks target that device (`ANDROID_SERIAL`).
+    pub fn start_on(
+        project: &Project,
+        args: &str,
+        serial: Option<&str>,
+        ctx: egui::Context,
+    ) -> std::io::Result<Run> {
         let gradlew = project.gradlew();
         let mut cmd = if gradlew.exists() {
             Command::new(gradlew)
@@ -28,6 +34,7 @@ impl Run {
         cmd.args(args.split_whitespace())
             .arg("--console=plain")
             .current_dir(&project.root)
+            .envs(serial.map(|s| ("ANDROID_SERIAL", s)))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = cmd.spawn()?;

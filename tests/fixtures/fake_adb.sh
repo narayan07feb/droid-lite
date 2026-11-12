@@ -7,6 +7,18 @@ case "$*" in
     printf 'List of devices attached\nemulator-5554          device product:sdk model:Pixel_8 device:x transport_id:1\n' ;;
   *"shell ps -A -o PID,NAME")
     printf 'PID NAME\n1 init\n4242 com.demo.app\n777 system_server\n' ;;
+  *"shell pm list packages "*)
+    printf 'package:com.demo.app.debug\npackage:com.demo.app.debug.test\n' ;;
+  *"resolve-activity"*)
+    printf 'priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=true\ncom.demo.app.debug/com.demo.MainActivity\n' ;;
+  *"am start"*"PreviewActivity"*)
+    if [ -n "$FAKE_NO_PREVIEW" ]; then
+      printf 'Error type 3\nError: Activity class {com.demo.app.debug/androidx.compose.ui.tooling.PreviewActivity} does not exist.\n'
+    else
+      printf 'Starting: Intent { cmp=com.demo.app.debug/androidx.compose.ui.tooling.PreviewActivity }\n'
+    fi ;;
+  *"am start"*)
+    printf 'Starting: Intent { cmp=com.demo.app.debug/com.demo.MainActivity }\n' ;;
   *"logcat"*)
     printf '%s\n' \
       '--------- beginning of main' \

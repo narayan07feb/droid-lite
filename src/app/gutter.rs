@@ -44,12 +44,16 @@ pub(super) struct Annotations {
     pub(super) badges: Vec<Badge>,
     /// Colour squares for lines that write a colour (`Color(0xFF…)`, `#RRGGBB`, `R.color.x`).
     pub(super) swatches: Vec<(usize, Color32)>,
+    /// `@Preview` functions: line and the name `PreviewActivity` runs (▶ in the gutter).
+    pub(super) previews: Vec<(usize, String)>,
 }
 
 /// What a click in the gutter or the context menu asks for, run after the editor is drawn.
 pub(super) enum Request {
     Pick(String, Vec<Hit>),
     Run(Action),
+    /// Show this `@Preview` on the device.
+    Preview(String),
 }
 
 impl App {
@@ -191,6 +195,21 @@ impl App {
                 });
             }
         }
+        let previews = t
+            .syms
+            .decls
+            .iter()
+            .filter(|d| d.is_preview())
+            .map(|d| {
+                let name = crate::device::preview_name(
+                    &t.syms.package,
+                    &t.path,
+                    d.container.as_deref(),
+                    &d.name,
+                );
+                (line_of(d.offset), name)
+            })
+            .collect();
         let mut swatches = Vec::new();
         for (line, text) in t.text.lines().enumerate() {
             let mut colors = crate::resources::literal_colors(text);
@@ -213,6 +232,7 @@ impl App {
                 marks,
                 badges,
                 swatches,
+                previews,
             });
         }
     }
@@ -224,6 +244,7 @@ impl App {
             }
             Request::Pick(title, hits) => self.pick(title, hits),
             Request::Run(a) => self.run(a, ctx),
+            Request::Preview(name) => self.run_on_device(crate::device::Launch::Preview(name), ctx),
         }
     }
 
@@ -312,6 +333,35 @@ pub(super) fn paint_marks(
             egui::Stroke::new(1.0, crate::theme::t().border),
             egui::StrokeKind::Outside,
         );
+    }
+    for (line, name) in &a.previews {
+        let Some(row) = galley.rows.get(*line) else {
+            continue;
+        };
+        let y = galley_pos.y + row.pos.y;
+        if y > clip.bottom()
+            || y + row.rect().height() < clip.top()
+            || a.marks.iter().any(|m| m.line == *line)
+        {
+            continue;
+        }
+        let rect = ui.painter().text(
+            Pos2::new(column.left() + 1.0, y),
+            Align2::LEFT_TOP,
+            ic::PLAY,
+            FontId::proportional(crate::theme::font_size()),
+            DOWN,
+        );
+        let r = ui.interact(
+            rect.expand(2.0),
+            ui.scope_id().with(("preview", *line)),
+            Sense::click(),
+        );
+        if r.clicked() {
+            out = Some(Request::Preview(name.clone()));
+        }
+        r.on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(format!("Show this preview on the device\n{name}"));
     }
     for m in &a.marks {
         let Some(row) = galley.rows.get(m.line) else {

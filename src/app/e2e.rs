@@ -67,7 +67,7 @@ impl Fixture {
         write(
             "gradlew",
             &format!(
-                "#!/bin/sh\necho \"> Task $1\"\ncase \"$1\" in\n  *recordPaparazziDebug) mkdir -p app/src/test/snapshots/images && cp '{}' app/src/test/snapshots/images/com.demo.ui_UserCardKt_UserCardPreview.png; echo 'BUILD SUCCESSFUL';;\n  *compileDebugKotlin) echo \"w: file://$PWD/app/src/main/java/com/demo/ui/UserCard.kt:6:18 Parameter 'user' is never used\"; echo \"e: file://$PWD/app/src/main/java/com/demo/data/User.kt:3:40 Unresolved reference 'Intt'.\"; echo 'BUILD FAILED'; exit 1;;\n  *failingTask) echo \"e: file://$PWD/app/src/main/java/com/demo/ui/UserCard.kt:7:9 Unresolved reference 'oops'.\"; echo 'BUILD FAILED'; exit 1;;\n  *) echo 'BUILD SUCCESSFUL';;\nesac\n",
+                "#!/bin/sh\necho \"> Task $1\"\ncase \"$1\" in\n  *recordPaparazziDebug) mkdir -p app/src/test/snapshots/images && cp '{}' app/src/test/snapshots/images/com.demo.ui_UserCardKt_UserCardPreview.png; echo 'BUILD SUCCESSFUL';;\n  *compileDebugKotlin) echo \"w: file://$PWD/app/src/main/java/com/demo/ui/UserCard.kt:6:18 Parameter 'user' is never used\"; echo \"e: file://$PWD/app/src/main/java/com/demo/data/User.kt:3:40 Unresolved reference 'Intt'.\"; echo 'BUILD FAILED'; exit 1;;\n  *failingTask) echo \"e: file://$PWD/app/src/main/java/com/demo/ui/UserCard.kt:7:9 Unresolved reference 'oops'.\"; echo 'BUILD FAILED'; exit 1;;\n  *installDebug) echo \"install on $ANDROID_SERIAL\"; echo 'BUILD SUCCESSFUL';;\n  *) echo 'BUILD SUCCESSFUL';;\nesac\n",
                 png.display()
             ),
         );
@@ -359,14 +359,14 @@ fn e2e_compose_panel_tree_stability_lints_preview_render() {
 fn e2e_gradle_run_and_click_error() {
     let f = Fixture::new("gradle");
     let mut h = f.harness();
-    h.get_by_label(&format!("{}  Run", ic::PLAY)).click();
+    h.get_by_label(&format!("{}  Run task", ic::PLAY)).click();
     steps(&mut h, 2);
     wait(&mut h, "build", |a| {
         a.gradle.is_none() && a.console.iter().any(|l| l.contains("Gradle finished: OK"))
     });
     h.state_mut().gradle_task = "failingTask".into();
     steps(&mut h, 2);
-    h.get_by_label(&format!("{}  Run", ic::PLAY)).click();
+    h.get_by_label(&format!("{}  Run task", ic::PLAY)).click();
     steps(&mut h, 2);
     wait(&mut h, "failing build", |a| {
         a.gradle.is_none() && a.console.iter().any(|l| l.contains("exit 1"))
@@ -2168,4 +2168,80 @@ fn e2e_kmp_expect_actual_gutter_and_jump() {
     key(&mut h, Modifiers::COMMAND, Key::T);
     steps(&mut h, 3);
     assert_eq!(tab(&h).path, common);
+}
+
+#[test]
+fn e2e_run_app_and_preview_on_a_device() {
+    let f = Fixture::new("runapp");
+    std::fs::write(
+        f.path("app/build.gradle.kts"),
+        "plugins { id(\"com.android.application\") }\nandroid {\n    defaultConfig {\n        applicationId = \"com.demo.app\"\n    }\n}\n",
+    )
+    .unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_adb.sh");
+    let calls = f.path("adb-calls.txt");
+    // SAFETY: tests run one at a time (SERIAL), so no other thread reads the environment now.
+    unsafe {
+        std::env::set_var("DROID_LITE_ADB", &script);
+        std::env::set_var("FAKE_ADB_LOG", &calls);
+    }
+    let mut h = f.harness();
+    // ▶ App: install on the device, start the launcher activity, show the app's log
+    h.get_by_label(&format!("{}  App", ic::PLAY)).click();
+    wait(&mut h, "app started", |a| a.status.starts_with("Started"));
+    steps(&mut h, 2);
+    assert!(
+        h.state()
+            .console
+            .iter()
+            .any(|l| l == "install on emulator-5554"),
+        "installDebug ran for the picked device: {:?}",
+        h.state().console
+    );
+    assert!(
+        h.state()
+            .console
+            .iter()
+            .any(|l| l.starts_with("> ./gradlew :app:installDebug"))
+    );
+    assert_eq!(h.state().bottom, Bottom::Logcat);
+    assert_eq!(h.state().logcat.query, "package:mine");
+    let log = std::fs::read_to_string(&calls).unwrap();
+    assert!(
+        log.contains("-s emulator-5554 shell am start -n com.demo.app.debug/com.demo.MainActivity"),
+        "{log}"
+    );
+
+    // ▶ next to the @Preview: the same install, then PreviewActivity with that preview
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    open(&mut h, &card);
+    steps(&mut h, 3);
+    let (line, name) = tab(&h).annotations.as_ref().unwrap().previews[0].clone();
+    assert_eq!(name, "com.demo.ui.UserCardKt.UserCardPreview");
+    let pos = icon_pos(&mut h, line);
+    click_at(&mut h, pos, egui::PointerButton::Primary);
+    wait(&mut h, "preview shown", |a| {
+        a.status.starts_with("Showing preview")
+    });
+    let log = std::fs::read_to_string(&calls).unwrap();
+    assert!(
+        log.contains("am start -n com.demo.app.debug/androidx.compose.ui.tooling.PreviewActivity -a android.intent.action.MAIN --es composable com.demo.ui.UserCardKt.UserCardPreview"),
+        "{log}"
+    );
+
+    // without ui-tooling in the debug app, the message says what to add
+    unsafe { std::env::set_var("FAKE_NO_PREVIEW", "1") };
+    click_at(&mut h, pos, egui::PointerButton::Primary);
+    wait(&mut h, "preview error", |a| a.status.contains("ui-tooling"));
+    assert_eq!(h.state().bottom, Bottom::Build);
+    unsafe {
+        std::env::remove_var("FAKE_NO_PREVIEW");
+        std::env::remove_var("FAKE_ADB_LOG");
+    }
+    for banned in [" install ", " uninstall", "logcat -c", " -G"] {
+        assert!(
+            !log.contains(banned),
+            "adb {banned} is Gradle's job or banned: {log}"
+        );
+    }
 }
