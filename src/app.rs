@@ -9,6 +9,7 @@ mod find;
 mod git_ui;
 mod gutter;
 mod libs_ui;
+mod logcat_ui;
 mod refactor_ui;
 mod typing;
 
@@ -247,6 +248,7 @@ enum Bottom {
     Build,
     Find,
     Git,
+    Logcat,
 }
 
 /// What the Compose panel shows for one composable; rebuilt only when its inputs change.
@@ -316,6 +318,7 @@ pub struct App {
     lsp_found: Option<Vec<FoundLine>>,
     /// Android Studio style usages dropdown at the caret (⌘-click on a declaration).
     usages_popup: Option<UsagesPopup>,
+    logcat: logcat_ui::LogcatView,
     /// The caret's screen position last frame, where popups open.
     caret_pos: Option<egui::Pos2>,
     bottom: Bottom,
@@ -409,6 +412,7 @@ impl App {
             find_rx: None,
             lsp_found: None,
             usages_popup: None,
+            logcat: Default::default(),
             caret_pos: None,
             bottom: Bottom::Problems,
             selected_composable: None,
@@ -2824,6 +2828,11 @@ impl App {
                 Bottom::Git,
                 format!("{}  Git", ic::GIT_COMMIT),
             );
+            ui.selectable_value(
+                &mut self.bottom,
+                Bottom::Logcat,
+                format!("{}  Logcat", ic::TERMINAL),
+            );
             if self.bottom == Bottom::Build
                 && ui.small_button("Reload stability").clicked()
                 && let Some(p) = self.project.take()
@@ -2986,6 +2995,7 @@ impl App {
                     .auto_shrink([false, false])
                     .show(ui, |ui| self.git_panel(ui));
             }
+            Bottom::Logcat => self.logcat_panel(ui),
             Bottom::Find => {
                 let root = self
                     .project
@@ -3071,6 +3081,7 @@ impl eframe::App for App {
         watch.stage("analysis", || self.settle(false));
         watch.stage("git blame", || self.poll_git(&ctx));
         self.poll_usages();
+        self.poll_logcat(&ctx);
         self.rescan_resources(&ctx);
         self.poll_libs();
         self.refresh_changes(&ctx); // git status for tree colours, not only the Git tab

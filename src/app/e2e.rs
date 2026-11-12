@@ -103,6 +103,8 @@ impl Fixture {
         unsafe { std::env::set_var("DROID_LITE_CONFIG_DIR", &config) };
         // tests never start the kotlin-lsp installed on this Mac; the LSP test sets the fake one
         unsafe { std::env::set_var("DROID_LITE_LSP", "/nonexistent/droid-lite-no-lsp") };
+        // nor any real phone: adb is missing unless a Logcat test sets the fake one
+        unsafe { std::env::set_var("DROID_LITE_ADB", "/nonexistent/droid-lite-no-adb") };
         // and never index the real Gradle cache of this Mac
         unsafe {
             std::env::set_var(
@@ -1847,4 +1849,89 @@ fn e2e_locate_file_opens_its_folders_in_the_project_tree() {
     h.get_by_label(crate::icons::CROSSHAIR).click();
     steps(&mut h, 2);
     assert!(h.state().locate.is_some());
+}
+
+#[test]
+fn e2e_logcat_streams_filters_opens_stack_frames_and_never_clears_the_phone() {
+    let f = Fixture::new("logcat");
+    std::fs::write(
+        f.path("app/build.gradle.kts"),
+        "plugins { id(\"com.android.application\") }\nandroid {\n    defaultConfig {\n        applicationId = \"com.demo.app\"\n    }\n}\n",
+    )
+    .unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_adb.sh");
+    let calls = f.path("adb-calls.txt");
+    // SAFETY: tests run one at a time (SERIAL), so no other thread reads the environment now.
+    unsafe {
+        std::env::set_var("DROID_LITE_ADB", &script);
+        std::env::set_var("FAKE_ADB_LOG", &calls);
+    }
+    let mut h = f.harness();
+    assert!(
+        !calls.exists(),
+        "no adb call before the Logcat tab is opened"
+    );
+    h.get_by_label_contains("Logcat").click();
+    wait(&mut h, "log lines", |a| a.logcat.view.len() == 5);
+    steps(&mut h, 3);
+    assert_eq!(
+        h.state().logcat.device.as_deref(),
+        Some("emulator-5554"),
+        "the only online device is picked"
+    );
+    h.get_by_label_contains("slow call");
+    h.get_by_label_contains("ANR in com.other");
+
+    // Android Studio filter: my app, warnings and up
+    // the filter field is the lowest text field: it sits in the bottom panel
+    let input = h
+        .get_all_by_role(egui::accesskit::Role::TextInput)
+        .map(|n| n.rect())
+        .max_by(|a, b| a.top().total_cmp(&b.top()))
+        .expect("filter field");
+    click_at(&mut h, input.center(), egui::PointerButton::Primary);
+    steps(&mut h, 2);
+    type_text(&mut h, "package:mine level:warn");
+    wait(&mut h, "filtered", |a| a.logcat.view.len() == 3);
+    steps(&mut h, 2);
+    assert!(
+        h.query_by_label_contains("ANR in com.other").is_none(),
+        "system_server is not mine"
+    );
+    assert!(
+        h.query_by_label_contains("fast call").is_none(),
+        "debug is below warn"
+    );
+
+    // a stack frame opens the project file at its line
+    h.get_by_label_contains("UserCard(UserCard.kt:7)").click();
+    steps(&mut h, 3);
+    assert!(tab(&h).path.ends_with("UserCard.kt"));
+    let t = tab(&h);
+    assert_eq!(
+        t.text[..t.cursor].matches('\n').count() + 1,
+        7,
+        "cursor on line 7"
+    );
+
+    // Clear empties the view only
+    h.get_by_label("Clear").click();
+    steps(&mut h, 2);
+    assert_eq!(h.state().logcat.view.len(), 0);
+
+    // leaving the tab stops adb logcat
+    h.get_by_label_contains("Problems").click();
+    steps(&mut h, 2);
+    assert!(h.state().logcat.stream.is_none());
+    unsafe {
+        std::env::remove_var("FAKE_ADB_LOG");
+    }
+    let log = std::fs::read_to_string(&calls).unwrap();
+    assert!(
+        log.contains("-s emulator-5554 logcat -v threadtime -T 2000"),
+        "{log}"
+    );
+    for banned in [" -c", "-G", "--clear"] {
+        assert!(!log.contains(banned), "never `logcat {banned}`: {log}");
+    }
 }

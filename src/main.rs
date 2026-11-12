@@ -15,6 +15,7 @@ mod keymap;
 mod kotlin;
 mod lexer;
 mod libs;
+mod logcat;
 mod lsp;
 mod project;
 mod refactor;
