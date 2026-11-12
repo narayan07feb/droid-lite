@@ -50,6 +50,91 @@ fn git(dir: &Path) -> Command {
 }
 
 /// Blame of `contents` (the editor text) for `path`. `None` when the file is not tracked by git.
+/// One uncommitted change in a file, compared with HEAD: `new_len` lines from `new_start`
+/// (0-based) replaced `old` (the lines from HEAD). `new_len == 0` is a deletion, `old` empty an addition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Hunk {
+    pub new_start: usize,
+    pub new_len: usize,
+    pub old: Vec<String>,
+}
+
+impl Hunk {
+    pub fn kind(&self) -> char {
+        match (self.old.is_empty(), self.new_len) {
+            (true, _) => 'A',
+            (false, 0) => 'D',
+            _ => 'M',
+        }
+    }
+}
+
+/// The file's text at HEAD; `None` when it is not tracked (then every line is new).
+pub fn head_text(path: &Path) -> Option<String> {
+    let (dir, name) = (path.parent()?, path.file_name()?);
+    let out = git(dir)
+        .arg("show")
+        .arg(format!("HEAD:./{}", name.to_string_lossy()))
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Line changes from `old` to `new`, through `git diff --no-index -U0`.
+pub fn hunks(old: &str, new: &str) -> Vec<Hunk> {
+    if old == new {
+        return Vec::new();
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "droid-lite-hunks-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let (a, b) = (dir.join("old"), dir.join("new"));
+    if std::fs::write(&a, old).is_err() || std::fs::write(&b, new).is_err() {
+        return Vec::new();
+    }
+    let out = Command::new("git")
+        .args(["diff", "--no-index", "--no-color", "-U0", "--"])
+        .arg(&a)
+        .arg(&b)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+    let _ = std::fs::remove_dir(&dir);
+    let mut v: Vec<Hunk> = Vec::new();
+    for line in out.lines() {
+        if let Some(h) = line.strip_prefix("@@ -") {
+            // @@ -old_start[,old_len] +new_start[,new_len] @@
+            let mut parts = h.split(' ');
+            let range = |p: Option<&str>| -> (usize, usize) {
+                let p = p.unwrap_or("0").trim_start_matches(['-', '+']);
+                let (s, l) = p.split_once(',').unwrap_or((p, "1"));
+                (s.parse().unwrap_or(0), l.parse().unwrap_or(1))
+            };
+            let _old = range(parts.next());
+            let (ns, nl) = range(parts.next());
+            // for a deletion git gives the line *before* the gap; 0-based that is the gap's index
+            let new_start = if nl == 0 { ns } else { ns.saturating_sub(1) };
+            v.push(Hunk {
+                new_start,
+                new_len: nl,
+                old: Vec::new(),
+            });
+        } else if let Some(removed) = line.strip_prefix('-').filter(|_| !line.starts_with("---"))
+            && let Some(h) = v.last_mut()
+        {
+            h.old.push(removed.to_string());
+        }
+    }
+    v
+}
+
 pub fn blame(path: &Path, contents: &str) -> Option<Blame> {
     let dir = path.parent()?;
     let mut child = git(dir)
@@ -545,5 +630,34 @@ mod tests {
         assert!(status(&dir).iter().all(|c| c.code == '?'));
         assert!(run(&dir, &["checkout", "nope"]).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hunks_of_added_modified_and_deleted_lines() {
+        let old = "a\nb\nc\nd\ne\n";
+        let new = "a\nB\nc\nnew\nd\n";
+        let h = hunks(old, new);
+        assert_eq!(
+            h,
+            vec![
+                Hunk {
+                    new_start: 1,
+                    new_len: 1,
+                    old: vec!["b".into()]
+                },
+                Hunk {
+                    new_start: 3,
+                    new_len: 1,
+                    old: vec![]
+                },
+                Hunk {
+                    new_start: 5,
+                    new_len: 0,
+                    old: vec!["e".into()]
+                },
+            ]
+        );
+        assert_eq!(h.iter().map(Hunk::kind).collect::<String>(), "MAD");
+        assert!(hunks(old, old).is_empty());
     }
 }

@@ -639,6 +639,7 @@ impl App {
         }
         match std::fs::write(&tab.path, &tab.text) {
             Ok(()) => {
+                self.git.changes_stale = true;
                 tab.saved = tab.text.clone();
                 self.index.update(&tab.path, &tab.text);
                 if let Some(l) = self.lsp.as_mut() {
@@ -1119,6 +1120,24 @@ impl App {
             self.open_file(&p, Some(o));
         }
         r.inner
+    }
+
+    /// Puts one uncommitted change back to its HEAD lines (the click on a change bar).
+    fn revert_hunk(&mut self, h: &crate::git::Hunk) {
+        let Some(t) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let line_start =
+            |n: usize| -> usize { t.text.split_inclusive('\n').take(n).map(str::len).sum() };
+        let (a, b) = (line_start(h.new_start), line_start(h.new_start + h.new_len));
+        let mut old: String = h.old.iter().map(|l| format!("{l}\n")).collect();
+        if b == t.text.len() && !t.text.ends_with('\n') && old.ends_with('\n') {
+            old.pop(); // the file's last line had no newline
+        }
+        t.text.replace_range(a..b, &old);
+        t.caret = Some(a);
+        t.mark_edited();
+        self.status = format!("Reverted {} line(s) to HEAD", h.old.len().max(h.new_len));
     }
 
     /// Runs one command, from a shortcut or a menu.
@@ -1626,6 +1645,12 @@ impl App {
             ui.label("Open an Android project folder (the one with settings.gradle).");
             return;
         }
+        let status: StatusMap = self
+            .git
+            .changes
+            .as_ref()
+            .map(|c| c.working.iter().map(|w| (w.path.clone(), w.code)).collect())
+            .unwrap_or_default();
         let mut open = None;
         egui::ScrollArea::both()
             .auto_shrink([false, false])
@@ -1643,7 +1668,7 @@ impl App {
                     )
                     .id_salt(module)
                     .show(ui, |ui| {
-                        dir_ui(ui, node, module, &mut open);
+                        dir_ui(ui, node, module, &mut open, &status);
                     });
                 }
             });
@@ -1826,6 +1851,8 @@ impl App {
         let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
         let gutter_w = char_w * lines.to_string().len().max(3) as f32 + 18.0;
         let blame = tab.git.blame.clone();
+        let hunks = tab.git.hunks.clone();
+        let mut revert_hunk: Option<usize> = None;
         let show_column = self.git.show_column;
         let mut open_commit: Option<String> = None;
         let Tab {
@@ -1990,6 +2017,10 @@ impl App {
                         &font,
                         theme,
                     );
+                    if let Some(h) = &hunks {
+                        revert_hunk =
+                            git_ui::paint_changes(ui, h, gutter, &out.galley, out.galley_pos);
+                    }
                     if let Some(rect) = blame_rect
                         && let Some(sha) = git_ui::blame_column(
                             ui,
@@ -2111,6 +2142,9 @@ impl App {
         }
         if cmd_click {
             self.goto_definition();
+        }
+        if let (Some(i), Some(h)) = (revert_hunk, hunks) {
+            self.revert_hunk(&h[i]);
         }
         if let Some(sha) = open_commit {
             self.open_commit(&sha, &path, &ui.ctx().clone());
@@ -2767,6 +2801,7 @@ impl eframe::App for App {
         self.poll_usages();
         self.rescan_resources(&ctx);
         self.poll_libs();
+        self.refresh_changes(&ctx); // git status for tree colours, not only the Git tab
         self.watch_focus(&ctx);
         self.save_session(false);
         watch.stage("shortcuts", || self.shortcuts(&ctx));
@@ -3034,7 +3069,10 @@ fn build_tree(p: &Project) -> Vec<(String, DirNode)> {
     out
 }
 
-fn dir_ui(ui: &mut Ui, node: &DirNode, id: &str, open: &mut Option<PathBuf>) {
+/// Git status letter by file, for colouring the tree (M modified, A / ? new).
+type StatusMap = HashMap<PathBuf, char>;
+
+fn dir_ui(ui: &mut Ui, node: &DirNode, id: &str, open: &mut Option<PathBuf>, status: &StatusMap) {
     for (name, child) in &node.dirs {
         // compact single-child chains, like Android Studio's package view: src/main/java/com/app
         let mut label = name.clone();
@@ -3047,7 +3085,7 @@ fn dir_ui(ui: &mut Ui, node: &DirNode, id: &str, open: &mut Option<PathBuf>) {
         let key = format!("{id}/{label}");
         egui::CollapsingHeader::new(format!("{}  {label}", ic::FOLDER_SIMPLE))
             .id_salt(&key)
-            .show(ui, |ui| dir_ui(ui, c, &key, open));
+            .show(ui, |ui| dir_ui(ui, c, &key, open, status));
     }
     for f in &node.files {
         let name = f
@@ -3062,7 +3100,13 @@ fn dir_ui(ui: &mut Ui, node: &DirNode, id: &str, open: &mut Option<PathBuf>) {
             ..Default::default()
         };
         job.append(icon, 0.0, fmt(color));
-        job.append(&format!("  {name}"), 0.0, fmt(crate::theme::t().text));
+        // like Android Studio: modified files blue, new files green
+        let name_color = match status.get(f) {
+            Some('M' | 'R') => Color32::from_rgb(0x58, 0x9D, 0xF6),
+            Some('A' | '?') => Color32::from_rgb(0x5F, 0xB8, 0x65),
+            _ => crate::theme::t().text,
+        };
+        job.append(&format!("  {name}"), 0.0, fmt(name_color));
         if ui.selectable_label(false, job).clicked() {
             *open = Some(f.clone());
         }

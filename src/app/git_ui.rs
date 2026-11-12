@@ -17,7 +17,9 @@ const DEBOUNCE: Duration = Duration::from_millis(450);
 #[derive(Default)]
 pub(super) struct TabBlame {
     pub blame: Option<Arc<Blame>>,
-    rx: Option<Receiver<Option<Blame>>>,
+    rx: Option<Receiver<(Option<Blame>, Vec<git::Hunk>)>>,
+    /// Uncommitted line changes against HEAD, for the gutter bars.
+    pub hunks: Option<Arc<Vec<git::Hunk>>>,
     /// Edit counter (`Tab::rev`) of the text the current (or running) blame is for.
     for_hash: u64,
     seen_hash: u64,
@@ -89,7 +91,18 @@ impl App {
                 let (tx, rx) = channel();
                 let (path, text, c) = (t.path.clone(), t.text.clone(), ctx.clone());
                 std::thread::spawn(move || {
-                    let _ = tx.send(git::blame(&path, &text));
+                    let blame = git::blame(&path, &text);
+                    // the change bars: this text against the file at HEAD (untracked: all new)
+                    let hunks = match git::head_text(&path) {
+                        Some(head) => git::hunks(&head, &text),
+                        None if blame.is_some() => vec![git::Hunk {
+                            new_start: 0,
+                            new_len: text.lines().count().max(1),
+                            old: Vec::new(),
+                        }],
+                        None => Vec::new(),
+                    };
+                    let _ = tx.send((blame, hunks));
                     c.request_repaint();
                 });
                 t.git.rx = Some(rx);
@@ -98,8 +111,9 @@ impl App {
                 ctx.request_repaint_after(DEBOUNCE);
             }
             if let Some(rx) = &t.git.rx
-                && let Ok(b) = rx.try_recv()
+                && let Ok((b, hunks)) = rx.try_recv()
             {
+                t.git.hunks = b.is_some().then(|| Arc::new(hunks));
                 t.git.blame = b.map(Arc::new);
                 t.git.rx = None;
             }
@@ -140,7 +154,7 @@ impl App {
         self.git.commit = Some((title, text.lines().map(String::from).collect()));
     }
 
-    fn refresh_changes(&mut self, ctx: &egui::Context) {
+    pub(super) fn refresh_changes(&mut self, ctx: &egui::Context) {
         let Some(root) = self.project.as_ref().map(|p| p.root.clone()) else {
             return;
         };
@@ -558,4 +572,99 @@ pub(super) fn blame_column(
         r.on_hover_ui_at_pointer(|ui| commit_tooltip(ui, c, now));
     }
     open
+}
+
+/// Change bars at the right edge of the line numbers: green added, blue modified, a red marker
+/// where lines were deleted. Hover shows the old lines; a click returns the hunk to revert.
+pub(super) fn paint_changes(
+    ui: &mut Ui,
+    hunks: &[git::Hunk],
+    gutter: egui::Rect,
+    galley: &Galley,
+    galley_pos: Pos2,
+) -> Option<usize> {
+    let clip = ui.clip_rect();
+    let x0 = gutter.right() - 6.0;
+    let mut revert = None;
+    for (i, h) in hunks.iter().enumerate() {
+        let row_top = |line: usize| galley.rows.get(line).map(|r| galley_pos.y + r.pos.y);
+        let row_bottom = |line: usize| {
+            galley
+                .rows
+                .get(line)
+                .map(|r| galley_pos.y + r.pos.y + r.rect().height())
+        };
+        let rect = if h.new_len == 0 {
+            // a deletion sits between two lines
+            let Some(y) =
+                row_top(h.new_start).or_else(|| row_bottom(h.new_start.saturating_sub(1)))
+            else {
+                continue;
+            };
+            egui::Rect::from_min_max(Pos2::new(x0 - 1.0, y - 3.0), Pos2::new(x0 + 5.0, y + 3.0))
+        } else {
+            let (Some(top), Some(bottom)) = (
+                row_top(h.new_start),
+                row_bottom(h.new_start + h.new_len - 1),
+            ) else {
+                continue;
+            };
+            egui::Rect::from_min_max(Pos2::new(x0, top), Pos2::new(x0 + 3.0, bottom))
+        };
+        if rect.bottom() < clip.top() || rect.top() > clip.bottom() {
+            continue;
+        }
+        let color = match h.kind() {
+            'A' => Color32::from_rgb(0x5F, 0xB8, 0x65),
+            'D' => ERROR,
+            _ => Color32::from_rgb(0x58, 0x9D, 0xF6),
+        };
+        if h.kind() == 'D' {
+            ui.painter().add(egui::Shape::convex_polygon(
+                vec![
+                    Pos2::new(x0 - 1.0, rect.top()),
+                    Pos2::new(x0 + 5.0, rect.center().y),
+                    Pos2::new(x0 - 1.0, rect.bottom()),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+        } else {
+            ui.painter().rect_filled(rect, 1.0, color);
+        }
+        let r = ui.interact(
+            rect.expand2(egui::vec2(3.0, 0.0)),
+            ui.scope_id().with(("hunk", i)),
+            egui::Sense::click(),
+        );
+        if r.clicked() {
+            revert = Some(i);
+        }
+        r.on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_ui(|ui| {
+                let what = match h.kind() {
+                    'A' => format!("{} added lines", h.new_len),
+                    'D' => format!("{} deleted lines", h.old.len()),
+                    _ => format!("{} lines changed; before:", h.new_len),
+                };
+                ui.label(RichText::new(what).strong());
+                for l in h.old.iter().take(15) {
+                    ui.label(
+                        RichText::new(format!("- {l}"))
+                            .monospace()
+                            .small()
+                            .color(ERROR),
+                    );
+                }
+                if h.old.len() > 15 {
+                    ui.label(
+                        RichText::new(format!("… {} more", h.old.len() - 15))
+                            .small()
+                            .weak(),
+                    );
+                }
+                ui.label(RichText::new("Click to revert this change").weak().small());
+            });
+    }
+    revert
 }

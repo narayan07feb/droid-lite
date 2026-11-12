@@ -1583,3 +1583,86 @@ fn e2e_library_classes_search_completion_and_sources() {
         h.state().status
     );
 }
+
+#[test]
+fn e2e_change_bars_show_and_revert_uncommitted_lines() {
+    let f = Fixture::new("bars");
+    let mut h = f.harness();
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    open(&mut h, &card);
+    // modify line 7, add a line after line 9, delete line 13 (`@Preview`)
+    let edited = CARD_KT
+        .replace(
+            "val count = mutableStateOf(0)",
+            "val count = remember { mutableStateOf(0) }",
+        )
+        .replace(
+            "        Text(user.name)\n",
+            "        Text(user.name)\n        Spacer()\n",
+        )
+        .replace("@Preview\n", "");
+    {
+        let t = h.state_mut().tabs.last_mut().unwrap();
+        t.text = edited.clone();
+        t.mark_edited();
+    }
+    wait(&mut h, "bars", |a| {
+        a.tabs[a.active]
+            .git
+            .hunks
+            .as_ref()
+            .is_some_and(|v| v.len() == 3)
+    });
+    let hunks = tab(&h).git.hunks.clone().unwrap();
+    assert_eq!(
+        hunks
+            .iter()
+            .map(|x| (x.kind(), x.new_start))
+            .collect::<Vec<_>>(),
+        vec![('M', 6), ('A', 9), ('D', 13)]
+    );
+    // the tree knows the file is modified once saved
+    key(&mut h, Modifiers::COMMAND, Key::S);
+    wait(&mut h, "status", |a| {
+        a.git.changes.as_ref().is_some_and(|c| {
+            c.working
+                .iter()
+                .any(|w| w.path.ends_with("UserCard.kt") && w.code == 'M')
+        })
+    });
+    if let Ok(dir) = std::env::var("DROID_LITE_SNAPSHOT_DIR") {
+        steps(&mut h, 3);
+        h.render()
+            .unwrap()
+            .save(Path::new(&dir).join("e2e-bars.png"))
+            .unwrap();
+    }
+    // click the blue bar of line 7: it goes back to HEAD
+    let editor = h
+        .get_by_role(egui::accesskit::Role::MultilineTextInput)
+        .rect();
+    let ctx = h.ctx.clone();
+    let font = egui::FontId::monospace(crate::theme::font_size());
+    let row_h = ctx.fonts_mut(|f| f.row_height(&font));
+    click_at(
+        &mut h,
+        egui::pos2(editor.left() - 4.5, editor.top() + row_h * 6.5),
+        egui::PointerButton::Primary,
+    );
+    assert!(
+        tab(&h).text.contains("    val count = mutableStateOf(0)\n"),
+        "{}",
+        tab(&h).text
+    );
+    assert!(
+        tab(&h).text.contains("Spacer()"),
+        "only that change is reverted"
+    );
+    wait(&mut h, "bars after revert", |a| {
+        a.tabs[a.active]
+            .git
+            .hunks
+            .as_ref()
+            .is_some_and(|v| v.len() == 2)
+    });
+}
