@@ -1881,7 +1881,27 @@ fn e2e_logcat_streams_filters_opens_stack_frames_and_never_clears_the_phone() {
     );
     h.get_by_label_contains("slow call");
     h.get_by_label_contains("ANR in com.other");
+    // rows are exactly the height the virtual list uses, so dragging never jumps
+    {
+        let row_h = h
+            .ctx
+            .fonts_mut(|f| f.row_height(&egui::FontId::monospace(12.0)))
+            + 4.0;
+        let a = h.get_by_label_contains("fast call").rect();
+        let b = h.get_by_label_contains("slow call").rect();
+        let c = h.get_by_label_contains("ANR in").rect();
+        assert_eq!(b.top() - a.top(), row_h, "row step");
+        assert_eq!(c.top() - b.top(), row_h, "row step");
+        assert_eq!(a.height(), row_h);
+    }
 
+    if let Ok(dir) = std::env::var("DROID_LITE_SNAPSHOT_DIR") {
+        steps(&mut h, 3);
+        h.render()
+            .unwrap()
+            .save(Path::new(&dir).join("e2e-logcat.png"))
+            .unwrap();
+    }
     // Android Studio filter: my app, warnings and up
     // the filter field is the lowest text field: it sits in the bottom panel
     let input = h

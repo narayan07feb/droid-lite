@@ -87,6 +87,25 @@ impl LogcatView {
     }
 }
 
+/// Column widths before the message: time, pid-tid, tag, app.
+const WIDTHS: [f32; 4] = [104.0, 84.0, 150.0, 110.0];
+/// Everything before the message: the columns and the level chip.
+const COLUMNS: f32 = WIDTHS[0] + WIDTHS[1] + WIDTHS[2] + WIDTHS[3] + 28.0;
+
+/// One log line as text, for copying and for screen readers.
+fn row_text(e: &Entry) -> String {
+    format!(
+        "{} {}-{} {} {} {} {}",
+        e.time,
+        e.pid,
+        e.tid,
+        e.tag,
+        e.process.as_deref().unwrap_or("?"),
+        e.level,
+        e.msg
+    )
+}
+
 /// Android Studio's Logcat colours per level: (letter background, message text).
 fn level_colors(level: char) -> (Color32, Color32) {
     let t = crate::theme::t();
@@ -293,66 +312,108 @@ impl App {
             return;
         }
         let mono = egui::FontId::monospace(12.0);
-        let row_h = ui.fonts_mut(|f| f.row_height(&mono)) + 2.0;
+        // every row is painted into exactly `row_h`: `show_rows` places rows by that height, so a
+        // taller row (a widget's minimum size) made the list jump while dragging
+        let row_h = ui.fonts_mut(|f| f.row_height(&mono)) + 4.0;
         let mut open: Option<(String, String, usize)> = None;
+        let mut copy: Option<String> = None;
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .stick_to_bottom(!lc.scroll_lock)
             .show_rows(ui, row_h, lc.view.len(), |ui, range| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let weak = crate::theme::t().weak;
                 for i in range {
                     let Some(e) = lc.view.get(i).and_then(|&s| lc.entry(s)) else {
                         continue;
                     };
                     let (bg, fg) = level_colors(e.level);
-                    let weak = crate::theme::t().weak;
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        let col = |ui: &mut Ui, text: String, w: f32, color| {
-                            ui.add_sized(
-                                [w, row_h],
-                                egui::Label::new(
-                                    RichText::new(text).font(mono.clone()).color(color),
-                                )
-                                .truncate(),
-                            );
-                        };
-                        col(
-                            ui,
-                            e.time
-                                .split_once(' ')
-                                .map_or(&e.time[..], |t| t.1)
-                                .to_string(),
-                            92.0,
-                            weak,
-                        );
-                        col(ui, format!("{}-{}", e.pid, e.tid), 80.0, weak);
-                        col(ui, e.tag.clone(), 150.0, fg);
-                        let process = e.process.as_deref().unwrap_or("");
-                        col(
-                            ui,
+                    let frame = logcat::stack_frame(&e.msg);
+                    let msg = ui.fonts_mut(|f| f.layout_no_wrap(e.msg.clone(), mono.clone(), fg));
+                    let width = COLUMNS + msg.size().x + 8.0;
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(width.max(ui.available_width()), row_h),
+                        egui::Sense::click(),
+                    );
+                    let line = row_text(e);
+                    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, &line));
+                    if !ui.is_rect_visible(rect) {
+                        continue;
+                    }
+                    let p = ui.painter_at(rect);
+                    if resp.hovered() {
+                        p.rect_filled(rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
+                    }
+                    let y = rect.center().y;
+                    let mut x = rect.left() + 4.0;
+                    let process = e.process.as_deref().unwrap_or("");
+                    let time = e.time.split_once(' ').map_or(&e.time[..], |t| t.1);
+                    let cols = [
+                        (time.to_string(), weak),
+                        (format!("{}-{}", e.pid, e.tid), weak),
+                        (e.tag.clone(), fg),
+                        (
                             process.rsplit('.').next().unwrap_or(process).to_string(),
-                            110.0,
                             weak,
+                        ),
+                    ];
+                    for ((text, color), w) in cols.into_iter().zip(WIDTHS) {
+                        let clip = egui::Rect::from_min_max(
+                            egui::pos2(x, rect.top()),
+                            egui::pos2(x + w - 8.0, rect.bottom()),
                         );
-                        ui.label(
-                            RichText::new(format!(" {} ", e.level))
-                                .font(mono.clone())
-                                .color(Color32::WHITE)
-                                .background_color(bg),
+                        p.with_clip_rect(clip).text(
+                            egui::pos2(x, y),
+                            egui::Align2::LEFT_CENTER,
+                            text,
+                            mono.clone(),
+                            color,
                         );
-                        if let Some(frame) = logcat::stack_frame(&e.msg) {
-                            if ui
-                                .link(RichText::new(&e.msg).font(mono.clone()).color(fg))
-                                .clicked()
-                            {
-                                open = Some(frame);
-                            }
-                        } else {
-                            ui.label(RichText::new(&e.msg).font(mono.clone()).color(fg));
+                        x += w;
+                    }
+                    let chip = egui::Rect::from_center_size(
+                        egui::pos2(x + 8.0, y),
+                        egui::vec2(16.0, row_h - 4.0),
+                    );
+                    p.rect_filled(chip, 2.0, bg);
+                    p.text(
+                        chip.center(),
+                        egui::Align2::CENTER_CENTER,
+                        e.level,
+                        mono.clone(),
+                        Color32::WHITE,
+                    );
+                    let at = egui::pos2(x + 24.0, y - msg.size().y / 2.0);
+                    if frame.is_some() && resp.hovered() {
+                        // a stack frame reads as a link
+                        let r = egui::Rect::from_min_size(at, msg.size());
+                        p.line_segment(
+                            [r.left_bottom(), r.right_bottom()],
+                            egui::Stroke::new(1.0, fg),
+                        );
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    p.galley(at, msg, fg);
+                    if resp.clicked()
+                        && let Some(f) = frame
+                    {
+                        open = Some(f);
+                    }
+                    resp.context_menu(|ui| {
+                        if ui.button("Copy line").clicked() {
+                            copy = Some(line.clone());
+                            ui.close();
+                        }
+                        if ui.button("Copy message").clicked() {
+                            copy = Some(e.msg.clone());
+                            ui.close();
                         }
                     });
                 }
             });
+        if let Some(text) = copy {
+            ui.ctx().copy_text(text);
+        }
         if let Some((pkg, file, line)) = open {
             self.open_stack_frame(&pkg, &file, line);
         }
