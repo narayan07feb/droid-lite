@@ -17,6 +17,11 @@ pub const WARNING: &str = "\u{E4E0}";
 pub const X: &str = "\u{E4F6}";
 pub const TREE_STRUCTURE: &str = "\u{E67C}";
 pub const CROSSHAIR: &str = "\u{E1D6}";
+pub const CAMERA: &str = "\u{E10E}";
+pub const VIDEO_CAMERA: &str = "\u{E4DA}";
+pub const RECORD: &str = "\u{E3EE}";
+pub const STOP_CIRCLE: &str = "\u{E46E}";
+pub const COPY: &str = "\u{E1CA}";
 pub const TERMINAL: &str = "\u{E47E}";
 /// A package in the Android view.
 pub const PACKAGE_SMALL: &str = "\u{E8F8}"; // folder-dotted

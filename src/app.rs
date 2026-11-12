@@ -1,6 +1,7 @@
 //! The IDE window: project tree, editor tabs, search popups, completion, Compose panel, Gradle console.
 
 mod android;
+mod capture_ui;
 mod comfort;
 mod disk;
 #[cfg(test)]
@@ -309,6 +310,7 @@ pub struct App {
     usages_popup: Option<UsagesPopup>,
     logcat: logcat_ui::LogcatView,
     run: run_ui::RunState,
+    capture: capture_ui::CaptureState,
     /// The caret's screen position last frame, where popups open.
     caret_pos: Option<egui::Pos2>,
     bottom: Bottom,
@@ -406,6 +408,7 @@ impl App {
             usages_popup: None,
             logcat: Default::default(),
             run: Default::default(),
+            capture: Default::default(),
             caret_pos: None,
             bottom: Bottom::Problems,
             selected_composable: None,
@@ -3165,6 +3168,7 @@ impl eframe::App for App {
         self.poll_usages();
         self.poll_logcat(&ctx);
         self.poll_launch();
+        self.poll_capture(&ctx);
         self.rescan_resources(&ctx);
         self.poll_libs();
         self.refresh_changes(&ctx); // git status for tree colours, not only the Git tab
@@ -3226,6 +3230,7 @@ impl eframe::App for App {
             self.commit_window(&ctx);
             self.shortcuts_window(&ctx);
             self.settings_window(&ctx);
+            self.capture_window(&ctx);
             self.history_window(&ctx);
         });
         self.frames += 1;

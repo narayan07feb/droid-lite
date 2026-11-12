@@ -153,6 +153,7 @@ impl App {
         if r.response.clicked() {
             self.logcat.refresh_devices_now();
         }
+        self.capture_controls(ui);
     }
 }
 

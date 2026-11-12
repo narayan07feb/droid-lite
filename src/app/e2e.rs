@@ -2245,3 +2245,84 @@ fn e2e_run_app_and_preview_on_a_device() {
         );
     }
 }
+
+#[test]
+fn e2e_device_screenshot_and_recording() {
+    let f = Fixture::new("capture");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_adb.sh");
+    let calls = f.path("adb-calls.txt");
+    let out = f.path("captures");
+    std::fs::create_dir_all(&out).unwrap();
+    // SAFETY: tests run one at a time (SERIAL), so no other thread reads the environment now.
+    unsafe {
+        std::env::set_var("DROID_LITE_ADB", &script);
+        std::env::set_var("FAKE_ADB_LOG", &calls);
+        std::env::set_var("DROID_LITE_CAPTURE_DIR", &out);
+    }
+    let mut h = f.harness();
+    h.state_mut().logcat.refresh_devices_now();
+    steps(&mut h, 2);
+
+    // 📷: a PNG lands in the capture folder and shows in the result window
+    h.get_by_label(ic::CAMERA).click();
+    wait(&mut h, "screenshot saved", |a| a.capture.last.is_some());
+    let shot = h.state().capture.last.clone().unwrap();
+    assert_eq!(shot.parent(), Some(out.as_path()));
+    let name = shot.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        name.starts_with("Screenshot emulator-5554 ") && name.ends_with(".png"),
+        "{name}"
+    );
+    assert!(std::fs::read(&shot).unwrap().starts_with(b"\x89PNG"));
+    steps(&mut h, 2);
+    h.get_by_label(&format!("{}  Show in Finder", ic::FOLDER_OPEN));
+
+    // ⏺ then ⏹: stopped by its own pid, pulled, and only that file deleted on the device
+    h.get_by_label(ic::RECORD).click();
+    wait(&mut h, "recording", |a| a.capture.recording.is_some());
+    steps(&mut h, 5);
+    h.get_by_label(&format!("{}  0:00", ic::STOP_CIRCLE))
+        .click();
+    wait(&mut h, "video saved", |a| {
+        a.capture
+            .last
+            .as_ref()
+            .is_some_and(|p| p.extension().is_some_and(|e| e == "mp4"))
+    });
+    let video = h.state().capture.last.clone().unwrap();
+    assert_eq!(std::fs::read(&video).unwrap(), b"fake mp4");
+    let log = std::fs::read_to_string(&calls).unwrap();
+    let remote = log
+        .lines()
+        .find_map(|l| l.split("exec screenrecord --time-limit 180 ").nth(1))
+        .expect("screenrecord started")
+        .to_string();
+    assert!(
+        remote.starts_with("/sdcard/droid-lite-") && remote.ends_with(".mp4"),
+        "{remote}"
+    );
+    let kill = log
+        .lines()
+        .find(|l| l.contains("shell kill -INT "))
+        .expect("stopped by pid");
+    assert!(
+        kill.rsplit(' ')
+            .next()
+            .unwrap()
+            .bytes()
+            .all(|b| b.is_ascii_digit()),
+        "{kill}"
+    );
+    assert!(
+        log.contains(&format!("pull {remote} {}", video.display())),
+        "{log}"
+    );
+    assert!(log.contains(&format!("shell rm -f {remote}")), "{log}");
+    for banned in ["pkill", "killall", "rm -rf", "*", "logcat -c", " -G"] {
+        assert!(!log.contains(banned), "adb {banned}: {log}");
+    }
+    unsafe {
+        std::env::remove_var("FAKE_ADB_LOG");
+        std::env::remove_var("DROID_LITE_CAPTURE_DIR");
+    }
+}

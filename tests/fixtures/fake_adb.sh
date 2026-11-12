@@ -19,6 +19,18 @@ case "$*" in
     fi ;;
   *"am start"*)
     printf 'Starting: Intent { cmp=com.demo.app.debug/com.demo.MainActivity }\n' ;;
+  *"exec-out screencap -p")
+    # a 1x1 PNG
+    printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==' | base64 --decode ;;
+  *"exec screenrecord"*)
+    # like the real one: print the pid, then record until SIGINT
+    echo $$
+    exec sleep 30 ;;
+  *"shell kill -INT "*)
+    kill -INT "${6}" ;;
+  *" pull "*)
+    printf 'fake mp4' > "${5}" ;;
+  *"shell rm -f "*) ;;
   *"logcat"*)
     printf '%s\n' \
       '--------- beginning of main' \

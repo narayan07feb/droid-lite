@@ -1,6 +1,7 @@
 #[cfg(any(test, feature = "memstats"))]
 mod alloc_count;
 mod app;
+mod capture;
 mod catalog;
 mod classfile;
 mod compose;
