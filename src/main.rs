@@ -2,6 +2,7 @@
 mod alloc_count;
 mod app;
 mod catalog;
+mod classfile;
 mod compose;
 mod edit;
 mod git;
@@ -13,6 +14,7 @@ mod index;
 mod keymap;
 mod kotlin;
 mod lexer;
+mod libs;
 mod lsp;
 mod project;
 mod refactor;
@@ -106,6 +108,27 @@ fn bench(dir: &std::path::Path) {
     time("module of every file", &mut || {
         p.files.iter().filter(|f| p.module_of(f).is_some()).count()
     });
+    let scripts: Vec<std::path::PathBuf> = p
+        .files
+        .iter()
+        .filter(|f| f.extension().is_some_and(|e| e == "kts" || e == "gradle"))
+        .cloned()
+        .collect();
+    let mut libs = None;
+    time("index libraries (Gradle cache)", &mut || {
+        libs = Some(libs::index(&p.root, &scripts));
+        libs.as_ref().map_or(0, |l| l.syms.len())
+    });
+    let libs = libs.unwrap();
+    println!(
+        "  {} artifacts; Text: {:?}",
+        libs.artifacts,
+        libs.named("Text")
+            .filter(|s| s.composable)
+            .map(|s| s.qualified())
+            .take(3)
+            .collect::<Vec<_>>()
+    );
     let any = idx.files.keys().next().cloned().unwrap_or_default();
     let src = std::fs::read_to_string(&any).unwrap_or_default();
     let mut idx = idx;

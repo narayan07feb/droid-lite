@@ -11,7 +11,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 /// Tests share env vars (DROID_LITE_LSP) and the file watcher, so they run one at a time.
-static SERIAL: Mutex<()> = Mutex::new(());
+pub(super) static SERIAL: Mutex<()> = Mutex::new(());
 
 const USER_KT: &str = "package com.demo.data\n\ndata class User(val name: String, var age: Int)\n\nclass UserRepository {\n    fun load(): List<User> = emptyList()\n}\n";
 const CARD_KT: &str = "package com.demo.ui\n\nimport com.demo.data.User\n\n@Composable\nfun UserCard(user: User, modifier: Modifier) {\n    val count = mutableStateOf(0)\n    Column(modifier) {\n        Text(user.name)\n    }\n}\n\n@Preview\n@Composable\nprivate fun UserCardPreview() {\n    UserCard(User(\"a\", 1), Modifier)\n}\n";
@@ -103,6 +103,13 @@ impl Fixture {
         unsafe { std::env::set_var("DROID_LITE_CONFIG_DIR", &config) };
         // tests never start the kotlin-lsp installed on this Mac; the LSP test sets the fake one
         unsafe { std::env::set_var("DROID_LITE_LSP", "/nonexistent/droid-lite-no-lsp") };
+        // and never index the real Gradle cache of this Mac
+        unsafe {
+            std::env::set_var(
+                "DROID_LITE_GRADLE_HOME",
+                "/nonexistent/droid-lite-no-gradle",
+            )
+        };
         Fixture {
             root,
             config,
@@ -1482,4 +1489,97 @@ fn e2e_android_resources_catalog_and_swatches() {
     steps(&mut h, 30);
     h.get_by_label_contains("default:  Shop");
     h.event(Event::ModifiersChanged(Modifiers::NONE));
+}
+
+#[test]
+fn e2e_library_classes_search_completion_and_sources() {
+    let f = Fixture::new("libs");
+    let home = f.config.join("gradle-home");
+    if !crate::libs::tests::fake_cache(&home) {
+        eprintln!("no javac: skipped");
+        return;
+    }
+    // SAFETY: the fixture holds the SERIAL lock.
+    unsafe { std::env::set_var("DROID_LITE_GRADLE_HOME", &home) };
+    std::fs::create_dir_all(f.path("gradle")).unwrap();
+    std::fs::write(
+        f.path("gradle/libs.versions.toml"),
+        "[libraries]\ndemo-ui = { module = \"demo.lib:ui\", version = \"1.0\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        f.path("app/src/main/java/com/demo/ui/Lib.kt"),
+        "package com.demo.ui\n\n@Composable\nfun Screen(repo: Repo) {\n    Text(\"hi\")\n}\n",
+    )
+    .unwrap();
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 2);
+    // ⇧⌘T finds a library interface
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::T);
+    type_text(&mut h, "Modifier");
+    let hit = h
+        .state()
+        .search
+        .as_ref()
+        .unwrap()
+        .hits
+        .first()
+        .cloned()
+        .expect("a hit");
+    assert!(
+        hit.detail.contains("demo.ui") && hit.detail.contains("demo.lib:ui-android"),
+        "{}",
+        hit.detail
+    );
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    // completion offers a library composable with its import
+    let lib_kt = f.path("app/src/main/java/com/demo/ui/Lib.kt");
+    open(&mut h, &lib_kt);
+    place_cursor(&mut h, "Text(\"hi\")", "Text(\"hi\")".len());
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    type_text(&mut h, "CoreBu");
+    let c = h.state().completion.as_ref().expect("completion");
+    let item = c
+        .items
+        .iter()
+        .find(|i| i.label == "CoreButton")
+        .expect("CoreButton offered");
+    assert_eq!(item.import.as_deref(), Some("demo.core.CoreButton"));
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    // the UI tree knows Text is a library composable
+    place_cursor(&mut h, "Text(", 0);
+    steps(&mut h, 3);
+    assert_eq!(
+        h.state()
+            .compose_view
+            .as_ref()
+            .unwrap()
+            .tree
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Text"]
+    );
+    // F3 on a library type with sources opens them read-only
+    place_cursor(&mut h, "repo: Repo", 6);
+    key(&mut h, Modifiers::NONE, Key::F3);
+    assert!(
+        crate::libs::is_archive_path(&tab(&h).path),
+        "{}",
+        tab(&h).path.display()
+    );
+    assert!(tab(&h).text.contains("interface Repo") && tab(&h).readonly);
+    type_text(&mut h, "x");
+    assert!(!tab(&h).dirty(), "typing does not change a library file");
+    key(&mut h, Modifiers::COMMAND, Key::S);
+    assert_eq!(h.state().status, "Library sources are read-only");
+    // F3 on a library function without sources explains it
+    key(&mut h, Modifiers::COMMAND, Key::OpenBracket);
+    place_cursor(&mut h, "Text(", 1);
+    key(&mut h, Modifiers::NONE, Key::F3);
+    assert!(
+        h.state().status.contains("no sources"),
+        "{}",
+        h.state().status
+    );
 }

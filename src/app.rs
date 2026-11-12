@@ -8,6 +8,7 @@ mod e2e;
 mod find;
 mod git_ui;
 mod gutter;
+mod libs_ui;
 mod refactor_ui;
 mod typing;
 
@@ -61,6 +62,8 @@ struct Tab {
     /// Changed on disk while this tab had unsaved edits.
     disk_changed: bool,
     deleted: bool,
+    /// A library source opened from a jar: navigate and copy, never edit or save.
+    readonly: bool,
     git: git_ui::TabBlame,
     annotations: Option<gutter::Annotations>,
     /// Selection to set with the next `goto` (a find match).
@@ -244,6 +247,9 @@ struct ComposeView {
     images: Vec<(String, PathBuf)>,
 }
 
+/// The ⌘-hovered name, a resource reference it may be (kind, name), and its response.
+type HoverWord = (String, Option<(String, String)>, egui::Response);
+
 /// A project opened on a worker thread: files, index, git branch and the tree.
 type Opened = (
     Project,
@@ -308,6 +314,9 @@ pub struct App {
     res_rx: Option<Receiver<crate::resources::Resources>>,
     /// A file under `res/` changed: rescan resources.
     res_stale: bool,
+    /// Library symbols from the Gradle cache.
+    libs: crate::libs::Libraries,
+    libs_rx: Option<Receiver<crate::libs::Libraries>>,
     compose_view: Option<ComposeView>,
     ctx: Option<egui::Context>,
     keymap: Keymap,
@@ -385,6 +394,8 @@ impl App {
             res: Default::default(),
             res_rx: None,
             res_stale: false,
+            libs: Default::default(),
+            libs_rx: None,
             compose_view: None,
             ctx: Some(cc.egui_ctx.clone()),
             keymap: load_setting("keymap").map_or(Keymap::Eclipse, |s| Keymap::from_name(&s)),
@@ -490,6 +501,7 @@ impl App {
             self.res.len()
         );
         self.project = Some(project);
+        self.start_lib_index(ctx);
         if self.tabs.is_empty() {
             self.restore_session();
         }
@@ -544,7 +556,16 @@ impl App {
         if let Some(i) = self.tabs.iter().position(|t| t.path == path) {
             self.active = i;
         } else {
-            let Ok(text) = std::fs::read_to_string(path) else {
+            if libs_ui::is_binary_archive(path) {
+                self.status = format!("{} has no sources to show (binary only)", path.display());
+                return;
+            }
+            let text = if crate::libs::is_archive_path(path) {
+                crate::libs::read_entry(path)
+            } else {
+                std::fs::read_to_string(path).ok()
+            };
+            let Some(text) = text else {
                 self.status = format!("Cannot read {}", path.display());
                 return;
             };
@@ -563,6 +584,7 @@ impl App {
                 selection: 0..0,
                 disk_changed: false,
                 deleted: false,
+                readonly: crate::libs::is_archive_path(path),
                 git: Default::default(),
                 rev: 0,
                 annotations: None,
@@ -608,6 +630,10 @@ impl App {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
+        if tab.readonly {
+            self.status = "Library sources are read-only".into();
+            return;
+        }
         if tab.text != tab.saved || !tab.path.exists() {
             comfort::record_history(&tab.path);
         }
@@ -686,7 +712,27 @@ impl App {
         }
         let defs = self.index.definitions(&word, &path);
         match defs.len() {
-            0 => self.status = format!("No declaration found for `{word}` in the project"),
+            // not in the project: a library class or function
+            0 => {
+                let found: Vec<Hit> = self
+                    .libs
+                    .named(&word)
+                    .map(|s| libs_ui::lib_hit(s, 0))
+                    .collect();
+                match found.len() {
+                    0 => {
+                        self.status = format!(
+                            "No declaration found for `{word}` in the project or its libraries"
+                        )
+                    }
+                    1 if libs_ui::is_binary_archive(&found[0].path) => {
+                        self.status =
+                            format!("`{word}`: {} (no sources downloaded)", found[0].detail)
+                    }
+                    1 => self.open_file(&found[0].path.clone(), None),
+                    n => self.pick(format!("`{word}` in {n} libraries"), found),
+                }
+            }
             1 => self.open_file(&defs[0].path.clone(), Some(defs[0].offset)),
             _ => {
                 self.pick(format!("Declarations of `{word}`"), defs);
@@ -1371,12 +1417,25 @@ impl App {
                 .collect()
         };
         match kind {
-            SearchKind::Class => self.index.search(q, true, 60),
-            SearchKind::Symbol => self.index.search(q, false, 60),
+            SearchKind::Class => {
+                let mut v = self.index.search(q, true, 60);
+                v.extend(self.lib_hits(q, true, 30));
+                v.sort_by_key(|h| std::cmp::Reverse(h.score));
+                v.truncate(60);
+                v
+            }
+            SearchKind::Symbol => {
+                let mut v = self.index.search(q, false, 60);
+                v.extend(self.lib_hits(q, false, 30));
+                v.sort_by_key(|h| std::cmp::Reverse(h.score));
+                v.truncate(60);
+                v
+            }
             SearchKind::File => files(q, &mut self.project.iter().flat_map(|p| p.files.iter()), 60),
             SearchKind::Recent => files(q, &mut self.recent.iter(), 60),
             SearchKind::Everywhere => {
                 let mut v = self.index.search(q, false, 30);
+                v.extend(self.lib_hits(q, false, 10));
                 v.extend(files(
                     q,
                     &mut self.project.iter().flat_map(|p| p.files.iter()),
@@ -1781,6 +1840,7 @@ impl App {
             lints,
             diagnostics,
             annotations,
+            readonly,
             ..
         } = tab;
         let marks_key = marks.iter().chain(bg.iter()).fold(0x9e37u64, |h, (r, c)| {
@@ -1813,7 +1873,7 @@ impl App {
                 .unwrap_or_else(|| ui.fonts_mut(|f| f.layout_job(Default::default())))
         };
         let mut changed = false;
-        let mut hover_word: Option<(String, Option<(String, String)>, egui::Response)> = None;
+        let mut hover_word: Option<HoverWord> = None;
         let mut cmd_click = false;
         let mut popup_pos = None;
         egui::ScrollArea::both()
@@ -1839,7 +1899,15 @@ impl App {
                     );
                     // filled in after layout, so it sits under the text
                     let line_bg = ui.painter().add(egui::Shape::Noop);
-                    let out = TextEdit::multiline(text)
+                    // library sources: a read-only copy keeps selection and navigation, drops edits
+                    let ro_copy = readonly.then(|| text.clone());
+                    let mut ro_str: &str = ro_copy.as_deref().unwrap_or("");
+                    let buffer: &mut dyn egui::TextBuffer = if ro_copy.is_some() {
+                        &mut ro_str
+                    } else {
+                        &mut *text
+                    };
+                    let out = TextEdit::multiline(buffer)
                         .id(id)
                         .code_editor()
                         .lock_focus(true)
@@ -2091,6 +2159,30 @@ impl App {
                     import: needs,
                 });
             }
+            // library classes and top-level functions (Text, Column, ViewModel…), with their import
+            let have: std::collections::HashSet<String> =
+                items.iter().map(|i| i.label.clone()).collect();
+            for (_, name) in index::rank_by(prefix, self.libs.names(), |n| n, 20) {
+                let Some(sym) = self.libs.named(name).next() else {
+                    continue;
+                };
+                if have.contains(name) {
+                    continue;
+                }
+                let fq = sym.qualified();
+                let needs = (!imported.contains(&fq.as_str())
+                    && sym.package != t.syms.package
+                    && !imported
+                        .iter()
+                        .any(|i| i.ends_with(".*") && sym.package == i.trim_end_matches(".*")))
+                .then_some(fq);
+                items.push(Item {
+                    label: name.to_string(),
+                    detail: libs_ui::lib_hit(sym, 0).detail,
+                    insert: name.to_string(),
+                    import: needs,
+                });
+            }
             for k in crate::lexer::KEYWORDS
                 .iter()
                 .filter(|k| k.starts_with(prefix) && **k != prefix)
@@ -2265,7 +2357,7 @@ impl App {
                     d.name.clone(),
                 );
                 if self.compose_view.as_ref().is_none_or(|v| v.key != key) {
-                    let is_ui = |n: &str| compose::is_ui_call(n, &self.index);
+                    let is_ui = |n: &str| compose::is_ui_call(n, &self.index, &self.libs);
                     let previews: Vec<String> = tab
                         .syms
                         .decls
@@ -2674,6 +2766,7 @@ impl eframe::App for App {
         watch.stage("git blame", || self.poll_git(&ctx));
         self.poll_usages();
         self.rescan_resources(&ctx);
+        self.poll_libs();
         self.watch_focus(&ctx);
         self.save_session(false);
         watch.stage("shortcuts", || self.shortcuts(&ctx));
@@ -3062,6 +3155,12 @@ fn config_file() -> Option<PathBuf> {
 
 /// `~/.config/droid-lite` (or `$DROID_LITE_CONFIG_DIR`). Tests never touch the user's folder:
 /// without the variable they get no config folder at all.
+/// Serialises tests that change process-wide state (environment, theme) with the e2e tests.
+#[cfg(test)]
+pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    e2e::SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Liquid Glass is wanted when the environment allows it and Settings has it on (dark theme only).
 pub fn glass_setting() -> bool {
     let s = comfort::Settings::load();

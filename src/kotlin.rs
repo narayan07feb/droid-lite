@@ -5,7 +5,7 @@
 use crate::lexer::{Tok, Token, lex};
 use std::ops::Range;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     Class,
     Interface,

@@ -158,15 +158,19 @@ fn is_value_type(name: &str) -> bool {
 }
 
 /// Is a call to `name` a UI node? Project composables yes, project classes no, then the built-in lists.
-pub fn is_ui_call(name: &str, index: &Index) -> bool {
+pub fn is_ui_call(name: &str, index: &Index, libs: &crate::libs::Libraries) -> bool {
     if UI.contains(&name)
         || index
             .find_decl(name, Kind::Fun)
             .is_some_and(|d| d.is_composable())
+        || libs.named(name).any(|s| s.composable)
     {
         return true;
     }
-    if index.find_type(name).is_some() || is_value_type(name) {
+    if index.find_type(name).is_some()
+        || is_value_type(name)
+        || libs.named(name).any(|s| s.kind.is_type())
+    {
         return false;
     }
     true
