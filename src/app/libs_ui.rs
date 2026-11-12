@@ -66,9 +66,9 @@ pub(super) fn lib_hit(s: &LibSym, score: u32) -> Hit {
         s.kind.label()
     };
     Hit {
-        name: s.name.clone(),
+        name: s.name.to_string(),
         detail: format!("{what}  {}  · {}", s.package, s.artifact),
-        path: s.source_path().unwrap_or_else(|| s.archive.clone()),
+        path: s.source_path().unwrap_or_else(|| s.archive.to_path_buf()),
         offset: 0,
         score,
     }

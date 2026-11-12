@@ -8,24 +8,25 @@ use crate::kotlin::Kind;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct LibSym {
-    pub name: String,
-    pub package: String,
+    pub name: Arc<str>,
+    pub package: Arc<str>,
     pub kind: Kind,
     pub composable: bool,
     /// The jar (or aar) it came from.
-    pub archive: PathBuf,
+    pub archive: Arc<Path>,
     /// Its source file inside a `-sources.jar`, when one exists.
-    pub entry: Option<String>,
-    pub artifact: String,
+    pub entry: Option<Arc<str>>,
+    pub artifact: Arc<str>,
 }
 
 impl LibSym {
     pub fn qualified(&self) -> String {
         if self.package.is_empty() {
-            self.name.clone()
+            self.name.to_string()
         } else {
             format!("{}.{}", self.package, self.name)
         }
@@ -41,7 +42,7 @@ impl LibSym {
 #[derive(Default)]
 pub struct Libraries {
     pub syms: Vec<LibSym>,
-    by_name: HashMap<String, Vec<usize>>,
+    by_name: HashMap<Arc<str>, Vec<u32>>,
     pub artifacts: usize,
 }
 
@@ -51,11 +52,23 @@ impl Libraries {
             .get(name)
             .into_iter()
             .flatten()
-            .map(|&i| &self.syms[i])
+            .map(|&i| &self.syms[i as usize])
     }
     pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.by_name.keys().map(String::as_str)
+        self.by_name.keys().map(|k| &**k)
     }
+}
+
+/// One symbol as read from an artifact (and as stored in the disk cache).
+#[derive(Debug, PartialEq)]
+struct Row {
+    kind: Kind,
+    composable: bool,
+    /// Index into the artifact's files: the archive it came from.
+    file: usize,
+    package: String,
+    name: String,
+    entry: Option<String>,
 }
 
 pub fn gradle_home() -> PathBuf {
@@ -249,18 +262,66 @@ fn pom_deps(pom: &str) -> Vec<(String, String, Option<String>)> {
 
 /// Follows the dependencies breadth first and reads every artifact's symbols.
 pub fn index(root: &Path, scripts: &[PathBuf]) -> Libraries {
+    let arts = resolve(root, scripts);
+    let rows = read_all(&arts, cache_dir().as_deref());
+    // strings repeat a lot (packages, names, archives): keep one copy of each
+    let mut pool: HashSet<Arc<str>> = HashSet::new();
+    let mut atom = |s: &str| -> Arc<str> {
+        if let Some(a) = pool.get(s) {
+            return a.clone();
+        }
+        let a: Arc<str> = s.into();
+        pool.insert(a.clone());
+        a
+    };
+    let mut libs = Libraries {
+        artifacts: arts.len(),
+        ..Default::default()
+    };
+    let mut seen = HashSet::new();
+    for (art, rows) in arts.iter().zip(rows) {
+        if libs.syms.len() > 300_000 {
+            break;
+        }
+        let artifact = atom(&art.id);
+        let archives: Vec<Arc<Path>> = art.files.iter().map(|f| f.as_path().into()).collect();
+        for r in rows {
+            let (package, name) = (atom(&r.package), atom(&r.name));
+            // the same class can come from two artifacts (an old and a new name): keep one
+            if !seen.insert((package.clone(), name.clone(), r.kind, r.composable)) {
+                continue;
+            }
+            libs.by_name
+                .entry(name.clone())
+                .or_default()
+                .push(libs.syms.len() as u32);
+            libs.syms.push(LibSym {
+                name,
+                package,
+                kind: r.kind,
+                composable: r.composable,
+                archive: archives[r.file].clone(),
+                entry: r.entry.as_deref().map(&mut atom),
+                artifact: artifact.clone(),
+            });
+        }
+    }
+    libs
+}
+
+/// The project's dependencies and theirs (from the `.pom` files), at most 800.
+fn resolve(root: &Path, scripts: &[PathBuf]) -> Vec<Artifact> {
     let cache = gradle_home().join("caches/modules-2/files-2.1");
     let mut queue: VecDeque<(String, String, Option<String>)> = direct_deps(root, scripts).into();
     let mut seen = HashSet::new();
-    let mut libs = Libraries::default();
+    let mut arts = Vec::new();
     while let Some((g, a, v)) = queue.pop_front() {
-        if !seen.insert(format!("{g}:{a}")) || libs.artifacts >= 800 {
+        if arts.len() >= 800 || !seen.insert(format!("{g}:{a}")) {
             continue;
         }
         let Some(art) = find_artifact(&cache, &g, &a, v.as_deref()) else {
             continue;
         };
-        libs.artifacts += 1;
         for f in &art.files {
             if f.extension().is_some_and(|e| e == "pom")
                 && let Ok(p) = std::fs::read_to_string(f)
@@ -268,35 +329,172 @@ pub fn index(root: &Path, scripts: &[PathBuf]) -> Libraries {
                 queue.extend(pom_deps(&p));
             }
         }
-        read_artifact(&mut libs, &art);
-        if libs.syms.len() > 300_000 {
-            break;
-        }
+        arts.push(art);
     }
-    // the same class can come from two artifacts (an old and a new name): keep one
-    let mut seen = HashSet::new();
-    libs.syms
-        .retain(|s| seen.insert((s.qualified(), s.kind, s.composable)));
-    for (i, s) in libs.syms.iter().enumerate() {
-        libs.by_name.entry(s.name.clone()).or_default().push(i);
-    }
-    libs
+    arts
 }
 
-fn read_artifact(libs: &mut Libraries, art: &Artifact) {
+/// Reads every artifact on all cores, each from the disk cache when it has one.
+fn read_all(arts: &[Artifact], cache: Option<&Path>) -> Vec<Vec<Row>> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(8);
+    let mut out: Vec<(usize, Vec<Row>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(art) = arts.get(i) else { break };
+                        done.push((i, cached_rows(art, cache)));
+                    }
+                    done
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+    out.sort_by_key(|(i, _)| *i);
+    out.into_iter().map(|(_, rows)| rows).collect()
+}
+
+/// Gradle never changes a downloaded artifact, so its symbols are read once and kept on disk.
+/// `DROID_LITE_CACHE_DIR`, else `~/Library/Caches/droid-lite`.
+fn cache_dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("DROID_LITE_CACHE_DIR") {
+        return Some(PathBuf::from(d).join("libs"));
+    }
+    if cfg!(test) {
+        return None;
+    }
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    Some(home.join("Library/Caches/droid-lite/libs"))
+}
+
+const KINDS: [Kind; 7] = [
+    Kind::Class,
+    Kind::Interface,
+    Kind::Object,
+    Kind::Enum,
+    Kind::Fun,
+    Kind::Property,
+    Kind::TypeAlias,
+];
+const CACHE_VERSION: &str = "droid-lite libs 1";
+
+/// What the cache entry must match: the files with their size and change time.
+fn cache_key(art: &Artifact) -> String {
+    let mut key = format!("{CACHE_VERSION}\t{}", art.id);
+    for f in &art.files {
+        let m = f.metadata().ok();
+        let len = m.as_ref().map_or(0, |m| m.len());
+        let mtime = m
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        key += &format!("\t{}|{len}|{mtime}", f.display());
+    }
+    key
+}
+
+fn cached_rows(art: &Artifact, cache: Option<&Path>) -> Vec<Row> {
+    let Some(dir) = cache else {
+        return read_artifact(art);
+    };
+    let key = cache_key(art);
+    let file = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        dir.join(format!("{:016x}.tsv", h.finish()))
+    };
+    if let Some(rows) = std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|t| parse_cache(&t, &key, art.files.len()))
+    {
+        return rows;
+    }
+    let rows = read_artifact(art);
+    if let Some(text) = write_cache(&rows, &key) {
+        // write then rename, so a reader never sees half a file
+        let tmp = file.with_extension(format!("tmp{}", std::process::id()));
+        if std::fs::create_dir_all(dir).is_ok() && std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &file);
+        }
+    }
+    rows
+}
+
+/// `key` on the first line, then one `kind composable file package name entry` row per line.
+/// None when a field has a tab or a line break (that artifact is then not cached).
+fn write_cache(rows: &[Row], key: &str) -> Option<String> {
+    let mut out = format!("{key}\n");
+    for r in rows {
+        let entry = r.entry.as_deref().unwrap_or("");
+        if [r.package.as_str(), &r.name, entry]
+            .iter()
+            .any(|f| f.contains(['\t', '\n', '\r']))
+        {
+            return None;
+        }
+        let kind = KINDS.iter().position(|k| *k == r.kind)?;
+        out += &format!(
+            "{kind}\t{}\t{}\t{}\t{}\t{entry}\n",
+            u8::from(r.composable),
+            r.file,
+            r.package,
+            r.name
+        );
+    }
+    Some(out)
+}
+
+/// The rows of a cache file, or None when it is for other files or damaged.
+fn parse_cache(text: &str, key: &str, files: usize) -> Option<Vec<Row>> {
+    let mut lines = text.split('\n');
+    if lines.next()? != key || !text.ends_with('\n') {
+        return None;
+    }
+    lines
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            let [kind, comp, file, package, name, entry] = f[..] else {
+                return None;
+            };
+            let file: usize = file.parse().ok()?;
+            Some(Row {
+                kind: *KINDS.get(kind.parse::<usize>().ok()?)?,
+                composable: comp == "1",
+                file: (file < files).then_some(file)?,
+                package: package.into(),
+                name: name.into(),
+                entry: (!entry.is_empty()).then(|| entry.into()),
+            })
+        })
+        .collect()
+}
+
+fn read_artifact(art: &Artifact) -> Vec<Row> {
+    let mut rows = Vec::new();
     let sources = art
         .files
         .iter()
-        .find(|f| f.to_string_lossy().ends_with("-sources.jar"));
+        .position(|f| f.to_string_lossy().ends_with("-sources.jar"));
     if let Some(src) = sources {
-        read_sources(libs, src, &art.id);
-        return;
+        read_sources(&mut rows, &art.files[src], src);
+        return rows;
     }
-    for f in &art.files {
+    for (i, f) in art.files.iter().enumerate() {
         match f.extension().and_then(|e| e.to_str()) {
             Some("jar") => {
                 if let Ok(file) = std::fs::File::open(f) {
-                    read_classes(libs, file, f, &art.id);
+                    read_classes(&mut rows, file, i);
                 }
             }
             Some("aar") => {
@@ -311,20 +509,16 @@ fn read_artifact(libs: &mut Libraries, art: &Artifact) {
                         Some(buf)
                     });
                 if let Some(buf) = inner {
-                    read_classes(libs, std::io::Cursor::new(buf), f, &art.id);
+                    read_classes(&mut rows, std::io::Cursor::new(buf), i);
                 }
             }
             _ => {}
         }
     }
+    rows
 }
 
-fn read_classes<R: Read + std::io::Seek>(
-    libs: &mut Libraries,
-    r: R,
-    archive: &Path,
-    artifact: &str,
-) {
+fn read_classes<R: Read + std::io::Seek>(rows: &mut Vec<Row>, r: R, file: usize) {
     let Ok(mut z) = zip::ZipArchive::new(r) else {
         return;
     };
@@ -364,14 +558,13 @@ fn read_classes<R: Read + std::io::Seek>(
                 if m.is_empty() || !seen.insert((m.clone(), composable)) {
                     continue;
                 }
-                libs.syms.push(LibSym {
-                    name: m,
-                    package: package.clone(),
+                rows.push(Row {
                     kind: Kind::Fun,
                     composable,
-                    archive: archive.to_path_buf(),
+                    file,
+                    package: package.clone(),
+                    name: m,
                     entry: None,
-                    artifact: artifact.into(),
                 });
             }
             continue;
@@ -381,23 +574,22 @@ fn read_classes<R: Read + std::io::Seek>(
             ClassKind::Enum => Kind::Enum,
             _ => Kind::Class,
         };
-        libs.syms.push(LibSym {
-            name: simple,
-            package,
+        rows.push(Row {
             kind,
             composable: false,
-            archive: archive.to_path_buf(),
+            file,
+            package,
+            name: simple,
             entry: None,
-            artifact: artifact.into(),
         });
     }
 }
 
-fn read_sources(libs: &mut Libraries, jar: &Path, artifact: &str) {
-    let Ok(file) = std::fs::File::open(jar) else {
+fn read_sources(rows: &mut Vec<Row>, jar: &Path, file: usize) {
+    let Ok(f) = std::fs::File::open(jar) else {
         return;
     };
-    let Ok(mut z) = zip::ZipArchive::new(file) else {
+    let Ok(mut z) = zip::ZipArchive::new(f) else {
         return;
     };
     for i in 0..z.len() {
@@ -414,14 +606,13 @@ fn read_sources(libs: &mut Libraries, jar: &Path, artifact: &str) {
         for d in syms.decls.iter().filter(|d| {
             d.container.is_none() && !d.has_modifier("private") && !d.has_modifier("internal")
         }) {
-            libs.syms.push(LibSym {
-                name: d.name.clone(),
-                package: syms.package.clone(),
+            rows.push(Row {
                 kind: d.kind,
                 composable: d.is_composable(),
-                archive: jar.to_path_buf(),
+                file,
+                package: syms.package.clone(),
+                name: d.name.clone(),
                 entry: Some(n.clone()),
-                artifact: artifact.into(),
             });
         }
     }
@@ -542,6 +733,130 @@ pub(crate) mod tests {
         assert!(libs.named("CoreButton").next().unwrap().composable);
         assert!(libs.named("hidden").next().is_none());
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn symbols_are_cached_on_disk_until_the_artifact_changes() {
+        let home = std::env::temp_dir().join(format!("droid-lite-libcache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        if !fake_cache(&home) {
+            eprintln!("no javac: skipped");
+            return;
+        }
+        let root = home.join("project");
+        std::fs::create_dir_all(root.join("gradle")).unwrap();
+        std::fs::write(
+            root.join("gradle/libs.versions.toml"),
+            "[libraries]\ndemo-ui = { module = \"demo.lib:ui\", version = \"1.0\" }\n",
+        )
+        .unwrap();
+        let cache = home.join("cache");
+        let _guard = crate::app::test_lock();
+        // SAFETY: only these tests read the variables, and they run under the e2e lock.
+        unsafe {
+            std::env::set_var("DROID_LITE_GRADLE_HOME", &home);
+            std::env::set_var("DROID_LITE_CACHE_DIR", &cache);
+        }
+        let names = |l: &Libraries| {
+            let mut v: Vec<String> = l.syms.iter().map(|s| s.qualified()).collect();
+            v.sort();
+            v
+        };
+        let first = index(&root, &[]);
+        let files: Vec<PathBuf> = std::fs::read_dir(cache.join("libs"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 2, "one cache file per artifact: {files:?}");
+        // a cached artifact is not read again: change its cache file and the change shows
+        let core = files
+            .iter()
+            .find(|f| std::fs::read_to_string(f).unwrap().contains("CoreButton"))
+            .unwrap();
+        let text = std::fs::read_to_string(core).unwrap();
+        std::fs::write(core, text.replace("CoreButton", "CachedButton")).unwrap();
+        let second = index(&root, &[]);
+        assert!(
+            second.named("CachedButton").next().is_some(),
+            "read from the cache"
+        );
+        assert_eq!(second.syms.len(), first.syms.len());
+        let src = second.named("CachedButton").next().unwrap();
+        assert!(
+            src.composable
+                && src
+                    .source_path()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("core-2.0-sources.jar!/demo/core/Repo.kt")
+        );
+        // a damaged cache file is read again from the jar
+        std::fs::write(core, &text[..text.len() / 2]).unwrap();
+        let third = index(&root, &[]);
+        assert_eq!(names(&third), names(&first));
+        // a changed jar (other size) does not use the old cache
+        std::fs::write(core, text.replace("CoreButton", "CachedButton")).unwrap();
+        let jar =
+            home.join("caches/modules-2/files-2.1/demo.lib/core/2.0/ccc/core-2.0-sources.jar");
+        let mut bytes = std::fs::read(&jar).unwrap();
+        bytes.extend_from_slice(&[0; 7]);
+        std::fs::write(&jar, bytes).unwrap();
+        let fourth = index(&root, &[]);
+        assert!(fourth.named("CachedButton").next().is_none());
+        assert!(fourth.named("CoreButton").next().is_some());
+        unsafe {
+            std::env::remove_var("DROID_LITE_GRADLE_HOME");
+            std::env::remove_var("DROID_LITE_CACHE_DIR");
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cache_rows_round_trip() {
+        let rows = vec![
+            Row {
+                kind: Kind::Fun,
+                composable: true,
+                file: 1,
+                package: "a.b".into(),
+                name: "Text".into(),
+                entry: None,
+            },
+            Row {
+                kind: Kind::TypeAlias,
+                composable: false,
+                file: 0,
+                package: String::new(),
+                name: "T".into(),
+                entry: Some("a/T.kt".into()),
+            },
+        ];
+        let text = write_cache(&rows, "key").unwrap();
+        assert_eq!(parse_cache(&text, "key", 2), Some(rows));
+        assert_eq!(
+            parse_cache(&text, "other", 2),
+            None,
+            "another artifact's file"
+        );
+        assert_eq!(
+            parse_cache(&text, "key", 1),
+            None,
+            "file index out of range"
+        );
+        assert_eq!(
+            parse_cache("key\n4\t0\t0\ta\tb\t", "key", 1),
+            None,
+            "cut short"
+        );
+        let tab = Row {
+            kind: Kind::Fun,
+            composable: false,
+            file: 0,
+            package: "a".into(),
+            name: "x\ty".into(),
+            entry: None,
+        };
+        assert_eq!(write_cache(&[tab], "key"), None);
     }
 
     #[test]

@@ -2394,10 +2394,10 @@ impl App {
                 }
                 let fq = sym.qualified();
                 let needs = (!imported.contains(&fq.as_str())
-                    && sym.package != t.syms.package
+                    && *sym.package != *t.syms.package
                     && !imported
                         .iter()
-                        .any(|i| i.ends_with(".*") && sym.package == i.trim_end_matches(".*")))
+                        .any(|i| i.ends_with(".*") && &*sym.package == i.trim_end_matches(".*")))
                 .then_some(fq);
                 items.push(Item {
                     label: name.to_string(),

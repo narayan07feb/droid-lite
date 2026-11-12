@@ -143,6 +143,24 @@ fn bench(dir: &std::path::Path) {
         libs.as_ref().map_or(0, |l| l.syms.len())
     });
     let libs = libs.unwrap();
+    {
+        // every field of every library symbol, in order: equal fingerprints mean the same index
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for s in &libs.syms {
+            format!(
+                "{}|{:?}|{}|{}|{:?}|{}",
+                s.qualified(),
+                s.kind,
+                s.composable,
+                s.archive.display(),
+                s.source_path(),
+                s.artifact
+            )
+            .hash(&mut h);
+        }
+        println!("  library fingerprint {:016x}", h.finish());
+    }
     println!(
         "  {} artifacts; Text: {:?}",
         libs.artifacts,
