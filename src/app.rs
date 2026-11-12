@@ -265,9 +265,24 @@ struct DirNode {
     files: Vec<PathBuf>,
 }
 
+impl DirNode {
+    fn contains(&self, f: &Path) -> bool {
+        self.files.iter().any(|p| p == f) || self.dirs.values().any(|d| d.contains(f))
+    }
+}
+
+/// The tree's selected file and the file being located, if any.
+#[derive(Clone, Copy)]
+struct Sel<'a> {
+    active: Option<&'a Path>,
+    locate: Option<&'a Path>,
+}
+
 pub struct App {
     project: Option<Project>,
     tree: Vec<(String, DirNode)>,
+    /// File to show in the Project tree, and the frames left to keep it scrolled into view.
+    locate: Option<(PathBuf, u8)>,
     index: Index,
     indexing: Option<Receiver<Opened>>,
     /// kotlin-lsp was started (or found missing) for this project.
@@ -287,6 +302,8 @@ pub struct App {
     console: Vec<String>,
     found: Vec<FoundLine>,
     find_rx: Option<Receiver<Vec<FoundLine>>>,
+    /// kotlin-lsp references that came back before the project search ended.
+    lsp_found: Option<Vec<FoundLine>>,
     bottom: Bottom,
     selected_composable: Option<String>,
     textures: HashMap<PathBuf, (SystemTime, egui::TextureHandle)>,
@@ -357,6 +374,7 @@ impl App {
         let mut app = App {
             project: None,
             tree: Vec::new(),
+            locate: None,
             index: Index::default(),
             indexing: None,
             lsp_tried: false,
@@ -375,6 +393,7 @@ impl App {
             console: Vec::new(),
             found: Vec::new(),
             find_rx: None,
+            lsp_found: None,
             bottom: Bottom::Problems,
             selected_composable: None,
             textures: HashMap::new(),
@@ -707,11 +726,18 @@ impl App {
         if self.goto_android_reference(&word, at) {
             return;
         }
+        let defs = self.index.definitions(&word, &path);
+        // ⌘-click on the declaration itself lists where it is used, like Android Studio
+        if defs.iter().any(|d| d.path == path && d.offset == at)
+            && let Some(ctx) = self.ctx.clone()
+        {
+            self.find_references(&ctx);
+            return;
+        }
         if let Some(l) = self.lsp.as_mut().filter(|l| l.ready) {
             let (line, col) = lsp::position(&self.tabs[self.active].text, at);
             l.definition(&path, line, col);
         }
-        let defs = self.index.definitions(&word, &path);
         match defs.len() {
             // not in the project: a library class or function
             0 => {
@@ -751,14 +777,15 @@ impl App {
         };
         self.found_title = format!("References to `{word}`");
         self.bottom = Bottom::Find;
+        self.lsp_found = None;
+        // The project search always runs: kotlin-lsp answers empty or with one file while it
+        // still imports a big Gradle project. Its answer is merged in when it comes.
+        self.search_project(word, true, ctx);
         if let Some(l) = self.lsp.as_mut().filter(|l| l.ready) {
             let t = &self.tabs[self.active];
             let (line, col) = lsp::position(&t.text, at);
             l.references(&t.path, line, col);
-            self.status = format!("Asking kotlin-lsp for references to `{word}`…");
-            return;
         }
-        self.search_project(word, true, ctx);
     }
 
     /// Searches every project file (open tabs use their unsaved text) in the background.
@@ -808,6 +835,28 @@ impl App {
         });
         self.find_rx = Some(rx);
         self.bottom = Bottom::Find;
+    }
+
+    /// Adds kotlin-lsp references the project search missed (each place once, in file order).
+    fn merge_found(&mut self, extra: Vec<FoundLine>) {
+        let seen: std::collections::HashSet<(PathBuf, usize)> = self
+            .found
+            .iter()
+            .map(|f| (f.path.clone(), f.offset))
+            .collect();
+        let before = self.found.len();
+        self.found.extend(
+            extra
+                .into_iter()
+                .filter(|f| !seen.contains(&(f.path.clone(), f.offset))),
+        );
+        self.found
+            .sort_by(|a, b| a.path.cmp(&b.path).then(a.offset.cmp(&b.offset)));
+        self.status = format!(
+            "{} references ({} more from kotlin-lsp)",
+            self.found.len(),
+            self.found.len() - before
+        );
     }
 
     /// Compiles the active file's module, so compile errors show in the editor and Problems.
@@ -904,6 +953,9 @@ impl App {
             self.status = format!("{} matches", f.len());
             self.found = f;
             self.find_rx = None;
+            if let Some(l) = self.lsp_found.take() {
+                self.merge_found(l);
+            }
         }
         if let Some(run) = self.gradle.as_mut() {
             let mut done = None;
@@ -983,9 +1035,11 @@ impl App {
                         });
                         found.push(found_line(&p, text, lsp::offset(text, line, col)));
                     }
-                    found.sort_by(|a, b| a.path.cmp(&b.path).then(a.offset.cmp(&b.offset)));
-                    self.status = format!("{} references (kotlin-lsp)", found.len());
-                    self.found = found;
+                    if self.find_rx.is_some() {
+                        self.lsp_found = Some(found);
+                    } else {
+                        self.merge_found(found);
+                    }
                 }
                 lsp::Event::Diagnostics(path, diags) => {
                     if let Some(t) = self.tabs.iter_mut().find(|t| t.path == path) {
@@ -1175,6 +1229,7 @@ impl App {
             Action::LocalHistory => {
                 self.history_for = self.tabs.get(self.active).map(|t| t.path.clone())
             }
+            Action::LocateFile => self.locate_file(),
             Action::Back => self.back(),
             Action::Forward => self.fwd(),
             Action::Complete => {
@@ -1639,8 +1694,39 @@ impl App {
         });
     }
 
+    /// Opens the folders down to the active file in the Project tree, selects it and scrolls to it.
+    fn locate_file(&mut self) {
+        let Some(f) = self.tabs.get(self.active).map(|t| t.path.clone()) else {
+            return;
+        };
+        if self.tree.iter().any(|(_, n)| n.contains(&f)) {
+            self.locate = Some((f, 20));
+        } else {
+            self.status = format!("{} is not in this project's tree", f.display());
+        }
+    }
+
     fn project_panel(&mut self, ui: &mut Ui) {
-        theme::section(ui, ic::TREE_STRUCTURE, "Project");
+        ui.horizontal(|ui| {
+            theme::section(ui, ic::TREE_STRUCTURE, "Project");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let tip = format!(
+                    "{}  {}",
+                    Action::LocateFile.label(),
+                    keymap::text(self.keymap, Action::LocateFile)
+                );
+                if ui
+                    .add_enabled(
+                        !self.tabs.is_empty(),
+                        egui::Button::new(ic::CROSSHAIR).frame(false),
+                    )
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    self.locate_file();
+                }
+            });
+        });
         if self.project.is_none() {
             ui.label("Open an Android project folder (the one with settings.gradle).");
             return;
@@ -1652,9 +1738,15 @@ impl App {
             .map(|c| c.working.iter().map(|w| (w.path.clone(), w.code)).collect())
             .unwrap_or_default();
         let mut open = None;
+        let active = self.tabs.get(self.active).map(|t| t.path.clone());
+        let locate = self.locate.as_ref().map(|(f, _)| f.clone());
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                let sel = Sel {
+                    active: active.as_deref(),
+                    locate: locate.as_deref(),
+                };
                 for (module, node) in &self.tree {
                     let label = if module == ":" {
                         self.project
@@ -1667,11 +1759,20 @@ impl App {
                         RichText::new(format!("{}  {label}", ic::PACKAGE)).strong(),
                     )
                     .id_salt(module)
+                    .open(sel.locate.filter(|f| node.contains(f)).map(|_| true))
                     .show(ui, |ui| {
-                        dir_ui(ui, node, module, &mut open, &status);
+                        dir_ui(ui, node, module, &mut open, &status, sel);
                     });
                 }
             });
+        // the folders open with an animation, so keep scrolling to the file until it ends
+        if let Some((_, frames)) = &mut self.locate {
+            *frames = frames.saturating_sub(1);
+            if *frames == 0 {
+                self.locate = None;
+            }
+            ui.ctx().request_repaint();
+        }
         if let Some(f) = open {
             self.open_file(&f, None);
         }
@@ -3072,7 +3173,14 @@ fn build_tree(p: &Project) -> Vec<(String, DirNode)> {
 /// Git status letter by file, for colouring the tree (M modified, A / ? new).
 type StatusMap = HashMap<PathBuf, char>;
 
-fn dir_ui(ui: &mut Ui, node: &DirNode, id: &str, open: &mut Option<PathBuf>, status: &StatusMap) {
+fn dir_ui(
+    ui: &mut Ui,
+    node: &DirNode,
+    id: &str,
+    open: &mut Option<PathBuf>,
+    status: &StatusMap,
+    sel: Sel,
+) {
     for (name, child) in &node.dirs {
         // compact single-child chains, like Android Studio's package view: src/main/java/com/app
         let mut label = name.clone();
@@ -3085,7 +3193,8 @@ fn dir_ui(ui: &mut Ui, node: &DirNode, id: &str, open: &mut Option<PathBuf>, sta
         let key = format!("{id}/{label}");
         egui::CollapsingHeader::new(format!("{}  {label}", ic::FOLDER_SIMPLE))
             .id_salt(&key)
-            .show(ui, |ui| dir_ui(ui, c, &key, open, status));
+            .open(sel.locate.filter(|f| c.contains(f)).map(|_| true))
+            .show(ui, |ui| dir_ui(ui, c, &key, open, status, sel));
     }
     for f in &node.files {
         let name = f
@@ -3107,7 +3216,11 @@ fn dir_ui(ui: &mut Ui, node: &DirNode, id: &str, open: &mut Option<PathBuf>, sta
             _ => crate::theme::t().text,
         };
         job.append(&format!("  {name}"), 0.0, fmt(name_color));
-        if ui.selectable_label(false, job).clicked() {
+        let r = ui.selectable_label(sel.active == Some(f.as_path()), job);
+        if sel.locate == Some(f.as_path()) {
+            r.scroll_to_me(Some(egui::Align::Center));
+        }
+        if r.clicked() {
             *open = Some(f.clone());
         }
     }

@@ -151,11 +151,18 @@ impl App {
             );
         }
         ui.separator();
+        let decls: Vec<(PathBuf, usize)> =
+            defs.iter().map(|d| (d.path.clone(), d.offset)).collect();
         match self.usages_of(word) {
             None => {
                 ui.label(RichText::new("Counting usages…").color(crate::theme::t().weak));
             }
             Some(found) => {
+                // the declaration is not a usage of itself
+                let found: Vec<&FoundLine> = found
+                    .iter()
+                    .filter(|f| !decls.iter().any(|(p, o)| *p == f.path && *o == f.offset))
+                    .collect();
                 let mut files: Vec<&std::path::Path> =
                     found.iter().map(|f| f.path.as_path()).collect();
                 files.dedup();
@@ -185,9 +192,11 @@ impl App {
             }
         }
         ui.label(
-            RichText::new("⌘-click: declaration    right-click: more")
-                .color(crate::theme::t().weak)
-                .small(),
+            RichText::new(
+                "⌘-click: declaration (on the declaration: all usages)    right-click: more",
+            )
+            .color(crate::theme::t().weak)
+            .small(),
         );
     }
 }

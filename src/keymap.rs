@@ -45,6 +45,7 @@ pub enum Action {
     Build,
     Settings,
     LocalHistory,
+    LocateFile,
     Back,
     Forward,
     Complete,
@@ -82,6 +83,7 @@ impl Action {
             Action::Build => "Build module (show compile errors)",
             Action::Settings => "Settings",
             Action::LocalHistory => "Local history of this file",
+            Action::LocateFile => "Locate file in the Project tree",
             Action::Back => "Back",
             Action::Forward => "Forward",
             Action::Complete => "Autocomplete",
@@ -145,6 +147,7 @@ pub fn bindings(km: Keymap) -> Vec<(Action, KeyboardShortcut)> {
             (CloseTab, sc(CMD, Key::W)),
             (Shortcuts, sc(CMD | SHIFT, Key::L)),
             (Settings, sc(CMD, Key::Comma)),
+            (LocateFile, sc(CMD | ALT, Key::W)), // Eclipse "Show In"
         ],
         Keymap::AndroidStudio => vec![
             (GotoClass, sc(CMD, Key::O)),
@@ -155,6 +158,7 @@ pub fn bindings(km: Keymap) -> Vec<(Action, KeyboardShortcut)> {
             (GotoLine, sc(CMD, Key::L)),
             (GotoDefinition, sc(CMD, Key::B)),
             (References, sc(ALT, Key::F7)),
+            (LocateFile, sc(ALT, Key::F1)), // Android Studio "Select In"
             (Implementations, sc(CMD | ALT, Key::B)),
             (Find, sc(CMD, Key::F)),
             (Replace, sc(CMD, Key::R)),

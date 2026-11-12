@@ -432,5 +432,6 @@ pub(super) fn context_menu(
     ui.separator();
     item(ui, Action::OptimizeImports);
     item(ui, Action::LocalHistory);
+    item(ui, Action::LocateFile);
     out
 }
