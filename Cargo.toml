@@ -27,3 +27,7 @@ egui_kittest = { version = "0.37", features = ["eframe", "wgpu", "snapshot"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSApplication", "NSGlassEffectView", "NSResponder", "NSView", "NSWindow"] }
+
+[features]
+# `cargo run --release --features memstats -- --bench <project>` also prints the live heap per step
+memstats = []

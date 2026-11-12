@@ -1,4 +1,4 @@
-#[cfg(test)]
+#[cfg(any(test, feature = "memstats"))]
 mod alloc_count;
 mod app;
 mod catalog;
@@ -69,12 +69,18 @@ fn icon() -> egui::IconData {
 
 /// `droid-lite --bench <project>`: times opening, indexing and the searches the UI runs per keystroke.
 fn bench(dir: &std::path::Path) {
+    // time, and how much live heap the step left behind
     let time = |label: &str, f: &mut dyn FnMut() -> usize| {
-        let t = std::time::Instant::now();
+        #[cfg(feature = "memstats")]
+        let live = alloc_count::live_bytes;
+        #[cfg(not(feature = "memstats"))]
+        let live = || 0isize;
+        let (t, before) = (std::time::Instant::now(), live());
         let n = f();
         println!(
-            "{label:<34} {:>8.2} ms  ({n})",
-            t.elapsed().as_secs_f64() * 1000.0
+            "{label:<34} {:>8.2} ms  {:>+8.1} MB heap  ({n})",
+            t.elapsed().as_secs_f64() * 1000.0,
+            (live() - before) as f64 / 1_048_576.0
         );
     };
     let mut project = None;
