@@ -1,6 +1,7 @@
 //! The IDE window: project tree, editor tabs, search popups, completion, Compose panel, Gradle console.
 
 mod disk;
+mod git_ui;
 mod refactor_ui;
 
 use crate::compose::{self, Lint, Severity, Stability, Verdict};
@@ -37,6 +38,7 @@ struct Tab {
     /// Changed on disk while this tab had unsaved edits.
     disk_changed: bool,
     deleted: bool,
+    git: git_ui::TabBlame,
 }
 
 impl Tab {
@@ -126,6 +128,7 @@ enum Bottom {
     Problems,
     Build,
     Find,
+    Git,
 }
 
 #[derive(Default)]
@@ -169,6 +172,7 @@ pub struct App {
     glass: bool,
     /// Content runs under the title bar: leave room for the window buttons.
     fullsize: bool,
+    git: git_ui::GitState,
 }
 
 impl App {
@@ -212,12 +216,17 @@ impl App {
             watcher: None,
             glass,
             fullsize: glass_wanted,
+            git: Default::default(),
         };
         if let Some(dir) = open.or_else(last_project) {
             app.open_project(&dir, &cc.egui_ctx);
         }
         if let Some(f) = std::env::var_os("DROID_LITE_OPEN") {
             app.open_file(Path::new(&f), None);
+        }
+        if std::env::var_os("DROID_LITE_BLAME").is_some() {
+            app.git.show_column = true;
+            app.bottom = Bottom::Git;
         }
         if let Ok(q) = std::env::var("DROID_LITE_SEARCH") {
             app.search = Some(Search {
@@ -305,6 +314,7 @@ impl App {
                 selection: 0..0,
                 disk_changed: false,
                 deleted: false,
+                git: Default::default(),
             };
             tab.reanalyse();
             if let Some(l) = self.lsp.as_mut().filter(|_| is_code(path)) {
@@ -1001,6 +1011,9 @@ impl App {
         let lines = tab.text.matches('\n').count() + 1;
         let digits = lines.to_string().len();
         let numbers: String = (1..=lines).map(|n| format!("{n:>digits$}\n")).collect();
+        let blame = tab.git.blame.clone();
+        let show_column = self.git.show_column;
+        let mut open_commit: Option<String> = None;
         let Tab {
             text,
             cache,
@@ -1027,6 +1040,9 @@ impl App {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.horizontal_top(|ui| {
+                    if show_column {
+                        open_commit = git_ui::blame_column(ui, blame.as_deref(), lines);
+                    }
                     ui.label(
                         RichText::new(&numbers)
                             .font(FontId::monospace(FONT_SIZE))
@@ -1070,6 +1086,14 @@ impl App {
                                 .left_bottom(),
                         );
                     }
+                    if let Some(b) = &blame {
+                        let line = text[..(*cursor).min(text.len())].matches('\n').count();
+                        if let Some(sha) =
+                            git_ui::paint_inline_blame(ui, b, &out.galley, out.galley_pos, line)
+                        {
+                            open_commit = Some(sha);
+                        }
+                    }
                     changed = out.response.changed();
                     cmd_click = out.response.clicked() && ui.input(|i| i.modifiers.command);
                     // hover a problem to read it
@@ -1109,6 +1133,9 @@ impl App {
         }
         if cmd_click {
             self.goto_definition();
+        }
+        if let Some(sha) = open_commit {
+            self.open_commit(&sha, &path, &ui.ctx().clone());
         }
         self.completion_popup(ui, popup_pos);
     }
@@ -1436,6 +1463,7 @@ impl App {
                 Bottom::Find,
                 format!("Find ({})", self.found.len()),
             );
+            ui.selectable_value(&mut self.bottom, Bottom::Git, "Git");
             if self.bottom == Bottom::Build
                 && ui.small_button("Reload stability").clicked()
                 && let Some(p) = self.project.take()
@@ -1505,6 +1533,7 @@ impl App {
                         }
                     }
                 }
+                Bottom::Git => self.git_panel(ui),
                 Bottom::Find => {
                     let root = self
                         .project
@@ -1543,6 +1572,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
         self.poll_disk(&ctx);
+        self.poll_git(&ctx);
         self.shortcuts(&ctx);
         if let Some(dropped) =
             ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()))
@@ -1581,6 +1611,7 @@ impl eframe::App for App {
             .show(ui, |ui| self.editor(ui));
         self.search_window(&ctx);
         self.refactor_window(&ctx);
+        self.commit_window(&ctx);
         if let Some((path, frames)) = self.shot.as_mut().filter(|_| self.indexing.is_none()) {
             *frames += 1;
             let wait: u32 = std::env::var("DROID_LITE_SHOT_FRAMES")

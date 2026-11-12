@@ -1,5 +1,6 @@
 mod app;
 mod compose;
+mod git;
 mod glass;
 mod gradle;
 mod highlight;

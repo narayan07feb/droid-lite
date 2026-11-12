@@ -28,6 +28,7 @@ Set `DROID_LITE_GLASS=0` for solid colours.
 | Preview render | Runs the module's screenshot task (Google's Compose Preview Screenshot Testing, Paparazzi or Roborazzi) and shows the PNGs for the previews in the open file |
 | Refactor | Rename (⇧F6) with a preview of every change; you can untick lines. kotlin-lsp does the rename when it runs, else a code-only text search (strings and comments are skipped). It also renames `Old.kt` when the class matches the file. Extract variable (⌥⌘V), optimize imports (⌃⌥O, keeps the order), and undo the last refactoring from the Refactor menu |
 | Files on disk | The project folder is watched. An open file without edits reloads by itself; with edits you choose Reload or Keep mine. New and deleted files update the tree and the index. New stability dumps and compiler reports load by themselves |
+| Git (GitLens-style) | Grey "author, time • summary" after the cursor's line; hover for the full commit, click for its diff. A blame column with author and age per block (Git tab → Blame column). The Git tab lists every commit that changed the open file (follows renames). Blame uses the editor text, so unsaved lines show "Not committed yet" |
 | Gradle | Run any task (`assembleDebug`, `installDebug`, …), see the output live, and click `e:` compiler errors to open them |
 
 ## Type-aware completion (optional)
@@ -47,12 +48,13 @@ go-to-declaration use the built-in index.
 - `index.rs`: the symbol index, fuzzy search (nucleo) and definition lookup.
 - `compose.rs`: the UI tree, Compose checks and stability.
 - `refactor.rs`: rename search, optimize imports, extract variable.
+- `git.rs`: blame, history and commit diffs from the `git` command.
 - `watch.rs`: the folder watcher. `glass.rs`: Liquid Glass.
 - `gradle.rs`, `lsp.rs`: Gradle runs and the LSP client.
 - `app.rs`, `app/`: the window, the refactoring UI and the reload logic.
 
 `cargo test` runs the unit tests. `DROID_LITE_SHOT=out.png` saves a window screenshot once indexing is done, then quits.
-Use it with `DROID_LITE_OPEN=<file>` or `DROID_LITE_SEARCH=<query>` for UI checks.
+Use it with `DROID_LITE_OPEN=<file>`, `DROID_LITE_SEARCH=<query>` or `DROID_LITE_BLAME=1` for UI checks.
 
 ## Limits (v0.1)
 
