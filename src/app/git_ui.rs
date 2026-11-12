@@ -229,10 +229,14 @@ pub(super) fn paint_inline_blame(
     galley: &Galley,
     galley_pos: Pos2,
     line: usize,
+    min_x: Option<f32>,
 ) -> Option<String> {
     let c = blame.line(line)?;
     let row = galley.rows.get(line)?;
-    let pos = galley_pos + row.rect().right_top().to_vec2() + egui::vec2(48.0, 0.0);
+    let mut pos = galley_pos + row.rect().right_top().to_vec2() + egui::vec2(48.0, 0.0);
+    if let Some(x) = min_x {
+        pos.x = pos.x.max(x + 24.0); // after a stability badge on the same line
+    }
     let now = git::now();
     let rect = ui.painter().text(
         pos,

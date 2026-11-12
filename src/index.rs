@@ -12,6 +12,8 @@ pub struct Index {
     pub files: HashMap<PathBuf, FileSyms>,
     /// Files that declare each name, for lookups that do not scan every declaration.
     by_name: HashMap<String, Vec<PathBuf>>,
+    /// Files with a class that names each supertype, for "implemented by" lookups.
+    subtypes: HashMap<String, Vec<PathBuf>>,
     /// Bumped on every change, so callers can cache results.
     pub generation: u64,
 }
@@ -59,14 +61,13 @@ impl Index {
     /// Adds a file whose symbols were already scanned (e.g. on a worker thread).
     pub fn insert_scanned(&mut self, path: PathBuf, syms: FileSyms) {
         self.remove(&path);
-        let mut names: Vec<&str> = syms.decls.iter().map(|d| d.name.as_str()).collect();
-        names.sort_unstable();
-        names.dedup();
-        for n in names {
-            self.by_name
-                .entry(n.to_string())
-                .or_default()
-                .push(path.clone());
+        for (map, keys) in [
+            (&mut self.by_name, names_of(&syms)),
+            (&mut self.subtypes, supers_of(&syms)),
+        ] {
+            for k in keys {
+                map.entry(k).or_default().push(path.clone());
+            }
         }
         self.files.insert(path, syms);
         self.generation += 1;
@@ -79,17 +80,23 @@ impl Index {
     }
 
     pub fn remove(&mut self, path: &Path) {
-        if let Some(old) = self.files.remove(path) {
-            for d in &old.decls {
-                if let Some(v) = self.by_name.get_mut(&d.name) {
+        let Some(old) = self.files.remove(path) else {
+            return;
+        };
+        for (map, keys) in [
+            (&mut self.by_name, names_of(&old)),
+            (&mut self.subtypes, supers_of(&old)),
+        ] {
+            for k in keys {
+                if let Some(v) = map.get_mut(&k) {
                     v.retain(|p| p != path);
                     if v.is_empty() {
-                        self.by_name.remove(&d.name);
+                        map.remove(&k);
                     }
                 }
             }
-            self.generation += 1;
         }
+        self.generation += 1;
     }
 
     /// Drops every file under `dir` (a deleted folder).
@@ -226,6 +233,88 @@ impl Index {
             .map(|(_, f, d)| qualified(f, d))
     }
 
+    /// Classes that extend or implement `name`, directly or through other classes (breadth first).
+    pub fn implementations(&self, name: &str) -> Vec<Hit> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::from([name.to_string()]);
+        while let Some(n) = queue.pop_front() {
+            for p in self.subtypes.get(&n).into_iter().flatten() {
+                let Some(f) = self.files.get(p) else { continue };
+                for d in f
+                    .decls
+                    .iter()
+                    .filter(|d| d.kind.is_type() && d.supers.contains(&n))
+                {
+                    if seen.insert((p.clone(), d.offset)) && out.len() < 500 {
+                        out.push(hit(p, f, d));
+                        queue.push_back(d.name.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Members named `member` inside the type `container`, with their files.
+    fn members_named<'a>(
+        &'a self,
+        container: &str,
+        member: &'a str,
+    ) -> impl Iterator<Item = (&'a PathBuf, &'a FileSyms, &'a Decl)> + 'a {
+        let key = self
+            .by_name
+            .get_key_value(container)
+            .map(|(k, _)| k.as_str());
+        self.named(container).flat_map(move |(p, f, _)| {
+            f.decls
+                .iter()
+                .filter(move |d| {
+                    d.name == member && d.container.as_deref().is_some_and(|c| Some(c) == key)
+                })
+                .map(move |d| (p, f, d))
+        })
+    }
+
+    /// The declaration an `override` member overrides: the nearest supertype of `container`
+    /// that declares `member`.
+    pub fn overridden(&self, container: &str, member: &str) -> Option<Hit> {
+        let mut seen = std::collections::HashSet::new();
+        let mut queue: std::collections::VecDeque<String> = self
+            .named(container)
+            .filter(|(_, _, d)| d.kind.is_type())
+            .flat_map(|(_, _, d)| d.supers.clone())
+            .collect();
+        while let Some(s) = queue.pop_front() {
+            if !seen.insert(s.clone()) {
+                continue;
+            }
+            if let Some((p, f, d)) = self.members_named(&s, member).next() {
+                return Some(hit(p, f, d));
+            }
+            queue.extend(
+                self.named(&s)
+                    .filter(|(_, _, d)| d.kind.is_type())
+                    .flat_map(|(_, _, d)| d.supers.clone()),
+            );
+        }
+        None
+    }
+
+    /// `override` members named `member` in the classes that implement `container`.
+    pub fn member_implementations(&self, container: &str, member: &str) -> Vec<Hit> {
+        self.implementations(container)
+            .iter()
+            .flat_map(|c| {
+                let class = c.name.rsplit('.').next().unwrap_or(&c.name).to_string();
+                self.members_named(&class, member)
+                    .filter(|(_, _, d)| d.modifiers.iter().any(|m| m == "override"))
+                    .map(|(p, f, d)| hit(p, f, d))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     pub fn find_decl(&self, name: &str, kind: Kind) -> Option<&Decl> {
         self.named(name).map(|(_, _, d)| d).find(|d| d.kind == kind)
     }
@@ -234,6 +323,37 @@ impl Index {
         self.named(name)
             .map(|(_, _, d)| d)
             .find(|d| d.kind.is_type())
+    }
+}
+
+fn names_of(f: &FileSyms) -> Vec<String> {
+    let mut v: Vec<String> = f.decls.iter().map(|d| d.name.clone()).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+fn supers_of(f: &FileSyms) -> Vec<String> {
+    let mut v: Vec<String> = f
+        .decls
+        .iter()
+        .flat_map(|d| d.supers.iter().cloned())
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+fn hit(p: &Path, f: &FileSyms, d: &Decl) -> Hit {
+    Hit {
+        name: match &d.container {
+            Some(c) => format!("{c}.{}", d.name),
+            None => d.name.clone(),
+        },
+        detail: describe(f, d),
+        path: p.to_path_buf(),
+        offset: d.offset,
+        score: 0,
     }
 }
 
@@ -356,6 +476,31 @@ mod tests {
         let defs = index().definitions("User", Path::new("/p/ui/Card.kt"));
         assert_eq!(defs[0].path, Path::new("/p/data/User.kt"));
         assert_eq!(defs.len(), 2);
+    }
+
+    #[test]
+    fn hierarchy_implementations_and_overrides() {
+        let mut i = Index::default();
+        i.update(
+            Path::new("/p/Api.kt"),
+            "interface Api { fun load(): Int }\nabstract class Base : Api\n",
+        );
+        i.update(Path::new("/p/Impl.kt"), "class Impl : Base() { override fun load() = 1 }\nclass Other : Api {\n override fun load() = 2\n}\n");
+        let names = |v: Vec<Hit>| v.into_iter().map(|h| h.name).collect::<Vec<_>>();
+        let mut impls = names(i.implementations("Api"));
+        impls.sort();
+        assert_eq!(
+            impls,
+            vec!["Base", "Impl", "Other"],
+            "direct and through Base"
+        );
+        assert_eq!(i.overridden("Impl", "load").unwrap().name, "Api.load");
+        assert!(i.overridden("Api", "load").is_none());
+        let mut m = names(i.member_implementations("Api", "load"));
+        m.sort();
+        assert_eq!(m, vec!["Impl.load", "Other.load"]);
+        i.remove(Path::new("/p/Impl.kt"));
+        assert_eq!(names(i.implementations("Api")), vec!["Base"]);
     }
 
     #[test]

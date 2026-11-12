@@ -65,9 +65,25 @@ pub fn blame(path: &Path, contents: &str) -> Option<Blame> {
     let writer = std::thread::spawn(move || stdin.write_all(text.as_bytes()));
     let out = child.wait_with_output().ok()?;
     let _ = writer.join();
-    out.status
-        .success()
-        .then(|| parse_porcelain(&String::from_utf8_lossy(&out.stdout)))
+    if out.status.success() {
+        return Some(parse_porcelain(&String::from_utf8_lossy(&out.stdout)));
+    }
+    // a new file git does not track yet: every line is "not committed", like GitLens shows
+    let inside = git(dir)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .ok()?;
+    (inside.status.success() && String::from_utf8_lossy(&inside.stdout).trim() == "true").then(
+        || Blame {
+            lines: vec![0; contents.lines().count().max(1)],
+            commits: vec![Commit {
+                sha: UNCOMMITTED.into(),
+                author: "You".into(),
+                summary: "Not committed yet".into(),
+                ..Default::default()
+            }],
+        },
+    )
 }
 
 pub fn parse_porcelain(out: &str) -> Blame {
@@ -257,7 +273,19 @@ mod tests {
         let h = history(&path, 10);
         assert_eq!(h.len(), 1);
         assert!(show(&dir, &h[0].sha, Some(&path)).contains("+fun b() = 2"));
-        assert!(blame(&dir.join("Untracked.kt"), "x").is_none());
+        let new = blame(&dir.join("Untracked.kt"), "x\ny").unwrap();
+        assert_eq!(new.lines.len(), 2);
+        assert!(
+            new.line(1).unwrap().is_uncommitted(),
+            "an untracked file is all uncommitted"
+        );
+        assert!(
+            blame(
+                &std::env::temp_dir().join("not-a-repo-droid-lite/A.kt"),
+                "x"
+            )
+            .is_none()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

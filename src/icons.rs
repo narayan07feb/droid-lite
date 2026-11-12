@@ -26,3 +26,6 @@ pub const STACK: &str = "\u{E466}";
 pub const WRENCH: &str = "\u{E5D4}";
 pub const CUBE: &str = "\u{E1DA}";
 pub const KEYBOARD: &str = "\u{E2D8}";
+pub const ARROW_CIRCLE_UP: &str = "\u{E030}";
+pub const ARROW_CIRCLE_DOWN: &str = "\u{E028}";
+pub const CHECK: &str = "\u{E182}";

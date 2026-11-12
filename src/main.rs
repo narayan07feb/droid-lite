@@ -98,6 +98,12 @@ fn bench(dir: &std::path::Path) {
     time("definitions of \"Modifier\"", &mut || {
         idx.definitions("Modifier", std::path::Path::new("/")).len()
     });
+    time("watch the project folder", &mut || {
+        usize::from(watch::Watcher::start(&p.root, egui::Context::default()).is_some())
+    });
+    time("module of every file", &mut || {
+        p.files.iter().filter(|f| p.module_of(f).is_some()).count()
+    });
     let any = idx.files.keys().next().cloned().unwrap_or_default();
     let src = std::fs::read_to_string(&any).unwrap_or_default();
     let mut idx = idx;

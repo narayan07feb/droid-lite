@@ -4,9 +4,10 @@ mod disk;
 #[cfg(test)]
 mod e2e;
 mod git_ui;
+mod gutter;
 mod refactor_ui;
 
-use crate::compose::{self, Lint, Severity, Stability, Verdict};
+use crate::compose::{self, Lint, Severity, Stability};
 use crate::edit;
 use crate::gradle::{self, PreviewTool};
 use crate::highlight::{self, ERROR, INFO, TEXT, WARN};
@@ -58,6 +59,7 @@ struct Tab {
     disk_changed: bool,
     deleted: bool,
     git: git_ui::TabBlame,
+    annotations: Option<gutter::Annotations>,
     /// Bumped on every text change; caches key on it.
     rev: u64,
 }
@@ -130,7 +132,7 @@ struct EditorCache {
 /// Analysis waits this long after the last keystroke, so typing in big files stays smooth.
 const SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum SearchKind {
     Class,
     File,
@@ -140,6 +142,8 @@ enum SearchKind {
     Structure,
     FindInFiles,
     GotoLine,
+    /// A fixed list from `Search::pinned`.
+    Pick,
 }
 
 impl SearchKind {
@@ -153,6 +157,7 @@ impl SearchKind {
             SearchKind::Structure => Action::Structure,
             SearchKind::FindInFiles => Action::FindInFiles,
             SearchKind::GotoLine => Action::GotoLine,
+            SearchKind::Pick => Action::Implementations,
         }
     }
     fn hint(self) -> &'static str {
@@ -170,6 +175,9 @@ struct Search {
     hits: Vec<Hit>,
     selected: usize,
     stale: bool,
+    /// For a picker (implementations, several declarations): the fixed list to filter, and its title.
+    pinned: Vec<Hit>,
+    title: Option<String>,
 }
 
 struct Completion {
@@ -217,8 +225,6 @@ enum Bottom {
 struct ComposeView {
     key: (PathBuf, u64, u64, u64, String),
     tree: Vec<compose::Node>,
-    stability: Stability,
-    guessed: bool,
     tool: Option<(crate::project::Module, PreviewTool)>,
     images: Vec<(String, PathBuf)>,
 }
@@ -233,7 +239,7 @@ pub struct App {
     project: Option<Project>,
     tree: Vec<(String, DirNode)>,
     index: Index,
-    indexing: Option<Receiver<(Project, Index, Option<String>)>>,
+    indexing: Option<Receiver<(Project, Index, Option<String>, Vec<(String, DirNode)>)>>,
     /// kotlin-lsp was started (or found missing) for this project.
     lsp_tried: bool,
     stability: HashMap<String, Stability>,
@@ -357,6 +363,8 @@ impl App {
                 hits: Vec::new(),
                 selected: 0,
                 stale: true,
+                pinned: Vec::new(),
+                title: None,
             });
         }
         app
@@ -393,7 +401,8 @@ impl App {
             let project = Project::open(&dir);
             let index = Index::build(&project.files);
             let branch = crate::git::branch(&project.root);
-            let _ = tx.send((project, index, branch));
+            let tree = build_tree(&project);
+            let _ = tx.send((project, index, branch, tree));
             c.request_repaint();
         });
         self.indexing = Some(rx);
@@ -408,7 +417,6 @@ impl App {
         ctx: &egui::Context,
     ) {
         remember_project(&project.root);
-        self.tree = build_tree(&project);
         self.index = index;
         for t in &self.tabs {
             self.index.update(&t.path, &t.text);
@@ -496,6 +504,7 @@ impl App {
                 deleted: false,
                 git: Default::default(),
                 rev: 0,
+                annotations: None,
             };
             tab.reanalyse();
             if let Some(l) = self.lsp.as_mut().filter(|_| is_code(path)) {
@@ -610,13 +619,7 @@ impl App {
             0 => self.status = format!("No declaration found for `{word}` in the project"),
             1 => self.open_file(&defs[0].path.clone(), Some(defs[0].offset)),
             _ => {
-                self.search = Some(Search {
-                    kind: SearchKind::Symbol,
-                    query: word,
-                    hits: defs,
-                    selected: 0,
-                    stale: false,
-                });
+                self.pick(format!("Declarations of `{word}`"), defs);
             }
         }
     }
@@ -708,9 +711,10 @@ impl App {
 
     fn poll(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.indexing
-            && let Ok((project, index, branch)) = rx.try_recv()
+            && let Ok((project, index, branch, tree)) = rx.try_recv()
         {
             self.indexing = None;
+            self.tree = tree;
             self.project_ready(project, index, branch, ctx);
         }
         if let Some(rx) = &self.stability_rx
@@ -836,6 +840,8 @@ impl App {
                 hits: Vec::new(),
                 selected: 0,
                 stale: true,
+                pinned: Vec::new(),
+                title: None,
             })
         };
         // double Shift: two Shift presses within 400 ms with no other key between
@@ -893,6 +899,8 @@ impl App {
                 hits: Vec::new(),
                 selected: 0,
                 stale: true,
+                pinned: Vec::new(),
+                title: None,
             })
         };
         match action {
@@ -906,6 +914,7 @@ impl App {
             Action::FindInFiles => self.search = open(SearchKind::FindInFiles),
             Action::GotoDefinition => self.goto_definition(),
             Action::References => self.find_references(ctx),
+            Action::Implementations => self.goto_implementations(),
             Action::Back => self.back(),
             Action::Forward => self.fwd(),
             Action::Complete => {
@@ -1032,7 +1041,14 @@ impl App {
             s.selected = s.selected.saturating_sub(1);
         }
         if s.stale {
-            s.hits = self.search_hits(s.kind, &s.query);
+            s.hits = if s.kind == SearchKind::Pick {
+                index::rank_by(&s.query, s.pinned.iter(), |h| &h.name, 200)
+                    .into_iter()
+                    .map(|(score, h)| Hit { score, ..h.clone() })
+                    .collect()
+            } else {
+                self.search_hits(s.kind, &s.query)
+            };
             s.selected = 0;
             s.stale = false;
         }
@@ -1054,11 +1070,13 @@ impl App {
                 chosen = Some((h.path.clone(), h.offset));
             }
         }
-        let title = format!(
-            "{}   {}",
-            s.kind.action().label(),
-            keymap::text(self.keymap, s.kind.action())
-        );
+        let title = s.title.clone().unwrap_or_else(|| {
+            format!(
+                "{}   {}",
+                s.kind.action().label(),
+                keymap::text(self.keymap, s.kind.action())
+            )
+        });
         let hint = s.kind.hint();
         egui::Window::new(title)
             .collapsible(false)
@@ -1173,6 +1191,7 @@ impl App {
                     .collect()
             }
             SearchKind::FindInFiles | SearchKind::GotoLine => Vec::new(),
+            SearchKind::Pick => Vec::new(), // filtered in search_window from `pinned`
         }
     }
 
@@ -1185,6 +1204,8 @@ impl App {
             hits: Vec::new(),
             selected: 0,
             stale: true,
+            pinned: Vec::new(),
+            title: None,
         };
         ui.horizontal(|ui| {
             let name = self
@@ -1361,6 +1382,9 @@ impl App {
     }
 
     fn editor(&mut self, ui: &mut Ui) {
+        self.refresh_annotations();
+        let mut request: Option<gutter::Request> = None;
+        let km = self.keymap;
         if self.tabs.is_empty() {
             ui.centered_and_justified(|ui| {
                 let km = self.keymap;
@@ -1484,6 +1508,7 @@ impl App {
             selection,
             lints,
             diagnostics,
+            annotations,
             ..
         } = tab;
         let marks_key = marks.iter().fold(0x9e37u64, |h, (r, c)| {
@@ -1531,6 +1556,10 @@ impl App {
                         )
                         .0
                     });
+                    let (icons, _) = ui.allocate_exact_size(
+                        egui::vec2(gutter::ICON_WIDTH, row_h * lines as f32),
+                        egui::Sense::hover(),
+                    );
                     let (gutter, _) = ui.allocate_exact_size(
                         egui::vec2(gutter_w, row_h * lines as f32),
                         egui::Sense::hover(),
@@ -1609,14 +1638,49 @@ impl App {
                     {
                         open_commit = Some(sha);
                     }
-                    if let Some(b) = &blame {
-                        let line = cursor_line;
-                        if let Some(sha) =
-                            git_ui::paint_inline_blame(ui, b, &out.galley, out.galley_pos, line)
+                    let mut badge_right = None;
+                    if let Some(a) = annotations.as_ref() {
+                        if let Some(r) =
+                            gutter::paint_marks(ui, a, icons, &out.galley, out.galley_pos)
                         {
-                            open_commit = Some(sha);
+                            request = Some(r);
+                        }
+                        badge_right =
+                            gutter::paint_badges(ui, a, &out.galley, out.galley_pos, cursor_line);
+                    }
+                    if let Some(b) = &blame
+                        && let Some(sha) = git_ui::paint_inline_blame(
+                            ui,
+                            b,
+                            &out.galley,
+                            out.galley_pos,
+                            cursor_line,
+                            badge_right,
+                        )
+                    {
+                        open_commit = Some(sha);
+                    }
+                    // right-click: move the cursor there (unless inside the selection), then the menu
+                    let resp = &out.response.response;
+                    if resp.secondary_clicked()
+                        && let Some(p) = resp.interact_pointer_pos()
+                    {
+                        let b = byte_of_char(
+                            text,
+                            out.galley.cursor_from_pos(p - out.galley_pos).index.0,
+                        );
+                        if !(selection.start..=selection.end).contains(&b)
+                            || selection.start == selection.end
+                        {
+                            *goto = Some(b);
                         }
                     }
+                    let has_selection = selection.start != selection.end;
+                    resp.context_menu(|ui| {
+                        if let Some(r) = gutter::context_menu(ui, km, has_selection) {
+                            request = Some(r);
+                        }
+                    });
                     changed = out.response.changed();
                     cmd_click = out.response.clicked() && ui.input(|i| i.modifiers.command);
                     // hover a problem to read it
@@ -1654,6 +1718,9 @@ impl App {
         }
         if let Some(sha) = open_commit {
             self.open_commit(&sha, &path, &ui.ctx().clone());
+        }
+        if let Some(r) = request {
+            self.handle(r, &ui.ctx().clone());
         }
         self.completion_popup(ui, popup_pos);
     }
@@ -1834,115 +1901,151 @@ impl App {
         let mut jump: Option<usize> = None;
         let mut pick = None;
         let mut render = false;
-        let mut dump = false;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            egui::CollapsingHeader::new(RichText::new(format!("{}  Composables ({})", ic::CUBE, composables.len())).strong()).default_open(composables.len() <= 8).show(ui, |ui| {
-                egui::ScrollArea::vertical().id_salt("composables").max_height(220.0).show(ui, |ui| {
-                    for d in &composables {
-                        let mut label = RichText::new(&d.name).monospace();
-                        if d.is_preview() {
-                            label = label.italics();
-                        }
-                        if ui.selectable_label(d.name == current, label).clicked() {
-                            pick = Some(d.name.clone());
-                            jump = Some(d.offset);
-                        }
-                    }
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::CollapsingHeader::new(
+                    RichText::new(format!("{}  Composables ({})", ic::CUBE, composables.len()))
+                        .strong(),
+                )
+                .default_open(composables.len() <= 8)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("composables")
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            for d in &composables {
+                                let mut label = RichText::new(&d.name).monospace();
+                                if d.is_preview() {
+                                    label = label.italics();
+                                }
+                                if ui.selectable_label(d.name == current, label).clicked() {
+                                    pick = Some(d.name.clone());
+                                    jump = Some(d.offset);
+                                }
+                            }
+                        });
                 });
-            });
-            let Some(d) = composables.iter().find(|d| d.name == current) else { return };
-            let key = (tab.path.clone(), tab.rev, self.index.generation, self.outputs_gen, d.name.clone());
-            if self.compose_view.as_ref().is_none_or(|v| v.key != key) {
-                let is_ui = |n: &str| compose::is_ui_call(n, &self.index);
-                let (stability, guessed) = match self.stability.get(&d.name) {
-                    Some(s) => (s.clone(), false),
-                    None => (compose::guess(d, &self.index), true),
+                let Some(d) = composables.iter().find(|d| d.name == current) else {
+                    return;
                 };
-                let previews: Vec<String> = tab.syms.decls.iter().filter(|d| d.is_preview()).map(|d| d.name.clone()).collect();
-                let tool = self.project.as_ref().and_then(|pr| pr.module_of(&tab.path)).and_then(|m| PreviewTool::detect(m).map(|t| (m.clone(), t)));
-                let images = tool.as_ref().map(|(m, t)| t.images(m, &previews)).unwrap_or_default();
-                self.compose_view = Some(ComposeView { key, tree: compose::tree(&tab.text, d, &is_ui), stability, guessed, tool, images });
-            }
-            let Some(view) = &self.compose_view else { return };
-            ui.separator();
-            theme::section(ui, ic::TREE_STRUCTURE, &format!("UI tree · {}", d.name));
-            if view.tree.is_empty() {
-                ui.label(RichText::new("No UI calls found.").weak());
-            }
-            for n in &view.tree {
-                node_ui(ui, n, &mut jump);
-            }
-
-            ui.separator();
-            theme::section(ui, ic::LIGHTNING, "Stability");
-            let (st, guessed) = (&view.stability, view.guessed);
-            ui.horizontal(|ui| {
-                let yes_no = |b: Option<bool>| b.map_or("?", |b| if b { "yes" } else { "no" });
-                ui.label(format!("skippable: {}   restartable: {}", yes_no(st.skippable), yes_no(st.restartable)));
-            });
-            ui.label(RichText::new(if guessed { "Source: local guess. Run stabilityDump (skydoves plugin) or a build with Compose compiler reports for exact results.".to_string() } else { format!("Source: {}", st.source) }).weak().small());
-            egui::Grid::new("stability").striped(true).show(ui, |ui| {
-                for p in &st.params {
-                    let (txt, color) = match p.verdict {
-                        Verdict::Stable => ("STABLE", Color32::LIGHT_GREEN),
-                        Verdict::Unstable => ("UNSTABLE", ERROR),
-                        Verdict::Runtime => ("RUNTIME", WARN),
-                        Verdict::Unknown => ("UNKNOWN", Color32::GRAY),
-                    };
-                    ui.label(RichText::new(&p.name).monospace());
-                    ui.label(RichText::new(txt).color(color).strong());
-                    ui.label(RichText::new(&p.reason).small());
-                    ui.end_row();
-                }
-            });
-            if ui.button("Run stabilityDump").on_hover_text("Needs the com.github.skydoves.compose.stability.analyzer plugin in the module").clicked() {
-                dump = true;
-            }
-
-            ui.separator();
-            theme::section(ui, ic::IMAGE, "Previews");
-            let previews: Vec<String> = tab.syms.decls.iter().filter(|d| d.is_preview()).map(|d| d.name.clone()).collect();
-            if previews.is_empty() {
-                ui.label(RichText::new("No @Preview functions in this file.").weak());
-            }
-            for p in &previews {
-                if ui.link(RichText::new(p).monospace()).clicked() {
-                    jump = tab.syms.decls.iter().find(|d| &d.name == p).map(|d| d.offset);
-                }
-            }
-            match &view.tool {
-                Some((m, tool)) => {
-                    ui.horizontal(|ui| {
-                        render = ui.add_enabled(self.gradle.is_none(), egui::Button::new(format!("{}  Render previews", ic::IMAGE))).on_hover_text(tool.task(m)).clicked();
-                        ui.label(RichText::new(format!("{tool:?}")).weak());
+                let key = (
+                    tab.path.clone(),
+                    tab.rev,
+                    self.index.generation,
+                    self.outputs_gen,
+                    d.name.clone(),
+                );
+                if self.compose_view.as_ref().is_none_or(|v| v.key != key) {
+                    let is_ui = |n: &str| compose::is_ui_call(n, &self.index);
+                    let previews: Vec<String> = tab
+                        .syms
+                        .decls
+                        .iter()
+                        .filter(|d| d.is_preview())
+                        .map(|d| d.name.clone())
+                        .collect();
+                    let tool = self
+                        .project
+                        .as_ref()
+                        .and_then(|pr| pr.module_of(&tab.path))
+                        .and_then(|m| PreviewTool::detect(m).map(|t| (m.clone(), t)));
+                    let images = tool
+                        .as_ref()
+                        .map(|(m, t)| t.images(m, &previews))
+                        .unwrap_or_default();
+                    self.compose_view = Some(ComposeView {
+                        key,
+                        tree: compose::tree(&tab.text, d, &is_ui),
+                        tool,
+                        images,
                     });
-                    // drop textures of images no longer shown, so memory stays flat
-                    self.textures.retain(|p, _| view.images.iter().any(|(_, q)| q == p));
-                    for (name, path) in &view.images {
-                        ui.label(RichText::new(name).small());
-                        if let Some(tex) = texture(ui.ctx(), &mut self.textures, path) {
-                            let size = tex.size_vec2();
-                            let w = ui.available_width().min(size.x);
-                            ui.image((tex.id(), egui::vec2(w, size.y * w / size.x)));
-                        }
+                }
+                let Some(view) = &self.compose_view else {
+                    return;
+                };
+                ui.separator();
+                theme::section(ui, ic::TREE_STRUCTURE, &format!("UI tree · {}", d.name));
+                if view.tree.is_empty() {
+                    ui.label(RichText::new("No UI calls found.").weak());
+                }
+                for n in &view.tree {
+                    node_ui(ui, n, &mut jump);
+                }
+
+                ui.separator();
+                theme::section(ui, ic::IMAGE, "Previews");
+                let previews: Vec<String> = tab
+                    .syms
+                    .decls
+                    .iter()
+                    .filter(|d| d.is_preview())
+                    .map(|d| d.name.clone())
+                    .collect();
+                if previews.is_empty() {
+                    ui.label(RichText::new("No @Preview functions in this file.").weak());
+                }
+                for p in &previews {
+                    if ui.link(RichText::new(p).monospace()).clicked() {
+                        jump = tab
+                            .syms
+                            .decls
+                            .iter()
+                            .find(|d| &d.name == p)
+                            .map(|d| d.offset);
                     }
                 }
-                None if !previews.is_empty() => {
-                    ui.label(RichText::new(gradle::SETUP_HELP).small());
+                match &view.tool {
+                    Some((m, tool)) => {
+                        ui.horizontal(|ui| {
+                            render = ui
+                                .add_enabled(
+                                    self.gradle.is_none(),
+                                    egui::Button::new(format!("{}  Render previews", ic::IMAGE)),
+                                )
+                                .on_hover_text(tool.task(m))
+                                .clicked();
+                            ui.label(RichText::new(format!("{tool:?}")).weak());
+                        });
+                        // drop textures of images no longer shown, so memory stays flat
+                        self.textures
+                            .retain(|p, _| view.images.iter().any(|(_, q)| q == p));
+                        for (name, path) in &view.images {
+                            ui.label(RichText::new(name).small());
+                            if let Some(tex) = texture(ui.ctx(), &mut self.textures, path) {
+                                let size = tex.size_vec2();
+                                let w = ui.available_width().min(size.x);
+                                ui.image((tex.id(), egui::vec2(w, size.y * w / size.x)));
+                            }
+                        }
+                    }
+                    None if !previews.is_empty() => {
+                        ui.label(RichText::new(gradle::SETUP_HELP).small());
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
 
-            ui.separator();
-            theme::section(ui, ic::CHECK_CIRCLE, "Compose checks");
-            for l in tab.lints.iter() {
-                let line = tab.text[..l.offset].matches('\n').count() + 1;
-                let c = if l.severity == Severity::Warning { WARN } else { INFO };
-                if ui.link(RichText::new(format!("{line}: [{}] {}", l.rule, l.message)).color(c).small()).clicked() {
-                    jump = Some(l.offset);
+                ui.separator();
+                theme::section(ui, ic::CHECK_CIRCLE, "Compose checks");
+                for l in tab.lints.iter() {
+                    let line = tab.text[..l.offset].matches('\n').count() + 1;
+                    let c = if l.severity == Severity::Warning {
+                        WARN
+                    } else {
+                        INFO
+                    };
+                    if ui
+                        .link(
+                            RichText::new(format!("{line}: [{}] {}", l.rule, l.message))
+                                .color(c)
+                                .small(),
+                        )
+                        .clicked()
+                    {
+                        jump = Some(l.offset);
+                    }
                 }
-            }
-        });
+            });
         let path = tab.path.clone();
         if let Some(n) = pick {
             self.selected_composable = Some(n);
@@ -1961,15 +2064,6 @@ impl App {
         {
             let ctx = ui.ctx().clone();
             self.run_gradle(tool.task(m), &ctx);
-        }
-        if dump && let Some(m) = &task_module {
-            let ctx = ui.ctx().clone();
-            let prefix = if m.name == ":" {
-                String::new()
-            } else {
-                m.name.clone()
-            };
-            self.run_gradle(format!("{prefix}:stabilityDump"), &ctx);
         }
     }
 

@@ -280,12 +280,23 @@ fn e2e_compose_panel_tree_stability_lints_preview_render() {
     }
     let view = h.state().compose_view.as_ref().unwrap();
     assert_eq!(view.tree[0].name, "Column");
+    // stability is inline now: a badge after `fun UserCard(` says one parameter is unstable
+    let a = tab(&h).annotations.as_ref().expect("annotations");
+    let badge = a
+        .badges
+        .iter()
+        .find(|b| b.line == 5)
+        .expect("badge on the UserCard line");
+    assert!(badge.text.ends_with("1 unstable"), "{}", badge.text);
     assert_eq!(
-        view.stability.params[0].verdict,
-        Verdict::Unstable,
+        badge.stability.params[0].verdict,
+        crate::compose::Verdict::Unstable,
         "User has a var"
     );
-    h.get_by_label("UNSTABLE");
+    assert!(
+        h.query_by_label("UNSTABLE").is_none(),
+        "no separate stability section any more"
+    );
     let rules: Vec<&str> = tab(&h).lints.iter().map(|l| l.rule).collect();
     assert!(
         rules.contains(&"remember-state") && rules.contains(&"modifier-default"),
@@ -606,6 +617,26 @@ fn e2e_snapshot_for_review() {
         let img = h.render().expect("render needs the wgpu feature");
         img.save(Path::new(&dir).join("e2e-snapshot.png")).unwrap();
     }
+    // a second snapshot with gutter icons and an inline stability badge on one screen
+    std::fs::write(f.path("app/src/main/java/com/demo/data/Repo.kt"), REPO_KT).unwrap();
+    let both = format!(
+        "{CARD_KT}\n{}",
+        REPO_KT.replace("package com.demo.data\n", "")
+    );
+    std::fs::write(f.path("app/src/main/java/com/demo/ui/Both.kt"), both).unwrap();
+    wait(&mut h, "index Both", |a| {
+        a.index.find_type("FakeRepo").is_some()
+    });
+    open(&mut h, &f.path("app/src/main/java/com/demo/ui/Both.kt"));
+    place_cursor(&mut h, "fun UserCard", 4);
+    wait(&mut h, "blame", |a| a.tabs[a.active].git.blame.is_some());
+    steps(&mut h, 5);
+    if let Ok(dir) = std::env::var("DROID_LITE_SNAPSHOT_DIR") {
+        h.render()
+            .unwrap()
+            .save(Path::new(&dir).join("e2e-gutter.png"))
+            .unwrap();
+    }
 }
 
 #[test]
@@ -822,4 +853,124 @@ fn watchdog_reports_only_slow_frames() {
     let mut w = Watchdog::start();
     w.stage("startup", || std::thread::sleep(Duration::from_millis(120)));
     assert!(w.finish(1).is_none(), "first frames are skipped");
+}
+
+const REPO_KT: &str = "package com.demo.data\n\ninterface Repo {\n    fun load(): List<User>\n}\n\nclass RealRepo : Repo {\n    override fun load(): List<User> = emptyList()\n}\n\nclass FakeRepo : Repo {\n    override fun load(): List<User> = listOf(User(\"a\", 1))\n}\n";
+
+/// Clicks a point the way a mouse would.
+fn click_at(h: &mut Harness<'static, App>, pos: egui::Pos2, button: egui::PointerButton) {
+    h.event(Event::PointerMoved(pos));
+    h.event(Event::PointerButton {
+        pos,
+        button,
+        pressed: true,
+        modifiers: Modifiers::NONE,
+    });
+    steps(h, 1);
+    h.event(Event::PointerButton {
+        pos,
+        button,
+        pressed: false,
+        modifiers: Modifiers::NONE,
+    });
+    steps(h, 3);
+}
+
+/// Screen position of `line` (0-based) in the gutter icon column of the active editor.
+fn icon_pos(h: &mut Harness<'static, App>, line: usize) -> egui::Pos2 {
+    let editor = h
+        .get_by_role(egui::accesskit::Role::MultilineTextInput)
+        .rect();
+    let ctx = h.ctx.clone();
+    let font = egui::FontId::monospace(FONT_SIZE);
+    let (row_h, char_w) = ctx.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
+    let lines = tab(h).text.matches('\n').count() + 1;
+    let gutter_w = char_w * lines.to_string().len().max(3) as f32 + 18.0;
+    egui::pos2(
+        editor.left() - gutter_w - gutter::ICON_WIDTH + 7.0,
+        editor.top() + row_h * (line as f32 + 0.5),
+    )
+}
+
+#[test]
+fn e2e_gutter_icons_implementations_and_overrides() {
+    let f = Fixture::new("gutter");
+    std::fs::write(f.path("app/src/main/java/com/demo/data/Repo.kt"), REPO_KT).unwrap();
+    let mut h = f.harness();
+    let repo = f.path("app/src/main/java/com/demo/data/Repo.kt");
+    open(&mut h, &repo);
+    steps(&mut h, 3);
+    let a = tab(&h).annotations.as_ref().unwrap();
+    let marks: Vec<(usize, bool, usize)> = a
+        .marks
+        .iter()
+        .map(|m| (m.line, m.up, m.targets.len()))
+        .collect();
+    // interface Repo (line 2): implemented by 2; fun load (3): implemented in 2;
+    // RealRepo (6) / FakeRepo (10): implement Repo; their load (7, 11): override
+    for want in [
+        (2, false, 2),
+        (3, false, 2),
+        (6, true, 1),
+        (7, true, 1),
+        (10, true, 1),
+        (11, true, 1),
+    ] {
+        assert!(marks.contains(&want), "missing {want:?} in {marks:?}");
+    }
+    // clicking the "implemented by" icon of `interface Repo` offers both classes
+    let p = icon_pos(&mut h, 2);
+    click_at(&mut h, p, egui::PointerButton::Primary);
+    let s = h
+        .state()
+        .search
+        .as_ref()
+        .expect("picker after clicking the icon");
+    assert_eq!(s.kind, SearchKind::Pick);
+    assert_eq!(s.hits.len(), 2);
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    // clicking the "overrides" icon of FakeRepo.load jumps to Repo.load
+    let p = icon_pos(&mut h, 11);
+    click_at(&mut h, p, egui::PointerButton::Primary);
+    assert!(
+        tab(&h).text[tab(&h).cursor..].starts_with("load(): List<User>\n}"),
+        "at the interface method"
+    );
+    // ⌘T on the interface name lists the implementations too (Eclipse quick hierarchy)
+    place_cursor(&mut h, "interface Repo", 10);
+    key(&mut h, Modifiers::COMMAND, Key::T);
+    assert_eq!(h.state().search.as_ref().map(|s| s.hits.len()), Some(2));
+}
+
+#[test]
+fn e2e_right_click_menu_runs_commands() {
+    let f = Fixture::new("menu");
+    let mut h = f.harness();
+    open(&mut h, &f.path("app/src/main/java/com/demo/ui/UserCard.kt"));
+    let editor = h
+        .get_by_role(egui::accesskit::Role::MultilineTextInput)
+        .rect();
+    let ctx = h.ctx.clone();
+    let row_h = ctx.fonts_mut(|f| f.row_height(&egui::FontId::monospace(FONT_SIZE)));
+    // right-click on line 9 (`Text(user.name)`) moves the cursor there and opens the menu
+    click_at(
+        &mut h,
+        egui::pos2(editor.left() + 120.0, editor.top() + row_h * 8.5),
+        egui::PointerButton::Secondary,
+    );
+    for label in [
+        "Go to declaration",
+        "Go to implementations",
+        "Find references",
+        "Rename",
+    ] {
+        h.get_by_label_contains(label);
+    }
+    h.get_by_label_contains("Comment / uncomment lines").click();
+    steps(&mut h, 3);
+    assert!(
+        tab(&h).text.contains("        // Text(user.name)"),
+        "{}",
+        tab(&h).text
+    );
 }

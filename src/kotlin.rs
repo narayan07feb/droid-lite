@@ -61,6 +61,8 @@ pub struct Decl {
     pub mutable: bool,
     /// Byte range of a fun body, including braces or the `=` expression.
     pub body: Option<Range<usize>>,
+    /// Direct supertypes of a class, simple names (`: Base(), Api` / `extends Base implements Api`).
+    pub supers: Vec<String>,
 }
 
 impl Decl {
@@ -407,6 +409,7 @@ pub fn scan(src: &str) -> FileSyms {
                         ty: p.ty.clone(),
                         mutable: p.mutable == Some(true),
                         body: None,
+                        supers: Vec::new(),
                     });
                 }
                 out.decls.push(Decl {
@@ -420,9 +423,13 @@ pub fn scan(src: &str) -> FileSyms {
                     ty: String::new(),
                     mutable: false,
                     body: None,
+                    supers: Vec::new(),
                 });
                 // the header (supertypes, where clause) runs until the body brace or the next declaration
+                let class_idx = out.decls.len() - 1;
                 let mut depth = 0;
+                let (mut in_supers, mut delegate) = (false, false);
+                let mut supers = Vec::new();
                 while s.i < s.t.len() {
                     let x = s.text(s.i);
                     if depth == 0
@@ -436,10 +443,23 @@ pub fn scan(src: &str) -> FileSyms {
                     match x {
                         "(" | "<" => depth += 1,
                         ")" | ">" => depth -= 1,
+                        ":" | "extends" | "implements" if depth == 0 => in_supers = true,
+                        "where" if depth == 0 => in_supers = false,
+                        "by" if depth == 0 => delegate = true,
+                        "," if depth == 0 => delegate = false,
+                        _ if depth == 0
+                            && in_supers
+                            && !delegate
+                            && s.kind(s.i) == Some(Tok::Ident)
+                            && !s.is(s.i + 1, ".") =>
+                        {
+                            supers.push(x.trim_matches('`').to_string());
+                        }
                         _ => {}
                     }
                     s.i += 1;
                 }
+                out.decls[class_idx].supers = supers;
                 if s.is(s.i, "{") {
                     pending_body = Some(name);
                 }
@@ -522,6 +542,7 @@ pub fn scan(src: &str) -> FileSyms {
                     ty,
                     mutable: false,
                     body,
+                    supers: Vec::new(),
                 });
             }
             "val" | "var" => {
@@ -579,6 +600,7 @@ pub fn scan(src: &str) -> FileSyms {
                         ty,
                         mutable,
                         body: None,
+                        supers: Vec::new(),
                     });
                 }
                 annotations.clear();
@@ -598,6 +620,7 @@ pub fn scan(src: &str) -> FileSyms {
                         ty: String::new(),
                         mutable: false,
                         body: None,
+                        supers: Vec::new(),
                     });
                 }
             }
@@ -622,6 +645,7 @@ pub fn scan(src: &str) -> FileSyms {
                         ty: c.clone(),
                         mutable: false,
                         body: None,
+                        supers: Vec::new(),
                     });
                 }
                 annotations.clear();
@@ -754,6 +778,20 @@ typealias Users = List<User>
         let vm = find(&f, "Vm");
         assert_eq!(vm.params[0].name, "api");
         assert_eq!(find(&f, "state").container.as_deref(), Some("Vm"));
+    }
+
+    #[test]
+    fn supertypes_of_kotlin_and_java_classes() {
+        let f = scan(
+            "class A(val x: Int) : Base(x), com.demo.Api, Listener<Int> by impl {\n}\ninterface I : J, K\nobject O : Runnable { override fun run() {} }\nclass Plain\n",
+        );
+        let supers = |n: &str| find(&f, n).supers.clone();
+        assert_eq!(supers("A"), vec!["Base", "Api", "Listener"]);
+        assert_eq!(supers("I"), vec!["J", "K"]);
+        assert_eq!(supers("O"), vec!["Runnable"]);
+        assert!(supers("Plain").is_empty());
+        let j = scan("public class Foo extends Bar implements Baz, java.io.Closeable {\n}\n");
+        assert_eq!(find(&j, "Foo").supers, vec!["Bar", "Baz", "Closeable"]);
     }
 
     #[test]
