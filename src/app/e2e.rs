@@ -1245,3 +1245,46 @@ fn e2e_git_tab_lists_changes_stage_commit_and_branch() {
     .unwrap();
     assert_eq!(log.trim(), "Rename count");
 }
+
+#[test]
+fn e2e_ctrl_and_cmd_click_open_the_declaration() {
+    let f = Fixture::new("ctrlclick");
+    let mut h = f.harness();
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    for mods in [Modifiers::CTRL, Modifiers::COMMAND] {
+        open(&mut h, &card);
+        let editor = h
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .rect();
+        let ctx = h.ctx.clone();
+        let font = egui::FontId::monospace(FONT_SIZE);
+        let (row_h, char_w) = ctx.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
+        // the type `User` in "fun UserCard(user: User, …)" on line 6
+        let pos = egui::pos2(editor.left() + char_w * 21.5, editor.top() + row_h * 5.5);
+        h.event(Event::ModifiersChanged(mods));
+        h.event(Event::PointerMoved(pos));
+        steps(&mut h, 2);
+        h.event(Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: mods,
+        });
+        steps(&mut h, 1);
+        h.event(Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: mods,
+        });
+        steps(&mut h, 3);
+        h.event(Event::ModifiersChanged(Modifiers::NONE));
+        steps(&mut h, 2);
+        assert_eq!(tab(&h).path, user, "{mods:?}-click on `User` opens User.kt");
+        assert!(
+            tab(&h).text[tab(&h).cursor..].starts_with("User("),
+            "{mods:?}: cursor on the declaration"
+        );
+    }
+}

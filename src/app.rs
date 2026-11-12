@@ -1851,7 +1851,10 @@ impl App {
                         }
                     });
                     changed = out.response.changed();
-                    cmd_click = out.response.clicked() && ui.input(|i| i.modifiers.command);
+                    // ⌘-click (Mac) or Ctrl-click (Eclipse / Windows habit) opens the declaration,
+                    // matching the ⌘ / Ctrl hover underline
+                    cmd_click = out.response.clicked()
+                        && ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
                     // hover a problem to read it
                     if let Some(pos) = out.response.hover_pos() {
                         let c = out.galley.cursor_from_pos(pos - out.galley_pos);
