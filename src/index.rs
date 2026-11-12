@@ -288,6 +288,33 @@ impl Index {
         })
     }
 
+    /// Kotlin Multiplatform: the `actual`s of an `expect` declaration, or the `expect` of an
+    /// `actual` one. They share the name, the package and the enclosing class, in other files;
+    /// each hit's detail starts with its source set (`androidMain · …`).
+    pub fn counterparts(&self, path: &Path, f: &FileSyms, d: &Decl) -> Vec<Hit> {
+        let Some(role) = kmp_role(f, d) else {
+            return Vec::new();
+        };
+        let want = if role == "expect" { "actual" } else { "expect" };
+        let mut hits: Vec<Hit> = self
+            .named(&d.name)
+            .filter(|(p, g, x)| {
+                p.as_path() != path
+                    && g.package == f.package
+                    && x.container == d.container
+                    && x.kind == d.kind
+                    && kmp_role(g, x) == Some(want)
+            })
+            .map(|(p, g, x)| {
+                let mut h = hit(p, g, x);
+                h.detail = format!("{} · {}", source_set(p), h.detail);
+                h
+            })
+            .collect();
+        hits.sort_by(|a, b| a.detail.cmp(&b.detail));
+        hits
+    }
+
     /// The declaration an `override` member overrides: the nearest supertype of `container`
     /// that declares `member`.
     pub fn overridden(&self, container: &str, member: &str) -> Option<Hit> {
@@ -355,6 +382,29 @@ fn share(f: &mut FileSyms, seen: &mut HashSet<Atom>) {
             one(c);
         }
     }
+}
+
+/// `expect` or `actual`: the declaration's own modifier, or for a member, its class's `expect`
+/// (members of an `expect class` carry no modifier of their own).
+pub fn kmp_role(f: &FileSyms, d: &Decl) -> Option<&'static str> {
+    if d.has_modifier("expect") {
+        return Some("expect");
+    }
+    if d.has_modifier("actual") {
+        return Some("actual");
+    }
+    let c = d.container.as_deref()?;
+    f.decls
+        .iter()
+        .any(|x| *x.name == *c && x.kind.is_type() && x.has_modifier("expect"))
+        .then_some("expect")
+}
+
+/// The source set of a file: the folder after `src/` (`commonMain`, `androidMain`, `test`).
+pub fn source_set(p: &Path) -> String {
+    let mut it = p.components().map(|c| c.as_os_str().to_string_lossy());
+    it.by_ref().find(|c| c == "src");
+    it.next().map(|c| c.into_owned()).unwrap_or_default()
 }
 
 fn names_of(f: &FileSyms) -> Vec<String> {
@@ -476,6 +526,73 @@ pub fn rank_by<T>(
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn pairs_expect_and_actual_across_source_sets() {
+        let mut idx = Index::default();
+        let common = PathBuf::from("/p/shared/src/commonMain/kotlin/a/Platform.kt");
+        let android = PathBuf::from("/p/shared/src/androidMain/kotlin/a/Platform.android.kt");
+        let ios = PathBuf::from("/p/shared/src/iosMain/kotlin/a/Platform.ios.kt");
+        let other = PathBuf::from("/p/shared/src/androidMain/kotlin/b/Platform.kt");
+        idx.update(&common, "package a\nexpect fun platformName(): String\nexpect class Clock {\n    fun now(): Long\n}\n");
+        idx.update(&android, "package a\nactual fun platformName(): String = \"Android\"\nactual class Clock {\n    actual fun now(): Long = 0\n}\n");
+        idx.update(
+            &ios,
+            "package a\nactual fun platformName(): String = \"iOS\"\n",
+        );
+        // same name, other package: not an actual of a.platformName
+        idx.update(
+            &other,
+            "package b\nactual fun platformName(): String = \"x\"\n",
+        );
+        let decl = |p: &Path, name: &str| {
+            let f = &idx.files[p];
+            (f, f.decls.iter().find(|d| &*d.name == name).unwrap())
+        };
+        let (f, d) = decl(&common, "platformName");
+        let sets: Vec<String> = idx
+            .counterparts(&common, f, d)
+            .iter()
+            .map(|h| h.detail.split(" · ").next().unwrap().to_string())
+            .collect();
+        assert_eq!(sets, ["androidMain", "iosMain"]);
+        let (f, d) = decl(&ios, "platformName");
+        let back = idx.counterparts(&ios, f, d);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].path, common);
+        // a member of an `expect class` has no modifier of its own
+        let (f, d) = decl(&common, "now");
+        assert_eq!(kmp_role(f, d), Some("expect"));
+        assert_eq!(idx.counterparts(&common, f, d)[0].path, android);
+        // a plain declaration has none
+        let (f, d) = decl(&common, "Clock");
+        assert_eq!(idx.counterparts(&common, f, d).len(), 1);
+    }
+
+    #[test]
+    fn a_variable_named_actual_is_not_a_modifier() {
+        // `actual` read by a property, then another declaration: still not a modifier of `t`
+        let f = scan(
+            "class T {\n    val expected = 1\n    val actual = 2\n    val copy = actual\n    fun t() { assertEquals(expected, actual) }\n}\n",
+        );
+        let names: Vec<&str> = f.decls.iter().map(|d| &*d.name).collect();
+        assert!(
+            names.contains(&"actual") && names.contains(&"expected"),
+            "{names:?}"
+        );
+        assert!(f.decls.iter().all(|d| d.modifiers.is_empty()));
+        // an enum entry named `actual` stays an entry
+        let e = scan("enum class Match {\n    expected,\n    actual\n}\nfun after() {}\n");
+        let names: Vec<&str> = e.decls.iter().map(|d| &*d.name).collect();
+        assert!(names.contains(&"actual"), "{names:?}");
+        assert!(
+            e.decls
+                .iter()
+                .filter(|d| matches!(&*d.name, "actual" | "after"))
+                .all(|d| d.modifiers.is_empty()),
+            "{names:?}"
+        );
+    }
 
     #[test]
     fn files_scanned_together_share_repeated_strings() {

@@ -2110,3 +2110,62 @@ fn e2e_tree_android_and_project_views_nested_modules_and_filter() {
     steps(&mut h, 3);
     assert_eq!(tab(&h).path, test);
 }
+
+#[test]
+fn e2e_kmp_expect_actual_gutter_and_jump() {
+    let f = Fixture::new("kmp");
+    std::fs::write(
+        f.path("settings.gradle.kts"),
+        "rootProject.name = \"Demo\"\ninclude(\":app\")\ninclude(\":shared\")\n",
+    )
+    .unwrap();
+    let write = |rel: &str, text: &str| {
+        let p = f.path(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, text).unwrap();
+        p
+    };
+    write("shared/build.gradle.kts", "");
+    let common = write(
+        "shared/src/commonMain/kotlin/com/demo/Platform.kt",
+        "package com.demo\n\nexpect fun platformName(): String\n",
+    );
+    let android = write(
+        "shared/src/androidMain/kotlin/com/demo/Platform.android.kt",
+        "package com.demo\n\nactual fun platformName(): String = \"Android\"\n",
+    );
+    write(
+        "shared/src/iosMain/kotlin/com/demo/Platform.ios.kt",
+        "package com.demo\n\nactual fun platformName(): String = \"iOS\"\n",
+    );
+    let mut h = f.harness();
+    open(&mut h, &common);
+    steps(&mut h, 3);
+    let marks: Vec<(usize, Option<&str>, usize)> = tab(&h)
+        .annotations
+        .as_ref()
+        .unwrap()
+        .marks
+        .iter()
+        .map(|m| (m.line, m.letter, m.targets.len()))
+        .collect();
+    assert_eq!(marks, [(2, Some("E"), 2)], "E on line 3 with both actuals");
+    // ⌥⌘B / ⌘T on the expect lists the actuals with their source sets
+    place_cursor(&mut h, "platformName", 3);
+    key(&mut h, Modifiers::COMMAND, Key::T); // Eclipse: implementations
+    steps(&mut h, 3);
+    h.get_by_label_contains("androidMain · ");
+    h.get_by_label_contains("iosMain · ");
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    // from an actual, the jump goes straight to the expect
+    open(&mut h, &android);
+    steps(&mut h, 3);
+    assert_eq!(
+        tab(&h).annotations.as_ref().unwrap().marks[0].letter,
+        Some("A")
+    );
+    place_cursor(&mut h, "platformName", 3);
+    key(&mut h, Modifiers::COMMAND, Key::T);
+    steps(&mut h, 3);
+    assert_eq!(tab(&h).path, common);
+}

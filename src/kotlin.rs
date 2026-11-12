@@ -169,7 +169,22 @@ impl<'a> Scanner<'a> {
     /// A token that can only begin a new declaration.
     fn starts_decl(&self, i: usize) -> bool {
         let w = self.text(i);
-        self.kind(i) == Some(Tok::Annotation) || MODIFIERS.contains(&w) || DECL_START.contains(&w)
+        self.kind(i) == Some(Tok::Annotation)
+            || MODIFIERS.contains(&w)
+            || DECL_START.contains(&w)
+            || self.soft_modifier(i)
+    }
+    /// Kotlin Multiplatform's `expect` / `actual`: soft keywords, so only a modifier when a
+    /// declaration follows (`actual fun`, `expect class`, `actual typealias`); a variable named
+    /// `actual` (`assertEquals(expected, actual)`) stays a name.
+    fn soft_modifier(&self, i: usize) -> bool {
+        matches!(self.text(i), "expect" | "actual")
+            && self.t.get(i + 1).is_some_and(|_| {
+                let n = self.text(i + 1);
+                MODIFIERS.contains(&n)
+                    || DECL_START.contains(&n)
+                    || matches!(n, "expect" | "actual")
+            })
     }
     /// Index just past the bracket that closes the one at `i` (`(`, `[`, `{` or `<`).
     fn skip_balanced(&self, i: usize) -> usize {
@@ -349,7 +364,7 @@ pub fn scan(src: &str) -> FileSyms {
             s.i += 1;
             continue;
         }
-        if MODIFIERS.contains(&w) && kind == Some(Tok::Keyword) {
+        if MODIFIERS.contains(&w) && kind == Some(Tok::Keyword) || s.soft_modifier(s.i) {
             modifiers.push(w.into());
             s.i += 1;
             continue;

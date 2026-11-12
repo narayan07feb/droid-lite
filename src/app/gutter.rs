@@ -21,7 +21,12 @@ pub(super) struct Mark {
     pub(super) up: bool,
     tip: String,
     pub(super) targets: Vec<Hit>,
+    /// Kotlin Multiplatform: "E" on an `expect` (goes to its actuals), "A" on an `actual`.
+    pub(super) letter: Option<&'static str>,
 }
+
+/// Kotlin purple, for the expect / actual letters.
+const KMP: Color32 = Color32::from_rgb(0xB3, 0x7F, 0xEB);
 
 /// Inline stability after a `@Composable` declaration.
 pub(super) struct Badge {
@@ -62,6 +67,26 @@ impl App {
         let mut badges = Vec::new();
         for d in &t.syms.decls {
             let line = line_of(d.offset);
+            let kmp = self.index.counterparts(&t.path, &t.syms, d);
+            if !kmp.is_empty() {
+                let expect = crate::index::kmp_role(&t.syms, d) == Some("expect");
+                let mut sets: Vec<&str> = kmp
+                    .iter()
+                    .filter_map(|h| h.detail.split(" · ").next())
+                    .collect();
+                sets.dedup();
+                marks.push(Mark {
+                    line,
+                    up: !expect,
+                    tip: format!(
+                        "{} in {}",
+                        if expect { "Actual" } else { "Expected" },
+                        sets.join(", ")
+                    ),
+                    targets: kmp,
+                    letter: Some(if expect { "E" } else { "A" }),
+                });
+            }
             if d.kind.is_type() {
                 let supers: Vec<Hit> = d
                     .supers
@@ -84,6 +109,7 @@ impl App {
                         up: true,
                         tip: format!("{verb} {}", d.supers.join(", ")),
                         targets: supers,
+                        letter: None,
                     });
                 }
                 let impls = self.index.implementations(&d.name);
@@ -102,6 +128,7 @@ impl App {
                             if impls.len() == 1 { "class" } else { "classes" }
                         ),
                         targets: impls,
+                        letter: None,
                     });
                 }
             } else if let Some(c) = &d.container
@@ -114,6 +141,7 @@ impl App {
                             up: true,
                             tip: format!("Overrides {}", h.name),
                             targets: vec![h],
+                            letter: None,
                         });
                     }
                 } else {
@@ -128,6 +156,7 @@ impl App {
                                 if impls.len() == 1 { "class" } else { "classes" }
                             ),
                             targets: impls,
+                            letter: None,
                         });
                     }
                 }
@@ -226,6 +255,12 @@ impl App {
         for c in containers {
             hits.extend(self.index.member_implementations(&c, &word));
         }
+        // Kotlin Multiplatform: from an expect to its actuals, from an actual to its expect
+        if let Some(t) = self.tabs.get(self.active) {
+            for d in t.syms.decls.iter().filter(|d| *d.name == *word) {
+                hits.extend(self.index.counterparts(&t.path, &t.syms, d));
+            }
+        }
         match hits.len() {
             0 => self.status = format!("No implementations of `{word}` in the project"),
             1 => self.open_file(&hits[0].path.clone(), Some(hits[0].offset)),
@@ -286,27 +321,51 @@ pub(super) fn paint_marks(
         if y > clip.bottom() || y + row.rect().height() < clip.top() {
             continue;
         }
-        // a class can both implement (up) and be implemented (down): then the down icon sits a bit right
-        let shared = !m.up && a.marks.iter().any(|o| o.line == m.line && o.up);
+        // a class can both implement (up) and be implemented (down): then the down icon sits a bit
+        // right; an expect / actual letter moves right when an arrow shares its line
+        let shared = if m.letter.is_some() {
+            a.marks
+                .iter()
+                .any(|o| o.line == m.line && o.letter.is_none())
+        } else {
+            !m.up
+                && a.marks
+                    .iter()
+                    .any(|o| o.line == m.line && o.up && o.letter.is_none())
+        };
         let pos = Pos2::new(
             column.left() + 1.0 + if shared { ICON_WIDTH * 0.45 } else { 0.0 },
             y,
         );
-        let (icon, color) = if m.up {
-            (ic::ARROW_CIRCLE_UP, UP)
+        let rect = if let Some(letter) = m.letter {
+            let size = crate::theme::font_size();
+            let r = Rect::from_min_size(pos + egui::vec2(0.0, 1.0), egui::vec2(size, size));
+            ui.painter().rect_filled(r, size * 0.3, KMP);
+            ui.painter().text(
+                r.center(),
+                Align2::CENTER_CENTER,
+                letter,
+                FontId::proportional(size * 0.75),
+                Color32::WHITE,
+            );
+            r
         } else {
-            (ic::ARROW_CIRCLE_DOWN, DOWN)
+            let (icon, color) = if m.up {
+                (ic::ARROW_CIRCLE_UP, UP)
+            } else {
+                (ic::ARROW_CIRCLE_DOWN, DOWN)
+            };
+            ui.painter().text(
+                pos,
+                Align2::LEFT_TOP,
+                icon,
+                FontId::proportional(crate::theme::font_size()),
+                color,
+            )
         };
-        let rect = ui.painter().text(
-            pos,
-            Align2::LEFT_TOP,
-            icon,
-            FontId::proportional(crate::theme::font_size()),
-            color,
-        );
         let r = ui.interact(
             rect.expand(2.0),
-            ui.scope_id().with(("mark", m.line, m.up)),
+            ui.scope_id().with(("mark", m.line, m.up, m.letter)),
             Sense::click(),
         );
         if r.clicked() {

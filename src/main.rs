@@ -95,17 +95,30 @@ fn bench(dir: &std::path::Path) {
         idx.as_ref().map_or(0, |i| i.symbol_count())
     });
     let idx = idx.unwrap();
+    // a single search takes a few ms, so one sample is noise: report the median of 25
+    let median = |label: &str, f: &dyn Fn() -> usize| {
+        let mut ms: Vec<f64> = (0..25)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                std::hint::black_box(f());
+                t.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect();
+        ms.sort_by(f64::total_cmp);
+        println!(
+            "{label:<34} {:>8.2} ms  {:>+8.1} MB heap  (median of 25)",
+            ms[12], 0.0
+        );
+    };
     for q in ["H", "HSVM", "HomeScreen", "viewmodel"] {
-        time(&format!("go to symbol \"{q}\""), &mut || {
+        median(&format!("go to symbol \"{q}\""), &|| {
             idx.search(q, false, 60).len()
         });
     }
-    time("go to class \"Repo\"", &mut || {
+    median("go to class \"Repo\"", &|| {
         idx.search("Repo", true, 60).len()
     });
-    time("complete \"remem\"", &mut || {
-        idx.complete("remem", 40).len()
-    });
+    median("complete \"remem\"", &|| idx.complete("remem", 40).len());
     time("definitions of \"Modifier\"", &mut || {
         idx.definitions("Modifier", std::path::Path::new("/")).len()
     });
