@@ -170,7 +170,7 @@ fn e2e_navigation_search_goto_back() {
     let f = Fixture::new("nav");
     let mut h = f.harness();
     // ⌘O: go to class
-    key(&mut h, Modifiers::COMMAND, Key::O);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::T); // Eclipse: Open Type
     assert!(
         h.state()
             .search
@@ -193,7 +193,7 @@ fn e2e_navigation_search_goto_back() {
         "UserRepository"
     );
     // ⇧⌘O: go to file
-    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::O);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::R); // Eclipse: Open Resource
     type_text(&mut h, "UserCard.kt");
     key(&mut h, Modifiers::NONE, Key::Enter);
     assert_eq!(
@@ -202,7 +202,7 @@ fn e2e_navigation_search_goto_back() {
     );
     // ⌘B on a usage jumps to the declaration in another file
     place_cursor(&mut h, "user: User", 7);
-    key(&mut h, Modifiers::COMMAND, Key::B);
+    key(&mut h, Modifiers::NONE, Key::F3); // Eclipse: Open Declaration
     assert_eq!(
         tab(&h).path,
         f.path("app/src/main/java/com/demo/data/User.kt")
@@ -226,7 +226,7 @@ fn e2e_navigation_search_goto_back() {
     assert!(h.state().search.is_none());
     // ⌥F7 find usages of User
     place_cursor(&mut h, "class User(", 6);
-    key(&mut h, Modifiers::ALT, Key::F7);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::G); // Eclipse: References
     wait(&mut h, "usages", |a| {
         a.find_rx.is_none() && !a.found.is_empty()
     });
@@ -342,7 +342,7 @@ fn e2e_refactor_rename_preview_apply_file_rename_and_undo() {
     let user = f.path("app/src/main/java/com/demo/data/User.kt");
     open(&mut h, &user);
     place_cursor(&mut h, "class User(", 6);
-    key(&mut h, Modifiers::SHIFT, Key::F6);
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::R); // Eclipse: Rename
     assert!(matches!(
         h.state().refactor,
         Some(refactor_ui::Refactor::RenameInput { .. })
@@ -400,7 +400,7 @@ fn e2e_refactor_extract_variable_and_optimize_imports() {
         key(&mut h, Modifiers::SHIFT, Key::ArrowRight);
     }
     assert_eq!(&tab(&h).text[tab(&h).selection.clone()], "user.name");
-    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::V);
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::L); // Eclipse: Extract Local Variable
     assert!(matches!(
         h.state().refactor,
         Some(refactor_ui::Refactor::Extract { .. })
@@ -420,7 +420,7 @@ fn e2e_refactor_extract_variable_and_optimize_imports() {
         .text
         .insert_str(at, "import java.util.UUID\n");
     h.state_mut().tabs.last_mut().unwrap().reanalyse();
-    key(&mut h, Modifiers::CTRL | Modifiers::ALT, Key::O);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::O); // Eclipse: Organize Imports
     assert!(
         !tab(&h).text.contains("java.util.UUID")
             && tab(&h).text.contains("import com.demo.data.User\n")
@@ -521,7 +521,7 @@ fn e2e_kotlin_lsp_completion_diagnostics_definition_rename() {
     key(&mut h, Modifiers::NONE, Key::Escape);
     // rename goes through the server
     place_cursor(&mut h, "val count", 4);
-    key(&mut h, Modifiers::SHIFT, Key::F6);
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::R);
     for _ in 0.."count".len() {
         key(&mut h, Modifiers::NONE, Key::Backspace);
     }
@@ -539,6 +539,12 @@ fn e2e_kotlin_lsp_completion_diagnostics_definition_rename() {
             .unwrap()
             .contains("val clicks = mutableStateOf(0)")
     );
+    // ⇧⌘G goes through the server too
+    place_cursor(&mut h, "user.name", 1);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::G);
+    wait(&mut h, "lsp references", |a| {
+        a.found.len() == 2 && a.status.contains("kotlin-lsp")
+    });
 }
 
 #[test]
@@ -560,7 +566,7 @@ fn e2e_memory_stays_flat_over_repeated_work() {
             open(h, p);
             type_text(h, "abc");
             wait(h, "blame", |a| a.tabs[a.active].git.blame.is_some());
-            key(h, Modifiers::COMMAND, Key::O);
+            key(h, Modifiers::COMMAND | Modifiers::SHIFT, Key::T);
             type_text(h, "User");
             key(h, Modifiers::NONE, Key::Escape);
             h.state_mut().revert();
@@ -594,4 +600,148 @@ fn e2e_snapshot_for_review() {
         let img = h.render().expect("render needs the wgpu feature");
         img.save(Path::new(&dir).join("e2e-snapshot.png")).unwrap();
     }
+}
+
+#[test]
+fn e2e_eclipse_line_commands_and_go_to_line() {
+    let f = Fixture::new("lines");
+    let mut h = f.harness();
+    assert_eq!(
+        h.state().keymap,
+        Keymap::Eclipse,
+        "Eclipse is the default keymap"
+    );
+    open(&mut h, &f.path("app/src/main/java/com/demo/ui/UserCard.kt"));
+    // ⌘L go to line 9, column 9
+    key(&mut h, Modifiers::COMMAND, Key::L);
+    assert!(
+        h.state()
+            .search
+            .as_ref()
+            .is_some_and(|s| s.kind == SearchKind::GotoLine)
+    );
+    type_text(&mut h, "9:9");
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("Text(user.name)"));
+    // ⌘/ comments the line, again uncomments
+    key(&mut h, Modifiers::COMMAND, Key::Slash);
+    assert!(tab(&h).text.contains("        // Text(user.name)"));
+    key(&mut h, Modifiers::COMMAND, Key::Slash);
+    assert_eq!(tab(&h).text, CARD_KT);
+    // ⌥↑ moves it above `Column(`; ⌥↓ moves it back
+    key(&mut h, Modifiers::ALT, Key::ArrowUp);
+    assert!(
+        tab(&h)
+            .text
+            .contains("        Text(user.name)\n    Column(modifier) {"),
+        "{}",
+        tab(&h).text
+    );
+    key(&mut h, Modifiers::ALT, Key::ArrowDown);
+    assert_eq!(tab(&h).text, CARD_KT);
+    // ⌥⌘↓ duplicates, ⌘D deletes
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::ArrowDown);
+    assert_eq!(tab(&h).text.matches("Text(user.name)").count(), 2);
+    key(&mut h, Modifiers::COMMAND, Key::D);
+    assert_eq!(tab(&h).text, CARD_KT);
+    // ⌘O quick outline lists this file's declarations
+    key(&mut h, Modifiers::COMMAND, Key::O);
+    let hits: Vec<String> = h
+        .state()
+        .search
+        .as_ref()
+        .unwrap()
+        .hits
+        .iter()
+        .map(|h| h.name.clone())
+        .collect();
+    assert!(
+        hits.contains(&"UserCard".to_string()) && hits.contains(&"UserCardPreview".to_string()),
+        "{hits:?}"
+    );
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    // ⌘3 search everywhere, ⇧⌘L shortcut cheat sheet
+    key(&mut h, Modifiers::COMMAND, Key::Num3);
+    assert!(
+        h.state()
+            .search
+            .as_ref()
+            .is_some_and(|s| s.kind == SearchKind::Everywhere)
+    );
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::L);
+    h.get_by_label("Open type / class");
+    h.get_by_label("⇧⌘T");
+}
+
+#[test]
+fn e2e_find_references_lists_code_and_xml_not_strings() {
+    let f = Fixture::new("refs");
+    std::fs::write(f.path("app/src/main/res/layout_user.xml"), "").ok();
+    std::fs::create_dir_all(f.path("app/src/main/res/layout")).unwrap();
+    std::fs::write(
+        f.path("app/src/main/res/layout/user_card.xml"),
+        "<com.demo.ui.UserCardView tools:context=\"User\" />\n",
+    )
+    .unwrap();
+    std::fs::write(
+        f.path("app/src/main/java/com/demo/ui/Strings.kt"),
+        "package com.demo.ui\nval s = \"User\" // User\nval u: User? = null\n",
+    )
+    .unwrap();
+    let mut h = f.harness();
+    open(&mut h, &f.path("app/src/main/java/com/demo/data/User.kt"));
+    place_cursor(&mut h, "class User(", 6);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::G);
+    wait(&mut h, "references", |a| {
+        a.find_rx.is_none() && !a.found.is_empty()
+    });
+    let found = &h.state().found;
+    let in_file = |name: &str| found.iter().filter(|f| f.path.ends_with(name)).count();
+    assert_eq!(in_file("User.kt"), 2, "declaration and List<User>");
+    assert_eq!(
+        in_file("UserCard.kt"),
+        3,
+        "import, parameter, constructor call: {:?}",
+        found.iter().map(|f| &f.text).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        in_file("Strings.kt"),
+        1,
+        "only the type, not the string or the comment"
+    );
+    assert_eq!(in_file("user_card.xml"), 1, "XML is searched as text");
+    h.get_by_label_contains("References to `User`");
+    // clicking a result opens it
+    h.get_by_label_contains("val u: User? = null").click();
+    steps(&mut h, 3);
+    assert!(tab(&h).path.ends_with("Strings.kt"));
+}
+
+#[test]
+fn e2e_android_studio_keymap_from_help_menu() {
+    let f = Fixture::new("keymap");
+    let mut h = f.harness();
+    h.get_by_label("Help").click();
+    steps(&mut h, 2);
+    h.get_by_label("Android Studio (macOS)").click();
+    steps(&mut h, 2);
+    assert_eq!(h.state().keymap, Keymap::AndroidStudio);
+    key(&mut h, Modifiers::COMMAND, Key::O);
+    assert!(
+        h.state()
+            .search
+            .as_ref()
+            .is_some_and(|s| s.kind == SearchKind::Class),
+        "⌘O is Go to class in Android Studio"
+    );
+    type_text(&mut h, "UserRepository");
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    place_cursor(&mut h, "List<User>", 5);
+    key(&mut h, Modifiers::COMMAND, Key::B);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("User("));
+    key(&mut h, Modifiers::ALT, Key::F7);
+    wait(&mut h, "usages", |a| {
+        a.find_rx.is_none() && !a.found.is_empty()
+    });
 }

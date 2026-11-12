@@ -535,15 +535,25 @@ impl App {
 
     pub(super) fn refactor_menu(&mut self, ui: &mut egui::Ui) {
         ui.menu_button("Refactor", |ui| {
-            if ui.button("Rename…  ⇧F6").clicked() {
+            let km = self.keymap;
+            let label = |a: crate::keymap::Action| {
+                format!("{}   {}", a.label(), crate::keymap::text(km, a))
+            };
+            if ui.button(label(crate::keymap::Action::Rename)).clicked() {
                 self.start_rename();
                 ui.close();
             }
-            if ui.button("Extract variable…  ⌥⌘V").clicked() {
+            if ui
+                .button(label(crate::keymap::Action::ExtractVariable))
+                .clicked()
+            {
                 self.start_extract();
                 ui.close();
             }
-            if ui.button("Optimize imports  ⌃⌥O").clicked() {
+            if ui
+                .button(label(crate::keymap::Action::OptimizeImports))
+                .clicked()
+            {
                 self.optimize_imports();
                 ui.close();
             }

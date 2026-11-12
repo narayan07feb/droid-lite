@@ -22,6 +22,8 @@ pub enum Event {
     /// Text edits per file from a rename: (start line, start col, end line, end col, new text).
     /// Empty when the server failed or refused.
     Rename(WorkspaceEdits),
+    /// Every reference to a symbol: (file, line, UTF-16 column).
+    References(Vec<(PathBuf, u32, u32)>),
     Diagnostics(PathBuf, Vec<(u32, u32, u8, String)>),
 }
 
@@ -31,6 +33,7 @@ enum Pending {
     Completion(usize),
     Definition,
     Rename,
+    References,
 }
 
 pub struct Lsp {
@@ -228,6 +231,15 @@ impl Lsp {
         self.request("textDocument/rename", json!({ "textDocument": { "uri": uri(path) }, "position": { "line": line, "character": col }, "newName": new_name }), Pending::Rename, false);
     }
 
+    pub fn references(&mut self, path: &Path, line: u32, col: u32) {
+        self.request(
+            "textDocument/references",
+            json!({ "textDocument": { "uri": uri(path) }, "position": { "line": line, "character": col }, "context": { "includeDeclaration": true } }),
+            Pending::References,
+            false,
+        );
+    }
+
     pub fn poll(&mut self) -> Vec<Event> {
         let mut out = Vec::new();
         while let Ok(msg) = self.rx.try_recv() {
@@ -270,27 +282,9 @@ impl Lsp {
                             .unwrap_or_default();
                         out.push(Event::Completion { at, items });
                     }
-                    Some(Pending::Definition) => {
-                        let locs = match result {
-                            Value::Array(a) => a,
-                            Value::Null => vec![],
-                            v => vec![v],
-                        };
-                        out.push(Event::Definition(
-                            locs.iter()
-                                .filter_map(|l| {
-                                    let u = l.get("uri").or(l.get("targetUri"))?.as_str()?;
-                                    let r = l.get("range").or(l.get("targetSelectionRange"))?;
-                                    Some((
-                                        path_of(u),
-                                        r.pointer("/start/line")?.as_u64()? as u32,
-                                        r.pointer("/start/character")?.as_u64()? as u32,
-                                    ))
-                                })
-                                .collect(),
-                        ));
-                    }
+                    Some(Pending::Definition) => out.push(Event::Definition(locations(&result))),
                     Some(Pending::Rename) => out.push(Event::Rename(workspace_edits(&result))),
+                    Some(Pending::References) => out.push(Event::References(locations(&result))),
                     None => {}
                 }
             } else if msg.get("method").and_then(Value::as_str)
@@ -338,6 +332,26 @@ impl Drop for Lsp {
         let _ = self.child.kill();
         let _ = self.child.wait(); // reap it, so no zombie process stays behind
     }
+}
+
+/// Start positions of a Location, Location[] or LocationLink[] result.
+fn locations(v: &Value) -> Vec<(PathBuf, u32, u32)> {
+    let list = match v {
+        Value::Array(a) => a.clone(),
+        Value::Null => vec![],
+        v => vec![v.clone()],
+    };
+    list.iter()
+        .filter_map(|l| {
+            let u = l.get("uri").or(l.get("targetUri"))?.as_str()?;
+            let r = l.get("range").or(l.get("targetSelectionRange"))?;
+            Some((
+                path_of(u),
+                r.pointer("/start/line")?.as_u64()? as u32,
+                r.pointer("/start/character")?.as_u64()? as u32,
+            ))
+        })
+        .collect()
 }
 
 /// Reads a WorkspaceEdit in either form: `changes` (uri → edits) or `documentChanges`.

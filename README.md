@@ -21,7 +21,8 @@ Set `DROID_LITE_GLASS=0` for solid colours.
 
 | Area | What you get |
 |------|--------------|
-| Navigation | ⌘O class, ⇧⌘O file, ⌥⌘O symbol, ⇧⇧ search everywhere, ⌘E recent files, ⌘F12 file structure, ⌘B or ⌘-click go to declaration, ⌘[ / ⌘] back and forward, ⌥F7 find usages, ⇧⌘F find in files |
+| Keymaps | **Eclipse (macOS)** by default, or Android Studio (macOS): Help → Keymap. Help → Keyboard shortcuts lists every key. Eclipse: ⇧⌘T open type, ⇧⌘R open file, ⌘O outline, ⌘3 search everywhere, ⌘E recent, F3 or ⌘-click declaration, ⇧⌘G references, ⌃H find in files, ⌘L go to line, ⌘[ / ⌘] back and forward, ⌥⌘R rename, ⌥⌘L extract variable, ⇧⌘O organize imports, ⌘/ comment, ⌘D delete line, ⌥⌘↓ duplicate, ⌥↑/↓ move line, ⌃Space complete |
+| Find references | kotlin-lsp when it runs; otherwise every code reference in the project (strings and comments skipped) plus XML layouts and the manifest, with a count per file |
 | Editing | Kotlin/Java colours, SF Mono, line numbers, current-line highlight, tabs, ⌘S save, ⌘W close tab |
 | Autocomplete | Project symbols and keywords as you type (⌃Space to force). Adds the `import` for you. Type-aware items come from kotlin-lsp when it is installed |
 | Compose analyser | The UI call tree of each composable. Parameter stability from skydoves' compose-stability-analyzer (`stabilityDump`) or Compose compiler reports, with a local guess when there is neither. Compose checks: `modifier` rules, naming, `mutableStateOf` without `remember`, effects without keys, `collectAsState` vs `collectAsStateWithLifecycle`, ViewModel parameters |

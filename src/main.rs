@@ -2,12 +2,14 @@
 mod alloc_count;
 mod app;
 mod compose;
+mod edit;
 mod git;
 mod glass;
 mod gradle;
 mod highlight;
 mod icons;
 mod index;
+mod keymap;
 mod kotlin;
 mod lexer;
 mod lsp;

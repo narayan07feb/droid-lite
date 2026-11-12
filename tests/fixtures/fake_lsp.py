@@ -55,6 +55,15 @@ while True:
     elif method == "textDocument/definition":
         uri = params["textDocument"]["uri"]
         send({"jsonrpc": "2.0", "id": mid, "result": [{"uri": uri, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}}]})
+    elif method == "textDocument/references":
+        uri, pos = params["textDocument"]["uri"], params["position"]
+        text = docs.get(uri, "")
+        old = word_at(text, pos["line"], pos["character"])
+        refs = []
+        for i, row in enumerate(text.split("\n")):
+            for m in re.finditer(r"\b%s\b" % re.escape(old), row):
+                refs.append({"uri": uri, "range": {"start": {"line": i, "character": m.start()}, "end": {"line": i, "character": m.end()}}})
+        send({"jsonrpc": "2.0", "id": mid, "result": refs})
     elif method == "textDocument/rename":
         uri, pos, new = params["textDocument"]["uri"], params["position"], params["newName"]
         text = docs.get(uri, "")

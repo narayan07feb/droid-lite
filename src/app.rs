@@ -7,18 +7,18 @@ mod git_ui;
 mod refactor_ui;
 
 use crate::compose::{self, Lint, Severity, Stability, Verdict};
+use crate::edit;
 use crate::gradle::{self, PreviewTool};
 use crate::highlight::{self, ERROR, INFO, TEXT, WARN};
 use crate::icons as ic;
 use crate::index::{self, Hit, Index};
+use crate::keymap::{self, Action, Keymap};
 use crate::kotlin::{Decl, FileSyms, scan};
 use crate::lsp::{self, Lsp};
 use crate::project::{Project, is_code};
 use crate::theme::{self, DARK};
 use egui::text::{CCursor, CCursorRange};
-use egui::{
-    Align, Align2, Color32, FontId, Key, KeyboardShortcut, Modifiers, RichText, TextEdit, Ui,
-};
+use egui::{Align, Align2, Color32, FontId, Key, Modifiers, RichText, TextEdit, Ui};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
@@ -83,18 +83,27 @@ enum SearchKind {
     Recent,
     Structure,
     FindInFiles,
+    GotoLine,
 }
 
 impl SearchKind {
-    fn title(self) -> &'static str {
+    fn action(self) -> Action {
         match self {
-            SearchKind::Class => "Go to class (⌘O)",
-            SearchKind::File => "Go to file (⇧⌘O)",
-            SearchKind::Symbol => "Go to symbol (⌥⌘O)",
-            SearchKind::Everywhere => "Search everywhere (⇧⇧)",
-            SearchKind::Recent => "Recent files (⌘E)",
-            SearchKind::Structure => "File structure (⌘F12)",
-            SearchKind::FindInFiles => "Find in files (⇧⌘F), press Enter",
+            SearchKind::Class => Action::GotoClass,
+            SearchKind::File => Action::GotoFile,
+            SearchKind::Symbol => Action::GotoSymbol,
+            SearchKind::Everywhere => Action::Everywhere,
+            SearchKind::Recent => Action::Recent,
+            SearchKind::Structure => Action::Structure,
+            SearchKind::FindInFiles => Action::FindInFiles,
+            SearchKind::GotoLine => Action::GotoLine,
+        }
+    }
+    fn hint(self) -> &'static str {
+        match self {
+            SearchKind::FindInFiles => "Text to find in every file, then Enter",
+            SearchKind::GotoLine => "line or line:column, then Enter",
+            _ => "Type to search; camel humps work: HSVM → HomeScreenViewModel",
         }
     }
 }
@@ -119,6 +128,17 @@ struct Item {
     detail: String,
     insert: String,
     import: Option<String>,
+}
+
+fn found_line(path: &Path, text: &str, o: usize) -> FoundLine {
+    let ls = text[..o].rfind('\n').map_or(0, |i| i + 1);
+    let le = text[o..].find('\n').map_or(text.len(), |i| o + i);
+    FoundLine {
+        path: path.to_path_buf(),
+        offset: o,
+        line: text[..o].matches('\n').count() + 1,
+        text: text[ls..le].trim().chars().take(160).collect(),
+    }
 }
 
 #[derive(Clone)]
@@ -195,6 +215,10 @@ pub struct App {
     outputs_gen: u64,
     compose_view: Option<ComposeView>,
     ctx: Option<egui::Context>,
+    keymap: Keymap,
+    show_shortcuts: bool,
+    /// What the Find tab lists, e.g. "References to `User`".
+    found_title: String,
 }
 
 impl App {
@@ -245,6 +269,9 @@ impl App {
             outputs_gen: 0,
             compose_view: None,
             ctx: Some(cc.egui_ctx.clone()),
+            keymap: load_setting("keymap").map_or(Keymap::Eclipse, |s| Keymap::from_name(&s)),
+            show_shortcuts: false,
+            found_title: String::new(),
         };
         if let Some(dir) = open.or_else(last_project) {
             app.open_project(&dir, &cc.egui_ctx);
@@ -475,34 +502,66 @@ impl App {
         }
     }
 
-    fn find_usages(&mut self, word: String, whole_word: bool, ctx: &egui::Context) {
+    /// Find References: kotlin-lsp when it runs, else every code reference in the project
+    /// (Kotlin/Java/Gradle scripts by token, so strings and comments are skipped) plus XML files
+    /// such as layouts and the manifest.
+    fn find_references(&mut self, ctx: &egui::Context) {
+        let Some((word, at)) = self.word_at_cursor() else {
+            self.status = "Put the cursor on a name to find its references".into();
+            return;
+        };
+        self.found_title = format!("References to `{word}`");
+        self.bottom = Bottom::Find;
+        if let Some(l) = self.lsp.as_mut().filter(|l| l.ready) {
+            let t = &self.tabs[self.active];
+            let (line, col) = lsp::position(&t.text, at);
+            l.references(&t.path, line, col);
+            self.status = format!("Asking kotlin-lsp for references to `{word}`…");
+            return;
+        }
+        self.search_project(word, true, ctx);
+    }
+
+    /// Searches every project file (open tabs use their unsaved text) in the background.
+    /// `code_refs`: whole identifiers only, outside strings and comments in code files.
+    fn search_project(&mut self, word: String, code_refs: bool, ctx: &egui::Context) {
         let Some(p) = &self.project else { return };
         let files: Vec<PathBuf> = p.files.clone();
+        let open: HashMap<PathBuf, String> = self
+            .tabs
+            .iter()
+            .map(|t| (t.path.clone(), t.text.clone()))
+            .collect();
         let (tx, rx) = channel();
         let c = ctx.clone();
         self.status = format!("Searching for `{word}`…");
         std::thread::spawn(move || {
             let mut out = Vec::new();
             for f in files {
-                let Ok(text) = std::fs::read_to_string(&f) else {
+                let Some(text) = open
+                    .get(&f)
+                    .cloned()
+                    .or_else(|| std::fs::read_to_string(&f).ok())
+                else {
                     continue;
                 };
-                for (o, _) in text.match_indices(&word) {
-                    let (a, b) = word_bounds(&text, o);
-                    if whole_word && (a != o || b != o + word.len()) {
-                        continue;
-                    }
-                    let ls = text[..o].rfind('\n').map_or(0, |i| i + 1);
-                    let le = text[o..].find('\n').map_or(text.len(), |i| o + i);
-                    out.push(FoundLine {
-                        path: f.clone(),
-                        offset: o,
-                        line: text[..o].matches('\n').count() + 1,
-                        text: text[ls..le].trim().chars().take(160).collect(),
-                    });
-                    if out.len() >= 2000 {
-                        break;
-                    }
+                if !text.contains(&word) {
+                    continue;
+                }
+                let hits: Vec<usize> = if code_refs && is_code(&f) {
+                    crate::refactor::occurrences(&text, &word)
+                        .into_iter()
+                        .map(|r| r.start)
+                        .collect()
+                } else {
+                    text.match_indices(&word)
+                        .map(|(o, _)| o)
+                        .filter(|&o| !code_refs || word_bounds(&text, o) == (o, o + word.len()))
+                        .collect()
+                };
+                out.extend(hits.into_iter().map(|o| found_line(&f, &text, o)));
+                if out.len() >= 5000 {
+                    break;
                 }
             }
             let _ = tx.send(out);
@@ -616,6 +675,24 @@ impl App {
                     }
                 }
                 lsp::Event::Rename(edits) => self.on_lsp_rename(edits),
+                lsp::Event::References(locs) => {
+                    let mut texts: HashMap<PathBuf, String> = HashMap::new();
+                    let mut found = Vec::new();
+                    for (p, line, col) in locs {
+                        let text = texts.entry(p.clone()).or_insert_with(|| {
+                            self.tabs
+                                .iter()
+                                .find(|t| t.path == p)
+                                .map(|t| t.text.clone())
+                                .or_else(|| std::fs::read_to_string(&p).ok())
+                                .unwrap_or_default()
+                        });
+                        found.push(found_line(&p, text, lsp::offset(text, line, col)));
+                    }
+                    found.sort_by(|a, b| a.path.cmp(&b.path).then(a.offset.cmp(&b.offset)));
+                    self.status = format!("{} references (kotlin-lsp)", found.len());
+                    self.found = found;
+                }
                 lsp::Event::Diagnostics(path, diags) => {
                     if let Some(t) = self.tabs.iter_mut().find(|t| t.path == path) {
                         t.diagnostics = diags
@@ -632,10 +709,11 @@ impl App {
     // ---------- keyboard ----------
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let cmd = Modifiers::COMMAND;
-        let pressed = |m: Modifiers, k: Key| {
-            ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)))
-        };
+        for (action, chord) in keymap::bindings(self.keymap) {
+            if ctx.input_mut(|i| i.consume_shortcut(&chord)) {
+                self.run(action, ctx);
+            }
+        }
         let open = |kind| {
             Some(Search {
                 kind,
@@ -645,48 +723,6 @@ impl App {
                 stale: true,
             })
         };
-        if pressed(cmd | Modifiers::SHIFT, Key::O) {
-            self.search = open(SearchKind::File);
-        } else if pressed(cmd | Modifiers::ALT, Key::O) {
-            self.search = open(SearchKind::Symbol);
-        } else if pressed(cmd, Key::O) {
-            self.search = open(SearchKind::Class);
-        } else if pressed(cmd, Key::E) {
-            self.search = open(SearchKind::Recent);
-        } else if pressed(cmd, Key::F12) {
-            self.search = open(SearchKind::Structure);
-        } else if pressed(cmd | Modifiers::SHIFT, Key::F) {
-            self.search = open(SearchKind::FindInFiles);
-        }
-        if pressed(Modifiers::SHIFT, Key::F6) {
-            self.start_rename();
-        }
-        if pressed(Modifiers::CTRL | Modifiers::ALT, Key::O) {
-            self.optimize_imports();
-        }
-        if pressed(cmd | Modifiers::ALT, Key::V) {
-            self.start_extract();
-        }
-        if pressed(cmd, Key::B) {
-            self.goto_definition();
-        }
-        if pressed(cmd, Key::OpenBracket) {
-            self.back();
-        }
-        if pressed(cmd, Key::CloseBracket) {
-            self.fwd();
-        }
-        if pressed(cmd, Key::S) {
-            self.save();
-        }
-        if pressed(cmd, Key::W) {
-            self.close_tab(self.active);
-        }
-        if pressed(Modifiers::ALT, Key::F7)
-            && let Some((w, _)) = self.word_at_cursor()
-        {
-            self.find_usages(w, true, ctx);
-        }
         // double Shift: two Shift presses within 400 ms with no other key between
         let (shift, other_key) = ctx.input(|i| {
             (
@@ -713,6 +749,136 @@ impl App {
         self.shift_down = shift;
     }
 
+    /// Runs one command, from a shortcut or a menu.
+    fn run(&mut self, action: Action, ctx: &egui::Context) {
+        let open = |kind| {
+            Some(Search {
+                kind,
+                query: String::new(),
+                hits: Vec::new(),
+                selected: 0,
+                stale: true,
+            })
+        };
+        match action {
+            Action::GotoClass => self.search = open(SearchKind::Class),
+            Action::GotoFile => self.search = open(SearchKind::File),
+            Action::GotoSymbol => self.search = open(SearchKind::Symbol),
+            Action::Everywhere => self.search = open(SearchKind::Everywhere),
+            Action::Recent => self.search = open(SearchKind::Recent),
+            Action::Structure => self.search = open(SearchKind::Structure),
+            Action::GotoLine => self.search = open(SearchKind::GotoLine),
+            Action::FindInFiles => self.search = open(SearchKind::FindInFiles),
+            Action::GotoDefinition => self.goto_definition(),
+            Action::References => self.find_references(ctx),
+            Action::Back => self.back(),
+            Action::Forward => self.fwd(),
+            Action::Complete => {
+                if !self.tabs.is_empty() {
+                    self.update_completion(true);
+                }
+            }
+            Action::Rename => self.start_rename(),
+            Action::ExtractVariable => self.start_extract(),
+            Action::OptimizeImports => self.optimize_imports(),
+            Action::ToggleComment => self.line_edit(|t, s| Some(edit::toggle_comment(t, s))),
+            Action::DeleteLine => self.line_edit(|t, s| Some(edit::delete_lines(t, s))),
+            Action::DuplicateLine => self.line_edit(|t, s| Some(edit::duplicate_lines(t, s))),
+            Action::MoveLineUp => self.line_edit(|t, s| edit::move_lines(t, s, true)),
+            Action::MoveLineDown => self.line_edit(|t, s| edit::move_lines(t, s, false)),
+            Action::Save => self.save(),
+            Action::CloseTab => self.close_tab(self.active),
+            Action::Shortcuts => self.show_shortcuts = !self.show_shortcuts,
+        }
+    }
+
+    /// Applies a line command to the active tab's selection (or cursor line).
+    fn line_edit(&mut self, f: impl Fn(&str, std::ops::Range<usize>) -> Option<(String, usize)>) {
+        let Some(t) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let sel = if t.selection.is_empty() {
+            t.cursor..t.cursor
+        } else {
+            t.selection.clone()
+        };
+        let Some((text, cursor)) = f(&t.text, sel) else {
+            return;
+        };
+        t.text = text;
+        t.goto = Some(cursor.min(t.text.len()));
+        t.reanalyse();
+        let (path, text) = (t.path.clone(), t.text.clone());
+        self.index.update(&path, &text);
+        if let Some(l) = self.lsp.as_mut() {
+            l.did_change(&path, &text);
+        }
+    }
+
+    pub(super) fn set_keymap(&mut self, km: Keymap) {
+        self.keymap = km;
+        save_setting("keymap", km.name());
+        self.status = format!("Keymap: {}", km.name());
+    }
+
+    fn help_menu(&mut self, ui: &mut Ui) {
+        ui.menu_button("Help", |ui| {
+            if ui
+                .button(format!(
+                    "{}  Keyboard shortcuts   {}",
+                    ic::KEYBOARD,
+                    keymap::text(self.keymap, Action::Shortcuts)
+                ))
+                .clicked()
+            {
+                self.show_shortcuts = true;
+                ui.close();
+            }
+            ui.separator();
+            ui.label(RichText::new("Keymap").color(DARK.weak).small());
+            for km in [Keymap::Eclipse, Keymap::AndroidStudio] {
+                if ui.radio(self.keymap == km, km.name()).clicked() {
+                    self.set_keymap(km);
+                    ui.close();
+                }
+            }
+        });
+    }
+
+    fn shortcuts_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_shortcuts;
+        egui::Window::new(format!("Keyboard shortcuts · {}", self.keymap.name()))
+            .open(&mut open)
+            .collapsible(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Grid::new("shortcuts")
+                    .striped(true)
+                    .num_columns(2)
+                    .spacing([24.0, 6.0])
+                    .show(ui, |ui| {
+                        let mut seen = Vec::new();
+                        for (action, _) in keymap::bindings(self.keymap) {
+                            if seen.contains(&action) {
+                                continue;
+                            }
+                            seen.push(action);
+                            ui.label(action.label());
+                            ui.label(
+                                RichText::new(keymap::text(self.keymap, action))
+                                    .monospace()
+                                    .color(DARK.accent),
+                            );
+                            ui.end_row();
+                        }
+                        ui.label("Go to declaration");
+                        ui.label(RichText::new("⌘-click").monospace().color(DARK.accent));
+                        ui.end_row();
+                    });
+            });
+        self.show_shortcuts = open;
+    }
+
     // ---------- search popup ----------
 
     fn search_window(&mut self, ctx: &egui::Context) {
@@ -736,16 +902,30 @@ impl App {
             s.stale = false;
         }
         if enter {
-            if s.kind == SearchKind::FindInFiles {
+            if s.kind == SearchKind::GotoLine {
+                if let Some(t) = self.tabs.get(self.active)
+                    && let Some(o) = edit::line_offset(&t.text, &s.query)
+                {
+                    chosen = Some((t.path.clone(), o));
+                }
+                close = true;
+            } else if s.kind == SearchKind::FindInFiles {
                 if !s.query.is_empty() {
-                    self.find_usages(s.query.clone(), false, ctx);
+                    self.found_title = format!("Text `{}`", s.query);
+                    self.search_project(s.query.clone(), false, ctx);
                 }
                 close = true;
             } else if let Some(h) = s.hits.get(s.selected) {
                 chosen = Some((h.path.clone(), h.offset));
             }
         }
-        egui::Window::new(s.kind.title())
+        let title = format!(
+            "{}   {}",
+            s.kind.action().label(),
+            keymap::text(self.keymap, s.kind.action())
+        );
+        let hint = s.kind.hint();
+        egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_TOP, [0.0, 60.0])
@@ -754,7 +934,7 @@ impl App {
                 let r = ui.add(
                     TextEdit::singleline(&mut s.query)
                         .desired_width(f32::INFINITY)
-                        .hint_text("Type to search; camel humps work: HSV → HomeScreenViewModel"),
+                        .hint_text(hint),
                 );
                 r.request_focus();
                 if r.changed() {
@@ -857,7 +1037,7 @@ impl App {
                     })
                     .collect()
             }
-            SearchKind::FindInFiles => Vec::new(),
+            SearchKind::FindInFiles | SearchKind::GotoLine => Vec::new(),
         }
     }
 
@@ -912,6 +1092,7 @@ impl App {
                 self.search = Some(open_search(SearchKind::Everywhere));
             }
             self.refactor_menu(ui);
+            self.help_menu(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let running = self.gradle.is_some();
                 if running {
@@ -1038,7 +1219,21 @@ impl App {
     fn editor(&mut self, ui: &mut Ui) {
         if self.tabs.is_empty() {
             ui.centered_and_justified(|ui| {
-                ui.label(RichText::new("⌘O class   ⇧⌘O file   ⇧⇧ everywhere   ⌘E recent   ⌘B go to declaration   ⌥F7 usages").weak());
+                let km = self.keymap;
+                let line = [
+                    Action::GotoClass,
+                    Action::GotoFile,
+                    Action::Everywhere,
+                    Action::Recent,
+                    Action::GotoDefinition,
+                    Action::References,
+                    Action::Shortcuts,
+                ]
+                .iter()
+                .map(|a| format!("{}  {}", a.label(), keymap::text(km, *a)))
+                .collect::<Vec<_>>()
+                .join("\n");
+                ui.label(RichText::new(line).color(DARK.weak));
             });
             return;
         }
@@ -1099,8 +1294,6 @@ impl App {
             });
             esc = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
         }
-        let ctrl_space = ui
-            .input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::Space)));
         if esc {
             self.completion = None;
         }
@@ -1301,9 +1494,6 @@ impl App {
                 l.did_change(&path, &self.tabs[self.active].text);
             }
             self.update_completion(false);
-        }
-        if ctrl_space {
-            self.update_completion(true);
         }
         if cmd_click {
             self.goto_definition();
@@ -1772,6 +1962,25 @@ impl App {
                     .as_ref()
                     .map(|p| p.root.clone())
                     .unwrap_or_default();
+                if !self.found_title.is_empty() {
+                    let mut files: Vec<&Path> =
+                        self.found.iter().map(|f| f.path.as_path()).collect();
+                    files.dedup();
+                    let busy = if self.find_rx.is_some() {
+                        "  searching…"
+                    } else {
+                        ""
+                    };
+                    ui.label(
+                        RichText::new(format!(
+                            "{}: {} in {} files{busy}",
+                            self.found_title,
+                            self.found.len(),
+                            files.len()
+                        ))
+                        .strong(),
+                    );
+                }
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .show_rows(ui, row_h, self.found.len(), |ui, range| {
@@ -1858,6 +2067,7 @@ impl eframe::App for App {
         self.search_window(&ctx);
         self.refactor_window(&ctx);
         self.commit_window(&ctx);
+        self.shortcuts_window(&ctx);
         if let Some((path, frames)) = self.shot.as_mut().filter(|_| self.indexing.is_none()) {
             *frames += 1;
             let wait: u32 = std::env::var("DROID_LITE_SHOT_FRAMES")
@@ -2159,11 +2369,26 @@ fn tab_widget(ui: &mut Ui, t: &Tab, active: bool) -> (bool, bool) {
 }
 
 fn config_file() -> Option<PathBuf> {
-    // tests must never read or overwrite the user's saved project
+    setting_file("last-project")
+}
+
+/// `~/.config/droid-lite/<name>`. Tests never read or write the user's settings.
+fn setting_file(name: &str) -> Option<PathBuf> {
     if cfg!(test) {
         return None;
     }
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/droid-lite/last-project"))
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/droid-lite").join(name))
+}
+
+fn load_setting(name: &str) -> Option<String> {
+    std::fs::read_to_string(setting_file(name)?).ok()
+}
+
+fn save_setting(name: &str, value: &str) {
+    if let Some(f) = setting_file(name) {
+        let _ = std::fs::create_dir_all(f.parent().unwrap_or(Path::new(".")));
+        let _ = std::fs::write(f, value);
+    }
 }
 
 fn last_project() -> Option<PathBuf> {

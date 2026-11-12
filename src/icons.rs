@@ -25,3 +25,4 @@ pub const ARROW_COUNTER_CLOCKWISE: &str = "\u{E038}";
 pub const STACK: &str = "\u{E466}";
 pub const WRENCH: &str = "\u{E5D4}";
 pub const CUBE: &str = "\u{E1DA}";
+pub const KEYBOARD: &str = "\u{E2D8}";
