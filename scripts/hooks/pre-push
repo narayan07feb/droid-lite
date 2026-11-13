@@ -1,0 +1,28 @@
+#!/bin/sh
+# Blocks a push that makes Droid Lite slower or use more memory (scripts/perf_check.py).
+# Install once:   git config core.hooksPath scripts/hooks
+#                 git config droidlite.perfProject /path/to/android/project
+# Skip once:      git push --no-verify
+# Only pushes that change the code are checked; docs-only pushes and new branches are not.
+cd "$(git rev-parse --show-toplevel)" || exit 1
+zero=0000000000000000000000000000000000000000
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case "$local_ref" in refs/tags/*) continue ;; esac
+  [ "$local_sha" = "$zero" ] && continue   # a delete
+  [ "$remote_sha" = "$zero" ] && continue  # a new branch: nothing to compare with
+  [ "$local_sha" = "$remote_sha" ] && continue
+  if ! git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+    echo "perf check: $remote_sha is not here (git fetch first); not checked"
+    continue
+  fi
+  if git diff --quiet "$remote_sha" "$local_sha" -- src Cargo.toml Cargo.lock assets; then
+    continue
+  fi
+  echo "perf check: $remote_ref ${remote_sha%"${remote_sha#????????}"}..${local_sha%"${local_sha#????????}"}"
+  python3 scripts/perf_check.py "$remote_sha" "$local_sha" || {
+    echo "Push stopped: it is slower or uses more memory (table above)."
+    echo "Fix it, or push anyway with: git push --no-verify"
+    exit 1
+  }
+done
+exit 0

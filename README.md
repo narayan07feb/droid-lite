@@ -60,6 +60,7 @@ Set `DROID_LITE_GLASS=0` for solid colours.
 | Compose preview on a device | A green **▶** in the gutter next to each `@Preview`: installs the debug app and opens just that preview with `androidx.compose.ui.tooling.PreviewActivity`, like Android Studio's "Run preview". The app module needs `debugImplementation("androidx.compose.ui:ui-tooling")`; the message says so when it is missing |
 | Logcat | Bottom **Logcat** tab, like Android Studio: device picker (USB or `adb connect`), live log with the last 2,000 lines, columns time / pid-tid / tag / app / level, Android Studio colours. Filter: `package:mine` (the project's `applicationId`s), `package:com.x`, `level:warn`, `tag:OkHttp`, `-tag:chatty`, free text. Pause, Scroll lock, Clear. Click a stack-trace line (`at …(File.kt:42)`) to open the file at that line. Keeps 50,000 lines. `adb` runs only while the tab is open, and never clears or resizes the phone's log buffer (Clear clears only the view), so other tools reading the same phone are not disturbed. `DROID_LITE_ADB` picks another adb |
 | Gradle | Run any task (`assembleDebug`, `installDebug`, …), see the output live, and click `e:` compiler errors to open them |
+| Performance | Bottom **Performance** tab: a graph of the last 240 frame times (lines at 16.7 ms and 100 ms; hover a bar for its slowest part), the median and slowest frame, the app's memory (as Activity Monitor shows it), how long the project took to open, and the time of each part of the last frame. A frame over 100 ms is also reported in the status bar |
 
 ## kotlin-lsp (live errors, type-aware completion)
 
@@ -94,7 +95,26 @@ Kotlin LSP (`tests/fixtures/fake_lsp.py`). They cover navigation, completion wit
 preview render, Gradle errors, rename/extract/optimize imports and undo, reload on disk change, git blame and history,
 LSP completion/diagnostics/rename, and a memory test that repeats real work 15 times and fails if the live heap grows.
 
-`droid-lite --bench <project>` times opening, indexing and each search. `DROID_LITE_SHOT=out.png` saves a window screenshot once indexing is done, then quits.
+## Performance checks
+
+`droid-lite --bench <project>` times opening, indexing and each search
+(`--features memstats` adds the memory each step keeps).
+
+`scripts/perf_check.py <old-ref> [<new-ref>]` compares two versions: it builds both (kept in `target/perf`),
+runs `--bench` on your project several times with the order swapped each round, and fails when a step is
+more than 15 % and 2 ms slower, or keeps more than 5 % and 2 MB more memory.
+
+Run it on every push with the pre-push hook:
+
+```sh
+git config core.hooksPath scripts/hooks
+git config droidlite.perfProject /path/to/android/project
+```
+
+The hook checks only pushes that change `src`, `Cargo.*` or `assets`, and skips new branches.
+`git push --no-verify` skips it once.
+
+`DROID_LITE_SHOT=out.png` saves a window screenshot once indexing is done, then quits. `DROID_LITE_SHOT=out.png` saves a window screenshot once indexing is done, then quits.
 Use it with `DROID_LITE_OPEN=<file>`, `DROID_LITE_SEARCH=<query>` or `DROID_LITE_BLAME=1` for UI checks.
 
 ## Limits (v0.1)

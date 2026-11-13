@@ -11,6 +11,7 @@ mod git_ui;
 mod gutter;
 mod libs_ui;
 mod logcat_ui;
+mod perf;
 mod refactor_ui;
 mod run_ui;
 mod tree;
@@ -112,8 +113,6 @@ struct Watchdog {
 }
 
 impl Watchdog {
-    const LIMIT_MS: f32 = 100.0;
-
     fn start() -> Watchdog {
         Watchdog {
             start: Instant::now(),
@@ -128,10 +127,16 @@ impl Watchdog {
         r
     }
 
-    /// The report for a slow frame. The first frames (fonts, first layout) are skipped.
-    fn finish(self, frame: u64) -> Option<String> {
+    /// The frame's total time and parts, and the report for a slow frame. The first frames
+    /// (fonts, first layout) are never reported.
+    fn finish(self, frame: u64) -> (f32, Vec<(&'static str, f32)>, Option<String>) {
         let total = self.start.elapsed().as_secs_f32() * 1000.0;
-        if frame <= 3 || total < Self::LIMIT_MS {
+        let report = self.report(frame, total);
+        (total, self.stages, report)
+    }
+
+    fn report(&self, frame: u64, total: f32) -> Option<String> {
+        if frame <= 3 || total < perf::SLOW_MS {
             return None;
         }
         let (name, ms) = self
@@ -254,6 +259,7 @@ enum Bottom {
     Build,
     Find,
     Logcat,
+    Performance,
 }
 
 /// The right panel's tab.
@@ -373,6 +379,7 @@ pub struct App {
     history_for: Option<PathBuf>,
     /// Last slow-frame report from the watchdog, shown in the status bar for a while.
     slow: Option<(String, Instant)>,
+    perf: perf::Perf,
 }
 
 impl App {
@@ -455,6 +462,7 @@ impl App {
             session_saved: (0, Instant::now()),
             history_for: None,
             slow: None,
+            perf: Default::default(),
         };
         if let Some(dir) = open.or_else(last_project) {
             app.open_project(&dir, &cc.egui_ctx);
@@ -505,6 +513,7 @@ impl App {
         self.project = None;
         self.tree.clear();
         let (tx, rx) = channel();
+        self.perf.opening = Some(Instant::now());
         self.status = format!("Opening {}…", dir.display());
         let (dir, c, view) = (dir.to_path_buf(), ctx.clone(), self.tree_view);
         std::thread::spawn(move || {
@@ -976,6 +985,7 @@ impl App {
             && let Ok((project, index, branch, tree, res)) = rx.try_recv()
         {
             self.indexing = None;
+            self.perf.opened_in = self.perf.opening.take().map(|t| t.elapsed());
             self.tree = tree;
             self.res = res;
             self.project_ready(project, index, branch, ctx);
@@ -2914,6 +2924,11 @@ impl App {
                 Bottom::Logcat,
                 format!("{}  Logcat", ic::TERMINAL),
             );
+            ui.selectable_value(
+                &mut self.bottom,
+                Bottom::Performance,
+                format!("{}  Performance", ic::GAUGE),
+            );
             if self.bottom == Bottom::Build
                 && ui.small_button("Reload stability").clicked()
                 && let Some(p) = self.project.take()
@@ -3073,6 +3088,7 @@ impl App {
                     });
             }
             Bottom::Logcat => self.logcat_panel(ui),
+            Bottom::Performance => self.perf_panel(ui),
             Bottom::Find => {
                 let root = self
                     .project
@@ -3253,7 +3269,12 @@ impl eframe::App for App {
             self.history_window(&ctx);
         });
         self.frames += 1;
-        if let Some(report) = watch.finish(self.frames) {
+        let (total, stages, report) = watch.finish(self.frames);
+        if self.frames > 3 {
+            // the first frames load fonts and lay out everything once
+            self.perf.record(stages, total);
+        }
+        if let Some(report) = report {
             eprintln!("droid-lite: {report}");
             self.slow = Some((report, Instant::now()));
         }

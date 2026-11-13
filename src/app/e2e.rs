@@ -966,15 +966,15 @@ fn e2e_bulk_disk_changes_and_background_open_do_not_block() {
 fn watchdog_reports_only_slow_frames() {
     let mut w = Watchdog::start();
     w.stage("fast", || ());
-    assert!(w.finish(10).is_none());
+    assert!(w.finish(10).2.is_none());
     let mut w = Watchdog::start();
     w.stage("fast", || ());
     w.stage("editor", || std::thread::sleep(Duration::from_millis(120)));
-    let r = w.finish(10).unwrap();
+    let r = w.finish(10).2.unwrap();
     assert!(r.contains("mostly editor"), "{r}");
     let mut w = Watchdog::start();
     w.stage("startup", || std::thread::sleep(Duration::from_millis(120)));
-    assert!(w.finish(1).is_none(), "first frames are skipped");
+    assert!(w.finish(1).2.is_none(), "first frames are skipped");
 }
 
 const REPO_KT: &str = "package com.demo.data\n\ninterface Repo {\n    fun load(): List<User>\n}\n\nclass RealRepo : Repo {\n    override fun load(): List<User> = emptyList()\n}\n\nclass FakeRepo : Repo {\n    override fun load(): List<User> = listOf(User(\"a\", 1))\n}\n";
@@ -2661,6 +2661,32 @@ fn e2e_pull_request_panel_resizes_both_ways() {
         h.render()
             .unwrap()
             .save(Path::new(&dir).join("e2e-pull-request-narrow.png"))
+            .unwrap();
+    }
+}
+
+#[test]
+fn e2e_performance_tab_shows_frames_memory_and_open_time() {
+    let f = Fixture::new("perf");
+    let mut h = f.harness();
+    h.get_by_label(&format!("{}  Performance", ic::GAUGE))
+        .click();
+    steps(&mut h, 5);
+    h.get_by_label_contains("Frames: median");
+    h.get_by_label_contains("Memory");
+    h.get_by_label_contains("Project opened in");
+    // the parts of the last frame, by name
+    h.get_by_label_contains("editor ");
+    h.get_by_label_contains("project tree ");
+    let p = &h.state().perf;
+    assert!(p.frames.len() > 5, "frames are recorded");
+    assert!(p.opened_in.is_some() && p.opening.is_none());
+    let mb = perf::footprint().unwrap() / 1_048_576;
+    assert!((10..4096).contains(&mb), "footprint {mb} MB");
+    if let Ok(dir) = std::env::var("DROID_LITE_SNAPSHOT_DIR") {
+        h.render()
+            .unwrap()
+            .save(Path::new(&dir).join("e2e-performance.png"))
             .unwrap();
     }
 }

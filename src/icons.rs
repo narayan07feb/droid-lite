@@ -23,6 +23,7 @@ pub const RECORD: &str = "\u{E3EE}";
 pub const STOP_CIRCLE: &str = "\u{E46E}";
 pub const COPY: &str = "\u{E1CA}";
 pub const TERMINAL: &str = "\u{E47E}";
+pub const GAUGE: &str = "\u{E628}";
 /// A package in the Android view.
 pub const PACKAGE_SMALL: &str = "\u{E8F8}"; // folder-dotted
 pub const IMAGE: &str = "\u{E2CA}";
