@@ -14,6 +14,7 @@ mod logcat_ui;
 mod perf;
 mod refactor_ui;
 mod run_ui;
+mod tests_ui;
 mod tree;
 mod typing;
 mod usage_filter;
@@ -259,6 +260,7 @@ enum Bottom {
     Build,
     Find,
     Logcat,
+    Tests,
     Performance,
 }
 
@@ -380,6 +382,7 @@ pub struct App {
     /// Last slow-frame report from the watchdog, shown in the status bar for a while.
     slow: Option<(String, Instant)>,
     perf: perf::Perf,
+    tests: tests_ui::Tests,
 }
 
 impl App {
@@ -463,6 +466,7 @@ impl App {
             history_for: None,
             slow: None,
             perf: Default::default(),
+            tests: Default::default(),
         };
         if let Some(dir) = open.or_else(last_project) {
             app.open_project(&dir, &cc.egui_ctx);
@@ -553,6 +557,7 @@ impl App {
             self.res.len()
         );
         self.project = Some(project);
+        self.load_plugins(ctx);
         self.start_lib_index(ctx);
         if self.tabs.is_empty() {
             self.restore_session();
@@ -1007,6 +1012,8 @@ impl App {
                 self.merge_found(l);
             }
         }
+        self.poll_tests();
+        self.keep_watch(ctx);
         if let Some(run) = self.gradle.as_mut() {
             let mut done = None;
             for l in run.poll() {
@@ -2058,6 +2065,8 @@ impl App {
         let hunks = tab.git.hunks.clone();
         let mut revert_hunk: Option<usize> = None;
         let show_column = self.git.show_column;
+        let test_rows = self.tests.marks_at(&tab.path);
+        let test_marks = &self.tests.marks;
         let mut open_commit: Option<String> = None;
         let Tab {
             text,
@@ -2238,6 +2247,23 @@ impl App {
                         open_commit = Some(sha);
                     }
                     let mut badge_right = None;
+                    if let Some(r) = gutter::paint_tests(
+                        ui,
+                        &test_rows,
+                        |m| {
+                            let names: Vec<&str> =
+                                m.iter().map(|&i| test_marks[i].label.as_str()).collect();
+                            match names[..] {
+                                [one] => format!("Run {one}"),
+                                _ => format!("Choose a case to run: {}", names.join(", ")),
+                            }
+                        },
+                        icons,
+                        &out.galley,
+                        out.galley_pos,
+                    ) {
+                        request = Some(r);
+                    }
                     if let Some(a) = annotations.as_ref() {
                         if let Some(r) =
                             gutter::paint_marks(ui, a, icons, &out.galley, out.galley_pos)
@@ -2926,6 +2952,15 @@ impl App {
             );
             ui.selectable_value(
                 &mut self.bottom,
+                Bottom::Tests,
+                if self.tests.running() {
+                    format!("{}  Testing…", ic::CLOCK_COUNTER_CLOCKWISE)
+                } else {
+                    format!("{}  Tests", ic::CHECK_CIRCLE)
+                },
+            );
+            ui.selectable_value(
+                &mut self.bottom,
                 Bottom::Performance,
                 format!("{}  Performance", ic::GAUGE),
             );
@@ -3088,6 +3123,7 @@ impl App {
                     });
             }
             Bottom::Logcat => self.logcat_panel(ui),
+            Bottom::Tests => self.tests_panel(ui),
             Bottom::Performance => self.perf_panel(ui),
             Bottom::Find => {
                 let root = self

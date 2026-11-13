@@ -66,6 +66,8 @@ pub(super) enum Request {
     Run(Action),
     /// Show this `@Preview` on the device.
     Preview(String),
+    /// Plugin test cases on one line (indexes into `Tests::marks`).
+    Tests(Vec<usize>),
 }
 
 impl App {
@@ -282,6 +284,7 @@ impl App {
             Request::Pick(title, hits) => self.pick(title, hits),
             Request::Run(a) => self.run(a, ctx),
             Request::Preview(name) => self.run_on_device(crate::device::Launch::Preview(name), ctx),
+            Request::Tests(marks) => self.gutter_tests(marks, ctx),
         }
     }
 
@@ -638,5 +641,52 @@ pub(super) fn context_menu(
     item(ui, Action::OptimizeImports);
     item(ui, Action::LocalHistory);
     item(ui, Action::LocateFile);
+    out
+}
+
+/// A ▶ on each row that plugin test cases name; `rows` comes from `Tests::marks_at`.
+pub(super) fn paint_tests(
+    ui: &mut Ui,
+    rows: &[(usize, Vec<usize>)],
+    labels: impl Fn(&[usize]) -> String,
+    column: Rect,
+    galley: &Galley,
+    galley_pos: Pos2,
+) -> Option<Request> {
+    let clip = ui.clip_rect();
+    let mut out = None;
+    for (line, marks) in rows {
+        let Some(row) = galley.rows.get(*line) else {
+            continue;
+        };
+        let y = galley_pos.y + row.pos.y;
+        if y > clip.bottom() || y + row.rect().height() < clip.top() {
+            continue;
+        }
+        let rect = ui.painter().text(
+            Pos2::new(column.left() + 1.0, y),
+            Align2::LEFT_TOP,
+            ic::PLAY,
+            FontId::proportional(crate::theme::font_size()),
+            DOWN,
+        );
+        let r = ui.interact(
+            rect.expand(2.0),
+            ui.scope_id().with(("test", *line)),
+            Sense::click(),
+        );
+        r.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::Role::Button,
+                true,
+                format!("Run tests on line {}", line + 1),
+            )
+        });
+        if r.clicked() {
+            out = Some(Request::Tests(marks.clone()));
+        }
+        r.on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(labels(marks));
+    }
     out
 }

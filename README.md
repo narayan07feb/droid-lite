@@ -61,6 +61,7 @@ Set `DROID_LITE_GLASS=0` for solid colours.
 | Logcat | Bottom **Logcat** tab, like Android Studio: device picker (USB or `adb connect`), live log with the last 2,000 lines, columns time / pid-tid / tag / app / level, Android Studio colours. Filter: `package:mine` (the project's `applicationId`s), `package:com.x`, `level:warn`, `tag:OkHttp`, `-tag:chatty`, free text. Pause, Scroll lock, Clear. Click a stack-trace line (`at …(File.kt:42)`) to open the file at that line. Keeps 50,000 lines. `adb` runs only while the tab is open, and never clears or resizes the phone's log buffer (Clear clears only the view), so other tools reading the same phone are not disturbed. `DROID_LITE_ADB` picks another adb |
 | Gradle | Run any task (`assembleDebug`, `installDebug`, …), see the output live, and click `e:` compiler errors to open them |
 | Performance | Bottom **Performance** tab: a graph of the last 240 frame times (lines at 16.7 ms and 100 ms; hover a bar for its slowest part), the median and slowest frame, the app's memory (as Activity Monitor shows it), how long the project took to open, and the time of each part of the last frame. A frame over 100 ms is also reported in the status bar |
+| Test plugins | Bottom **Tests** tab for any test tool that follows the plugin format ([docs/PLUGINS.md](docs/PLUGINS.md)): its cases as a tree with a filter and ▶ per case or group, live pass / fail, results that open their file or link, the run's log, a live state panel (for example the phone and screen of a device test), extra views (failures, …), action buttons and links. A ▶ also shows in the editor gutter on lines a case names. To add one, press **Add plugin…** in the Tests tab and pick the tool's folder (its `plugin.json` or `droid-lite-plugin/` folder); a project can also ship plugins in `.droid-lite/plugins/<name>/` |
 
 ## kotlin-lsp (live errors, type-aware completion)
 
@@ -87,13 +88,14 @@ ln -sf ~/.local/share/kotlin-lsp/kotlin-server-<version>/bin/intellij-server ~/.
 - `git.rs`: blame, history and commit diffs from the `git` command.
 - `watch.rs`: the folder watcher. `glass.rs`: Liquid Glass.
 - `gradle.rs`, `lsp.rs`: Gradle runs and the LSP client.
+- `plugins.rs`, `app/tests_ui.rs`: test plugins (the contract is in [docs/PLUGINS.md](docs/PLUGINS.md)) and the Tests tab.
 - `app.rs`, `app/`: the window, the refactoring UI and the reload logic.
 
 `cargo test -- --test-threads=1` runs the unit tests and end-to-end tests. The end-to-end tests drive the real
 app with key presses and clicks (egui_kittest) on a fixture project with git history, a fake `gradlew` and a fake
 Kotlin LSP (`tests/fixtures/fake_lsp.py`). They cover navigation, completion with imports, save, the Compose panel,
 preview render, Gradle errors, rename/extract/optimize imports and undo, reload on disk change, git blame and history,
-LSP completion/diagnostics/rename, and a memory test that repeats real work 15 times and fails if the live heap grows.
+LSP completion/diagnostics/rename, test plugins (add, run from the list and the gutter, views, actions, live state, remove), and a memory test that repeats real work 15 times and fails if the live heap grows.
 
 ## Performance checks
 

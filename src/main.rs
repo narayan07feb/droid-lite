@@ -19,6 +19,7 @@ mod lexer;
 mod libs;
 mod logcat;
 mod lsp;
+mod plugins;
 mod project;
 mod refactor;
 mod resources;

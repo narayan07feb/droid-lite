@@ -34,10 +34,13 @@ impl Run {
         cmd.args(args.split_whitespace())
             .arg("--console=plain")
             .current_dir(&project.root)
-            .envs(serial.map(|s| ("ANDROID_SERIAL", s)))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd.spawn()?;
+            .envs(serial.map(|s| ("ANDROID_SERIAL", s)));
+        Run::spawn(cmd, ctx)
+    }
+
+    /// Starts any command; its stdout and stderr lines arrive through `poll`.
+    pub fn spawn(mut cmd: Command, ctx: egui::Context) -> std::io::Result<Run> {
+        let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
         let (tx, rx) = channel();
         for pipe in [
             child
@@ -73,6 +76,10 @@ impl Run {
             out.push(Line::Done(status.code()));
         }
         out
+    }
+
+    pub fn id(&self) -> u32 {
+        self.child.id()
     }
 
     pub fn stop(&mut self) {

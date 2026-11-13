@@ -2690,3 +2690,117 @@ fn e2e_performance_tab_shows_frames_memory_and_open_time() {
             .unwrap();
     }
 }
+
+#[test]
+fn e2e_plugin_tests_tab_runs_cases_from_list_gutter_views_and_actions() {
+    let f = Fixture::new("plugins");
+    std::fs::create_dir_all(f.path("flows")).unwrap();
+    std::fs::write(f.path("flows/login.yaml"), "appId: demo\n- tapOn: Login\n").unwrap();
+    std::fs::write(f.path("flows/solo.yaml"), "appId: demo\n").unwrap();
+    let mut h = f.harness();
+    // no plugin yet: the tab says how to add one
+    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE))
+        .click();
+    steps(&mut h, 2);
+    h.get_by_label(&format!("{}  Add plugin…", ic::FOLDER_OPEN));
+    // Add plugin with the example of docs/PLUGINS.md (the dialog's pick), so the documented
+    // format stays tested
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/plugin-example");
+    let ctx = h.ctx.clone();
+    h.state_mut().add_plugin(&example, &ctx);
+    assert!(f.config.join("plugins/example-tests").is_symlink());
+    wait(&mut h, "cases listed", |a| a.tests.marks.len() == 3);
+    wait(&mut h, "live state", |a| {
+        a.tests.plugins[0]
+            .live
+            .as_ref()
+            .is_some_and(|l| l.title == "Phone idle")
+    });
+    steps(&mut h, 2);
+    h.get_by_label("Phone idle");
+    h.get_by_label("fake-1");
+
+    // ▶ in the list: no status line for the case itself, so exit 0 means passed
+    click_in_row(&mut h, "solo case", ic::PLAY);
+    wait(&mut h, "solo run", |a| a.tests.plugins[0].run.is_none());
+    let st =
+        |h: &Harness<'static, App>, id: &str| h.state().tests.plugins[0].status.get(id).copied();
+    assert_eq!(st(&h, "solo"), Some(crate::plugins::Status::Passed));
+    steps(&mut h, 2);
+    h.get_by_label("step 1");
+    assert!(
+        h.state().tests.plugins[0]
+            .log
+            .iter()
+            .any(|l| l == "starting solo")
+    );
+
+    // gutter ▶ on a line with two cases: the list shows just those to choose
+    let login = f.path("flows/login.yaml");
+    h.state_mut().open_file(&login, None);
+    steps(&mut h, 3);
+    h.get_by_label("Run tests on line 2").click();
+    steps(&mut h, 3);
+    assert_eq!(h.state().tests.only.len(), 2);
+    h.get_by_label("Cases on this line");
+    click_in_row(&mut h, "fails", ic::PLAY);
+    wait(&mut h, "failing run", |a| a.tests.plugins[0].run.is_none());
+    assert_eq!(st(&h, "bad"), Some(crate::plugins::Status::Failed));
+    steps(&mut h, 2);
+    // a result with a file opens it at its line
+    h.state_mut()
+        .open_file(&f.path("app/src/main/java/com/demo/data/User.kt"), None);
+    steps(&mut h, 2);
+    h.get_by_label("step 1  button missing").click();
+    steps(&mut h, 3);
+    assert!(tab(&h).path.ends_with("flows/login.yaml"));
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("- tapOn"));
+
+    // gutter ▶ on a line with one case runs it at once
+    h.state_mut().open_file(&f.path("flows/solo.yaml"), None);
+    steps(&mut h, 3);
+    h.state_mut().tests.plugins[0].status.clear();
+    h.get_by_label("Run tests on line 1").click();
+    steps(&mut h, 2);
+    wait(&mut h, "gutter run", |a| {
+        a.tests.plugins[0].run.is_none() && a.tests.plugins[0].status.contains_key("solo")
+    });
+    assert_eq!(st(&h, "solo"), Some(crate::plugins::Status::Passed));
+
+    // a view lists rows; an action reports like a run
+    h.get_by_label("Failures").click();
+    wait(&mut h, "failures view", |a| {
+        a.tests.plugins[0].rows.len() == 1
+    });
+    steps(&mut h, 2);
+    h.get_by_label("F-1  stuck on Home");
+    h.get_by_label("Check").click();
+    wait(&mut h, "action", |a| {
+        a.tests.plugins[0].run.is_none() && !a.tests.plugins[0].results.is_empty()
+    });
+    steps(&mut h, 2);
+    h.get_by_label("tool  ready");
+    if let Ok(dir) = std::env::var("DROID_LITE_SNAPSHOT_DIR") {
+        h.render()
+            .unwrap()
+            .save(Path::new(&dir).join("e2e-tests-tab.png"))
+            .unwrap();
+    }
+
+    // the live state runs only while the tab shows
+    h.get_by_label(&format!("{}  Performance", ic::GAUGE))
+        .click();
+    steps(&mut h, 2);
+    assert!(h.state().tests.plugins[0].watch.is_none());
+    assert!(h.state().tests.plugins[0].live.is_none());
+
+    // Remove drops the link only
+    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE))
+        .click();
+    steps(&mut h, 2);
+    h.get_by_label("Remove").click();
+    steps(&mut h, 2);
+    assert!(h.state().tests.plugins.is_empty());
+    assert!(!f.config.join("plugins/example-tests").exists());
+    assert!(example.join("plugin.json").is_file());
+}

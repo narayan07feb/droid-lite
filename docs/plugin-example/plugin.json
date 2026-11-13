@@ -1,0 +1,8 @@
+{
+  "name": "Example tests",
+  "list": ["sh", "{plugin}/plugin.sh", "list"],
+  "run": ["sh", "{plugin}/plugin.sh", "run", "{id}"],
+  "watch": ["sh", "{plugin}/plugin.sh", "watch"],
+  "views": [{"name": "Failures", "run": ["sh", "{plugin}/plugin.sh", "failures"]}],
+  "actions": [{"name": "Check", "run": ["sh", "{plugin}/plugin.sh", "check"]}]
+}
