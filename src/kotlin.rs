@@ -269,10 +269,15 @@ impl<'a> Scanner<'a> {
             // one parameter runs to the next comma at depth 0
             let mut k = j;
             let mut depth = 0;
+            // `<` `>` nest only in the type: not the `>` of `->`, not a `<` in a default value
+            let mut in_type = true;
             while k < end - 1 {
                 match self.text(k) {
-                    "(" | "[" | "{" | "<" => depth += 1,
-                    ")" | "]" | "}" | ">" => depth -= 1,
+                    "(" | "[" | "{" => depth += 1,
+                    "<" if in_type => depth += 1,
+                    ")" | "]" | "}" => depth -= 1,
+                    ">" if in_type && !self.is(k.wrapping_sub(1), "-") => depth -= 1,
+                    "=" if depth == 0 && !self.is(k + 1, ">") => in_type = false,
                     "," if depth == 0 => break,
                     _ => {}
                 }
@@ -795,6 +800,29 @@ typealias Users = List<User>
         assert_eq!(card.params[2].ty, "() -> Unit");
         let body = card.body.clone().unwrap();
         assert!(SAMPLE[body].contains("Column(modifier)"));
+    }
+
+    #[test]
+    fn function_type_params_and_comparison_defaults() {
+        let f = scan(
+            "@Composable\nfun Screen(\n    state: UiState,\n    onEvent: (Event) -> Unit,\n    onBack: () -> Unit,\n    map: Map<String, (Int) -> Unit>,\n    big: Boolean = a < b,\n    onDone: () -> Unit = {},\n) {}\n",
+        );
+        let s = find(&f, "Screen");
+        assert_eq!(
+            s.params
+                .iter()
+                .map(|p| (p.name.as_str(), p.ty.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("state", "UiState"),
+                ("onEvent", "(Event) -> Unit"),
+                ("onBack", "() -> Unit"),
+                ("map", "Map<String, (Int) -> Unit>"),
+                ("big", "Boolean"),
+                ("onDone", "() -> Unit"),
+            ]
+        );
+        assert!(s.params[5].has_default);
     }
 
     #[test]
