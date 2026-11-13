@@ -24,7 +24,7 @@ For a newer version, replace the app and run step 3 again.
 cargo run --release -- /path/to/android/project
 ```
 
-You can also press **Open project…**, or drop a folder on the window. The last project opens again on the next start.
+You can also press **Open project…**, or drop a folder on the window. The last project opens again on the next start. To work on two projects at once, press **+** next to the project name, ⇧⌘N, or Help → **New window…**: it asks for a project and opens it in its own window (a separate Droid Lite process, with its own tabs and builds).
 
 To get a normal Mac app with the icon, run `scripts/bundle-mac.sh`, then copy `target/release/Droid Lite.app` to `/Applications`.
 
@@ -35,7 +35,7 @@ Set `DROID_LITE_GLASS=0` for solid colours.
 
 | Area | What you get |
 |------|--------------|
-| Keymaps | **Eclipse (macOS)** by default, or Android Studio (macOS): Help → Keymap. Help → Keyboard shortcuts lists every key. Eclipse: ⇧⌘T open type, ⇧⌘R open file, ⌘O outline, ⌘3 search everywhere, ⌘E recent, F3 or ⌘-click declaration, ⇧⌘G references, ⌥⌘W locate file, ⌃H find in files, ⌘L go to line, ⌘[ / ⌘] back and forward, ⌥⌘R rename, ⌥⌘L extract variable, ⇧⌘O organize imports, ⌘/ comment, ⌘D delete line, ⌥⌘↓ duplicate, ⌥↑/↓ move line, ⌃Space complete |
+| Keymaps | **Eclipse (macOS)** by default, or Android Studio (macOS): Help → Keymap. Help → Keyboard shortcuts lists every key. Eclipse: ⇧⌘T open type, ⇧⌘R open file, ⌘O outline, ⌘3 search everywhere, ⌘E recent, F3 or ⌘-click declaration, ⇧⌘G references, ⌥⌘W locate file, ⌃H find in files, ⌘L go to line, ⌘[ / ⌘] back and forward, ⌥⌘R rename, ⌥⌘L extract variable, ⇧⌘O organize imports, ⌘/ comment, ⌘D delete line, ⌥⌘↓ duplicate, ⌥↑/↓ move line, ⌃Space complete, ⇧⌘N new window |
 | Find / replace | ⌘F bar above the editor: case and whole-word toggles, Enter / ⇧Enter (Eclipse ⌘K / ⇧⌘K, Android Studio ⌘G / ⇧⌘G) step through matches, Replace and Replace all, all matches highlighted |
 | Smart typing | Enter keeps the indent (one level more after `{` `(` `->`), brackets and quotes close themselves, typing a closer steps over it, Backspace removes an empty pair, the matching bracket is highlighted |
 | ⌘ / Ctrl hover | Underlines the name and shows its declaration and "N usages in M files" (the declaration itself not counted) with the first usage lines |
@@ -116,7 +116,7 @@ git config droidlite.perfProject /path/to/android/project
 The hook checks only pushes that change `src`, `Cargo.*` or `assets`, and skips new branches.
 `git push --no-verify` skips it once.
 
-`DROID_LITE_SHOT=out.png` saves a window screenshot once indexing is done, then quits. `DROID_LITE_SHOT=out.png` saves a window screenshot once indexing is done, then quits.
+`DROID_LITE_SHOT=out.png` saves a window screenshot once indexing is done, then quits.
 Use it with `DROID_LITE_OPEN=<file>`, `DROID_LITE_SEARCH=<query>` or `DROID_LITE_BLAME=1` for UI checks.
 
 ## Limits (v0.1)

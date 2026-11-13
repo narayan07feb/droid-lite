@@ -1306,6 +1306,7 @@ impl App {
             Action::Save => self.save(),
             Action::CloseTab => self.close_tab(self.active),
             Action::Shortcuts => self.show_shortcuts = !self.show_shortcuts,
+            Action::NewWindow => self.new_window(),
         }
     }
 
@@ -1338,8 +1339,38 @@ impl App {
         self.status = format!("Keymap: {}", km.name());
     }
 
+    /// Asks for a project and opens it in a new window: another Droid Lite process, so each
+    /// window has its own project, tabs and Gradle runs.
+    fn new_window(&mut self) {
+        let Some(dir) = rfd::FileDialog::new()
+            .set_title("Open a project in a new window")
+            .pick_folder()
+        else {
+            return;
+        };
+        let started = window_command(&dir).and_then(|mut c| c.spawn());
+        self.status = match started {
+            Ok(mut child) => {
+                // reap it when that window closes
+                std::thread::spawn(move || child.wait());
+                format!("Opened {} in a new window", dir.display())
+            }
+            Err(e) => format!("Could not open a new window: {e}"),
+        };
+    }
+
     fn help_menu(&mut self, ui: &mut Ui) {
         ui.menu_button("Help", |ui| {
+            if ui
+                .add(
+                    egui::Button::new("New window…")
+                        .shortcut_text(keymap::text(self.keymap, Action::NewWindow)),
+                )
+                .clicked()
+            {
+                ui.close();
+                self.new_window();
+            }
             if ui
                 .add(
                     egui::Button::new("Settings…")
@@ -1625,6 +1656,16 @@ impl App {
                     .pick_folder()
             {
                 self.open_project(&dir, &ui.ctx().clone());
+            }
+            if ui
+                .small_button("+")
+                .on_hover_text(format!(
+                    "Open a project in a new window   {}",
+                    keymap::text(self.keymap, Action::NewWindow)
+                ))
+                .clicked()
+            {
+                self.new_window();
             }
             if let Some(b) = &self.branch {
                 ui.label(
@@ -3594,6 +3635,15 @@ fn tab_widget(ui: &mut Ui, t: &Tab, active: bool) -> (bool, bool) {
     (r.clicked() && !close, close || r.middle_clicked())
 }
 
+/// This app again, opening `dir`, in its own process group so it outlives this window.
+fn window_command(dir: &Path) -> std::io::Result<std::process::Command> {
+    let mut c = std::process::Command::new(std::env::current_exe()?);
+    c.arg(dir);
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut c, 0);
+    Ok(c)
+}
+
 fn config_file() -> Option<PathBuf> {
     setting_file("last-project")
 }
@@ -3675,5 +3725,18 @@ mod tests {
             ("/Users/me/app/src/Main.kt", 12, 5)
         );
         assert!(compiler_location("BUILD SUCCESSFUL").is_none());
+    }
+
+    #[test]
+    fn new_window_runs_this_app_on_the_picked_project() {
+        let c = window_command(Path::new("/some/project")).unwrap();
+        assert_eq!(
+            Path::new(c.get_program()),
+            std::env::current_exe().unwrap().as_path()
+        );
+        assert_eq!(c.get_args().collect::<Vec<_>>(), ["/some/project"]);
+        for km in [Keymap::Eclipse, Keymap::AndroidStudio] {
+            assert_eq!(keymap::text(km, Action::NewWindow), "⇧⌘N");
+        }
     }
 }

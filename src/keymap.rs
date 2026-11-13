@@ -60,6 +60,7 @@ pub enum Action {
     Save,
     CloseTab,
     Shortcuts,
+    NewWindow,
 }
 
 impl Action {
@@ -98,6 +99,7 @@ impl Action {
             Action::Save => "Save",
             Action::CloseTab => "Close tab",
             Action::Shortcuts => "Keyboard shortcuts",
+            Action::NewWindow => "New window (open a project)",
         }
     }
 }
@@ -146,6 +148,7 @@ pub fn bindings(km: Keymap) -> Vec<(Action, KeyboardShortcut)> {
             (Save, sc(CMD, Key::S)),
             (CloseTab, sc(CMD, Key::W)),
             (Shortcuts, sc(CMD | SHIFT, Key::L)),
+            (NewWindow, sc(CMD | SHIFT, Key::N)),
             (Settings, sc(CMD, Key::Comma)),
             (LocateFile, sc(CMD | ALT, Key::W)), // Eclipse "Show In"
         ],
@@ -180,6 +183,7 @@ pub fn bindings(km: Keymap) -> Vec<(Action, KeyboardShortcut)> {
             (Save, sc(CMD, Key::S)),
             (CloseTab, sc(CMD, Key::W)),
             (Shortcuts, sc(CMD | SHIFT, Key::Slash)),
+            (NewWindow, sc(CMD | SHIFT, Key::N)),
             (Settings, sc(CMD, Key::Comma)),
         ],
     };
