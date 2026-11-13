@@ -4,7 +4,21 @@ A light, Mac-first IDE for Android and Jetpack Compose code, written in Rust (eg
 It opens any Gradle Android project folder and indexes it in about a second:
 a large app (578 modules, 11.7k files) takes 0.6 s.
 
-## Run
+## Install (Apple Silicon Mac)
+
+1. Download `Droid-Lite-<version>-arm64.zip` from [Releases](https://github.com/narayan07feb/droid-lite/releases/latest).
+2. Unzip it and drag **Droid Lite.app** to **Applications**.
+3. The app is not signed with an Apple Developer ID, so macOS blocks the first open. Run this once in Terminal:
+
+   ```sh
+   xattr -dr com.apple.quarantine "/Applications/Droid Lite.app"
+   ```
+
+4. Open Droid Lite from Launchpad or Applications.
+
+For a newer version, replace the app and run step 3 again.
+
+## Run from source
 
 ```sh
 cargo run --release -- /path/to/android/project
@@ -29,7 +43,7 @@ Set `DROID_LITE_GLASS=0` for solid colours.
 | Kotlin Multiplatform | Purple **E** gutter icon on an `expect` declaration (click: its `actual`s, each with its source set, e.g. `androidMain · …`, `iosMain · …`), **A** on an `actual` (click: the `expect`). Members of an `expect class` count too. Go to implementations (Eclipse ⌘T, Android Studio ⌥⌘B) jumps the same way. `expect` / `actual` are soft keywords: a variable or enum entry named `actual` stays a name |
 | Compose stability | Inline badge after each `@Composable` (✓ skippable / ⚠ N unstable / ? unknown), and a hint on every parameter: a stable / unstable / runtime chip at the end of its line, or a coloured underline when several parameters share a line. Hover for the reason |
 | Compile errors | Build (Eclipse ⌘B, Android Studio ⌘F9) compiles the file's module; errors and warnings from any Gradle run show as underlines in the editor and in Problems (all files) |
-| Pull request and Git changes | Right panel → Pull request: the files the branch / pull request changed against its base, uncommitted files (stage, unstage, commit), diffs, branch switch. On a PR branch it asks which PR this one is based on (open PRs from `gh`, or type `#123` or a branch), so a stacked PR shows only its own files; the choice is kept per branch. Revert on each file (asks first): an uncommitted file goes back to the last commit (a new file is deleted); a PR file goes back to the base version as an uncommitted change |
+| Pull request and Git changes | Right panel → Pull request: the files the branch / pull request changed against its base, uncommitted files (stage, unstage, commit), branch switch. Click a file name to open it in the editor; "Diff" shows its changes. The panel resizes freely: long branch and file names are shortened. On a PR branch it asks which PR this one is based on (open PRs from `gh`, or type `#123` or a branch), so a stacked PR shows only its own files; the choice is kept per branch. Revert on each file (asks first): an uncommitted file goes back to the last commit (a new file is deleted); a PR file goes back to the base version as an uncommitted change |
 | Find references | ⌘-click (or F3 / ⌘B) on a declaration opens a usages dropdown at the cursor, like Android Studio: `File.kt:line` and the code per usage, ↑ ↓ Enter to open, Esc to close, "Open in Find panel" for the full list; a single usage opens straight away. Filters in the dropdown and the Find panel, saved with the settings: **Hide tests** (`test`, `androidTest`, `commonTest`, `iosTest`… source sets, `*-test` / `test-*` modules, `*Test` / `*Spec` files), **Hide imports**, **Hide XML**, and a path box (`feature/` keeps only those paths, `-android-test` hides them). Every code reference in the project (strings and comments skipped) plus XML layouts and the manifest, with a count per file. kotlin-lsp adds what it finds, so a project it is still importing never shows an empty list |
 | Project tree | Two views with a switch, remembered per project. **Android** (like Android Studio): per module `manifests`, `kotlin` with packages as dotted names, `res`, one group per source set (`kotlin (test)`, `kotlin (commonMain)`, `kotlin (iosMain)`). **Project**: the real folders without the `src/` level, single-child chains joined (`kotlin · com.app.feature`). Modules nest by Gradle path (`:feature:lending:data` → feature › lending › data), tests are green, platform source sets blue. **Filter files** at the top lists matching files with their folder |
 | Locate file | ⌖ on the Project header, Eclipse ⌥⌘W, Android Studio ⌥F1, or right-click → Locate: opens the folders down to the open file in the Project tree and scrolls to it. The open file is always selected in the tree |

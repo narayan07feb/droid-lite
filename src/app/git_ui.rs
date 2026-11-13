@@ -3,7 +3,7 @@
 use super::App;
 use crate::git::{self, Blame, Commit};
 use crate::highlight::{ERROR, INFO};
-use egui::{Align2, Color32, FontId, Galley, Pos2, RichText, Sense, Ui};
+use egui::{Align, Align2, Color32, FontId, Galley, Layout, Pos2, RichText, Sense, Ui};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
@@ -306,10 +306,18 @@ impl App {
             Some((c, None)) => c.to_string(),
         };
         let branch = self.branch.clone().unwrap_or_default();
+        // "Base" and "or" are equally wide, so the two fields after them line up
+        let label_w = ui.fonts_mut(|f| {
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            f.layout_no_wrap("Base".into(), font, Color32::WHITE)
+                .size()
+                .x
+        });
         ui.horizontal(|ui| {
-            ui.label("Base");
+            field_label(ui, "Base", label_w);
             egui::ComboBox::from_id_salt("base-pr")
                 .selected_text(shown)
+                .truncate()
                 .width(ui.available_width().min(260.0))
                 .show_ui(ui, |ui| {
                     if ui.selectable_label(picked.is_none(), &auto).clicked() {
@@ -331,12 +339,13 @@ impl App {
                 });
         });
         ui.horizontal(|ui| {
-            let label = ui.label("or");
+            let label = field_label(ui, "or", label_w);
             let r = ui
                 .add(
                     egui::TextEdit::singleline(&mut self.git.base_input)
                         .hint_text("#123 or a branch")
-                        .desired_width(140.0),
+                        // leave room for the "Use" button
+                        .desired_width((ui.available_width() - 48.0).max(40.0)),
                 )
                 .labelled_by(label.id);
             let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -390,44 +399,50 @@ impl App {
             '?' => crate::theme::t().weak,
             _ => Color32::from_rgb(0x58, 0x9D, 0xF6),
         };
-        ui.horizontal(|ui| {
-            let branch = self.branch.clone().unwrap_or_else(|| "(no branch)".into());
-            ui.menu_button(format!("{}  {branch}", crate::icons::GIT_BRANCH), |ui| {
-                for b in self
-                    .git
-                    .changes
-                    .as_ref()
-                    .map(|c| c.branches.clone())
-                    .unwrap_or_default()
-                {
-                    if ui
-                        .selectable_label(Some(&b) == self.branch.as_ref(), &b)
-                        .clicked()
-                    {
-                        command = Some(vec!["checkout".into(), b]);
-                        ui.close();
-                    }
-                }
-            })
-            .response
-            .on_hover_text("Switch branch");
+        right_row(ui, |ui| {
+            ui.checkbox(&mut self.git.show_column, "Blame column");
             if ui.button("Refresh").clicked() {
                 self.git.changes_stale = true;
             }
             if self.git.changes_rx.is_some() {
                 ui.spinner();
             }
-            ui.checkbox(&mut self.git.show_column, "Blame column");
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                let branch = self.branch.clone().unwrap_or_else(|| "(no branch)".into());
+                let button =
+                    egui::Button::new(format!("{}  {branch}", crate::icons::GIT_BRANCH)).truncate();
+                egui::containers::menu::MenuButton::from_button(button)
+                    .ui(ui, |ui| {
+                        for b in self
+                            .git
+                            .changes
+                            .as_ref()
+                            .map(|c| c.branches.clone())
+                            .unwrap_or_default()
+                        {
+                            if ui
+                                .selectable_label(Some(&b) == self.branch.as_ref(), &b)
+                                .clicked()
+                            {
+                                command = Some(vec!["checkout".into(), b]);
+                                ui.close();
+                            }
+                        }
+                    })
+                    .0
+                    .on_hover_text(format!("{branch}\nSwitch branch"));
+            });
         });
         let mut base_choice: Option<Option<String>> = None;
         let mut revert: Option<Revert> = None;
         let mut confirm = self.git.confirm_revert.clone();
-        // "Revert", then "Discard? Yes / No" in the same row
+        // "Revert", then "Discard? Yes / No" in the same row (right to left: "No" first)
         let mut revert_button = |ui: &mut Ui, key: (PathBuf, bool), tip: &str| -> bool {
             if confirm.as_ref() == Some(&key) {
-                ui.label(RichText::new("Discard?").color(ERROR));
+                let no = ui.small_button("No").clicked();
                 let yes = ui.small_button("Yes").clicked();
-                if yes || ui.small_button("No").clicked() {
+                ui.label(RichText::new("Discard?").color(ERROR));
+                if yes || no {
                     confirm = None;
                 }
                 yes
@@ -452,16 +467,7 @@ impl App {
                     .path
                     .file_name()
                     .map_or(rel.clone(), |n| n.to_string_lossy().into_owned());
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(c.code.to_string())
-                            .monospace()
-                            .strong()
-                            .color(code_color(c.code)),
-                    );
-                    if c.code != 'D' && ui.small_button("Open").clicked() {
-                        open_file = Some(c.path.clone());
-                    }
+                let clicked = file_row(ui, c.code, code_color(c.code), &name, &rel, |ui| {
                     if let Some(base) = &ch.base
                         && revert_button(
                             ui,
@@ -475,13 +481,20 @@ impl App {
                         });
                     }
                     if ui
-                        .link(&name)
-                        .on_hover_text(format!("{rel}\nShow the diff against the base"))
+                        .small_button("Diff")
+                        .on_hover_text("Show the diff against the base")
                         .clicked()
                     {
                         diff = Some((c.path.clone(), ch.base.clone(), false));
                     }
                 });
+                if clicked {
+                    if c.code == 'D' {
+                        diff = Some((c.path.clone(), ch.base.clone(), false));
+                    } else {
+                        open_file = Some(c.path.clone());
+                    }
+                }
             }
             ui.separator();
             ui.horizontal(|ui| {
@@ -506,26 +519,7 @@ impl App {
                     .path
                     .file_name()
                     .map_or(rel.clone(), |n| n.to_string_lossy().into_owned());
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(c.code.to_string())
-                            .monospace()
-                            .strong()
-                            .color(code_color(c.code)),
-                    );
-                    // buttons first: a long path must not push them out of the narrow panel
-                    let p = c.path.to_string_lossy().into_owned();
-                    if c.staged {
-                        if ui.small_button("Unstage").clicked() {
-                            command =
-                                Some(vec!["restore".into(), "--staged".into(), "--".into(), p]);
-                        }
-                    } else if ui.small_button("Stage").clicked() {
-                        command = Some(vec!["add".into(), "--".into(), p]);
-                    }
-                    if c.code != 'D' && ui.small_button("Open").clicked() {
-                        open_file = Some(c.path.clone());
-                    }
+                let clicked = file_row(ui, c.code, code_color(c.code), &name, &rel, |ui| {
                     let untracked = c.code == '?';
                     if revert_button(
                         ui,
@@ -541,29 +535,41 @@ impl App {
                             untracked,
                         });
                     }
-                    if ui
-                        .link(&name)
-                        .on_hover_text(format!("{rel}\nShow the diff"))
-                        .clicked()
-                    {
+                    if ui.small_button("Diff").clicked() {
                         diff = Some((c.path.clone(), None, c.staged));
                     }
+                    let p = c.path.to_string_lossy().into_owned();
+                    if c.staged {
+                        if ui.small_button("Unstage").clicked() {
+                            command =
+                                Some(vec!["restore".into(), "--staged".into(), "--".into(), p]);
+                        }
+                    } else if ui.small_button("Stage").clicked() {
+                        command = Some(vec!["add".into(), "--".into(), p]);
+                    }
                 });
+                if clicked {
+                    if c.code == 'D' {
+                        diff = Some((c.path.clone(), None, c.staged));
+                    } else {
+                        open_file = Some(c.path.clone());
+                    }
+                }
             }
             if ch.working.iter().any(|c| c.staged) {
-                ui.horizontal(|ui| {
-                    let label = ui.label("Commit message");
+                let label = ui.label("Commit message");
+                right_row(ui, |ui| {
+                    let ok = !self.git.commit_message.trim().is_empty();
+                    let commit = ui
+                        .add_enabled(ok, egui::Button::new("Commit staged"))
+                        .clicked();
                     ui.add(
                         egui::TextEdit::singleline(&mut self.git.commit_message)
                             .hint_text("what changed")
-                            .desired_width(ui.available_width().min(220.0)),
+                            .desired_width(ui.available_width()),
                     )
                     .labelled_by(label.id);
-                    let ok = !self.git.commit_message.trim().is_empty();
-                    if ui
-                        .add_enabled(ok, egui::Button::new("Commit staged"))
-                        .clicked()
-                    {
+                    if commit {
                         command = Some(vec![
                             "commit".into(),
                             "-m".into(),
@@ -693,6 +699,63 @@ impl App {
             self.git.commit = None;
         }
     }
+}
+
+/// A form label `w` wide with its text at the right end.
+fn field_label(ui: &mut Ui, text: &str, w: f32) -> egui::Response {
+    let h = ui.spacing().interact_size.y;
+    ui.allocate_ui_with_layout(
+        egui::vec2(w, h),
+        Layout::right_to_left(Align::Center),
+        |ui| ui.label(text),
+    )
+    .inner
+}
+
+/// A row laid out right to left (the first widget is at the right end), one line high.
+fn right_row<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), add)
+            .inner
+    })
+    .inner
+}
+
+/// One changed file: its status letter, its name (click to open), and `buttons` on the right.
+/// `buttons` adds right to left. The name truncates, so a long name never holds the panel wide.
+fn file_row(
+    ui: &mut Ui,
+    code: char,
+    color: Color32,
+    name: &str,
+    rel: &str,
+    buttons: impl FnOnce(&mut Ui),
+) -> bool {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(code.to_string())
+                .monospace()
+                .strong()
+                .color(color),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            buttons(ui);
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                let link = ui.visuals().hyperlink_color;
+                ui.add(
+                    egui::Label::new(RichText::new(name).color(link))
+                        .truncate()
+                        .sense(Sense::click()),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(format!("{rel}\nClick to open"))
+                .clicked()
+            })
+            .inner
+        })
+        .inner
+    })
+    .inner
 }
 
 /// Grey "author, time • summary" after the end of the cursor's line, with the full commit on hover.

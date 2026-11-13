@@ -1309,10 +1309,18 @@ fn e2e_git_tab_lists_changes_stage_commit_and_branch() {
     h.get_by_label("Uncommitted changes (2)");
     h.get_by_label("This branch");
     h.get_by_label_contains("1 files changed vs origin/");
-    // the diff of the branch file
+    // a click on the name opens the file in the editor, with no diff window
     h.get_by_label("User.kt").scroll_to_me();
     steps(&mut h, 3);
     h.get_by_label("User.kt").click();
+    wait(&mut h, "opened", |a| {
+        a.tabs
+            .get(a.active)
+            .is_some_and(|t| t.path.ends_with("data/User.kt"))
+    });
+    assert!(h.state().commit_lines().is_none(), "no diff window");
+    // "Diff" shows the diff of the branch file
+    click_in_row(&mut h, "User.kt", "Diff");
     wait(&mut h, "diff", |a| {
         a.commit_lines().is_some_and(|l| {
             l.iter()
@@ -2561,5 +2569,98 @@ fn e2e_device_screenshot_and_recording() {
     unsafe {
         std::env::remove_var("FAKE_ADB_LOG");
         std::env::remove_var("DROID_LITE_CAPTURE_DIR");
+    }
+}
+
+/// Drags from `from` to `to` with the primary button.
+fn drag(h: &mut Harness<'static, App>, from: egui::Pos2, to: egui::Pos2) {
+    h.event(Event::PointerMoved(from));
+    steps(h, 1);
+    h.event(Event::PointerButton {
+        pos: from,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: Modifiers::NONE,
+    });
+    steps(h, 1);
+    for i in 1..=10 {
+        h.event(Event::PointerMoved(from + (to - from) * (i as f32 / 10.0)));
+        steps(h, 1);
+    }
+    h.event(Event::PointerButton {
+        pos: to,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: Modifiers::NONE,
+    });
+    steps(h, 3);
+}
+
+#[test]
+fn e2e_pull_request_panel_resizes_both_ways() {
+    let f = Fixture::new("prwidth");
+    let mut h = f.harness();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&f.root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    };
+    // long names are what used to hold the panel wide
+    let branch = "feature/a-very-long-branch-name-for-the-pull-request-panel-width";
+    git(&["checkout", "-q", "-b", branch]);
+    let long =
+        f.path("app/src/main/java/com/demo/ui/AVeryLongComposableScreenFileNameThatIsWide.kt");
+    std::fs::write(&long, "package com.demo.ui\n").unwrap();
+    // staged: the commit message row shows too
+    git(&["add", "."]);
+    h.state_mut().branch = Some(branch.into());
+    h.state_mut().git.changes_stale = true;
+    h.get_by_label(&format!("{}  Pull request", ic::GIT_PULL_REQUEST))
+        .click();
+    wait(&mut h, "changes", |a| {
+        a.git.changes.as_ref().is_some_and(|c| c.working.len() == 1)
+    });
+    steps(&mut h, 3);
+    let edge = |h: &Harness<'static, App>| {
+        h.get_by_label(&format!("{}  Compose", ic::CUBE))
+            .rect()
+            .left()
+    };
+    let y = 450.0;
+    // the right panel's resize handle: the splitter with the largest x
+    let handle = |h: &Harness<'static, App>| {
+        h.get_all_by_role(egui::accesskit::Role::Splitter)
+            .map(|n| n.rect())
+            .filter(|r| r.height() > r.width())
+            .max_by(|a, b| a.left().total_cmp(&b.left()))
+            .expect("right panel handle")
+            .center()
+            .x
+    };
+    for (dx, what) in [
+        (110.0, "narrower"),
+        (-300.0, "wider"),
+        (200.0, "narrower again"),
+    ] {
+        let before = edge(&h);
+        let at = egui::pos2(handle(&h), y);
+        drag(&mut h, at, at + egui::vec2(dx, 0.0));
+        let after = edge(&h);
+        assert!(
+            (after - before - dx).abs() < 4.0,
+            "{what}: the edge moved {} of {dx}",
+            after - before
+        );
+    }
+    if let Ok(dir) = std::env::var("DROID_LITE_SNAPSHOT_DIR") {
+        steps(&mut h, 3);
+        h.render()
+            .unwrap()
+            .save(Path::new(&dir).join("e2e-pull-request-narrow.png"))
+            .unwrap();
     }
 }
