@@ -1464,6 +1464,46 @@ fn e2e_pull_request_tab_compares_with_the_picked_base() {
     steps(&mut h, 2);
     h.get_by_label_contains("no-such-branch not found: using the automatic base");
     assert_eq!(files(h.state()), Some(2));
+    // dim bars: what this branch changed since its parent; nothing is uncommitted
+    let bars = |a: &App| {
+        let g = &a.tabs[a.active].git;
+        g.branch_hunks
+            .as_ref()
+            .map(|v| v.len())
+            .zip(g.hunks.as_ref().map(|v| v.len()))
+    };
+    h.state_mut()
+        .open_file(&f.path("app/src/main/java/com/demo/ui/UserCard.kt"), None);
+    wait(&mut h, "branch bars", |a| bars(a) == Some((1, 0)));
+    // automatic base: User.kt (changed in the parent PR) is part of the branch
+    h.state_mut()
+        .open_file(&f.path("app/src/main/java/com/demo/data/User.kt"), None);
+    wait(&mut h, "parent's change vs the automatic base", |a| {
+        bars(a) == Some((1, 0))
+    });
+    // with the parent branch set, only this PR's work has bars
+    let input = h
+        .get_by_role_and_label(egui::accesskit::Role::TextInput, "or")
+        .rect()
+        .center();
+    click_at(&mut h, input, egui::PointerButton::Primary);
+    type_text(&mut h, "first");
+    h.get_by_label("Use").click();
+    wait(&mut h, "no bars for the parent's change", |a| {
+        bars(a) == Some((0, 0))
+    });
+    // an uncommitted edit adds a bright bar on top
+    {
+        let t = h
+            .state_mut()
+            .tabs
+            .iter_mut()
+            .find(|t| t.path.ends_with("User.kt"))
+            .unwrap();
+        t.text = t.text.replace("class UserRepository", "class UserStore");
+        t.mark_edited();
+    }
+    wait(&mut h, "bright and dim bars", |a| bars(a) == Some((1, 1)));
 }
 
 /// Clicks the button `button` in the row of the label `row` (the first such row).

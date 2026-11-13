@@ -13,13 +13,20 @@ const DIM: Color32 = Color32::from_gray(110);
 /// Wait this long after the last keystroke before blaming the edited text again.
 const DEBOUNCE: Duration = Duration::from_millis(450);
 
+/// Blame, the uncommitted change bars and the branch change bars of one text.
+type BlameAndBars = (Option<Blame>, Vec<git::Hunk>, Vec<git::Hunk>);
+
 /// Blame state of one tab.
 #[derive(Default)]
 pub(super) struct TabBlame {
     pub blame: Option<Arc<Blame>>,
-    rx: Option<Receiver<(Option<Blame>, Vec<git::Hunk>)>>,
+    rx: Option<Receiver<BlameAndBars>>,
     /// Uncommitted line changes against HEAD, for the gutter bars.
     pub hunks: Option<Arc<Vec<git::Hunk>>>,
+    /// What this branch changed against the PR base (committed or not), for the dim bars.
+    pub branch_hunks: Option<Arc<Vec<git::Hunk>>>,
+    /// The PR base `branch_hunks` were made for.
+    for_base: Option<String>,
     /// Edit counter (`Tab::rev`) of the text the current (or running) blame is for.
     for_hash: u64,
     seen_hash: u64,
@@ -88,6 +95,8 @@ impl App {
 
     /// Starts or refreshes blame for the active tab when its text settled after an edit.
     pub(super) fn poll_git(&mut self, ctx: &egui::Context) {
+        let base = self.git.changes.as_ref().and_then(|c| c.base.clone());
+        let root = self.project.as_ref().map(|p| p.root.clone());
         if let Some(t) = self.tabs.get_mut(self.active) {
             let h = t.rev; // bumped on every edit, cheaper than hashing the text each frame
             if h != t.git.seen_hash {
@@ -100,33 +109,47 @@ impl App {
                 };
             }
             let settled = t.git.seen_at.is_some_and(|at| at.elapsed() >= DEBOUNCE);
-            if settled && t.git.rx.is_none() && t.git.for_hash != h {
+            if settled && t.git.rx.is_none() && (t.git.for_hash != h || t.git.for_base != base) {
                 let (tx, rx) = channel();
                 let (path, text, c) = (t.path.clone(), t.text.clone(), ctx.clone());
+                let (b, root) = (base.clone(), root.clone());
                 std::thread::spawn(move || {
                     let blame = git::blame(&path, &text);
-                    // the change bars: this text against the file at HEAD (untracked: all new)
-                    let hunks = match git::head_text(&path) {
-                        Some(head) => git::hunks(&head, &text),
-                        None if blame.is_some() => vec![git::Hunk {
+                    let all_new = || {
+                        vec![git::Hunk {
                             new_start: 0,
                             new_len: text.lines().count().max(1),
                             old: Vec::new(),
-                        }],
+                        }]
+                    };
+                    // the change bars: this text against the file at HEAD (untracked: all new)
+                    let head = git::head_text(&path);
+                    let hunks = match &head {
+                        Some(head) => git::hunks(head, &text),
+                        None if blame.is_some() => all_new(),
                         None => Vec::new(),
                     };
-                    let _ = tx.send((blame, hunks));
+                    // the dim bars: against where the branch left its PR base (added on it: all new)
+                    let fork = b.zip(root).and_then(|(b, r)| git::merge_base(&r, &b));
+                    let branch = match fork.map(|f| git::file_at(&path, &f)) {
+                        Some(Some(old)) => git::hunks(&old, &text),
+                        Some(None) if head.is_some() => all_new(),
+                        _ => Vec::new(),
+                    };
+                    let _ = tx.send((blame, hunks, branch));
                     c.request_repaint();
                 });
                 t.git.rx = Some(rx);
                 t.git.for_hash = h;
+                t.git.for_base = base;
             } else if t.git.seen_at.is_some() && !settled {
                 ctx.request_repaint_after(DEBOUNCE);
             }
             if let Some(rx) = &t.git.rx
-                && let Ok((b, hunks)) = rx.try_recv()
+                && let Ok((b, hunks, branch)) = rx.try_recv()
             {
                 t.git.hunks = b.is_some().then(|| Arc::new(hunks));
+                t.git.branch_hunks = b.is_some().then(|| Arc::new(branch));
                 t.git.blame = b.map(Arc::new);
                 t.git.rx = None;
             }
@@ -867,9 +890,11 @@ pub(super) fn blame_column(
 
 /// Change bars at the right edge of the line numbers: green added, blue modified, a red marker
 /// where lines were deleted. Hover shows the old lines; a click returns the hunk to revert.
+/// `branch`: the dim bars of what the branch changed since its PR base; they do not revert.
 pub(super) fn paint_changes(
     ui: &mut Ui,
     hunks: &[git::Hunk],
+    branch: bool,
     gutter: egui::Rect,
     galley: &Galley,
     galley_pos: Pos2,
@@ -910,6 +935,11 @@ pub(super) fn paint_changes(
             'D' => ERROR,
             _ => Color32::from_rgb(0x58, 0x9D, 0xF6),
         };
+        let color = if branch {
+            color.gamma_multiply(0.6)
+        } else {
+            color
+        };
         if h.kind() == 'D' {
             ui.painter().add(egui::Shape::convex_polygon(
                 vec![
@@ -925,37 +955,54 @@ pub(super) fn paint_changes(
         }
         let r = ui.interact(
             rect.expand2(egui::vec2(3.0, 0.0)),
-            ui.scope_id().with(("hunk", i)),
-            egui::Sense::click(),
+            ui.scope_id().with(("hunk", branch, i)),
+            if branch {
+                egui::Sense::hover()
+            } else {
+                egui::Sense::click()
+            },
         );
         if r.clicked() {
             revert = Some(i);
         }
-        r.on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_ui(|ui| {
-                let what = match h.kind() {
-                    'A' => format!("{} added lines", h.new_len),
-                    'D' => format!("{} deleted lines", h.old.len()),
-                    _ => format!("{} lines changed; before:", h.new_len),
-                };
-                ui.label(RichText::new(what).strong());
-                for l in h.old.iter().take(15) {
-                    ui.label(
-                        RichText::new(format!("- {l}"))
-                            .monospace()
-                            .small()
-                            .color(ERROR),
-                    );
-                }
-                if h.old.len() > 15 {
-                    ui.label(
-                        RichText::new(format!("… {} more", h.old.len() - 15))
-                            .small()
-                            .weak(),
-                    );
-                }
+        let r = if branch {
+            r
+        } else {
+            r.on_hover_cursor(egui::CursorIcon::PointingHand)
+        };
+        r.on_hover_ui(|ui| {
+            if branch {
+                ui.label(
+                    RichText::new("Changed on this branch (since its PR base)")
+                        .weak()
+                        .small(),
+                );
+            }
+            let what = match h.kind() {
+                'A' => format!("{} added lines", h.new_len),
+                'D' => format!("{} deleted lines", h.old.len()),
+                _ => format!("{} lines changed; before:", h.new_len),
+            };
+            ui.label(RichText::new(what).strong());
+            for l in h.old.iter().take(15) {
+                ui.label(
+                    RichText::new(format!("- {l}"))
+                        .monospace()
+                        .small()
+                        .color(ERROR),
+                );
+            }
+            if h.old.len() > 15 {
+                ui.label(
+                    RichText::new(format!("… {} more", h.old.len() - 15))
+                        .small()
+                        .weak(),
+                );
+            }
+            if !branch {
                 ui.label(RichText::new("Click to revert this change").weak().small());
-            });
+            }
+        });
     }
     revert
 }

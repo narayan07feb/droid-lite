@@ -74,10 +74,15 @@ impl Hunk {
 
 /// The file's text at HEAD; `None` when it is not tracked (then every line is new).
 pub fn head_text(path: &Path) -> Option<String> {
+    file_at(path, "HEAD")
+}
+
+/// The file's text at commit `rev`; None when it did not exist there.
+pub fn file_at(path: &Path, rev: &str) -> Option<String> {
     let (dir, name) = (path.parent()?, path.file_name()?);
     let out = git(dir)
         .arg("show")
-        .arg(format!("HEAD:./{}", name.to_string_lossy()))
+        .arg(format!("{rev}:./{}", name.to_string_lossy()))
         .output()
         .ok()?;
     out.status

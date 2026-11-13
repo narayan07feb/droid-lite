@@ -2104,6 +2104,7 @@ impl App {
         let gutter_w = char_w * lines.to_string().len().max(3) as f32 + 18.0;
         let blame = tab.git.blame.clone();
         let hunks = tab.git.hunks.clone();
+        let branch_hunks = tab.git.branch_hunks.clone();
         let mut revert_hunk: Option<usize> = None;
         let show_column = self.git.show_column;
         let test_rows = self.tests.marks_at(&tab.path);
@@ -2271,9 +2272,19 @@ impl App {
                         &font,
                         theme,
                     );
+                    // dim branch bars first: the bright uncommitted ones paint over them
+                    if let Some(h) = &branch_hunks {
+                        git_ui::paint_changes(ui, h, true, gutter, &out.galley, out.galley_pos);
+                    }
                     if let Some(h) = &hunks {
-                        revert_hunk =
-                            git_ui::paint_changes(ui, h, gutter, &out.galley, out.galley_pos);
+                        revert_hunk = git_ui::paint_changes(
+                            ui,
+                            h,
+                            false,
+                            gutter,
+                            &out.galley,
+                            out.galley_pos,
+                        );
                     }
                     if let Some(rect) = blame_rect
                         && let Some(sha) = git_ui::blame_column(
