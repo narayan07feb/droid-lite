@@ -27,4 +27,6 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+# seal the whole bundle (Info.plist, icon), not only the binary: a half-signed app shows as "damaged"
+codesign --force --sign - "$APP"
 echo "Built $APP"
