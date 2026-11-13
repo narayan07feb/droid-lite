@@ -292,7 +292,7 @@ pub struct Change {
     pub staged: bool,
 }
 
-/// What the Git tab shows: uncommitted work, and what this branch changed against its base.
+/// What the Pull request tab shows: uncommitted work, and what this branch changed against its base.
 #[derive(Clone, Debug, Default)]
 pub struct Changes {
     pub working: Vec<Change>,
@@ -301,7 +301,115 @@ pub struct Changes {
     pub base: Option<String>,
     /// "#6120 Fix login crash" when `gh` knows a pull request for this branch.
     pub pr: Option<String>,
+    /// The base found without a choice (the PR's base, else origin/HEAD, develop, main, master).
+    pub auto_base: Option<String>,
+    /// The user's base choice could not be found (an unknown PR number or branch).
+    pub base_error: Option<String>,
     pub branches: Vec<String>,
+}
+
+/// An open pull request: number, title and its branch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenPr {
+    pub number: u64,
+    pub title: String,
+    pub head: String,
+}
+
+/// `gh pr list --json number,title,headRefName` output.
+pub fn parse_pr_list(json: &[u8]) -> Vec<OpenPr> {
+    serde_json::from_slice::<Vec<serde_json::Value>>(json)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|v| {
+            Some(OpenPr {
+                number: v["number"].as_u64()?,
+                title: v["title"].as_str().unwrap_or("").to_string(),
+                head: v["headRefName"].as_str()?.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Open pull requests of the repository (newest first), for the base PR picker.
+pub fn open_prs(root: &Path) -> Vec<OpenPr> {
+    Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            "100",
+            "--json",
+            "number,title,headRefName",
+        ])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map(|o| parse_pr_list(&o.stdout))
+        .unwrap_or_default()
+}
+
+/// `#123` or `123` as a PR number.
+pub fn pr_number(choice: &str) -> Option<u64> {
+    choice.trim().trim_start_matches('#').parse().ok()
+}
+
+fn ref_exists(root: &Path, r: &str) -> bool {
+    git(root)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{r}^{{commit}}"),
+        ])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// The git ref for a base choice: a PR number becomes `origin/<its branch>` (fetched when it is
+/// not here yet); a branch name is used as it is, or as `origin/<name>`.
+pub fn resolve_base(root: &Path, choice: &str) -> Result<String, String> {
+    let branch = match pr_number(choice) {
+        Some(n) => {
+            let out = Command::new("gh")
+                .args(["pr", "view", &n.to_string(), "--json", "headRefName"])
+                .current_dir(root)
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|e| format!("gh: {e}"))?;
+            let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+            let head = v["headRefName"]
+                .as_str()
+                .ok_or_else(|| format!("PR #{n} not found"))?;
+            format!("origin/{head}")
+        }
+        None => choice.trim().to_string(),
+    };
+    if ref_exists(root, &branch) {
+        return Ok(branch);
+    }
+    let remote = format!("origin/{branch}");
+    if !branch.starts_with("origin/") && ref_exists(root, &remote) {
+        return Ok(remote);
+    }
+    // a PR's branch that was never fetched: fetch only that branch
+    if let Some(name) = branch.strip_prefix("origin/") {
+        let _ = git(root)
+            .args([
+                "fetch",
+                "--quiet",
+                "origin",
+                &format!("refs/heads/{name}:refs/remotes/origin/{name}"),
+            ])
+            .output();
+        if ref_exists(root, &branch) {
+            return Ok(branch);
+        }
+    }
+    Err(format!("{} not found", choice.trim()))
 }
 
 /// `git status --porcelain -z`: staged and unstaged changes and untracked files.
@@ -366,12 +474,6 @@ pub fn base_branch(root: &Path) -> (Option<String>, Option<String>) {
         let pr = format!("#{} {}", v["number"], v["title"].as_str().unwrap_or(""));
         return (Some(format!("origin/{base}")), Some(pr));
     }
-    let ok = |r: &str| {
-        git(root)
-            .args(["rev-parse", "--verify", "--quiet", r])
-            .output()
-            .is_ok_and(|o| o.status.success())
-    };
     if let Ok(out) = git(root)
         .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         .output()
@@ -385,7 +487,7 @@ pub fn base_branch(root: &Path) -> (Option<String>, Option<String>) {
     (
         ["origin/develop", "origin/main", "origin/master"]
             .into_iter()
-            .find(|b| ok(b))
+            .find(|b| ref_exists(root, b))
             .map(String::from),
         None,
     )
@@ -427,8 +529,14 @@ pub fn branches(root: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub fn changes(root: &Path) -> Changes {
-    let (base, pr) = base_branch(root);
+/// `choice`: the base the user picked for this branch (`#123` or a branch), else the auto base.
+pub fn changes(root: &Path, choice: Option<&str>) -> Changes {
+    let (auto_base, pr) = base_branch(root);
+    let (base, base_error) = match choice.map(|c| resolve_base(root, c)) {
+        Some(Ok(b)) => (Some(b), None),
+        Some(Err(e)) => (auto_base.clone(), Some(e)),
+        None => (auto_base.clone(), None),
+    };
     let branch = base
         .as_deref()
         .map(|b| branch_changes(root, b))
@@ -438,6 +546,8 @@ pub fn changes(root: &Path) -> Changes {
         branch,
         base,
         pr,
+        auto_base,
+        base_error,
         branches: branches(root),
     }
 }
@@ -467,6 +577,30 @@ pub fn file_diff(root: &Path, path: &Path, base: Option<&str>, staged: bool) -> 
             .unwrap_or_default();
     }
     out
+}
+
+/// Puts `path` back as it was at `source` (`HEAD`, or where the branch left its base), in the
+/// index and the working tree. A file `source` does not have is removed.
+pub fn revert_file(root: &Path, path: &Path, source: &str) -> Result<(), String> {
+    let p = path.to_string_lossy();
+    run(
+        root,
+        &[
+            "restore",
+            &format!("--source={source}"),
+            "--staged",
+            "--worktree",
+            "--",
+            &p,
+        ],
+    )
+}
+
+/// The commit where this branch left `base`.
+pub fn merge_base(root: &Path, base: &str) -> Option<String> {
+    let out = git(root).args(["merge-base", base, "HEAD"]).output().ok()?;
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !sha.is_empty()).then_some(sha)
 }
 
 /// Runs a git command that changes the repository (stage, unstage, commit, checkout).
@@ -507,6 +641,32 @@ pub fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_pr_list_and_pr_numbers() {
+        let prs = parse_pr_list(
+            br#"[{"number":12,"title":"Login","headRefName":"login"},{"number":"x"},{"number":9,"headRefName":"b"}]"#,
+        );
+        assert_eq!(
+            prs,
+            vec![
+                OpenPr {
+                    number: 12,
+                    title: "Login".into(),
+                    head: "login".into()
+                },
+                OpenPr {
+                    number: 9,
+                    title: String::new(),
+                    head: "b".into()
+                },
+            ]
+        );
+        assert!(parse_pr_list(b"not json").is_empty());
+        assert_eq!(pr_number("#6110"), Some(6110));
+        assert_eq!(pr_number(" 42 "), Some(42));
+        assert_eq!(pr_number("feature/x"), None);
+    }
 
     #[test]
     fn relative_times() {

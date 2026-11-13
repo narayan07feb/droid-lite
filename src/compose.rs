@@ -628,6 +628,64 @@ pub fn load_reports(module_dirs: &[PathBuf]) -> HashMap<String, Stability> {
     map
 }
 
+/// Byte range of each parameter name in the declaration whose name starts at `name_at`
+/// (`fun UserCard(user: User, modifier: Modifier = Modifier)`), for the inline stability chips.
+pub fn param_names(src: &str, name_at: usize) -> Vec<(String, std::ops::Range<usize>)> {
+    let b = src.as_bytes();
+    let Some(open) = src
+        .get(name_at..)
+        .and_then(|t| t.find('('))
+        .map(|i| name_at + i)
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let (mut depth, mut i, mut seg) = (0i32, open + 1, open + 1);
+    // the type part of a parameter ends at `=`: only there do `<` and `>` nest
+    let mut in_type = true;
+    let mut colon = None;
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b'"' | b'\'' => {
+                i += 1;
+                while i < b.len() && b[i] != c {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b'<' if in_type => depth += 1,
+            b'>' if in_type && b.get(i.wrapping_sub(1)) != Some(&b'-') => depth -= 1,
+            b'=' if depth == 0 => in_type = false,
+            b':' if depth == 0 && colon.is_none() => colon = Some(i),
+            b')' | b']' | b'}' if depth > 0 => depth -= 1,
+            b',' | b')' if depth == 0 => {
+                if let Some(c) = colon {
+                    // the name: the last word before `:` (after annotations and `vararg`)
+                    let head = &src[seg..c];
+                    let t = head.trim_end();
+                    let start = t
+                        .rfind(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '`'))
+                        .map_or(0, |k| k + 1);
+                    if start < t.len() {
+                        out.push((
+                            t[start..].trim_matches('`').to_string(),
+                            seg + start..seg + t.len(),
+                        ));
+                    }
+                }
+                if c == b')' {
+                    break;
+                }
+                (seg, in_type, colon) = (i + 1, true, None);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Local guess when no report exists: mutable collections, project classes with `var`, interfaces.
 pub fn guess(d: &Decl, index: &Index) -> Stability {
     let params = d
@@ -746,6 +804,29 @@ pub fn guess(d: &Decl, index: &Index) -> Stability {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_each_parameter_name() {
+        let src = "@Composable\nfun UserCard(\n    user: User,\n    @StringRes title: Int,\n    items: Map<String, List<Int>> = mapOf(\"a,b\" to listOf(1, 2)),\n    onClick: (Int, String) -> Unit = { a, b -> },\n    vararg tags: String,\n) {}";
+        let at = src.find("UserCard").unwrap();
+        let names = param_names(src, at);
+        assert_eq!(
+            names.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            ["user", "title", "items", "onClick", "tags"]
+        );
+        for (n, r) in &names {
+            assert_eq!(&src[r.clone()], n);
+        }
+        let one = "fun A(a: Int = if (x < y) 1 else 2, b: Boolean)";
+        assert_eq!(
+            param_names(one, 4)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert!(param_names("fun B() {}", 4).is_empty());
+    }
     use crate::kotlin::scan;
     use std::path::Path;
 

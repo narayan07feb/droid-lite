@@ -253,8 +253,14 @@ enum Bottom {
     Problems,
     Build,
     Find,
-    Git,
     Logcat,
+}
+
+/// The right panel's tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Right {
+    Compose,
+    PullRequest,
 }
 
 /// What the Compose panel shows for one composable; rebuilt only when its inputs change.
@@ -314,6 +320,7 @@ pub struct App {
     /// The caret's screen position last frame, where popups open.
     caret_pos: Option<egui::Pos2>,
     bottom: Bottom,
+    right: Right,
     selected_composable: Option<String>,
     textures: HashMap<PathBuf, (SystemTime, egui::TextureHandle)>,
     shift_down: bool,
@@ -411,6 +418,7 @@ impl App {
             capture: Default::default(),
             caret_pos: None,
             bottom: Bottom::Problems,
+            right: Right::Compose,
             selected_composable: None,
             textures: HashMap::new(),
             shift_down: false,
@@ -456,7 +464,7 @@ impl App {
         }
         if std::env::var_os("DROID_LITE_BLAME").is_some() {
             app.git.show_column = true;
-            app.bottom = Bottom::Git;
+            app.right = Right::PullRequest;
         }
         if let Ok(q) = std::env::var("DROID_LITE_SEARCH") {
             app.search = Some(Search {
@@ -2683,7 +2691,6 @@ impl App {
     // ---------- Compose panel ----------
 
     fn compose_panel(&mut self, ui: &mut Ui) {
-        theme::section(ui, ic::CUBE, "Compose");
         let Some(tab) = self.tabs.get(self.active) else {
             ui.label("Open a Kotlin file to see its composables.");
             return;
@@ -2904,11 +2911,6 @@ impl App {
             );
             ui.selectable_value(
                 &mut self.bottom,
-                Bottom::Git,
-                format!("{}  Git", ic::GIT_COMMIT),
-            );
-            ui.selectable_value(
-                &mut self.bottom,
                 Bottom::Logcat,
                 format!("{}  Logcat", ic::TERMINAL),
             );
@@ -3070,11 +3072,6 @@ impl App {
                         }
                     });
             }
-            Bottom::Git => {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| self.git_panel(ui));
-            }
             Bottom::Logcat => self.logcat_panel(ui),
             Bottom::Find => {
                 let root = self
@@ -3171,7 +3168,7 @@ impl eframe::App for App {
         self.poll_capture(&ctx);
         self.rescan_resources(&ctx);
         self.poll_libs();
-        self.refresh_changes(&ctx); // git status for tree colours, not only the Git tab
+        self.refresh_changes(&ctx); // git status for tree colours, not only the Pull request tab
         self.watch_focus(&ctx);
         self.save_session(false);
         watch.stage("shortcuts", || self.shortcuts(&ctx));
@@ -3214,7 +3211,29 @@ impl eframe::App for App {
             egui::Panel::right("compose")
                 .resizable(true)
                 .default_size(340.0)
-                .show(ui, |ui| self.compose_panel(ui))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.right,
+                            Right::Compose,
+                            format!("{}  Compose", ic::CUBE),
+                        );
+                        ui.selectable_value(
+                            &mut self.right,
+                            Right::PullRequest,
+                            format!("{}  Pull request", ic::GIT_PULL_REQUEST),
+                        );
+                    });
+                    ui.separator();
+                    match self.right {
+                        Right::Compose => self.compose_panel(ui),
+                        Right::PullRequest => {
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| self.git_panel(ui));
+                        }
+                    }
+                })
         });
         let editor_frame =
             egui::Frame::central_panel(ui.style()).fill(crate::glass::editor_fill(self.glass));

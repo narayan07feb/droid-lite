@@ -20,6 +20,8 @@ pub(super) struct Settings {
     pub hide_imports: bool,
     pub hide_xml: bool,
     pub usage_path: String,
+    /// The base PR or branch picked for a branch, keyed by `<project root>\t<branch>`.
+    pub pr_bases: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -34,6 +36,7 @@ impl Default for Settings {
             hide_imports: false,
             hide_xml: false,
             usage_path: String::new(),
+            pr_bases: Default::default(),
         }
     }
 }
@@ -57,6 +60,14 @@ impl Settings {
             hide_imports: v["hide_imports"].as_bool().unwrap_or(d.hide_imports),
             hide_xml: v["hide_xml"].as_bool().unwrap_or(d.hide_xml),
             usage_path: v["usage_path"].as_str().map_or(d.usage_path, String::from),
+            pr_bases: v["pr_bases"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -64,7 +75,7 @@ impl Settings {
         if let Some(c) = config_dir() {
             let _ = std::fs::create_dir_all(&c);
             let v = json!({ "font_size": self.font_size, "light": self.light, "glass": self.glass, "autosave": self.autosave, "lsp_heap": self.lsp_heap,
-                "hide_tests": self.hide_tests, "hide_imports": self.hide_imports, "hide_xml": self.hide_xml, "usage_path": self.usage_path });
+                "hide_tests": self.hide_tests, "hide_imports": self.hide_imports, "hide_xml": self.hide_xml, "usage_path": self.usage_path, "pr_bases": self.pr_bases });
             let _ = std::fs::write(
                 c.join("settings.json"),
                 serde_json::to_string_pretty(&v).unwrap_or_default(),

@@ -35,6 +35,18 @@ pub(super) struct Badge {
     color: Color32,
     pub(super) stability: Stability,
     guessed: bool,
+    /// One hint per parameter, like the stability analyzer plugin's inline parameter hints.
+    pub(super) params: Vec<ParamHint>,
+}
+
+/// Where a parameter's stability shows: a chip at the end of its line when it has the line to
+/// itself, else a coloured underline under its name. `param` indexes `Badge::stability.params`.
+pub(super) struct ParamHint {
+    pub(super) line: usize,
+    /// Char range of the name in the text (the galley counts chars).
+    pub(super) chars: std::ops::Range<usize>,
+    pub(super) own_line: bool,
+    pub(super) param: usize,
 }
 
 /// Annotations of one tab, rebuilt only when its text, the index or the reports change.
@@ -66,7 +78,17 @@ impl App {
         if t.annotations.as_ref().is_some_and(|a| a.key == key) {
             return;
         }
-        let line_of = |o: usize| t.text[..o.min(t.text.len())].matches('\n').count();
+        // line and char index of a byte offset, by binary search instead of a scan from the top
+        let newlines: Vec<usize> = t.text.match_indices('\n').map(|(i, _)| i).collect();
+        let line_of = |o: usize| newlines.partition_point(|&n| n < o);
+        let ascii = t.text.is_ascii();
+        let char_of = |o: usize| {
+            if ascii {
+                o
+            } else {
+                t.text[..o].chars().count()
+            }
+        };
         let mut marks = Vec::new();
         let mut badges = Vec::new();
         for d in &t.syms.decls {
@@ -186,12 +208,27 @@ impl App {
                     (0, n) => (format!("?  {n} unknown"), crate::theme::t().weak),
                     (n, _) => (format!("{}  {n} unstable", ic::WARNING), WARN),
                 };
+                let spans = compose::param_names(&t.text, d.offset);
+                let lines: Vec<usize> = spans.iter().map(|(_, r)| line_of(r.start)).collect();
+                let params = spans
+                    .iter()
+                    .zip(&lines)
+                    .filter_map(|((name, r), &l)| {
+                        Some(ParamHint {
+                            line: l,
+                            chars: char_of(r.start)..char_of(r.end),
+                            own_line: l != line && lines.iter().filter(|&&x| x == l).count() == 1,
+                            param: stability.params.iter().position(|p| &p.name == name)?,
+                        })
+                    })
+                    .collect();
                 badges.push(Badge {
                     line,
                     text,
                     color,
                     stability,
                     guessed,
+                    params,
                 });
             }
         }
@@ -451,28 +488,92 @@ pub(super) fn paint_badges(
 ) -> Option<f32> {
     let clip = ui.clip_rect();
     let mut right_on_line = None;
+    // the row of `line` when it is on screen
+    let visible = |line: usize| {
+        galley.rows.get(line).filter(|row| {
+            let y = galley_pos.y + row.pos.y;
+            y <= clip.bottom() && y + row.rect().height() >= clip.top()
+        })
+    };
     for b in &a.badges {
-        let Some(row) = galley.rows.get(b.line) else {
-            continue;
-        };
-        let y = galley_pos.y + row.pos.y;
-        if y > clip.bottom() || y + row.rect().height() < clip.top() {
-            continue;
+        if let Some(row) = visible(b.line) {
+            let pos = galley_pos + row.rect().right_top().to_vec2() + egui::vec2(24.0, 0.0);
+            let font = FontId::proportional(crate::theme::font_size() - 1.0);
+            let galley_b = ui.painter().layout_no_wrap(b.text.clone(), font, b.color);
+            let rect = Rect::from_min_size(pos, galley_b.size()).expand2(egui::vec2(6.0, 1.0));
+            ui.painter()
+                .rect_filled(rect, 6.0, b.color.gamma_multiply(0.14));
+            ui.painter().galley(pos, galley_b, b.color);
+            if b.line == line {
+                right_on_line = Some(rect.right());
+            }
+            let r = ui.interact(rect, ui.scope_id().with(("badge", b.line)), Sense::hover());
+            r.on_hover_ui(|ui| stability_tooltip(ui, &b.stability, b.guessed));
         }
-        let pos = galley_pos + row.rect().right_top().to_vec2() + egui::vec2(24.0, 0.0);
-        let font = FontId::proportional(crate::theme::font_size() - 1.0);
-        let galley_b = ui.painter().layout_no_wrap(b.text.clone(), font, b.color);
-        let rect = Rect::from_min_size(pos, galley_b.size()).expand2(egui::vec2(6.0, 1.0));
-        ui.painter()
-            .rect_filled(rect, 6.0, b.color.gamma_multiply(0.14));
-        ui.painter().galley(pos, galley_b, b.color);
-        if b.line == line {
-            right_on_line = Some(rect.right());
+        for (i, h) in b.params.iter().enumerate() {
+            let Some(row) = visible(h.line) else {
+                continue;
+            };
+            let p = &b.stability.params[h.param];
+            let (word, color) = verdict_look(p.verdict);
+            let rect = if h.own_line {
+                let pos = galley_pos + row.rect().right_top().to_vec2() + egui::vec2(16.0, 0.0);
+                let font = FontId::proportional(crate::theme::font_size() - 2.0);
+                let g = ui
+                    .painter()
+                    .layout_no_wrap(word.to_lowercase(), font, color);
+                let rect = Rect::from_min_size(pos, g.size()).expand2(egui::vec2(5.0, 1.0));
+                ui.painter()
+                    .rect_filled(rect, 5.0, color.gamma_multiply(0.14));
+                ui.painter().galley(pos, g, color);
+                if h.line == line {
+                    right_on_line = Some(rect.right().max(right_on_line.unwrap_or(0.0)));
+                }
+                rect
+            } else {
+                let at = |c: usize| {
+                    galley
+                        .pos_from_cursor(egui::text::CCursor::new(c))
+                        .translate(galley_pos.to_vec2())
+                };
+                let (a, z) = (at(h.chars.start), at(h.chars.end));
+                ui.painter().hline(
+                    a.left()..=z.left(),
+                    a.bottom() - 1.0,
+                    egui::Stroke::new(1.5, color),
+                );
+                Rect::from_min_max(a.left_top(), z.left_bottom())
+            };
+            ui.interact(
+                rect,
+                ui.scope_id().with(("param", b.line, i)),
+                Sense::hover(),
+            )
+            .on_hover_ui(|ui| {
+                ui.label(
+                    RichText::new(format!("{}: {word}", p.name))
+                        .strong()
+                        .color(color),
+                );
+                if !p.reason.is_empty() {
+                    ui.label(&p.reason);
+                }
+                if b.guessed {
+                    ui.label(RichText::new("local guess").weak().small());
+                }
+            });
         }
-        let r = ui.interact(rect, ui.scope_id().with(("badge", b.line)), Sense::hover());
-        r.on_hover_ui(|ui| stability_tooltip(ui, &b.stability, b.guessed));
     }
     right_on_line
+}
+
+fn verdict_look(v: Verdict) -> (&'static str, Color32) {
+    match v {
+        Verdict::Stable => ("STABLE", Color32::from_rgb(0x5F, 0xB8, 0x65)),
+        Verdict::Unstable => ("UNSTABLE", ERROR),
+        Verdict::Runtime => ("RUNTIME", WARN),
+        Verdict::Unknown => ("UNKNOWN", crate::theme::t().weak),
+    }
 }
 
 fn stability_tooltip(ui: &mut Ui, st: &Stability, guessed: bool) {
@@ -491,12 +592,7 @@ fn stability_tooltip(ui: &mut Ui, st: &Stability, guessed: bool) {
         .spacing([12.0, 2.0])
         .show(ui, |ui| {
             for p in &st.params {
-                let (txt, color) = match p.verdict {
-                    Verdict::Stable => ("STABLE", Color32::from_rgb(0x5F, 0xB8, 0x65)),
-                    Verdict::Unstable => ("UNSTABLE", ERROR),
-                    Verdict::Runtime => ("RUNTIME", WARN),
-                    Verdict::Unknown => ("UNKNOWN", crate::theme::t().weak),
-                };
+                let (txt, color) = verdict_look(p.verdict);
                 ui.label(RichText::new(&p.name).monospace());
                 ui.label(RichText::new(txt).color(color).strong());
                 ui.label(RichText::new(&p.reason).small());

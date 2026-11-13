@@ -332,6 +332,61 @@ fn e2e_compose_panel_tree_stability_lints_preview_render() {
         h.query_by_label("UNSTABLE").is_none(),
         "no separate stability section any more"
     );
+    // a hint per parameter: on a one-line signature an underline under each name
+    fn name_at(text: &str, b: &super::gutter::Badge, i: usize) -> String {
+        let r = &b.params[i].chars;
+        text.chars().skip(r.start).take(r.len()).collect()
+    }
+    assert_eq!(badge.params.len(), 2);
+    assert!(badge.params.iter().all(|p| !p.own_line && p.line == 5));
+    assert_eq!(name_at(&tab(&h).text, badge, 0), "user");
+    assert_eq!(name_at(&tab(&h).text, badge, 1), "modifier");
+    // one parameter per line: a chip at the end of each line
+    let multi = f.path("app/src/main/java/com/demo/ui/Multi.kt");
+    std::fs::write(
+        &multi,
+        "package com.demo.ui\n\nimport com.demo.data.User\n\n@Composable\nfun Multi(\n    user: User,\n    tags: List<String>,\n    modifier: Modifier = Modifier,\n) {}\n",
+    )
+    .unwrap();
+    open(&mut h, &multi);
+    steps(&mut h, 3);
+    let a = tab(&h).annotations.as_ref().expect("annotations");
+    let badge = a
+        .badges
+        .iter()
+        .find(|b| b.line == 5)
+        .expect("badge on fun Multi(");
+    let hints: Vec<(usize, bool, String, crate::compose::Verdict)> = badge
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let st = &badge.stability.params[p.param];
+            (
+                p.line,
+                p.own_line,
+                name_at(&tab(&h).text, badge, i),
+                st.verdict,
+            )
+        })
+        .collect();
+    use crate::compose::Verdict::{Stable, Unstable};
+    assert_eq!(
+        hints,
+        vec![
+            (6, true, "user".into(), Unstable),
+            (7, true, "tags".into(), Unstable),
+            (8, true, "modifier".into(), Stable),
+        ]
+    );
+    if let Ok(dir) = std::env::var("DROID_LITE_SNAPSHOT_DIR") {
+        h.render()
+            .unwrap()
+            .save(Path::new(&dir).join("e2e-param-stability.png"))
+            .unwrap();
+    }
+    open(&mut h, &f.path("app/src/main/java/com/demo/ui/UserCard.kt"));
+    steps(&mut h, 3);
     let rules: Vec<&str> = tab(&h).lints.iter().map(|l| l.rule).collect();
     assert!(
         rules.contains(&"remember-state") && rules.contains(&"modifier-default"),
@@ -520,8 +575,9 @@ fn e2e_git_blame_history_and_commit_diff() {
             .as_ref()
             .is_some_and(|b| b.line(2).is_some_and(|c| c.is_uncommitted()))
     });
-    // Git tab: history and the commit's diff
-    h.get_by_label(&format!("{}  Git", ic::GIT_COMMIT)).click();
+    // Pull request tab: history and the commit's diff
+    h.get_by_label(&format!("{}  Pull request", ic::GIT_PULL_REQUEST))
+        .click();
     wait(&mut h, "history", |a| a.git_history_len() == 1);
     h.get_by_label("Initial commit");
     h.get_by_label("Blame column").click();
@@ -1242,7 +1298,8 @@ fn e2e_git_tab_lists_changes_stage_commit_and_branch() {
         "package com.demo.ui\n",
     )
     .unwrap();
-    h.get_by_label(&format!("{}  Git", ic::GIT_COMMIT)).click();
+    h.get_by_label(&format!("{}  Pull request", ic::GIT_PULL_REQUEST))
+        .click();
     wait(&mut h, "changes", |a| {
         a.git
             .changes
@@ -1250,13 +1307,12 @@ fn e2e_git_tab_lists_changes_stage_commit_and_branch() {
             .is_some_and(|c| c.working.len() == 2 && c.branch.len() == 1)
     });
     h.get_by_label("Uncommitted changes (2)");
-    h.get_by_label_contains("This branch: 1 files changed vs origin/");
+    h.get_by_label("This branch");
+    h.get_by_label_contains("1 files changed vs origin/");
     // the diff of the branch file
-    h.get_by_label("app/src/main/java/com/demo/data/User.kt")
-        .scroll_to_me();
+    h.get_by_label("User.kt").scroll_to_me();
     steps(&mut h, 3);
-    h.get_by_label("app/src/main/java/com/demo/data/User.kt")
-        .click();
+    h.get_by_label("User.kt").click();
     wait(&mut h, "diff", |a| {
         a.commit_lines().is_some_and(|l| {
             l.iter()
@@ -1267,12 +1323,9 @@ fn e2e_git_tab_lists_changes_stage_commit_and_branch() {
     assert!(h.state().commit_lines().is_none(), "Esc closes the diff");
     steps(&mut h, 2);
     // stage one file and commit it
-    h.get_by_label("app/src/main/java/com/demo/ui/UserCard.kt")
-        .scroll_to_me();
+    h.get_by_label("UserCard.kt").scroll_to_me();
     steps(&mut h, 3);
-    let row = h
-        .get_by_label("app/src/main/java/com/demo/ui/UserCard.kt")
-        .rect();
+    let row = h.get_by_label("UserCard.kt").rect();
     let stage = h
         .get_all_by_label("Stage")
         .find(|n| (n.rect().center().y - row.center().y).abs() < 4.0)
@@ -1315,6 +1368,190 @@ fn e2e_git_tab_lists_changes_stage_commit_and_branch() {
     )
     .unwrap();
     assert_eq!(log.trim(), "Rename count");
+}
+
+#[test]
+fn e2e_pull_request_tab_compares_with_the_picked_base() {
+    let f = Fixture::new("prbase");
+    let mut h = f.harness();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&f.root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    };
+    let main = String::from_utf8(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&f.root)
+            .args(["branch", "--show-current"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    git(&["update-ref", &format!("refs/remotes/origin/{main}"), &main]);
+    // stacked work: `first` changes User.kt, `second` (on top of it) changes UserCard.kt
+    git(&["checkout", "-q", "-b", "first"]);
+    std::fs::write(
+        f.path("app/src/main/java/com/demo/data/User.kt"),
+        USER_KT.replace("var age", "val age"),
+    )
+    .unwrap();
+    git(&["commit", "-q", "-am", "first PR"]);
+    git(&["checkout", "-q", "-b", "second"]);
+    std::fs::write(
+        f.path("app/src/main/java/com/demo/ui/UserCard.kt"),
+        CARD_KT.replace("count", "clicks"),
+    )
+    .unwrap();
+    git(&["commit", "-q", "-am", "second PR"]);
+    h.state_mut().branch = Some("second".into());
+    h.state_mut().git.changes_stale = true;
+    h.get_by_label(&format!("{}  Pull request", ic::GIT_PULL_REQUEST))
+        .click();
+    let files = |a: &App| a.git.changes.as_ref().map(|c| c.branch.len());
+    wait(&mut h, "automatic base", |a| files(a) == Some(2));
+    steps(&mut h, 2);
+    h.get_by_label_contains(&format!("2 files changed vs origin/{main}"));
+    // type the base branch (a PR number works the same through gh)
+    let input = h
+        .get_by_role_and_label(egui::accesskit::Role::TextInput, "or")
+        .rect()
+        .center();
+    click_at(&mut h, input, egui::PointerButton::Primary);
+    type_text(&mut h, "first");
+    h.get_by_label("Use").click();
+    wait(&mut h, "picked base", |a| {
+        files(a) == Some(1) && a.git.changes.as_ref().unwrap().base.as_deref() == Some("first")
+    });
+    steps(&mut h, 2);
+    h.get_by_label("UserCard.kt");
+    h.get_by_label_contains("1 files changed vs first");
+    assert!(
+        h.query_by_label("User.kt").is_none(),
+        "the base PR's file is not listed"
+    );
+    let saved = std::fs::read_to_string(f.config.join("settings.json")).unwrap();
+    assert!(saved.contains(r#"\tsecond": "first""#), "{saved}");
+    // an unknown base says so and falls back to the automatic base
+    let input = h
+        .get_by_role_and_label(egui::accesskit::Role::TextInput, "or")
+        .rect()
+        .center();
+    click_at(&mut h, input, egui::PointerButton::Primary);
+    type_text(&mut h, "no-such-branch");
+    h.get_by_label("Use").click();
+    wait(&mut h, "bad base", |a| {
+        a.git
+            .changes
+            .as_ref()
+            .is_some_and(|c| c.base_error.is_some())
+    });
+    steps(&mut h, 2);
+    h.get_by_label_contains("no-such-branch not found: using the automatic base");
+    assert_eq!(files(h.state()), Some(2));
+}
+
+/// Clicks the button `button` in the row of the label `row` (the first such row).
+fn click_in_row(h: &mut Harness<'static, App>, row: &str, button: &str) {
+    h.get_all_by_label(row).next().unwrap().scroll_to_me();
+    steps(h, 2);
+    let y = h.get_all_by_label(row).next().unwrap().rect().center().y;
+    let at = h
+        .get_all_by_label(button)
+        .find(|n| (n.rect().center().y - y).abs() < 4.0)
+        .unwrap_or_else(|| panic!("no {button} in the {row} row"))
+        .rect()
+        .center();
+    click_at(h, at, egui::PointerButton::Primary);
+    steps(h, 2);
+}
+
+#[test]
+fn e2e_revert_each_file() {
+    let f = Fixture::new("revert");
+    let mut h = f.harness();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&f.root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    };
+    let main = String::from_utf8(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&f.root)
+            .args(["branch", "--show-current"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    git(&["update-ref", &format!("refs/remotes/origin/{main}"), &main]);
+    git(&["checkout", "-q", "-b", "feature"]);
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    let new = f.path("app/src/main/java/com/demo/ui/New.kt");
+    std::fs::write(&card, CARD_KT.replace("count", "clicks")).unwrap();
+    git(&["commit", "-q", "-am", "clicks"]);
+    std::fs::write(&user, USER_KT.replace("var age", "val age")).unwrap();
+    std::fs::write(&new, "package com.demo.ui\n").unwrap();
+    h.state_mut().branch = Some("feature".into());
+    h.state_mut().git.changes_stale = true;
+    h.get_by_label(&format!("{}  Pull request", ic::GIT_PULL_REQUEST))
+        .click();
+    let counts = |a: &App| {
+        a.git
+            .changes
+            .as_ref()
+            .map(|c| (c.branch.len(), c.working.len()))
+    };
+    wait(&mut h, "changes", |a| counts(a) == Some((1, 2)));
+    steps(&mut h, 2);
+    // Revert asks first; No keeps the file
+    click_in_row(&mut h, "New.kt", "Revert");
+    h.get_by_label("Discard?");
+    click_in_row(&mut h, "New.kt", "No");
+    assert!(new.exists() && h.query_by_label("Discard?").is_none());
+    // an untracked file is deleted
+    click_in_row(&mut h, "New.kt", "Revert");
+    click_in_row(&mut h, "New.kt", "Yes");
+    assert!(!new.exists());
+    // a changed file goes back to the last commit
+    wait(&mut h, "untracked gone", |a| counts(a) == Some((1, 1)));
+    steps(&mut h, 2);
+    click_in_row(&mut h, "User.kt", "Revert");
+    click_in_row(&mut h, "User.kt", "Yes");
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), USER_KT);
+    // a PR file goes back to the base version, as an uncommitted change
+    wait(&mut h, "working clean", |a| counts(a) == Some((1, 0)));
+    steps(&mut h, 2);
+    click_in_row(&mut h, "UserCard.kt", "Revert");
+    click_in_row(&mut h, "UserCard.kt", "Yes");
+    assert_eq!(std::fs::read_to_string(&card).unwrap(), CARD_KT);
+    wait(&mut h, "base version", |a| counts(a) == Some((1, 1)));
+    let log = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&f.root)
+        .args(["log", "-1", "--format=%s"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&log.stdout).trim(),
+        "clicks",
+        "commits stay"
+    );
 }
 
 #[test]

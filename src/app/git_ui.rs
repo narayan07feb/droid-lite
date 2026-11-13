@@ -38,9 +38,22 @@ pub(super) struct GitState {
     /// Uncommitted files and the branch's changes (refreshed in the background).
     pub changes: Option<git::Changes>,
     changes_rx: Option<Receiver<git::Changes>>,
-    /// Set by file-system events and git commands; the next Git tab frame refreshes.
+    /// Set by file-system events and git commands; the next Pull request tab frame refreshes.
     pub changes_stale: bool,
     commit_message: String,
+    /// Open pull requests for the base PR picker (loaded when the picker opens).
+    prs: Option<Vec<git::OpenPr>>,
+    prs_rx: Option<Receiver<Vec<git::OpenPr>>>,
+    /// Typed base: `#123` or a branch name.
+    base_input: String,
+    /// The row whose Revert waits for "Discard?" Yes: the file, and true for a PR file.
+    confirm_revert: Option<(PathBuf, bool)>,
+}
+
+/// Discard one file's changes: the uncommitted ones, or what this branch changed in it.
+enum Revert {
+    Working { path: PathBuf, untracked: bool },
+    Branch { path: PathBuf, base: String },
 }
 
 pub(super) fn commit_line(c: &Commit, now: i64) -> String {
@@ -148,10 +161,28 @@ impl App {
         self.git.commit_rx = Some(rx);
     }
 
-    /// The Git tab: history of the active file.
     /// Shows a diff (of a commit or a file) in the diff window.
     pub(super) fn show_diff_text(&mut self, title: String, text: String) {
         self.git.commit = Some((title, text.lines().map(String::from).collect()));
+    }
+
+    /// Settings key of the base choice for the current branch.
+    fn base_key(&self) -> Option<String> {
+        let root = &self.project.as_ref()?.root;
+        Some(format!("{}\t{}", root.display(), self.branch.as_deref()?))
+    }
+
+    /// Remembers `choice` (`#123`, a branch, or `None` for the automatic base) for this branch.
+    fn set_base(&mut self, choice: Option<String>) {
+        let Some(key) = self.base_key() else {
+            return;
+        };
+        match choice {
+            Some(c) => self.settings.pr_bases.insert(key, c),
+            None => self.settings.pr_bases.remove(&key),
+        };
+        self.settings.save();
+        self.git.changes_stale = true;
     }
 
     pub(super) fn refresh_changes(&mut self, ctx: &egui::Context) {
@@ -160,10 +191,14 @@ impl App {
         };
         if self.git.changes_rx.is_none() && (self.git.changes.is_none() || self.git.changes_stale) {
             self.git.changes_stale = false;
+            let choice = self
+                .base_key()
+                .and_then(|k| self.settings.pr_bases.get(&k).cloned());
             let (tx, rx) = channel();
             let c = ctx.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(git::changes(&root)); // gh may use the network: never on the UI thread
+                // gh may use the network: never on the UI thread
+                let _ = tx.send(git::changes(&root, choice.as_deref()));
                 c.request_repaint();
             });
             self.git.changes_rx = Some(rx);
@@ -174,6 +209,34 @@ impl App {
             self.git.changes = Some(ch);
             self.git.changes_rx = None;
         }
+    }
+
+    fn revert_file(&mut self, root: &Path, r: Revert) {
+        let (path, res) = match r {
+            Revert::Working {
+                path,
+                untracked: true,
+            } => {
+                let res = std::fs::remove_file(&path).map_err(|e| e.to_string());
+                (path, res)
+            }
+            Revert::Working { path, .. } => {
+                let res = git::revert_file(root, &path, "HEAD");
+                (path, res)
+            }
+            Revert::Branch { path, base } => {
+                let res = git::merge_base(root, &base)
+                    .ok_or_else(|| format!("no common commit with {base}"))
+                    .and_then(|mb| git::revert_file(root, &path, &mb));
+                (path, res)
+            }
+        };
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        self.status = match res {
+            Ok(()) => format!("Reverted {name}"),
+            Err(e) => format!("Revert {name}: {e}"),
+        };
+        self.git.changes_stale = true;
     }
 
     fn git_command(&mut self, args: &[&str]) {
@@ -190,7 +253,124 @@ impl App {
         }
     }
 
-    /// The Git tab: uncommitted changes (stage, commit), the branch / pull request's files,
+    /// The pull request title and the base picker. On a PR branch with no base picked yet it asks
+    /// which PR this one is based on (stacked PRs), so the files and diffs show only this PR's work.
+    fn pr_header(&mut self, ui: &mut Ui, ch: &git::Changes, choice: &mut Option<Option<String>>) {
+        let picked = self
+            .base_key()
+            .and_then(|k| self.settings.pr_bases.get(&k).cloned());
+        let title = match &ch.pr {
+            Some(pr) => format!("Pull request {pr}"),
+            None => "This branch".to_string(),
+        };
+        ui.label(RichText::new(title).strong());
+        if ch.pr.is_some() && picked.is_none() {
+            ui.label(
+                RichText::new(
+                    "Which PR is this one based on? Pick it to see only this PR's changes.",
+                )
+                .color(crate::highlight::WARN),
+            );
+        }
+        // the open PRs, once, off the UI thread (gh uses the network)
+        if self.git.prs.is_none()
+            && self.git.prs_rx.is_none()
+            && let Some(root) = self.project.as_ref().map(|p| p.root.clone())
+        {
+            let (tx, rx) = channel();
+            let c = ui.ctx().clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(git::open_prs(&root));
+                c.request_repaint();
+            });
+            self.git.prs_rx = Some(rx);
+        }
+        if let Some(rx) = &self.git.prs_rx
+            && let Ok(prs) = rx.try_recv()
+        {
+            self.git.prs = Some(prs);
+            self.git.prs_rx = None;
+        }
+        let auto = format!(
+            "Automatic ({})",
+            ch.auto_base.as_deref().unwrap_or("none found")
+        );
+        let pr_label = |p: &git::OpenPr| format!("#{} {}", p.number, p.title);
+        let prs = self.git.prs.clone().unwrap_or_default();
+        let shown = match picked.as_deref().map(|c| (c, git::pr_number(c))) {
+            None => auto.clone(),
+            Some((_, Some(n))) => prs
+                .iter()
+                .find(|p| p.number == n)
+                .map_or(format!("#{n}"), pr_label),
+            Some((c, None)) => c.to_string(),
+        };
+        let branch = self.branch.clone().unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.label("Base");
+            egui::ComboBox::from_id_salt("base-pr")
+                .selected_text(shown)
+                .width(ui.available_width().min(260.0))
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(picked.is_none(), &auto).clicked() {
+                        *choice = Some(None);
+                    }
+                    if self.git.prs_rx.is_some() {
+                        ui.label(RichText::new("Loading open PRs…").weak());
+                    }
+                    for p in prs.iter().filter(|p| p.head != branch) {
+                        let c = format!("#{}", p.number);
+                        if ui
+                            .selectable_label(picked.as_deref() == Some(c.as_str()), pr_label(p))
+                            .on_hover_text(&p.head)
+                            .clicked()
+                        {
+                            *choice = Some(Some(c));
+                        }
+                    }
+                });
+        });
+        ui.horizontal(|ui| {
+            let label = ui.label("or");
+            let r = ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.git.base_input)
+                        .hint_text("#123 or a branch")
+                        .desired_width(140.0),
+                )
+                .labelled_by(label.id);
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let typed = self.git.base_input.trim().to_string();
+            if (ui
+                .add_enabled(!typed.is_empty(), egui::Button::new("Use"))
+                .clicked()
+                || enter)
+                && !typed.is_empty()
+            {
+                *choice = Some(Some(typed));
+                self.git.base_input.clear();
+            }
+        });
+        if let Some(e) = &ch.base_error {
+            ui.label(RichText::new(format!("{e}: using the automatic base")).color(ERROR));
+        }
+        ui.label(
+            RichText::new(format!(
+                "{} files changed vs {}",
+                ch.branch.len(),
+                ch.base.as_deref().unwrap_or("?")
+            ))
+            .weak(),
+        );
+        if ch.base.is_none() {
+            ui.label(
+                RichText::new("No base branch found (no origin/HEAD, develop, main or master).")
+                    .weak(),
+            );
+        }
+    }
+
+    /// The Pull request tab: the branch / pull request's files, uncommitted changes (stage, commit),
     /// branch switch, and the open file's history.
     pub(super) fn git_panel(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
@@ -239,7 +419,70 @@ impl App {
             }
             ui.checkbox(&mut self.git.show_column, "Blame column");
         });
+        let mut base_choice: Option<Option<String>> = None;
+        let mut revert: Option<Revert> = None;
+        let mut confirm = self.git.confirm_revert.clone();
+        // "Revert", then "Discard? Yes / No" in the same row
+        let mut revert_button = |ui: &mut Ui, key: (PathBuf, bool), tip: &str| -> bool {
+            if confirm.as_ref() == Some(&key) {
+                ui.label(RichText::new("Discard?").color(ERROR));
+                let yes = ui.small_button("Yes").clicked();
+                if yes || ui.small_button("No").clicked() {
+                    confirm = None;
+                }
+                yes
+            } else {
+                if ui.small_button("Revert").on_hover_text(tip).clicked() {
+                    confirm = Some(key);
+                }
+                false
+            }
+        };
         if let Some(ch) = self.git.changes.clone() {
+            ui.separator();
+            self.pr_header(ui, &ch, &mut base_choice);
+            for c in &ch.branch {
+                let rel = c
+                    .path
+                    .strip_prefix(&root)
+                    .unwrap_or(&c.path)
+                    .display()
+                    .to_string();
+                let name = c
+                    .path
+                    .file_name()
+                    .map_or(rel.clone(), |n| n.to_string_lossy().into_owned());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(c.code.to_string())
+                            .monospace()
+                            .strong()
+                            .color(code_color(c.code)),
+                    );
+                    if c.code != 'D' && ui.small_button("Open").clicked() {
+                        open_file = Some(c.path.clone());
+                    }
+                    if let Some(base) = &ch.base
+                        && revert_button(
+                            ui,
+                            (c.path.clone(), true),
+                            "Put this file back as it was on the base (an uncommitted change)",
+                        )
+                    {
+                        revert = Some(Revert::Branch {
+                            path: c.path.clone(),
+                            base: base.clone(),
+                        });
+                    }
+                    if ui
+                        .link(&name)
+                        .on_hover_text(format!("{rel}\nShow the diff against the base"))
+                        .clicked()
+                    {
+                        diff = Some((c.path.clone(), ch.base.clone(), false));
+                    }
+                });
+            }
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label(
@@ -259,6 +502,10 @@ impl App {
                     .unwrap_or(&c.path)
                     .display()
                     .to_string();
+                let name = c
+                    .path
+                    .file_name()
+                    .map_or(rel.clone(), |n| n.to_string_lossy().into_owned());
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(c.code.to_string())
@@ -266,17 +513,7 @@ impl App {
                             .strong()
                             .color(code_color(c.code)),
                     );
-                    if ui.link(&rel).on_hover_text("Show the diff").clicked() {
-                        diff = Some((c.path.clone(), None, c.staged));
-                    }
-                    ui.label(
-                        RichText::new(if c.staged { "staged" } else { "" })
-                            .weak()
-                            .small(),
-                    );
-                    if c.code != 'D' && ui.small_button("Open").clicked() {
-                        open_file = Some(c.path.clone());
-                    }
+                    // buttons first: a long path must not push them out of the narrow panel
                     let p = c.path.to_string_lossy().into_owned();
                     if c.staged {
                         if ui.small_button("Unstage").clicked() {
@@ -286,6 +523,31 @@ impl App {
                     } else if ui.small_button("Stage").clicked() {
                         command = Some(vec!["add".into(), "--".into(), p]);
                     }
+                    if c.code != 'D' && ui.small_button("Open").clicked() {
+                        open_file = Some(c.path.clone());
+                    }
+                    let untracked = c.code == '?';
+                    if revert_button(
+                        ui,
+                        (c.path.clone(), false),
+                        if untracked {
+                            "Delete this new file"
+                        } else {
+                            "Discard the changes: back to the last commit"
+                        },
+                    ) {
+                        revert = Some(Revert::Working {
+                            path: c.path.clone(),
+                            untracked,
+                        });
+                    }
+                    if ui
+                        .link(&name)
+                        .on_hover_text(format!("{rel}\nShow the diff"))
+                        .clicked()
+                    {
+                        diff = Some((c.path.clone(), None, c.staged));
+                    }
                 });
             }
             if ch.working.iter().any(|c| c.staged) {
@@ -294,7 +556,7 @@ impl App {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.git.commit_message)
                             .hint_text("what changed")
-                            .desired_width(420.0),
+                            .desired_width(ui.available_width().min(220.0)),
                     )
                     .labelled_by(label.id);
                     let ok = !self.git.commit_message.trim().is_empty();
@@ -311,49 +573,15 @@ impl App {
                     }
                 });
             }
-            ui.separator();
-            let base = ch.base.clone().unwrap_or_else(|| "?".into());
-            let title = match &ch.pr {
-                Some(pr) => format!("Pull request {pr}: {} files vs {base}", ch.branch.len()),
-                None => format!("This branch: {} files changed vs {base}", ch.branch.len()),
-            };
-            ui.label(RichText::new(title).strong());
-            if ch.base.is_none() {
-                ui.label(
-                    RichText::new(
-                        "No base branch found (no origin/HEAD, develop, main or master).",
-                    )
-                    .weak(),
-                );
-            }
-            for c in &ch.branch {
-                let rel = c
-                    .path
-                    .strip_prefix(&root)
-                    .unwrap_or(&c.path)
-                    .display()
-                    .to_string();
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(c.code.to_string())
-                            .monospace()
-                            .strong()
-                            .color(code_color(c.code)),
-                    );
-                    if ui
-                        .link(&rel)
-                        .on_hover_text("Show the diff against the base")
-                        .clicked()
-                    {
-                        diff = Some((c.path.clone(), ch.base.clone(), false));
-                    }
-                    if c.code != 'D' && ui.small_button("Open").clicked() {
-                        open_file = Some(c.path.clone());
-                    }
-                });
-            }
         }
         ui.separator();
+        if let Some(c) = base_choice {
+            self.set_base(c);
+        }
+        self.git.confirm_revert = confirm;
+        if let Some(r) = revert {
+            self.revert_file(&root, r);
+        }
         if let Some(args) = command {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             self.git_command(&args);
@@ -404,20 +632,20 @@ impl App {
         });
         let now = git::now();
         let mut open = None;
-        egui::Grid::new("history")
-            .striped(true)
-            .num_columns(4)
-            .show(ui, |ui| {
-                for c in &self.git.history {
-                    if ui.link(RichText::new(c.short()).monospace()).clicked() {
-                        open = Some(c.sha.clone());
-                    }
-                    ui.label(&c.author);
-                    ui.label(RichText::new(git::ago(c.time, now)).weak());
-                    ui.label(&c.summary);
-                    ui.end_row();
+        // one short row per commit (the panel is narrow): sha, age, summary; author on hover
+        for c in &self.git.history {
+            ui.horizontal(|ui| {
+                if ui
+                    .link(RichText::new(c.short()).monospace())
+                    .on_hover_text(&c.author)
+                    .clicked()
+                {
+                    open = Some(c.sha.clone());
                 }
+                ui.label(RichText::new(git::ago(c.time, now)).weak());
+                ui.add(egui::Label::new(&c.summary).truncate());
             });
+        }
         if let Some(sha) = open {
             self.open_commit(&sha, &path, &ui.ctx().clone());
         }

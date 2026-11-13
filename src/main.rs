@@ -170,6 +170,46 @@ fn bench(dir: &std::path::Path) {
             .take(3)
             .collect::<Vec<_>>()
     );
+    // the editor's per-parameter stability hints, rebuilt after each edit: the Kotlin file with
+    // the most composable parameters, median of 25
+    let (big, big_src, params) = p
+        .files
+        .iter()
+        .filter(|f| f.extension().is_some_and(|e| e == "kt"))
+        .filter_map(|f| {
+            let s = std::fs::read_to_string(f).ok()?;
+            let n: usize = kotlin::scan(&s)
+                .decls
+                .iter()
+                .filter(|d| d.is_composable())
+                .map(|d| d.params.len())
+                .sum();
+            Some((f.clone(), s, n))
+        })
+        .max_by_key(|x| x.2)
+        .unwrap_or_default();
+    let syms = kotlin::scan(&big_src);
+    let mut runs: Vec<f64> = (0..25)
+        .map(|_| {
+            let t = std::time::Instant::now();
+            let newlines: Vec<usize> = big_src.match_indices('\n').map(|(i, _)| i).collect();
+            let mut n = 0;
+            for d in syms.decls.iter().filter(|d| d.is_composable()) {
+                for (_, r) in compose::param_names(&big_src, d.offset) {
+                    n += newlines.partition_point(|&x| x < r.start);
+                }
+            }
+            std::hint::black_box(n);
+            t.elapsed().as_secs_f64() * 1000.0
+        })
+        .collect();
+    runs.sort_by(f64::total_cmp);
+    println!(
+        "{:<34} {:>8.3} ms  ({params} params in {})",
+        "compose parameter hints (1 file)",
+        runs[12],
+        big.file_name().unwrap_or_default().to_string_lossy()
+    );
     let any = idx.files.keys().next().cloned().unwrap_or_default();
     let src = std::fs::read_to_string(&any).unwrap_or_default();
     let mut idx = idx;

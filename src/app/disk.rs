@@ -52,7 +52,7 @@ impl App {
             Err(_) => false,
         });
         if !ready.is_empty() {
-            self.git.changes_stale = true; // the Git tab's lists may have changed
+            self.git.changes_stale = true; // the Pull request tab's lists may have changed
             self.res_stale |= ready.iter().any(|c| match c {
                 DiskChange::File(p, ..) | DiskChange::Gone(p) => {
                     p.components().any(|c| c.as_os_str() == "res")
