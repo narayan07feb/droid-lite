@@ -1,5 +1,6 @@
 #[cfg(any(test, feature = "memstats"))]
 mod alloc_count;
+mod android_kit;
 mod app;
 mod capture;
 mod catalog;
@@ -8,7 +9,6 @@ mod compose;
 mod device;
 mod edit;
 mod git;
-mod glass;
 mod gradle;
 mod highlight;
 mod icons;
@@ -22,8 +22,10 @@ mod lsp;
 mod plugins;
 mod project;
 mod refactor;
+mod reports;
 mod resources;
 mod theme;
+mod usage;
 mod watch;
 
 fn main() -> eframe::Result {
@@ -39,23 +41,18 @@ fn main() -> eframe::Result {
         .nth(1)
         .map(std::path::PathBuf::from)
         .filter(|p| p.is_dir());
-    let glass = app::glass_setting();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Droid Lite")
             .with_inner_size([1440.0, 900.0])
             .with_drag_and_drop(true)
-            .with_icon(icon())
-            .with_transparent(glass)
-            .with_fullsize_content_view(glass)
-            .with_title_shown(!glass)
-            .with_titlebar_shown(!glass),
+            .with_icon(icon()),
         ..Default::default()
     };
     eframe::run_native(
         "Droid Lite",
         options,
-        Box::new(|cc| Ok(Box::new(app::App::new(cc, open, glass)))),
+        Box::new(|cc| Ok(Box::new(app::App::new(cc, open)))),
     )
 }
 

@@ -12,7 +12,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub(super) struct Settings {
     pub font_size: f32,
     pub light: bool,
-    pub glass: bool,
     pub autosave: bool,
     pub lsp_heap: String,
     /// Find usages filters (see `usage_filter`).
@@ -29,7 +28,6 @@ impl Default for Settings {
         Settings {
             font_size: 13.0,
             light: false,
-            glass: true,
             autosave: true,
             lsp_heap: "2g".into(),
             hide_tests: false,
@@ -53,7 +51,6 @@ impl Settings {
         Settings {
             font_size: v["font_size"].as_f64().map_or(d.font_size, |f| f as f32),
             light: v["light"].as_bool().unwrap_or(d.light),
-            glass: v["glass"].as_bool().unwrap_or(d.glass),
             autosave: v["autosave"].as_bool().unwrap_or(d.autosave),
             lsp_heap: v["lsp_heap"].as_str().map_or(d.lsp_heap, String::from),
             hide_tests: v["hide_tests"].as_bool().unwrap_or(d.hide_tests),
@@ -74,7 +71,7 @@ impl Settings {
     pub fn save(&self) {
         if let Some(c) = config_dir() {
             let _ = std::fs::create_dir_all(&c);
-            let v = json!({ "font_size": self.font_size, "light": self.light, "glass": self.glass, "autosave": self.autosave, "lsp_heap": self.lsp_heap,
+            let v = json!({ "font_size": self.font_size, "light": self.light, "autosave": self.autosave, "lsp_heap": self.lsp_heap,
                 "hide_tests": self.hide_tests, "hide_imports": self.hide_imports, "hide_xml": self.hide_xml, "usage_path": self.usage_path, "pr_bases": self.pr_bases });
             let _ = std::fs::write(
                 c.join("settings.json"),
@@ -84,10 +81,10 @@ impl Settings {
     }
 
     /// Applies what can change while running: theme and font size.
-    pub fn apply(&self, ctx: &egui::Context, glass: bool) {
+    pub fn apply(&self, ctx: &egui::Context) {
         theme::set_light(self.light);
         theme::set_font_size(self.font_size);
-        ctx.set_visuals(theme::visuals(glass && !self.light));
+        ctx.set_visuals(theme::visuals());
     }
 }
 
@@ -195,7 +192,12 @@ impl App {
             .iter()
             .map(|t| json!({ "path": t.path.to_string_lossy(), "cursor": t.cursor }))
             .collect();
-        let v = json!({ "tabs": tabs, "active": self.active, "tree_view": self.tree_view.name() });
+        let v = json!({
+            "tabs": tabs,
+            "active": self.active,
+            "tree_view": self.tree_view.name(),
+            "variant": self.variant,
+        });
         let text = v.to_string();
         let h = hash(&text);
         if h == self.session_saved.0 || (!force && self.session_saved.1.elapsed().as_secs() < 1) {
@@ -219,6 +221,12 @@ impl App {
         else {
             return;
         };
+        if let Some(var) = v["variant"]
+            .as_str()
+            .filter(|x| self.variants.iter().any(|y| y == x))
+        {
+            self.variant = var.to_string();
+        }
         let view = match v["tree_view"].as_str() {
             Some("Project") => super::tree::View::Project,
             _ => super::tree::View::Android,
@@ -289,9 +297,6 @@ impl App {
                     ui.radio_value(&mut self.settings.light, true, "Light");
                 });
                 ui.end_row();
-                ui.label("Liquid Glass");
-                ui.checkbox(&mut self.settings.glass, "On (dark theme, applies after restart)");
-                ui.end_row();
                 ui.label("Auto-save");
                 ui.checkbox(&mut self.settings.autosave, "Save edited files when Droid Lite loses focus");
                 ui.end_row();
@@ -306,7 +311,7 @@ impl App {
         });
         if self.settings != before {
             self.settings.save();
-            self.settings.apply(ctx, self.glass);
+            self.settings.apply(ctx);
             for t in self.tabs.iter_mut() {
                 t.recolor = true;
             }

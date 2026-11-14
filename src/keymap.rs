@@ -61,7 +61,70 @@ pub enum Action {
     CloseTab,
     Shortcuts,
     NewWindow,
+    Palette,
+    ToggleProject,
+    ToggleRight,
+    ToggleBottom,
+    FocusMode,
+    RunApp,
+    RunTask,
+    QuickFix,
+    NewFile,
+    Translations,
+    DeepLink,
 }
+
+/// Every action, in the order the action palette lists them with an empty query.
+pub const ALL: &[Action] = {
+    use Action::*;
+    &[
+        RunApp,
+        RunTask,
+        Build,
+        QuickFix,
+        NewFile,
+        Translations,
+        DeepLink,
+        Palette,
+        Everywhere,
+        GotoClass,
+        GotoFile,
+        GotoSymbol,
+        Recent,
+        Structure,
+        GotoLine,
+        GotoDefinition,
+        References,
+        Implementations,
+        FindInFiles,
+        Find,
+        Replace,
+        FindNext,
+        FindPrev,
+        Rename,
+        ExtractVariable,
+        OptimizeImports,
+        ToggleComment,
+        DeleteLine,
+        DuplicateLine,
+        MoveLineUp,
+        MoveLineDown,
+        Complete,
+        Back,
+        Forward,
+        LocateFile,
+        LocalHistory,
+        ToggleProject,
+        ToggleRight,
+        ToggleBottom,
+        FocusMode,
+        Save,
+        CloseTab,
+        NewWindow,
+        Settings,
+        Shortcuts,
+    ]
+};
 
 impl Action {
     pub fn label(self) -> &'static str {
@@ -100,6 +163,17 @@ impl Action {
             Action::CloseTab => "Close tab",
             Action::Shortcuts => "Keyboard shortcuts",
             Action::NewWindow => "New window (open a project)",
+            Action::Palette => "Find action",
+            Action::ToggleProject => "Show / hide the Project panel",
+            Action::ToggleRight => "Show / hide the Compose panel",
+            Action::ToggleBottom => "Show / hide the bottom panel",
+            Action::FocusMode => "Focus mode (hide all panels)",
+            Action::RunApp => "Run the app on the device",
+            Action::RunTask => "Run the Gradle task",
+            Action::QuickFix => "Quick fix (show fixes for this line)",
+            Action::NewFile => "New Kotlin file (Composable, ViewModel, Activity…)",
+            Action::Translations => "Translations (strings in every language)",
+            Action::DeepLink => "Open a deep link on the device",
         }
     }
 }
@@ -151,6 +225,15 @@ pub fn bindings(km: Keymap) -> Vec<(Action, KeyboardShortcut)> {
             (NewWindow, sc(CMD | SHIFT, Key::N)),
             (Settings, sc(CMD, Key::Comma)),
             (LocateFile, sc(CMD | ALT, Key::W)), // Eclipse "Show In"
+            (Palette, sc(CMD | SHIFT, Key::A)),
+            (ToggleProject, sc(CMD, Key::Num1)),
+            (ToggleBottom, sc(CMD, Key::Num4)),
+            (ToggleRight, sc(CMD, Key::Num9)),
+            (FocusMode, sc(CMD | SHIFT, Key::F12)),
+            (RunApp, sc(CTRL, Key::R)),
+            (RunTask, sc(CTRL | SHIFT, Key::R)),
+            (QuickFix, sc(ALT, Key::Enter)),
+            (NewFile, sc(CMD, Key::N)),
         ],
         Keymap::AndroidStudio => vec![
             (GotoClass, sc(CMD, Key::O)),
@@ -185,6 +268,15 @@ pub fn bindings(km: Keymap) -> Vec<(Action, KeyboardShortcut)> {
             (Shortcuts, sc(CMD | SHIFT, Key::Slash)),
             (NewWindow, sc(CMD | SHIFT, Key::N)),
             (Settings, sc(CMD, Key::Comma)),
+            (Palette, sc(CMD | SHIFT, Key::A)),
+            (ToggleProject, sc(CMD, Key::Num1)),
+            (ToggleBottom, sc(CMD, Key::Num4)),
+            (ToggleRight, sc(CMD, Key::Num9)),
+            (FocusMode, sc(CMD | SHIFT, Key::F12)),
+            (RunApp, sc(CTRL, Key::R)),
+            (RunTask, sc(CTRL | SHIFT, Key::R)),
+            (QuickFix, sc(ALT, Key::Enter)),
+            (NewFile, sc(CMD, Key::N)),
         ],
     };
     v.sort_by_key(|(_, s)| std::cmp::Reverse(count(s.modifiers)));
@@ -230,6 +322,15 @@ mod tests {
                 for (a2, s2) in &b[i + 1..] {
                     assert!(s != s2, "{km:?}: {a:?} and {a2:?} share {s:?}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn the_palette_lists_every_bound_action_once() {
+        for km in [Keymap::Eclipse, Keymap::AndroidStudio] {
+            for (a, _) in bindings(km) {
+                assert_eq!(ALL.iter().filter(|x| **x == a).count(), 1, "{a:?}");
             }
         }
     }

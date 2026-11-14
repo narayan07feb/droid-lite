@@ -411,6 +411,10 @@ pub fn scan(src: &str) -> FileSyms {
                         || MODIFIERS.contains(&s.text(s.i))
                         || s.is(s.i, "constructor"))
                 {
+                    // Hilt / Dagger: `@Inject constructor` marks the class as injectable
+                    if s.text(s.i) == "@Inject" {
+                        annotations.push("Inject".into());
+                    }
                     s.i += 1; // private constructor / @Inject constructor
                 }
                 let params = if s.is(s.i, "(") {
@@ -830,6 +834,7 @@ typealias Users = List<User>
         let f = scan(SAMPLE);
         let vm = find(&f, "Vm");
         assert_eq!(vm.params[0].name, "api");
+        assert!(vm.has_annotation("Inject"), "{:?}", vm.annotations);
         assert_eq!(find(&f, "state").container.as_deref(), Some("Vm"));
     }
 

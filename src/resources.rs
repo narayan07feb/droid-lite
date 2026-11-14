@@ -13,11 +13,17 @@ pub struct Entry {
     pub value: Option<String>,
     /// The folder qualifier, e.g. `values-night` or `drawable-xxhdpi` ("" for the default folder).
     pub qualifier: String,
+    /// `translatable="false"`: never needs a translation.
+    pub fixed: bool,
 }
 
 #[derive(Default)]
 pub struct Resources {
     map: HashMap<(String, String), Vec<Entry>>,
+    /// Manifest components by full class name, with the manifest that declares them.
+    components: HashMap<String, (PathBuf, crate::android_kit::Component)>,
+    /// Example deep links from the manifests' `VIEW` intent filters.
+    pub links: Vec<String>,
 }
 
 const FILE_TYPES: &[&str] = &[
@@ -68,15 +74,49 @@ impl Resources {
             .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
             .map(|e| e.into_path())
             .filter(|p| {
-                p.parent()
-                    .and_then(Path::parent)
-                    .and_then(Path::file_name)
-                    .is_some_and(|n| n == "res")
+                p.file_name().is_some_and(|n| n == "AndroidManifest.xml")
+                    || p.parent()
+                        .and_then(Path::parent)
+                        .and_then(Path::file_name)
+                        .is_some_and(|n| n == "res")
             });
         for p in files {
-            r.add_file(&p);
+            if p.file_name().is_some_and(|n| n == "AndroidManifest.xml") {
+                r.add_manifest(&p);
+            } else {
+                r.add_file(&p);
+            }
         }
         r
+    }
+
+    /// Reads a module's `src/<set>/AndroidManifest.xml`; relative names start from its
+    /// `package` or the module's `namespace`.
+    fn add_manifest(&mut self, path: &Path) {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let module = path.ancestors().nth(3).unwrap_or(Path::new(""));
+        let build = ["build.gradle.kts", "build.gradle"]
+            .iter()
+            .find_map(|f| std::fs::read_to_string(module.join(f)).ok())
+            .unwrap_or_default();
+        let ns = crate::android_kit::namespace(&text, &build);
+        for l in crate::android_kit::deep_links(&text) {
+            if !self.links.contains(&l) {
+                self.links.push(l);
+            }
+        }
+        for c in crate::android_kit::components(&text, &ns) {
+            self.components
+                .entry(c.class.clone())
+                .or_insert_with(|| (path.to_path_buf(), c));
+        }
+    }
+
+    /// Where the manifest declares this Activity / Service / Receiver / Provider / Application.
+    pub fn component(&self, class: &str) -> Option<&(PathBuf, crate::android_kit::Component)> {
+        self.components.get(class)
     }
 
     pub fn add_file(&mut self, path: &Path) {
@@ -96,7 +136,7 @@ impl Resources {
         let is_xml = path.extension().is_some_and(|e| e == "xml");
         if ty == "values" && is_xml {
             if let Ok(text) = std::fs::read_to_string(path) {
-                for (kind, name, offset, value) in value_entries(&text) {
+                for (kind, name, offset, value, fixed) in value_entries(&text) {
                     self.push(
                         kind,
                         name,
@@ -105,6 +145,7 @@ impl Resources {
                             offset,
                             value,
                             qualifier: qualifier.clone(),
+                            fixed,
                         },
                     );
                 }
@@ -122,6 +163,7 @@ impl Resources {
                     offset: 0,
                     value: None,
                     qualifier: qualifier.clone(),
+                    fixed: false,
                 },
             );
             if is_xml && let Ok(text) = std::fs::read_to_string(path) {
@@ -134,6 +176,7 @@ impl Resources {
                             offset,
                             value: None,
                             qualifier: qualifier.clone(),
+                            fixed: false,
                         },
                     );
                 }
@@ -146,6 +189,22 @@ impl Resources {
         if !v.contains(&e) {
             v.push(e);
         }
+    }
+
+    /// Every string resource with its entries (default folder first), sorted by name.
+    pub fn strings(&self) -> Vec<(&str, Vec<&Entry>)> {
+        let mut out: Vec<(&str, Vec<&Entry>)> = self
+            .map
+            .iter()
+            .filter(|((kind, _), _)| kind == "string")
+            .map(|((_, name), v)| {
+                let mut v: Vec<&Entry> = v.iter().collect();
+                v.sort_by_key(|e| (!e.qualifier.is_empty(), e.qualifier.clone()));
+                (name.as_str(), v)
+            })
+            .collect();
+        out.sort_by_key(|(n, _)| *n);
+        out
     }
 
     /// Entries for `R.<kind>.<name>`, the default folder first.
@@ -180,7 +239,7 @@ impl Resources {
 }
 
 /// `<string name="x">value</string>` and friends: (kind, name, offset of the name, value).
-fn value_entries(text: &str) -> Vec<(String, String, usize, Option<String>)> {
+fn value_entries(text: &str) -> Vec<(String, String, usize, Option<String>, bool)> {
     let mut out = Vec::new();
     let mut at = 0;
     while let Some(i) = text[at..].find('<') {
@@ -220,7 +279,8 @@ fn value_entries(text: &str) -> Vec<(String, String, usize, Option<String>)> {
                 .map(|e| text[body_start..body_start + e].trim().to_string())
         })
         .flatten();
-        out.push((kind, name.to_string(), name_at, value));
+        let fixed = attr(header, "translatable") == Some("false");
+        out.push((kind, name.to_string(), name_at, value, fixed));
     }
     out
 }

@@ -39,6 +39,8 @@ pub(super) struct LogcatView {
     mine: Vec<String>,
     pub(super) paused: bool,
     scroll_lock: bool,
+    /// Collects an app crash's trace as it arrives, for the crash note.
+    crash: crate::android_kit::CrashWatch,
 }
 
 impl LogcatView {
@@ -258,10 +260,16 @@ impl App {
             new.extend(s.rx.try_iter().take(20_000));
         }
         let mut unknown_pid = false;
+        let mut crashes = Vec::new();
+        if new.is_empty() {
+            crashes.extend(lc.crash.finish());
+        }
         for e in new {
             unknown_pid |= !lc.procs.contains_key(&e.pid);
+            crashes.extend(lc.crash.feed(&e.tag, e.level, e.pid, &e.msg));
             lc.push(e);
         }
+        crashes.retain(|c| lc.mine.iter().any(|m| c.process.starts_with(m.as_str())));
         let due = lc.procs_at.is_none_or(|t| {
             t.elapsed() > Duration::from_secs(5)
                 || unknown_pid && t.elapsed() > Duration::from_secs(1)
@@ -275,6 +283,9 @@ impl App {
                 c.request_repaint();
             });
             lc.procs_rx = Some(rx);
+        }
+        for c in crashes {
+            self.crash_note(c);
         }
     }
 
@@ -461,20 +472,26 @@ impl App {
 
     /// Opens `file` at `line`, picking the project file whose folders match the frame's package.
     fn open_stack_frame(&mut self, pkg: &str, file: &str, line: usize) {
-        let Some(p) = &self.project else { return };
-        let mut found: Vec<&PathBuf> = p
-            .files
-            .iter()
-            .filter(|f| f.file_name().is_some_and(|n| n == file))
-            .collect();
-        found.sort_by_key(|f| !f.to_string_lossy().contains(pkg));
-        let Some(f) = found.first().map(|f| (*f).clone()) else {
+        let Some(f) = self.frame_path(pkg, file) else {
             self.status = format!("{file} is not in this project (a library or the platform)");
             return;
         };
         let text = std::fs::read_to_string(&f).unwrap_or_default();
         let at = crate::edit::line_offset(&text, &line.to_string());
         self.open_file(&f, at);
+    }
+
+    /// The project file of a stack frame: `file` in the folders of the frame's package first.
+    pub(super) fn frame_path(&self, pkg: &str, file: &str) -> Option<PathBuf> {
+        let p = self.project.as_ref()?;
+        let mut found: Vec<&PathBuf> = p
+            .files
+            .iter()
+            .filter(|f| f.file_name().is_some_and(|n| n == file))
+            .collect();
+        // a package path that matches beats a file of the same name elsewhere
+        found.sort_by_key(|f| !f.to_string_lossy().contains(pkg));
+        found.first().map(|f| (*f).clone())
     }
 }
 

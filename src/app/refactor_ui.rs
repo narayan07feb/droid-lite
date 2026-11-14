@@ -56,6 +56,17 @@ struct EditLine {
     include: bool,
 }
 
+impl Preview {
+    /// Each planned change as (its line with the new name, ticked), for tests.
+    #[cfg(test)]
+    pub(super) fn lines(&self) -> Vec<(String, bool)> {
+        self.files
+            .iter()
+            .flat_map(|f| f.edits.iter().map(|e| (e.preview.clone(), e.include)))
+            .collect()
+    }
+}
+
 /// What the last refactoring changed, to undo it.
 pub(super) struct Undo {
     label: String,
@@ -96,7 +107,7 @@ fn edit_line(text: &str, range: Range<usize>, new_text: String) -> EditLine {
 
 impl App {
     /// The current text of a file: the open tab if there is one, else the disk.
-    fn current_text(&self, path: &Path) -> Option<String> {
+    pub(super) fn current_text(&self, path: &Path) -> Option<String> {
         self.tabs
             .iter()
             .find(|t| t.path == path)
@@ -114,6 +125,7 @@ impl App {
             return;
         }
         let old = tab.text[a..b].to_string();
+        self.rename_target = self.usage_target(a);
         self.refactor = Some(Refactor::RenameInput {
             path: tab.path.clone(),
             at: a,
@@ -132,6 +144,7 @@ impl App {
         let files: Vec<PathBuf> = p.files.iter().filter(|f| is_code(f)).cloned().collect();
         let (tx, rx) = channel();
         let (o, n) = (old.clone(), new.clone());
+        let target = self.rename_target.clone().filter(|t| t.name == old);
         std::thread::spawn(move || {
             let out: Vec<FileEdits> = files
                 .into_iter()
@@ -140,9 +153,21 @@ impl App {
                         .get(&path)
                         .cloned()
                         .or_else(|| std::fs::read_to_string(&path).ok())?;
-                    let edits: Vec<EditLine> = refactor::occurrences(&text, &o)
+                    let hits = refactor::occurrences(&text, &o);
+                    let syms =
+                        (target.is_some() && !hits.is_empty()).then(|| crate::kotlin::scan(&text));
+                    let edits: Vec<EditLine> = hits
                         .into_iter()
-                        .map(|r| edit_line(&text, r, n.clone()))
+                        .map(|r| {
+                            // a place that looks like another declaration of the name starts unticked
+                            let ours = match (&target, &syms) {
+                                (Some(t), Some(s)) => t.is_use(&path, &text, s, r.start),
+                                _ => true,
+                            };
+                            let mut e = edit_line(&text, r, n.clone());
+                            e.include = ours;
+                            e
+                        })
                         .collect();
                     (!edits.is_empty()).then_some(FileEdits { path, text, edits })
                 })

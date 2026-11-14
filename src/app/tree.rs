@@ -363,6 +363,10 @@ pub(super) struct Sel<'a> {
     pub active: Option<&'a Path>,
     pub locate: Option<&'a Path>,
     pub status: &'a StatusMap,
+    /// Declarations by file, for the Activity / ViewModel / Composable icons.
+    pub syms: &'a HashMap<PathBuf, crate::kotlin::FileSyms>,
+    /// Right-click → New file in this folder.
+    pub new_in: &'a std::cell::Cell<Option<PathBuf>>,
 }
 
 /// Draws nodes; a clicked file goes into `open`.
@@ -392,7 +396,7 @@ fn file_row(ui: &mut Ui, f: &Path, sel: Sel, open: &mut Option<PathBuf>) {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let (icon, color) = super::file_icon(f);
+    let (icon, color) = super::assist::kind_icon(f, sel.syms.get(f));
     let mut job = egui::text::LayoutJob::default();
     let fmt = |color| egui::TextFormat {
         font_id: egui::FontId::proportional(13.0),
@@ -414,6 +418,18 @@ fn file_row(ui: &mut Ui, f: &Path, sel: Sel, open: &mut Option<PathBuf>) {
     if r.clicked() {
         *open = Some(f.to_path_buf());
     }
+    r.context_menu(|ui| {
+        if ui
+            .button(format!(
+                "{}  New Kotlin file here…",
+                crate::icons::FILE_PLUS
+            ))
+            .clicked()
+        {
+            sel.new_in.set(f.parent().map(Path::to_path_buf));
+            ui.close();
+        }
+    });
 }
 
 /// Files whose name contains `query` (any case), best first: name starts with it, then shorter.

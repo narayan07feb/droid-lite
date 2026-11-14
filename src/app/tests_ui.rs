@@ -313,6 +313,7 @@ impl App {
     pub(super) fn poll_tests(&mut self) {
         let root = self.project.as_ref().map(|p| p.root.clone());
         let mut lists_changed = false;
+        let mut ended_runs = Vec::new();
         for p in &mut self.tests.plugins {
             if let Some(rx) = &p.loading
                 && let Ok(r) = rx.try_recv()
@@ -399,7 +400,11 @@ impl App {
                 } else {
                     format!("{}: {line}", p.m.name)
                 };
+                ended_runs.push((self.status.clone(), failed == 0 && ok));
             }
+        }
+        for (text, ok) in ended_runs {
+            self.toast(text, ok, Bottom::Tests);
         }
         if lists_changed {
             self.tests.rebuild_marks();

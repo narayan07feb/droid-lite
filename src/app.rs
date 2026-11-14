@@ -1,6 +1,7 @@
 //! The IDE window: project tree, editor tabs, search popups, completion, Compose panel, Gradle console.
 
 mod android;
+mod assist;
 mod capture_ui;
 mod comfort;
 mod disk;
@@ -15,6 +16,8 @@ mod perf;
 mod refactor_ui;
 mod run_ui;
 mod tests_ui;
+mod toasts;
+mod translations;
 mod tree;
 mod typing;
 mod usage_filter;
@@ -156,6 +159,8 @@ struct EditorCache {
     key: u64,
     job: egui::text::LayoutJob,
     galley: std::sync::Arc<egui::Galley>,
+    /// `galley` with room for the link rows, and the key of the rows it was made for.
+    shown: Option<(u64, std::sync::Arc<egui::Galley>)>,
 }
 
 /// Analysis waits this long after the last keystroke, so typing in big files stays smooth.
@@ -173,6 +178,8 @@ enum SearchKind {
     GotoLine,
     /// A fixed list from `Search::pinned`.
     Pick,
+    /// Every command, by name (⇧⌘A).
+    Actions,
 }
 
 impl SearchKind {
@@ -187,12 +194,14 @@ impl SearchKind {
             SearchKind::FindInFiles => Action::FindInFiles,
             SearchKind::GotoLine => Action::GotoLine,
             SearchKind::Pick => Action::Implementations,
+            SearchKind::Actions => Action::Palette,
         }
     }
     fn hint(self) -> &'static str {
         match self {
             SearchKind::FindInFiles => "Text to find in every file, then Enter",
             SearchKind::GotoLine => "line or line:column, then Enter",
+            SearchKind::Actions => "Type a command: rename, logcat, run app, focus…",
             _ => "Type to search; camel humps work: HSVM → HomeScreenViewModel",
         }
     }
@@ -233,6 +242,8 @@ struct Item {
     detail: String,
     insert: String,
     import: Option<String>,
+    /// A live template (`comp`, `vm`…) to expand instead of inserting `insert`.
+    template: Option<&'static crate::android_kit::Template>,
 }
 
 fn found_line(path: &Path, text: &str, o: usize) -> FoundLine {
@@ -280,7 +291,8 @@ struct ComposeView {
 }
 
 /// The ⌘-hovered name, a resource reference it may be (kind, name), and its response.
-type HoverWord = (String, Option<(String, String)>, egui::Response);
+type HoverWord = (String, usize, Option<(String, String)>, egui::Response);
+type HoverTarget = ((PathBuf, usize, u64, u64), Option<crate::usage::Target>);
 
 /// A project opened on a worker thread: files, index, git branch and the tree.
 type Opened = (
@@ -341,10 +353,6 @@ pub struct App {
     watcher: Option<crate::watch::Watcher>,
     /// Disk changes being read and scanned on worker threads.
     disk_rx: Vec<Receiver<Vec<disk::DiskChange>>>,
-    /// Liquid Glass is behind the window.
-    glass: bool,
-    /// Content runs under the title bar: leave room for the window buttons.
-    fullsize: bool,
     git: git_ui::GitState,
     /// Current git branch of the project, shown in the toolbar.
     branch: Option<String>,
@@ -383,19 +391,39 @@ pub struct App {
     slow: Option<(String, Instant)>,
     perf: perf::Perf,
     tests: tests_ui::Tests,
+    /// Which side panels are open (⌘1, ⌘9, ⌘4); focus mode hides all three.
+    show_project: bool,
+    show_right: bool,
+    show_bottom: bool,
+    focus: bool,
+    toasts: Vec<toasts::Toast>,
+    toast_seq: u64,
+    /// The running Gradle task and when it started, for the note when it ends.
+    gradle_started: Option<(String, Instant)>,
+    fix_popup: Option<assist::FixPopup>,
+    new_file_window: Option<assist::NewFile>,
+    /// The picked build variant (`debug`, `freeRelease`…) and the app module's variants.
+    variant: String,
+    variants: Vec<String>,
+    translations: translations::Translations,
+    /// The declaration a rename started from, for the text search fallback.
+    rename_target: Option<crate::usage::Target>,
+    /// The ⌘-hover card's declaration: (file, offset, text version, index version) → target.
+    hover_target: Option<HoverTarget>,
+    /// Virtual devices for the device picker, read in the background on open and when it opens.
+    avds: Vec<String>,
+    avds_rx: Option<Receiver<Vec<String>>>,
+    /// The Deep link window's text while it is open.
+    deep_link: Option<String>,
+    /// Bumped when the resources are scanned again, so views built from them refresh.
+    res_gen: u64,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext, open: Option<PathBuf>, glass_wanted: bool) -> App {
-        let glass = glass_wanted && crate::glass::apply(cc);
-        if glass_wanted && !glass {
-            eprintln!(
-                "droid-lite: Liquid Glass not available (macOS 26+ needed); using solid colours"
-            );
-        }
+    pub fn new(cc: &eframe::CreationContext, open: Option<PathBuf>) -> App {
         crate::theme::install_fonts(&cc.egui_ctx);
         let settings = comfort::Settings::load();
-        settings.apply(&cc.egui_ctx, glass);
+        settings.apply(&cc.egui_ctx);
         crate::theme::style(&cc.egui_ctx);
         let mut app = App {
             project: None,
@@ -439,8 +467,6 @@ impl App {
             undo: None,
             watcher: None,
             disk_rx: Vec::new(),
-            glass,
-            fullsize: glass_wanted,
             git: Default::default(),
             branch: None,
             outputs_gen: 0,
@@ -467,6 +493,24 @@ impl App {
             slow: None,
             perf: Default::default(),
             tests: Default::default(),
+            show_project: true,
+            show_right: true,
+            show_bottom: true,
+            focus: false,
+            toasts: Vec::new(),
+            toast_seq: 0,
+            gradle_started: None,
+            fix_popup: None,
+            new_file_window: None,
+            variant: "debug".into(),
+            variants: Vec::new(),
+            translations: Default::default(),
+            rename_target: None,
+            hover_target: None,
+            avds: Vec::new(),
+            avds_rx: None,
+            deep_link: None,
+            res_gen: 0,
         };
         if let Some(dir) = open.or_else(last_project) {
             app.open_project(&dir, &cc.egui_ctx);
@@ -557,6 +601,8 @@ impl App {
             self.res.len()
         );
         self.project = Some(project);
+        self.load_variants();
+        self.load_avds(ctx);
         self.load_plugins(ctx);
         self.start_lib_index(ctx);
         if self.tabs.is_empty() {
@@ -828,7 +874,8 @@ impl App {
         self.lsp_found = None;
         // The project search always runs: kotlin-lsp answers empty or with one file while it
         // still imports a big Gradle project. Its answer is merged in when it comes.
-        self.search_project(word, true, ctx);
+        let target = self.usage_target(at);
+        self.search_project(word, true, target, ctx);
         if let Some(l) = self.lsp.as_mut().filter(|l| l.ready) {
             let t = &self.tabs[self.active];
             let (line, col) = lsp::position(&t.text, at);
@@ -838,7 +885,50 @@ impl App {
 
     /// Searches every project file (open tabs use their unsaved text) in the background.
     /// `code_refs`: whole identifiers only, outside strings and comments in code files.
-    fn search_project(&mut self, word: String, code_refs: bool, ctx: &egui::Context) {
+    /// What the name at `at` in the active file refers to: its declaration when that is known
+    /// for sure, so same-named members of other classes are not counted as its uses.
+    fn usage_target(&self, at: usize) -> Option<crate::usage::Target> {
+        let t = self.tabs.get(self.active)?;
+        let (a, b) = word_bounds(&t.text, at);
+        let word = t.text.get(a..b)?;
+        if let Some(d) = t
+            .syms
+            .decls
+            .iter()
+            .find(|d| d.offset == a && d.name == word)
+        {
+            return Some(crate::usage::Target::new(
+                &self.index,
+                &t.path,
+                &t.syms,
+                d,
+                &t.text,
+            ));
+        }
+        // from a use: the one declaration this place can mean
+        let mut fits = self
+            .index
+            .definitions(word, &t.path)
+            .into_iter()
+            .take(12)
+            .filter_map(|h| {
+                let f = self.index.files.get(&h.path)?;
+                let d = f.decls.iter().find(|d| d.offset == h.offset)?;
+                let text = self.current_text(&h.path)?;
+                Some(crate::usage::Target::new(&self.index, &h.path, f, d, &text))
+            })
+            .filter(|target| target.is_use(&t.path, &t.text, &t.syms, a));
+        let one = fits.next()?;
+        fits.next().is_none().then_some(one)
+    }
+
+    fn search_project(
+        &mut self,
+        word: String,
+        code_refs: bool,
+        target: Option<crate::usage::Target>,
+        ctx: &egui::Context,
+    ) {
         let Some(p) = &self.project else { return };
         let files: Vec<PathBuf> = p.files.clone();
         let open: HashMap<PathBuf, String> = self
@@ -863,10 +953,19 @@ impl App {
                     continue;
                 }
                 let hits: Vec<usize> = if code_refs && is_code(&f) {
-                    crate::refactor::occurrences(&text, &word)
-                        .into_iter()
-                        .map(|r| r.start)
-                        .collect()
+                    let hits = crate::refactor::occurrences(&text, &word).into_iter();
+                    match &target {
+                        Some(t) => {
+                            let syms = scan(&text);
+                            hits.map(|r| r.start)
+                                .filter(|&o| t.is_use(&f, &text, &syms, o))
+                                .collect()
+                        }
+                        None => hits.map(|r| r.start).collect(),
+                    }
+                } else if target.as_ref().is_some_and(|t| !t.is_type) {
+                    // a function or property is not named in layouts and manifests
+                    Vec::new()
                 } else {
                     text.match_indices(&word)
                         .map(|(o, _)| o)
@@ -935,7 +1034,9 @@ impl App {
     }
 
     /// After a Gradle run: compiler errors and warnings become editor marks and Problems rows.
-    fn collect_build_problems(&mut self) {
+    /// Compiler errors from the console, and Android lint / detekt findings from the reports the
+    /// run wrote (`since` is when it started).
+    fn collect_build_problems(&mut self, since: Option<SystemTime>) {
         self.build_problems.clear();
         for line in &self.console {
             if let Some((p, l, c, sev, msg)) = compiler_problem(line) {
@@ -944,6 +1045,25 @@ impl App {
                     .or_default()
                     .push((l, c, sev, msg));
             }
+        }
+        let mut found = 0;
+        if let (Some(p), Some(since)) = (&self.project, since) {
+            let dirs: Vec<PathBuf> = p.modules.iter().map(|m| m.dir.clone()).collect();
+            for (f, l, c, error, msg) in crate::reports::collect(&dirs, &p.root, since) {
+                let sev = if error { 1 } else { 2 };
+                self.build_problems
+                    .entry(f)
+                    .or_default()
+                    .push((l, c, sev, msg));
+                found += 1;
+            }
+        }
+        if found > 0 {
+            self.status = format!(
+                "Lint: {}, in Problems",
+                translations::count(found, "finding")
+            );
+            self.bottom = Bottom::Problems;
         }
         let errors: usize = self
             .build_problems
@@ -977,7 +1097,10 @@ impl App {
         self.console.clear();
         self.console.push(format!("> ./gradlew {task}"));
         match gradle::Run::start_on(p, &task, serial, ctx.clone()) {
-            Ok(r) => self.gradle = Some(r),
+            Ok(r) => {
+                self.gradle = Some(r);
+                self.gradle_started = Some((task.clone(), Instant::now()));
+            }
             Err(e) => self.console.push(format!("Could not start Gradle: {e}")),
         }
         self.bottom = Bottom::Build;
@@ -993,6 +1116,7 @@ impl App {
             self.perf.opened_in = self.perf.opening.take().map(|t| t.elapsed());
             self.tree = tree;
             self.res = res;
+            self.res_gen += 1;
             self.project_ready(project, index, branch, ctx);
         }
         if let Some(rx) = &self.stability_rx
@@ -1035,9 +1159,28 @@ impl App {
                     })
                 ));
                 self.gradle = None;
+                let since = self
+                    .gradle_started
+                    .as_ref()
+                    .map(|(_, at)| SystemTime::now() - at.elapsed());
+                if let Some((task, at)) = self.gradle_started.take() {
+                    let secs = at.elapsed().as_secs();
+                    let tests = task.contains("UnitTest") || task.contains("AndroidTest");
+                    let summary = tests
+                        .then(|| crate::android_kit::test_summary(&self.console))
+                        .flatten()
+                        .filter(|_| code.is_some());
+                    let text = match (code, summary) {
+                        (_, Some((s, _))) => format!("{s} in {secs} s"),
+                        (Some(0), None) => format!("{task} finished in {secs} s"),
+                        (Some(c), None) => format!("{task} failed (exit {c}) after {secs} s"),
+                        (None, None) => format!("{task} stopped"),
+                    };
+                    self.toast(text, code == Some(0), Bottom::Build);
+                }
                 self.after_install(code == Some(0), ctx);
                 self.outputs_gen += 1;
-                self.collect_build_problems();
+                self.collect_build_problems(since);
                 // a build can write new stability dumps or Compose compiler reports
                 if let Some(p) = self.project.take() {
                     self.reload_stability(&p, ctx);
@@ -1057,9 +1200,14 @@ impl App {
                                 label,
                                 detail,
                                 import: None,
+                                template: None,
                             })
                             .collect();
-                        lsp_items.extend(c.items.drain(..).filter(|i| i.import.is_some()));
+                        lsp_items.extend(
+                            c.items
+                                .drain(..)
+                                .filter(|i| i.import.is_some() || i.template.is_some()),
+                        );
                         c.items = lsp_items;
                         c.items.truncate(80);
                     }
@@ -1307,6 +1455,40 @@ impl App {
             Action::CloseTab => self.close_tab(self.active),
             Action::Shortcuts => self.show_shortcuts = !self.show_shortcuts,
             Action::NewWindow => self.new_window(),
+            Action::Palette => self.search = open(SearchKind::Actions),
+            Action::ToggleProject => self.toggle_panel(|a| &mut a.show_project),
+            Action::ToggleRight => self.toggle_panel(|a| &mut a.show_right),
+            Action::ToggleBottom => self.toggle_panel(|a| &mut a.show_bottom),
+            Action::FocusMode => self.focus = !self.focus,
+            Action::RunApp => {
+                if self.gradle.is_none() && self.run.launching.is_none() {
+                    self.run_on_device(crate::device::Launch::App, ctx);
+                }
+            }
+            Action::RunTask => {
+                let t = self.gradle_task.clone();
+                self.run_gradle(t, ctx);
+            }
+            Action::QuickFix => self.quick_fix(),
+            Action::Translations => self.translations.open = true,
+            Action::DeepLink => {
+                self.deep_link = Some(self.res.links.first().cloned().unwrap_or_default())
+            }
+            Action::NewFile => self.new_file(None),
+        }
+    }
+
+    /// Opens or closes one panel. In focus mode it leaves focus mode with only that panel open.
+    fn toggle_panel(&mut self, panel: fn(&mut App) -> &mut bool) {
+        if self.focus {
+            self.focus = false;
+            self.show_project = false;
+            self.show_right = false;
+            self.show_bottom = false;
+            *panel(self) = true;
+        } else {
+            let open = panel(self);
+            *open = !*open;
         }
     }
 
@@ -1485,7 +1667,7 @@ impl App {
             } else if s.kind == SearchKind::FindInFiles {
                 if !s.query.is_empty() {
                     self.found_title = format!("Text `{}`", s.query);
-                    self.search_project(s.query.clone(), false, ctx);
+                    self.search_project(s.query.clone(), false, None, ctx);
                 }
                 close = true;
             } else if let Some(h) = s.hits.get(s.selected) {
@@ -1538,7 +1720,13 @@ impl App {
                     });
             });
         if let Some((p, o)) = chosen {
-            self.open_file(&p, Some(o));
+            if s.kind == SearchKind::Actions {
+                if let Some(a) = keymap::ALL.get(o) {
+                    self.run(*a, ctx);
+                }
+            } else {
+                self.open_file(&p, Some(o));
+            }
             return;
         }
         if !close {
@@ -1627,160 +1815,187 @@ impl App {
             }
             SearchKind::FindInFiles | SearchKind::GotoLine => Vec::new(),
             SearchKind::Pick => Vec::new(), // filtered in search_window from `pinned`
+            SearchKind::Actions => {
+                index::rank_by(q, keymap::ALL.iter().enumerate(), |(_, a)| a.label(), 100)
+                    .into_iter()
+                    .map(|(score, (i, a))| Hit {
+                        name: a.label().into(),
+                        detail: keymap::text(self.keymap, *a),
+                        path: PathBuf::new(),
+                        offset: i,
+                        score,
+                    })
+                    .collect()
+            }
         }
     }
 
     // ---------- panels ----------
 
+    /// Three groups, like Android Studio's new UI: project and navigation on the left, search in
+    /// the middle, Gradle task and device runs on the right.
     fn top_bar(&mut self, ui: &mut Ui) {
-        let open_search = |kind| Search {
-            kind,
-            query: String::new(),
-            hits: Vec::new(),
-            selected: 0,
-            stale: true,
-            pinned: Vec::new(),
-            title: None,
-        };
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
             let name = self
                 .project
                 .as_ref()
                 .map_or("Open project…".to_string(), |p| p.name.clone());
-            if ui
-                .button(RichText::new(format!("{}  {name}", ic::FOLDER_OPEN)).strong())
-                .on_hover_text("Open an Android project folder")
-                .clicked()
-                && let Some(dir) = rfd::FileDialog::new()
-                    .set_title("Open an Android project folder")
-                    .pick_folder()
+            ui.menu_button(
+                RichText::new(format!("{}  {name}  ▾", ic::FOLDER_OPEN)).strong(),
+                |ui| {
+                    if ui.button("Translations…").clicked() {
+                        ui.close();
+                        self.translations.open = true;
+                    }
+                    if ui.button("Open project…").clicked() {
+                        ui.close();
+                        if let Some(dir) = rfd::FileDialog::new()
+                            .set_title("Open an Android project folder")
+                            .pick_folder()
+                        {
+                            self.open_project(&dir, &ui.ctx().clone());
+                        }
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new("New window…")
+                                .shortcut_text(keymap::text(self.keymap, Action::NewWindow)),
+                        )
+                        .clicked()
+                    {
+                        ui.close();
+                        self.new_window();
+                    }
+                },
+            )
+            .response
+            .on_hover_text("Open a project, or a second one in a new window");
+            if let Some(b) = self.branch.clone()
+                && theme::button(ui, true, format!("{}  {b}", ic::GIT_BRANCH))
+                    .on_hover_text("Show this branch's changes")
+                    .clicked()
             {
-                self.open_project(&dir, &ui.ctx().clone());
+                self.right = Right::PullRequest;
+                self.show_right = true;
+                self.focus = false;
             }
-            if ui
-                .small_button("+")
-                .on_hover_text(format!(
-                    "Open a project in a new window   {}",
-                    keymap::text(self.keymap, Action::NewWindow)
-                ))
-                .clicked()
-            {
-                self.new_window();
-            }
-            if let Some(b) = &self.branch {
-                ui.label(
-                    RichText::new(format!("{}  {b}", ic::GIT_BRANCH)).color(crate::theme::t().weak),
-                );
-            }
-            ui.separator();
-            if ui
-                .add_enabled(!self.history.is_empty(), egui::Button::new(ic::ARROW_LEFT))
+            ui.add_space(6.0);
+            if theme::button(ui, !self.history.is_empty(), ic::ARROW_LEFT)
                 .on_hover_text("Back  ⌘[")
                 .clicked()
             {
                 self.back();
             }
-            if ui
-                .add_enabled(!self.forward.is_empty(), egui::Button::new(ic::ARROW_RIGHT))
+            if theme::button(ui, !self.forward.is_empty(), ic::ARROW_RIGHT)
                 .on_hover_text("Forward  ⌘]")
                 .clicked()
             {
                 self.fwd();
             }
-            if ui
-                .button(format!("{}  Search", ic::MAGNIFYING_GLASS))
+            self.refactor_menu(ui);
+            self.help_menu(ui);
+            // search box in the middle of the window, moved left when the run group needs the room
+            // (its width is known from the last frame)
+            let w = 260.0;
+            let right_id = egui::Id::unique("top_bar_right_width");
+            let right_w: f32 = ui.data(|d| d.get_temp(right_id)).unwrap_or(0.0);
+            let left = (ui.max_rect().center().x - w / 2.0)
+                .min(ui.max_rect().right() - right_w - 16.0 - w);
+            ui.add_space((left - ui.cursor().left()).max(8.0));
+            if search_box(ui, w)
                 .on_hover_text("Go to class  ⌘O\nGo to file  ⇧⌘O\nSearch everywhere  ⇧⇧")
                 .clicked()
             {
-                self.search = Some(open_search(SearchKind::Everywhere));
+                self.search = Some(Search {
+                    kind: SearchKind::Everywhere,
+                    query: String::new(),
+                    hits: Vec::new(),
+                    selected: 0,
+                    stale: true,
+                    pinned: Vec::new(),
+                    title: None,
+                });
             }
-            self.refactor_menu(ui);
-            self.help_menu(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.run_controls(ui);
-                ui.separator();
-                let running = self.gradle.is_some();
-                if running {
-                    if ui
-                        .button(
-                            RichText::new(format!("{}  Stop", ic::STOP))
-                                .color(crate::highlight::ERROR),
-                        )
-                        .clicked()
+                ui.add_space(10.0);
+                if self.gradle.is_some() {
+                    if theme::button(
+                        ui,
+                        true,
+                        RichText::new(format!("{}  Stop", ic::STOP)).color(ERROR),
+                    )
+                    .clicked()
                         && let Some(r) = self.gradle.as_mut()
                     {
                         r.stop();
                     }
                     ui.spinner();
-                } else if ui
-                    .add_enabled(
-                        self.project.is_some(),
-                        egui::Button::new(
-                            RichText::new(format!("{}  Run task", ic::PLAY))
-                                .color(Color32::from_rgb(0x5F, 0xB8, 0x65)),
-                        ),
-                    )
-                    .on_hover_text("Run the Gradle task")
-                    .clicked()
+                } else if theme::button(
+                    ui,
+                    self.project.is_some(),
+                    RichText::new(format!("{}  Run task", ic::PLAY)).color(RUN_GREEN),
+                )
+                .on_hover_text("Run the Gradle task")
+                .clicked()
                 {
                     let t = self.gradle_task.clone();
                     self.run_gradle(t, &ui.ctx().clone());
                 }
-                ui.menu_button("Tasks", |ui| {
-                    for t in [
-                        "assembleDebug",
-                        "installDebug",
-                        "testDebugUnitTest",
-                        "lint",
-                        "clean",
-                        "stabilityDump",
-                    ] {
-                        if ui.selectable_label(self.gradle_task == t, t).clicked() {
-                            self.gradle_task = t.into();
-                            ui.close();
+                let r = egui::ComboBox::from_id_salt("gradle_task")
+                    .selected_text(format!("{}  {}", ic::WRENCH, self.gradle_task))
+                    .width(170.0)
+                    .show_ui(ui, |ui| {
+                        for t in [
+                            "assembleDebug",
+                            "installDebug",
+                            "testDebugUnitTest",
+                            "lint",
+                            "detekt",
+                            "clean",
+                            "stabilityDump",
+                        ] {
+                            if ui.selectable_label(self.gradle_task == t, t).clicked() {
+                                self.gradle_task = t.into();
+                            }
                         }
-                    }
-                })
-                .response
-                .on_hover_text("Common Gradle tasks");
-                ui.add(
-                    TextEdit::singleline(&mut self.gradle_task)
-                        .desired_width(200.0)
-                        .hint_text("Gradle task"),
-                );
-                ui.label(RichText::new(ic::WRENCH).color(crate::theme::t().weak));
+                        ui.separator();
+                        ui.add(
+                            TextEdit::singleline(&mut self.gradle_task)
+                                .desired_width(180.0)
+                                .hint_text("Any Gradle task"),
+                        );
+                    });
+                run_ui::name_combo(&r.response, "Gradle task");
+                let used = ui.min_rect().width();
+                ui.data_mut(|d| d.insert_temp(right_id, used));
             });
         });
     }
 
+    /// Indexing and messages on the left; symbols, the language server and the cursor on the right.
     fn status_bar(&mut self, ui: &mut Ui) {
+        let weak = theme::t().weak;
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (action, icon, open) in [
+                (Action::ToggleProject, ic::TREE_STRUCTURE, self.show_project),
+                (Action::ToggleBottom, ic::TERMINAL, self.show_bottom),
+                (Action::ToggleRight, ic::CUBE, self.show_right),
+            ] {
+                let open = open && !self.focus && self.project.is_some();
+                let text = RichText::new(icon).color(if open { theme::t().accent } else { weak });
+                let tip = format!("{}  {}", action.label(), keymap::text(self.keymap, action));
+                if theme::button(ui, true, text).on_hover_text(tip).clicked() {
+                    self.run(action, &ui.ctx().clone());
+                }
+            }
+            ui.add_space(8.0);
+            ui.spacing_mut().item_spacing.x = 8.0;
             if self.indexing.is_some() {
                 ui.spinner();
-                ui.label(RichText::new("Indexing…").color(crate::theme::t().weak));
-            } else {
-                ui.label(format!("{} symbols", self.index.symbol_count()));
-            }
-            ui.separator();
-            match &self.lsp {
-                Some(l) if l.ready => {
-                    ui.label(RichText::new(format!("{} ready", l.name)).color(Color32::LIGHT_GREEN))
-                }
-                Some(l) => ui.label(format!("{} starting…", l.name)),
-                None => ui
-                    .label(RichText::new("No Kotlin LSP (install: see README)").weak())
-                    .on_hover_text("Without it, completion and go-to use the built-in index only."),
-            };
-            ui.separator();
-            if let Some(t) = self.tabs.get(self.active) {
-                let line = t.text[..t.cursor.min(t.text.len())].matches('\n').count() + 1;
-                let col = t.cursor
-                    - t.text[..t.cursor.min(t.text.len())]
-                        .rfind('\n')
-                        .map_or(0, |i| i + 1)
-                    + 1;
-                ui.label(format!("{line}:{col}"));
-                ui.separator();
+                ui.label(RichText::new("Indexing…").color(weak));
             }
             if let Some((report, at)) = &self.slow
                 && at.elapsed().as_secs() < 15
@@ -1789,9 +2004,35 @@ impl App {
                     .on_hover_text(
                         "The window was blocked this long. The same line is printed to stderr.",
                     );
-                ui.separator();
             }
-            ui.label(&self.status);
+            ui.label(RichText::new(&self.status).color(weak));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 14.0;
+                if let Some(t) = self.tabs.get(self.active) {
+                    let before = &t.text[..t.cursor.min(t.text.len())];
+                    let line = before.matches('\n').count() + 1;
+                    let col = before.len() - before.rfind('\n').map_or(0, |i| i + 1) + 1;
+                    ui.label(RichText::new(format!("{line}:{col}")).color(weak));
+                }
+                match &self.lsp {
+                    Some(l) if l.ready => ui.label(
+                        RichText::new(format!("{}  {} ready", ic::CHECK_CIRCLE, l.name))
+                            .color(RUN_GREEN),
+                    ),
+                    Some(l) => ui.label(RichText::new(format!("{} starting…", l.name)).color(weak)),
+                    None => ui
+                        .label(RichText::new("Built-in index").color(weak))
+                        .on_hover_text(
+                            "No Kotlin language server. Completion and go-to use the built-in \
+                             index only. Install kotlin-lsp to get more (see README).",
+                        ),
+                };
+                if self.indexing.is_none() {
+                    ui.label(
+                        RichText::new(format!("{} symbols", self.index.symbol_count())).color(weak),
+                    );
+                }
+            });
         });
     }
 
@@ -1835,6 +2076,21 @@ impl App {
                 {
                     self.locate_file();
                 }
+                let tip = format!(
+                    "{}  {}",
+                    Action::NewFile.label(),
+                    keymap::text(self.keymap, Action::NewFile)
+                );
+                if ui
+                    .add_enabled(
+                        self.project.is_some(),
+                        egui::Button::new(ic::FILE_PLUS).frame(false),
+                    )
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    self.new_file(None);
+                }
             });
         });
         if self.project.is_none() {
@@ -1849,13 +2105,13 @@ impl App {
             .unwrap_or_default();
         // view switch and file filter
         ui.horizontal(|ui| {
+            let mut tabs = theme::Tabs::new(ui, "tree-view");
             for v in [tree::View::Android, tree::View::Project] {
-                if ui.selectable_label(self.tree_view == v, v.name()).clicked()
-                    && self.tree_view != v
-                {
+                if tabs.tab(ui, self.tree_view == v, v.name()).clicked() && self.tree_view != v {
                     self.set_tree_view(v);
                 }
             }
+            tabs.finish(ui);
         });
         ui.add(
             egui::TextEdit::singleline(&mut self.tree_filter)
@@ -1865,10 +2121,13 @@ impl App {
         let mut open = None;
         let active = self.tabs.get(self.active).map(|t| t.path.clone());
         let locate = self.locate.as_ref().map(|(f, _)| f.clone());
+        let new_in = std::cell::Cell::new(None);
         let sel = tree::Sel {
             active: active.as_deref(),
             locate: locate.as_deref(),
             status: &status,
+            syms: &self.index.files,
+            new_in: &new_in,
         };
         let root = self.root();
         egui::ScrollArea::both()
@@ -1897,7 +2156,7 @@ impl App {
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    let (icon, tint) = file_icon(f);
+                    let (icon, tint) = assist::kind_icon(f, self.index.files.get(f));
                     let mut job = egui::text::LayoutJob::default();
                     let fmt = |color| egui::TextFormat {
                         font_id: FontId::proportional(13.0),
@@ -1927,12 +2186,75 @@ impl App {
         if let Some(f) = open {
             self.open_file(&f, None);
         }
+        if let Some(dir) = new_in.take() {
+            self.new_file(Some(dir));
+        }
+    }
+
+    /// No project open: a big Open button and the recent projects.
+    fn welcome(&mut self, ui: &mut Ui) {
+        let t = theme::t();
+        let mut open = None;
+        ui.vertical_centered(|ui| {
+            ui.add_space((ui.available_height() * 0.22).max(24.0));
+            ui.label(
+                RichText::new("Droid Lite")
+                    .size(28.0)
+                    .strong()
+                    .color(t.text),
+            );
+            ui.label(RichText::new("A light editor for Android and Kotlin").color(t.weak));
+            ui.add_space(18.0);
+            let button = egui::Button::new(
+                RichText::new(format!("{}  Open project…", ic::FOLDER_OPEN))
+                    .size(14.0)
+                    .color(Color32::WHITE),
+            )
+            .fill(t.accent)
+            .min_size(egui::vec2(200.0, 34.0));
+            if ui.add(button).clicked() {
+                open = rfd::FileDialog::new()
+                    .set_title("Open an Android project folder")
+                    .pick_folder();
+            }
+            ui.label(
+                RichText::new("or drop a project folder on this window")
+                    .small()
+                    .color(t.weak),
+            );
+            let recent = recent_projects();
+            if !recent.is_empty() {
+                ui.add_space(26.0);
+                ui.allocate_ui(egui::vec2(460.0_f32.min(ui.available_width()), 0.0), |ui| {
+                    theme::section(ui, ic::CLOCK_COUNTER_CLOCKWISE, "Recent projects");
+                    for p in recent {
+                        let name = p
+                            .file_name()
+                            .map_or(String::new(), |n| n.to_string_lossy().into_owned());
+                        let home = std::env::var("HOME").unwrap_or_default();
+                        let shown = p.display().to_string().replacen(&home, "~", 1);
+                        if theme::problem_row(ui, ic::FOLDER_SIMPLE, t.weak, &name, &shown)
+                            .clicked()
+                        {
+                            open = Some(p);
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(dir) = open {
+            self.open_project(&dir, &ui.ctx().clone());
+        }
     }
 
     fn editor(&mut self, ui: &mut Ui) {
         self.refresh_annotations();
         let mut request: Option<gutter::Request> = None;
         let km = self.keymap;
+        if self.project.is_none() && self.indexing.is_none() {
+            self.welcome(ui);
+            return;
+        }
         if self.tabs.is_empty() {
             ui.centered_and_justified(|ui| {
                 let km = self.keymap;
@@ -2107,8 +2429,39 @@ impl App {
         let branch_hunks = tab.git.branch_hunks.clone();
         let mut revert_hunk: Option<usize> = None;
         let show_column = self.git.show_column;
-        let test_rows = self.tests.marks_at(&tab.path);
-        let test_marks = &self.tests.marks;
+        // plugin test cases named on a line get a ▶ link like JUnit tests
+        let plugin_lenses: Vec<gutter::Lens> = {
+            let lines: Vec<&str> = tab.text.split('\n').collect();
+            self.tests
+                .marks_at(&tab.path)
+                .into_iter()
+                .filter(|(l, _)| *l < lines.len())
+                .map(|(l, m)| {
+                    let names: Vec<&str> = m
+                        .iter()
+                        .map(|&i| self.tests.marks[i].label.as_str())
+                        .collect();
+                    let text = match names[..] {
+                        [one] => format!("{}  Run {one}", ic::PLAY),
+                        _ => format!("{}  Run a case: {}", ic::PLAY, names.join(", ")),
+                    };
+                    gutter::Lens::new(l, lines[l], vec![(text, gutter::Request::Tests(m))])
+                })
+                .collect()
+        };
+        let mut lens_lines: Vec<usize> = tab
+            .annotations
+            .iter()
+            .flat_map(|a| a.lenses.iter())
+            .chain(&plugin_lenses)
+            .map(|l| l.line)
+            .collect();
+        lens_lines.sort_unstable();
+        lens_lines.dedup();
+        let lens_h = gutter::lens_height(row_h);
+        let lens_key = lens_lines
+            .iter()
+            .fold(0x51u64, |h, l| h.rotate_left(5) ^ *l as u64);
         let mut open_commit: Option<String> = None;
         let Tab {
             text,
@@ -2145,14 +2498,28 @@ impl App {
                 _ => {
                     let job = highlight::job(s, font.clone(), &marks, &bg);
                     let galley = ui.fonts_mut(|f| f.layout_job(job.clone()));
-                    *cache = Some(EditorCache { key, job, galley });
+                    *cache = Some(EditorCache {
+                        key,
+                        job,
+                        galley,
+                        shown: None,
+                    });
                     *recolor = false;
                 }
             }
-            cache
-                .as_ref()
-                .map(|c| c.galley.clone())
-                .unwrap_or_else(|| ui.fonts_mut(|f| f.layout_job(Default::default())))
+            let Some(c) = cache.as_mut() else {
+                return ui.fonts_mut(|f| f.layout_job(Default::default()));
+            };
+            if lens_lines.is_empty() {
+                return c.galley.clone();
+            }
+            // room for the link rows, made again only when the text or the rows change
+            let k = c.key ^ lens_key;
+            if c.shown.as_ref().is_none_or(|(sk, _)| *sk != k) {
+                let g = gutter::with_lens_room(&c.galley, &lens_lines, lens_h);
+                c.shown = Some((k, std::sync::Arc::new(g)));
+            }
+            c.shown.as_ref().map(|(_, g)| g.clone()).expect("set above")
         };
         let mut changed = false;
         let mut hover_word: Option<HoverWord> = None;
@@ -2171,10 +2538,6 @@ impl App {
                         )
                         .0
                     });
-                    let (icons, _) = ui.allocate_exact_size(
-                        egui::vec2(gutter::ICON_WIDTH, row_h * lines as f32),
-                        egui::Sense::hover(),
-                    );
                     let (gutter, _) = ui.allocate_exact_size(
                         egui::vec2(gutter_w, row_h * lines as f32),
                         egui::Sense::hover(),
@@ -2272,6 +2635,18 @@ impl App {
                         &font,
                         theme,
                     );
+                    let aids = ScopeView {
+                        text,
+                        galley: &out.galley,
+                        galley_pos: out.galley_pos,
+                        gutter,
+                        row_h,
+                        char_w,
+                        font: &font,
+                    };
+                    if let Some(o) = aids.paint(ui) {
+                        *goto = Some(o);
+                    }
                     // dim branch bars first: the bright uncommitted ones paint over them
                     if let Some(h) = &branch_hunks {
                         git_ui::paint_changes(ui, h, true, gutter, &out.galley, out.galley_pos);
@@ -2299,31 +2674,26 @@ impl App {
                         open_commit = Some(sha);
                     }
                     let mut badge_right = None;
-                    if let Some(r) = gutter::paint_tests(
+                    let lenses = annotations
+                        .iter()
+                        .flat_map(|a| a.lenses.iter())
+                        .chain(&plugin_lenses);
+                    if let Some(r) = gutter::paint_lenses(
                         ui,
-                        &test_rows,
-                        |m| {
-                            let names: Vec<&str> =
-                                m.iter().map(|&i| test_marks[i].label.as_str()).collect();
-                            match names[..] {
-                                [one] => format!("Run {one}"),
-                                _ => format!("Choose a case to run: {}", names.join(", ")),
-                            }
-                        },
-                        icons,
+                        lenses,
                         &out.galley,
                         out.galley_pos,
+                        char_w,
+                        lens_h,
                     ) {
                         request = Some(r);
                     }
                     if let Some(a) = annotations.as_ref() {
-                        if let Some(r) =
-                            gutter::paint_marks(ui, a, icons, &out.galley, out.galley_pos)
-                        {
-                            request = Some(r);
-                        }
+                        let swatch =
+                            gutter::paint_swatches(ui, a, &out.galley, out.galley_pos, cursor_line);
                         badge_right =
-                            gutter::paint_badges(ui, a, &out.galley, out.galley_pos, cursor_line);
+                            gutter::paint_badges(ui, a, &out.galley, out.galley_pos, cursor_line)
+                                .or(swatch);
                     }
                     if let Some(b) = &blame
                         && let Some(sha) = git_ui::paint_inline_blame(
@@ -2403,6 +2773,7 @@ impl App {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                             hover_word = Some((
                                 text[a..w].to_string(),
+                                a,
                                 crate::resources::reference_at(text, a, w),
                                 out.response.response.clone(),
                             ));
@@ -2416,10 +2787,10 @@ impl App {
             tab.mark_edited();
             self.update_completion(false);
         }
-        if let Some((word, res_ref, resp)) = hover_word {
+        if let Some((word, at, res_ref, resp)) = hover_word {
             resp.on_hover_ui_at_pointer(|ui| match res_ref {
                 Some((kind, name)) => self.resource_card(ui, &kind, &name),
-                None => self.hover_card(ui, &word),
+                None => self.hover_card(ui, &word, at),
             });
         }
         if cmd_click {
@@ -2476,6 +2847,7 @@ impl App {
                     detail: h.detail,
                     insert: h.name,
                     import: needs,
+                    template: None,
                 });
             }
             // library classes and top-level functions (Text, Column, ViewModel…), with their import
@@ -2500,6 +2872,7 @@ impl App {
                     detail: libs_ui::lib_hit(sym, 0).detail,
                     insert: name.to_string(),
                     import: needs,
+                    template: None,
                 });
             }
             for k in crate::lexer::KEYWORDS
@@ -2511,7 +2884,28 @@ impl App {
                     detail: "keyword".into(),
                     insert: k.to_string(),
                     import: None,
+                    template: None,
                 });
+            }
+            // live templates: an exact name goes first, so Tab expands it
+            if t.path.extension().is_some_and(|e| e == "kt") {
+                for tpl in crate::android_kit::TEMPLATES
+                    .iter()
+                    .filter(|x| x.abbr.starts_with(prefix))
+                {
+                    let item = Item {
+                        label: tpl.abbr.to_string(),
+                        detail: format!("template · {}", tpl.about),
+                        insert: tpl.abbr.to_string(),
+                        import: None,
+                        template: Some(tpl),
+                    };
+                    if tpl.abbr == prefix {
+                        items.insert(0, item);
+                    } else {
+                        items.push(item);
+                    }
+                }
             }
         }
         if self.lsp.as_ref().is_some_and(|l| l.ready)
@@ -2545,6 +2939,10 @@ impl App {
         };
         let t = &mut self.tabs[self.active];
         let end = word_bounds(&t.text, t.cursor).1.max(t.cursor);
+        if let Some(tpl) = item.template {
+            self.expand_template(c.start, end, tpl);
+            return;
+        }
         t.text.replace_range(c.start..end, &item.insert);
         let mut cursor = c.start + item.insert.len();
         if let Some(fq) = item.import {
@@ -2938,12 +3336,13 @@ impl App {
                     } else {
                         INFO
                     };
-                    if ui
-                        .link(
-                            RichText::new(format!("{line}: [{}] {}", l.rule, l.message))
-                                .color(c)
-                                .small(),
-                        )
+                    let icon = if c == WARN {
+                        ic::WARNING
+                    } else {
+                        ic::LIGHTNING
+                    };
+                    if theme::problem_row(ui, icon, c, &l.message, &format!("line {line}"))
+                        .on_hover_text(l.rule)
                         .clicked()
                     {
                         jump = Some(l.offset);
@@ -2978,44 +3377,41 @@ impl App {
                 .get(self.active)
                 .map_or(0, |t| t.lints.len() + t.diagnostics.len())
                 + self.build_problems.values().map(Vec::len).sum::<usize>();
-            ui.selectable_value(
-                &mut self.bottom,
-                Bottom::Problems,
-                format!("{}  Problems  {problems}", ic::WARNING),
-            );
-            ui.selectable_value(
-                &mut self.bottom,
-                Bottom::Build,
-                if self.gradle.is_some() {
-                    format!("{}  Building…", ic::CLOCK_COUNTER_CLOCKWISE)
-                } else {
-                    format!("{}  Build", ic::STACK)
-                },
-            );
-            ui.selectable_value(
-                &mut self.bottom,
-                Bottom::Find,
-                format!("{}  Find  {}", ic::MAGNIFYING_GLASS, self.found.len()),
-            );
-            ui.selectable_value(
-                &mut self.bottom,
-                Bottom::Logcat,
-                format!("{}  Logcat", ic::TERMINAL),
-            );
-            ui.selectable_value(
-                &mut self.bottom,
-                Bottom::Tests,
-                if self.tests.running() {
-                    format!("{}  Testing…", ic::CLOCK_COUNTER_CLOCKWISE)
-                } else {
-                    format!("{}  Tests", ic::CHECK_CIRCLE)
-                },
-            );
-            ui.selectable_value(
-                &mut self.bottom,
-                Bottom::Performance,
-                format!("{}  Performance", ic::GAUGE),
-            );
+            let labels = [
+                (
+                    Bottom::Problems,
+                    format!("{}  Problems  {problems}", ic::WARNING),
+                ),
+                (
+                    Bottom::Build,
+                    if self.gradle.is_some() {
+                        format!("{}  Building…", ic::CLOCK_COUNTER_CLOCKWISE)
+                    } else {
+                        format!("{}  Build", ic::STACK)
+                    },
+                ),
+                (
+                    Bottom::Find,
+                    format!("{}  Find  {}", ic::MAGNIFYING_GLASS, self.found.len()),
+                ),
+                (Bottom::Logcat, format!("{}  Logcat", ic::TERMINAL)),
+                (
+                    Bottom::Tests,
+                    if self.tests.running() {
+                        format!("{}  Testing…", ic::CLOCK_COUNTER_CLOCKWISE)
+                    } else {
+                        format!("{}  Tests", ic::CHECK_CIRCLE)
+                    },
+                ),
+                (Bottom::Performance, format!("{}  Performance", ic::GAUGE)),
+            ];
+            let mut tabs = theme::Tabs::new(ui, "bottom");
+            for (b, label) in labels {
+                if tabs.tab(ui, self.bottom == b, label).clicked() {
+                    self.bottom = b;
+                }
+            }
+            tabs.finish(ui);
             if self.bottom == Bottom::Build
                 && ui.small_button("Reload stability").clicked()
                 && let Some(p) = self.project.take()
@@ -3044,21 +3440,19 @@ impl App {
                         for f in files {
                             let rel = f.strip_prefix(&root).unwrap_or(f).display().to_string();
                             for (l, c, sev, msg) in &self.build_problems[f] {
-                                let r = ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(if *sev == 1 { ic::X } else { ic::WARNING })
-                                            .color(if *sev == 1 { ERROR } else { WARN }),
-                                    );
-                                    let r =
-                                        ui.link(RichText::new(msg).color(crate::theme::t().text));
-                                    ui.label(
-                                        RichText::new(format!("{rel}:{l}:{c}"))
-                                            .color(crate::theme::t().weak)
-                                            .small(),
-                                    );
-                                    r
-                                });
-                                if r.inner.clicked()
+                                let (icon, tint) = if *sev == 1 {
+                                    (ic::X, ERROR)
+                                } else {
+                                    (ic::WARNING, WARN)
+                                };
+                                let r = theme::problem_row(
+                                    ui,
+                                    icon,
+                                    tint,
+                                    msg,
+                                    &format!("{rel}:{l}:{c}"),
+                                );
+                                if r.clicked()
                                     && let Ok(text) = std::fs::read_to_string(f)
                                 {
                                     open = Some((
@@ -3117,22 +3511,12 @@ impl App {
                             );
                         }
                         for (o, (icon, color), rule, msg) in rows {
-                            let r = ui.horizontal(|ui| {
-                                ui.label(RichText::new(icon).color(color));
-                                let r = ui.link(RichText::new(&msg).color(crate::theme::t().text));
-                                if !rule.is_empty() {
-                                    ui.label(
-                                        RichText::new(&rule).color(crate::theme::t().weak).small(),
-                                    );
-                                }
-                                ui.label(
-                                    RichText::new(format!("line {}", line_of(o)))
-                                        .color(crate::theme::t().weak)
-                                        .small(),
-                                );
-                                r
-                            });
-                            if r.inner.clicked() {
+                            let detail = if rule.is_empty() {
+                                format!("line {}", line_of(o))
+                            } else {
+                                format!("{rule} · line {}", line_of(o))
+                            };
+                            if theme::problem_row(ui, icon, color, &msg, &detail).clicked() {
                                 open = Some((t.path.clone(), o));
                             }
                         }
@@ -3251,14 +3635,6 @@ impl eframe::App for App {
         }
     }
 
-    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
-        if self.glass {
-            [0.0; 4]
-        } else {
-            visuals.panel_fill.to_normalized_gamma_f32()
-        }
-    }
-
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let mut watch = Watchdog::start();
@@ -3277,6 +3653,7 @@ impl eframe::App for App {
         self.save_session(false);
         watch.stage("shortcuts", || self.shortcuts(&ctx));
         self.usages_popup_keys(&ctx);
+        self.fix_popup_keys(&ctx);
         if let Some(dropped) =
             ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()))
             && dropped.is_dir()
@@ -3284,49 +3661,63 @@ impl eframe::App for App {
             self.open_project(&dropped, &ctx);
         }
         watch.stage("toolbar", || {
-            egui::Panel::top("top").show(ui, |ui| {
-                if self.fullsize {
-                    ui.add_space(4.0);
-                }
-                ui.horizontal(|ui| {
-                    if self.fullsize {
-                        ui.add_space(72.0); // traffic lights
-                    }
-                    self.top_bar(ui);
-                });
-            })
+            egui::Panel::top("top")
+                .frame(
+                    egui::Frame::side_top_panel(ui.style())
+                        .inner_margin(egui::Margin::symmetric(10, 6)),
+                )
+                .show(ui, |ui| self.top_bar(ui))
         });
+        // focus mode, and the welcome screen before a project opens, show no side panels
+        let hidden = self.focus || (self.project.is_none() && self.indexing.is_none());
         watch.stage("status bar", || {
-            egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui))
+            egui::Panel::bottom("status")
+                .frame(
+                    egui::Frame::side_top_panel(ui.style())
+                        .inner_margin(egui::Margin::symmetric(10, 3)),
+                )
+                .show(ui, |ui| self.status_bar(ui))
         });
         watch.stage("bottom panel", || {
+            let mut open = self.show_bottom && !hidden;
             egui::Panel::bottom("bottom")
                 .resizable(true)
-                .default_size(180.0)
-                .show(ui, |ui| self.bottom_panel(ui))
+                .default_size(160.0)
+                .show_collapsible(ui, &mut open, |ui| self.bottom_panel(ui));
+            if !open && !hidden {
+                self.show_bottom = false; // dragged closed
+            }
         });
         watch.stage("project tree", || {
+            let mut open = self.show_project && !hidden;
             egui::Panel::left("project")
                 .resizable(true)
                 .default_size(260.0)
-                .show(ui, |ui| self.project_panel(ui))
+                .show_collapsible(ui, &mut open, |ui| self.project_panel(ui));
+            if !open && !hidden {
+                self.show_project = false;
+            }
         });
         watch.stage("compose panel", || {
+            let mut open = self.show_right && !hidden;
             egui::Panel::right("compose")
                 .resizable(true)
                 .default_size(340.0)
-                .show(ui, |ui| {
+                .show_collapsible(ui, &mut open, |ui| {
                     ui.horizontal(|ui| {
-                        ui.selectable_value(
-                            &mut self.right,
-                            Right::Compose,
-                            format!("{}  Compose", ic::CUBE),
-                        );
-                        ui.selectable_value(
-                            &mut self.right,
-                            Right::PullRequest,
-                            format!("{}  Pull request", ic::GIT_PULL_REQUEST),
-                        );
+                        let mut tabs = theme::Tabs::new(ui, "right");
+                        for (r, label) in [
+                            (Right::Compose, format!("{}  Compose", ic::CUBE)),
+                            (
+                                Right::PullRequest,
+                                format!("{}  Pull request", ic::GIT_PULL_REQUEST),
+                            ),
+                        ] {
+                            if tabs.tab(ui, self.right == r, label).clicked() {
+                                self.right = r;
+                            }
+                        }
+                        tabs.finish(ui);
                     });
                     ui.separator();
                     match self.right {
@@ -3337,10 +3728,12 @@ impl eframe::App for App {
                                 .show(ui, |ui| self.git_panel(ui));
                         }
                     }
-                })
+                });
+            if !open && !hidden {
+                self.show_right = false;
+            }
         });
-        let editor_frame =
-            egui::Frame::central_panel(ui.style()).fill(crate::glass::editor_fill(self.glass));
+        let editor_frame = egui::Frame::central_panel(ui.style()).fill(theme::t().editor_bg);
         watch.stage("editor", || {
             egui::CentralPanel::default()
                 .frame(editor_frame)
@@ -3349,12 +3742,17 @@ impl eframe::App for App {
         watch.stage("popups", || {
             self.search_window(&ctx);
             self.usages_popup_ui(&ctx);
+            self.fix_popup_ui(&ctx);
+            self.new_file_ui(&ctx);
+            self.translations_window(&ctx);
+            self.deep_link_window(&ctx);
             self.refactor_window(&ctx);
             self.commit_window(&ctx);
             self.shortcuts_window(&ctx);
             self.settings_window(&ctx);
             self.capture_window(&ctx);
             self.history_window(&ctx);
+            self.toasts_ui(&ctx);
         });
         self.frames += 1;
         let (total, stages, report) = watch.finish(self.frames);
@@ -3394,6 +3792,198 @@ impl eframe::App for App {
 }
 
 // ---------- helpers ----------
+
+/// Indent guides and the sticky scope header, both read from indentation, so they work for Kotlin,
+/// Java, Gradle scripts and XML alike. Only the lines down to the bottom of the view are looked at.
+struct ScopeView<'a> {
+    text: &'a str,
+    /// Rows can sit lower than `line × row_h` (link rows above declarations), so positions come
+    /// from the laid-out rows.
+    galley: &'a egui::Galley,
+    galley_pos: egui::Pos2,
+    gutter: egui::Rect,
+    row_h: f32,
+    char_w: f32,
+    font: &'a FontId,
+}
+
+impl ScopeView<'_> {
+    /// Paints both; returns the offset of a sticky line that was clicked.
+    fn paint(&self, ui: &Ui) -> Option<usize> {
+        let clip = ui.clip_rect();
+        let row_top = |i: usize| {
+            self.galley_pos.y + self.galley.rows.get(i).map_or(f32::INFINITY, |r| r.pos.y)
+        };
+        let row = |y: f32| {
+            self.galley
+                .rows
+                .partition_point(|r| self.galley_pos.y + r.pos.y + self.row_h <= y)
+        };
+        let (top, bottom) = (row(clip.top()), row(clip.bottom()) + 1);
+        let lines: Vec<&str> = self.text.split('\n').take(bottom + 1).collect();
+        let t = theme::t();
+        let p = ui.painter();
+        // guides: one thin line per indent level, through blank lines inside a block
+        let guide = t.raised;
+        for i in top..bottom.min(lines.len()) {
+            let y = row_top(i);
+            for level in 1..indent_level(&lines, i) {
+                let x = self.galley_pos.x + ((level - 1) * INDENT) as f32 * self.char_w;
+                p.vline(
+                    x.round() + 0.5,
+                    y..=y + self.row_h,
+                    egui::Stroke::new(1.0, guide),
+                );
+            }
+        }
+        // sticky header: the lines that open the scopes around the top line, outermost first
+        let mut heads = scope_heads(&lines, top);
+        heads.retain(|h| *h < top);
+        let heads = &heads[heads.len().saturating_sub(3)..];
+        if heads.is_empty() {
+            return None;
+        }
+        let area = egui::Rect::from_min_size(
+            egui::pos2(self.gutter.left(), clip.top()),
+            egui::vec2(
+                clip.right() - self.gutter.left(),
+                heads.len() as f32 * self.row_h + 2.0,
+            ),
+        );
+        p.rect_filled(area, 0.0, t.editor_bg);
+        p.hline(
+            area.x_range(),
+            area.bottom(),
+            egui::Stroke::new(1.0, t.raised),
+        );
+        let mut clicked = None;
+        for (i, &h) in heads.iter().enumerate() {
+            let y = clip.top() + i as f32 * self.row_h;
+            let r = egui::Rect::from_min_size(
+                egui::pos2(area.left(), y),
+                egui::vec2(area.width(), self.row_h),
+            );
+            let resp = ui.interact(r, ui.scope_id().with(("sticky", i)), egui::Sense::click());
+            if resp.hovered() {
+                p.rect_filled(r, 0.0, t.current_line);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            p.text(
+                egui::pos2(self.gutter.right() - 12.0, y),
+                Align2::RIGHT_TOP,
+                (h + 1).to_string(),
+                self.font.clone(),
+                t.gutter,
+            );
+            p.text(
+                egui::pos2(self.galley_pos.x, y),
+                Align2::LEFT_TOP,
+                lines[h],
+                self.font.clone(),
+                t.code,
+            );
+            if resp.clicked() {
+                clicked = Some(lines[..h].iter().map(|l| l.len() + 1).sum::<usize>());
+            }
+        }
+        clicked
+    }
+}
+
+const INDENT: usize = 4;
+
+/// Leading spaces of a line (a tab counts as one indent), or None when the line is blank.
+fn indent_of(line: &str) -> Option<usize> {
+    let mut n = 0;
+    for c in line.chars() {
+        match c {
+            ' ' => n += 1,
+            '\t' => n += INDENT,
+            _ => return Some(n),
+        }
+    }
+    None
+}
+
+/// How many guides line `i` shows: its indent levels, plus one for the guide at column 0.
+/// A blank line takes the smaller indent of the lines around it, so guides run through gaps.
+fn indent_level(lines: &[&str], i: usize) -> usize {
+    let near = |it: &mut dyn Iterator<Item = &&str>| it.take(200).find_map(|l| indent_of(l));
+    let n = indent_of(lines[i]).unwrap_or_else(|| {
+        let up = near(&mut lines[..i].iter().rev()).unwrap_or(0);
+        let down = near(&mut lines[i + 1..].iter()).unwrap_or(0);
+        up.min(down)
+    });
+    n / INDENT + 1
+}
+
+/// The lines that open the scopes around line `at`: walking up, each non-blank line with a smaller
+/// indent than the last one found, skipping closers, comments and annotations. Outermost first.
+fn scope_heads(lines: &[&str], at: usize) -> Vec<usize> {
+    // a blank line belongs to the deeper of its neighbours (the inside of the block it splits)
+    let near = |it: &mut dyn Iterator<Item = &&str>| it.take(200).find_map(|l| indent_of(l));
+    let at = at.min(lines.len().saturating_sub(1));
+    let mut want = indent_of(lines.get(at).unwrap_or(&"")).unwrap_or_else(|| {
+        let up = near(&mut lines[..at].iter().rev()).unwrap_or(0);
+        let down = near(&mut lines[at + 1..].iter()).unwrap_or(0);
+        up.max(down)
+    });
+    let mut heads = Vec::new();
+    for i in (0..at).rev() {
+        if want == 0 {
+            break;
+        }
+        let Some(n) = indent_of(lines[i]) else {
+            continue;
+        };
+        let code = lines[i].trim_start();
+        let closer = code.starts_with("</") || code.starts_with(['}', ')', ']', '/', '*', '@']);
+        if n < want && !closer {
+            heads.push(i);
+            want = n;
+        }
+    }
+    heads.reverse();
+    heads
+}
+
+const RUN_GREEN: Color32 = Color32::from_rgb(0x5F, 0xB8, 0x65);
+
+/// The toolbar's search field: looks like a text box, opens Search everywhere when clicked.
+fn search_box(ui: &mut Ui, width: f32) -> egui::Response {
+    let (rect, r) = ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::click());
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Search"));
+    let t = theme::t();
+    let hover = theme::ease(ui.ctx(), r.id.with("hover"), r.hovered() as u8 as f32, 0.12);
+    let p = ui.painter();
+    p.rect(
+        rect,
+        egui::CornerRadius::same(7),
+        t.editor_bg,
+        egui::Stroke::new(1.0, t.raised.lerp_to_gamma(t.accent, hover * 0.6)),
+        egui::StrokeKind::Inside,
+    );
+    let font = FontId::proportional(13.0);
+    let mid = rect.left_center() + egui::vec2(10.0, 0.0);
+    p.text(
+        mid,
+        Align2::LEFT_CENTER,
+        format!("{}  Search", ic::MAGNIFYING_GLASS),
+        font.clone(),
+        t.weak,
+    );
+    p.text(
+        rect.right_center() - egui::vec2(10.0, 0.0),
+        Align2::RIGHT_CENTER,
+        "⇧⇧",
+        font,
+        t.gutter,
+    );
+    if r.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    r
+}
 
 /// Paints the numbers of the visible rows only, right-aligned; the cursor's line is brighter.
 fn paint_line_numbers(
@@ -3580,7 +4170,7 @@ fn file_icon(path: &Path) -> (&'static str, Color32) {
 /// One editor tab: file icon, name (● when unsaved), close button, accent line when active.
 /// Returns (clicked, close clicked). Middle-click closes too.
 fn tab_widget(ui: &mut Ui, t: &Tab, active: bool) -> (bool, bool) {
-    let (icon, tint) = file_icon(&t.path);
+    let (icon, tint) = assist::kind_icon(&t.path, is_code(&t.path).then_some(&t.syms));
     let name = t
         .path
         .file_name()
@@ -3667,12 +4257,6 @@ pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     e2e::SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Liquid Glass is wanted when the environment allows it and Settings has it on (dark theme only).
-pub fn glass_setting() -> bool {
-    let s = comfort::Settings::load();
-    crate::glass::wanted() && s.glass && !s.light
-}
-
 fn config_dir() -> Option<PathBuf> {
     if let Some(d) = std::env::var_os("DROID_LITE_CONFIG_DIR") {
         return Some(PathBuf::from(d));
@@ -3708,11 +4292,87 @@ fn remember_project(root: &Path) {
         let _ = std::fs::create_dir_all(f.parent().unwrap_or(Path::new(".")));
         let _ = std::fs::write(f, root.to_string_lossy().as_bytes());
     }
+    let list = with_recent(recent_projects(), root);
+    save_setting(
+        "recent-projects",
+        &list
+            .iter()
+            .map(|p| p.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+}
+
+/// Projects opened before, newest first (folders that still exist), for the welcome screen.
+fn recent_projects() -> Vec<PathBuf> {
+    load_setting("recent-projects")
+        .unwrap_or_default()
+        .lines()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
+/// `root` moved to the front, without a duplicate, at most 8.
+fn with_recent(mut list: Vec<PathBuf>, root: &Path) -> Vec<PathBuf> {
+    list.retain(|p| p != root);
+    list.insert(0, root.to_path_buf());
+    list.truncate(8);
+    list
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_heads_follow_indentation_and_skip_closers_and_annotations() {
+        let src = "class Home {\n    @Composable\n    fun Screen() {\n        Column {\n\n            Text()\n        }\n    }\n}";
+        let lines: Vec<&str> = src.split('\n').collect();
+        assert_eq!(
+            scope_heads(&lines, 5),
+            vec![0, 2, 3],
+            "class, fun, Column for Text()"
+        );
+        assert_eq!(
+            scope_heads(&lines, 4),
+            vec![0, 2, 3],
+            "a blank line belongs to the block it splits"
+        );
+        assert_eq!(
+            scope_heads(&lines, 7),
+            vec![0],
+            "the fun's closing brace sits in the class"
+        );
+        assert_eq!(scope_heads(&lines, 0), Vec::<usize>::new());
+        let xml = "<LinearLayout>\n    <TextView\n        android:text=\"a\" />\n</LinearLayout>";
+        let lines: Vec<&str> = xml.split('\n').collect();
+        assert_eq!(
+            scope_heads(&lines, 2),
+            vec![0, 1],
+            "XML tags open scopes too"
+        );
+        assert_eq!(indent_level(&lines, 2), 3);
+        let gap = ["a {", "        x", "", "    y", "}"];
+        assert_eq!(
+            indent_level(&gap, 2),
+            2,
+            "a blank line takes the smaller neighbour"
+        );
+    }
+
+    #[test]
+    fn recent_projects_move_to_the_front_without_duplicates_and_keep_eight() {
+        let p = |s: &str| PathBuf::from(s);
+        let list: Vec<PathBuf> = (0..8).map(|i| p(&format!("/p{i}"))).collect();
+        let out = with_recent(list, &p("/p3"));
+        assert_eq!(out[0], p("/p3"));
+        assert_eq!(out.len(), 8);
+        assert_eq!(out.iter().filter(|x| **x == p("/p3")).count(), 1);
+        let out = with_recent(out, &p("/new"));
+        assert_eq!((out[0].clone(), out.len()), (p("/new"), 8));
+        assert!(!out.contains(&p("/p7")), "the oldest drops off");
+    }
 
     #[test]
     fn word_bounds_and_imports() {

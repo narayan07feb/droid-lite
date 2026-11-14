@@ -289,7 +289,9 @@ pub fn application_ids(files: &[PathBuf]) -> Vec<String> {
         .flat_map(|text| {
             text.lines()
                 .filter_map(|l| {
-                    let rest = l.trim().strip_prefix("applicationId")?;
+                    // also inside a one-line block: `defaultConfig { applicationId = "…" }`
+                    // (`applicationIdSuffix = "…"` fails the quote check below)
+                    let rest = &l[l.find("applicationId")? + "applicationId".len()..];
                     let q = rest.trim_start_matches([' ', '=']).trim();
                     let q = q.strip_prefix('"').or_else(|| q.strip_prefix('\''))?;
                     let end = q.find(['"', '\''])?;
@@ -352,6 +354,21 @@ mod tests {
         let f = Filter::parse("package:com.other", &mine);
         assert!(!f.matches(&app_w));
         assert!(!Filter::parse("package:mine", &mine).matches(&e('I', "x", "y", None)));
+    }
+
+    #[test]
+    fn application_ids_on_their_own_line_or_inside_a_block() {
+        let dir = std::env::temp_dir().join(format!("droid-lite-appid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("build.gradle.kts");
+        std::fs::write(
+            &f,
+            "android {\n    defaultConfig { applicationId = \"com.a\" }\n    buildTypes { debug { applicationIdSuffix = \".debug\" } }\n}\nandroid {\n    applicationId \"com.b\"\n}\n",
+        )
+        .unwrap();
+        let ids = application_ids(&[f]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(ids, ["com.a", "com.b"]);
     }
 
     #[test]

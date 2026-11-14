@@ -18,6 +18,12 @@ impl App {
         if !ui.memory(|m| m.has_focus(id)) || self.completion.is_some() {
             return;
         }
+        if self.template_key(ui) {
+            return;
+        }
+        let Some(t) = self.tabs.get_mut(self.active) else {
+            return;
+        };
         let sel = if t.selection.start != t.selection.end {
             t.selection.clone()
         } else {
@@ -86,45 +92,78 @@ impl App {
     }
 
     /// Usages of `word` for the hover card; starts counting in the background the first time.
-    pub(super) fn usages_of(&mut self, word: &str) -> Option<&Vec<FoundLine>> {
+    pub(super) fn usages_of(&mut self, word: &str, at: usize) -> Option<&Vec<FoundLine>> {
         let index_gen = self.index.generation;
-        if !self.usages.contains_key(word) {
-            self.usages.insert(word.to_string(), (index_gen, None));
+        let target = self.hover_target(at);
+        // one count per declaration: two `insert`s in different classes are counted apart
+        let key = match &target {
+            Some(t) => format!("{word}\u{0}{}:{}", t.path.display(), t.offset),
+            None => word.to_string(),
+        };
+        if !self.usages.contains_key(&key) {
+            self.usages.insert(key.clone(), (index_gen, None));
             let files: Vec<PathBuf> = self
                 .project
                 .as_ref()
                 .map(|p| p.files.iter().filter(|f| is_code(f)).cloned().collect())
                 .unwrap_or_default();
             let (tx, rx) = channel();
-            let (w, c) = (word.to_string(), self.ctx.clone());
+            let (w, k, c) = (word.to_string(), key.clone(), self.ctx.clone());
             std::thread::spawn(move || {
                 let mut found = Vec::new();
                 for f in files {
                     let Ok(text) = std::fs::read_to_string(&f) else {
                         continue;
                     };
-                    for r in crate::refactor::occurrences(&text, &w) {
+                    let hits = crate::refactor::occurrences(&text, &w);
+                    let syms =
+                        (target.is_some() && !hits.is_empty()).then(|| crate::kotlin::scan(&text));
+                    for r in hits {
+                        if let (Some(t), Some(s)) = (&target, &syms)
+                            && !t.is_use(&f, &text, s, r.start)
+                        {
+                            continue;
+                        }
                         found.push(found_line(&f, &text, r.start));
                     }
                 }
-                let _ = tx.send((w, index_gen, found));
+                let _ = tx.send((k, index_gen, found));
                 if let Some(c) = c {
                     c.request_repaint();
                 }
             });
             self.usages_rx.push(rx);
         }
-        self.usages.get(word).and_then(|(_, f)| f.as_ref())
+        self.usages.get(&key).and_then(|(_, f)| f.as_ref())
+    }
+
+    /// `usage_target` for the hovered name, worked out once per place and text version (it reads
+    /// files and walks class hierarchies: too slow for every frame).
+    fn hover_target(&mut self, at: usize) -> Option<crate::usage::Target> {
+        let t = self.tabs.get(self.active)?;
+        let key = (t.path.clone(), at, t.rev, self.index.generation);
+        if let Some((k, target)) = &self.hover_target
+            && *k == key
+        {
+            return target.clone();
+        }
+        let target = self.usage_target(at);
+        self.hover_target = Some((key, target.clone()));
+        target
     }
 
     /// The card shown while ⌘ (or Ctrl) is held over a name: where it is declared and its usages.
-    pub(super) fn hover_card(&mut self, ui: &mut Ui, word: &str) {
+    pub(super) fn hover_card(&mut self, ui: &mut Ui, word: &str, at: usize) {
         let path = self
             .tabs
             .get(self.active)
             .map(|t| t.path.clone())
             .unwrap_or_default();
-        let defs = self.index.definitions(word, &path);
+        let mut defs = self.index.definitions(word, &path);
+        // the one declaration this place means, when that is known
+        if let Some(t) = self.hover_target(at) {
+            defs.retain(|d| d.path == t.path && d.offset == t.offset);
+        }
         let root = self
             .project
             .as_ref()
@@ -153,7 +192,7 @@ impl App {
         ui.separator();
         let decls: Vec<(PathBuf, usize)> =
             defs.iter().map(|d| (d.path.clone(), d.offset)).collect();
-        match self.usages_of(word) {
+        match self.usages_of(word, at) {
             None => {
                 ui.label(RichText::new("Counting usages…").color(crate::theme::t().weak));
             }

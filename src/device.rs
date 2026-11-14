@@ -38,15 +38,6 @@ pub fn app_modules(p: &Project) -> Vec<(Module, Option<String>)> {
     apps
 }
 
-/// The `installDebug` task of a module (`:app:installDebug`, or `installDebug` for the root).
-pub fn install_task(m: &Module) -> String {
-    if m.name == ":" {
-        "installDebug".into()
-    } else {
-        format!("{}:installDebug", m.name)
-    }
-}
-
 /// What to start after the install.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Launch {
@@ -151,6 +142,81 @@ pub fn launch(adb: &Path, serial: &str, app_id: &str, what: &Launch) -> Result<S
         Launch::App => format!("Started {component} on {serial}"),
         Launch::Preview(name) => format!("Showing preview {name} on {serial}"),
     })
+}
+
+/// The Android emulator: `DROID_LITE_EMULATOR`, else next to the SDK's `platform-tools/adb`.
+pub fn emulator(adb: Option<&Path>) -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("DROID_LITE_EMULATOR") {
+        return Some(p.into()).filter(|p: &std::path::PathBuf| p.is_file());
+    }
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    adb.and_then(|a| Some(a.parent()?.parent()?.to_path_buf()))
+        .into_iter()
+        .chain(
+            ["ANDROID_HOME", "ANDROID_SDK_ROOT"]
+                .iter()
+                .filter_map(|v| std::env::var_os(v).map(Into::into)),
+        )
+        .chain(home.map(|h| h.join("Library/Android/sdk")))
+        .map(|sdk| sdk.join("emulator/emulator"))
+        .find(|p| p.is_file())
+}
+
+/// The virtual devices (`emulator -list-avds`).
+pub fn avds(emulator: &Path) -> Vec<String> {
+    Command::new(emulator)
+        .arg("-list-avds")
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with("INFO") && !l.contains(' '))
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Starts a virtual device; it keeps running on its own.
+pub fn start_avd(emulator: &Path, avd: &str) -> std::io::Result<()> {
+    Command::new(emulator)
+        .args(["-avd", avd])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+}
+
+/// Opens `uri` in the app on `serial` (`am start -a VIEW -d`), like a tapped link.
+pub fn open_link(adb: &Path, serial: &str, app_id: &str, uri: &str) -> Result<String, String> {
+    let pkg = installed(adb, serial, app_id)?;
+    // the device's shell reads the command line: quote the link (it may hold `&` or `?`)
+    let quoted = format!("'{}'", uri.replace('\'', "'\\''"));
+    let out = shell(
+        adb,
+        serial,
+        &[
+            "am",
+            "start",
+            "-W",
+            "-a",
+            "android.intent.action.VIEW",
+            "-d",
+            &quoted,
+            &pkg,
+        ],
+    )?;
+    if out.contains("Error") {
+        return Err(out
+            .lines()
+            .find(|l| l.contains("Error"))
+            .unwrap_or(&out)
+            .trim()
+            .to_string());
+    }
+    Ok(format!("Opened {uri} on {serial}"))
 }
 
 #[cfg(test)]

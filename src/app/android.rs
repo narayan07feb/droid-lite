@@ -122,6 +122,7 @@ impl App {
         {
             self.res = r;
             self.res_rx = None;
+            self.res_gen += 1;
             for t in self.tabs.iter_mut() {
                 t.annotations = None; // swatches may change
             }

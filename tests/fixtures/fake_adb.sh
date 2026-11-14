@@ -34,10 +34,12 @@ case "$*" in
   *"logcat"*)
     printf '%s\n' \
       '--------- beginning of main' \
-      '11-12 10:00:00.001  4242  4242 D DemoNet : fast call' \
-      '11-12 10:00:00.002  4242  4243 W DemoNet : slow call' \
-      '11-12 10:00:00.003   777   800 E ActivityManager: ANR in com.other' \
-      '11-12 10:00:00.004  4242  4242 E AndroidRuntime: FATAL EXCEPTION: main' \
-      '11-12 10:00:00.005  4242  4242 E AndroidRuntime: 	at com.demo.ui.UserCardKt.UserCard(UserCard.kt:7)'
+      '11-12 10:00:00.001  4242  4242 E AndroidRuntime: FATAL EXCEPTION: main' \
+      '11-12 10:00:00.001  4242  4242 E AndroidRuntime: Process: com.demo.app, PID: 4242' \
+      '11-12 10:00:00.001  4242  4242 E AndroidRuntime: java.lang.IllegalStateException: boom' \
+      '11-12 10:00:00.002  4242  4242 E AndroidRuntime: 	at com.demo.ui.UserCardKt.UserCard(UserCard.kt:7)' \
+      '11-12 10:00:00.003  4242  4242 D DemoNet : fast call' \
+      '11-12 10:00:00.004  4242  4243 W DemoNet : slow call' \
+      '11-12 10:00:00.005   777   800 E ActivityManager: ANR in com.other'
     exec sleep 30 ;;
 esac

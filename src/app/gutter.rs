@@ -1,32 +1,26 @@
-//! Editor annotations, like Android Studio's gutter: "implemented by" / "overrides" icons next to
-//! the line numbers, inline Compose stability badges after `@Composable` declarations, and the
-//! right-click menu.
+//! Editor annotations: a row of small links above each declaration (implementations, overrides,
+//! expect / actual, ▶ run test or preview, manifest entry, Hilt providers and injection points)
+//! in place of gutter icons, inline Compose stability badges and colour swatches after their
+//! lines, and the right-click menu.
 
 use super::{App, Search, SearchKind};
+use crate::android_kit::TestTarget;
 use crate::compose::{self, Stability, Verdict};
 use crate::highlight::{ERROR, WARN};
 use crate::icons as ic;
 use crate::index::Hit;
+use crate::index::type_name;
 use crate::keymap::{self, Action};
 use crate::kotlin::Kind;
 use egui::{Align2, Color32, FontId, Galley, Pos2, Rect, RichText, Sense, Ui};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-pub(super) const ICON_WIDTH: f32 = 18.0;
-const UP: Color32 = Color32::from_rgb(0x58, 0x9D, 0xF6);
-const DOWN: Color32 = Color32::from_rgb(0x5F, 0xB8, 0x65);
-
-/// One gutter icon: `up` points to what this overrides or implements, else to what implements it.
-pub(super) struct Mark {
-    pub(super) line: usize,
-    pub(super) up: bool,
+/// A link to related code: implementations, overrides, Kotlin Multiplatform expect / actual.
+struct Mark {
+    line: usize,
     tip: String,
-    pub(super) targets: Vec<Hit>,
-    /// Kotlin Multiplatform: "E" on an `expect` (goes to its actuals), "A" on an `actual`.
-    pub(super) letter: Option<&'static str>,
+    targets: Vec<Hit>,
 }
-
-/// Kotlin purple, for the expect / actual letters.
-const KMP: Color32 = Color32::from_rgb(0xB3, 0x7F, 0xEB);
 
 /// Inline stability after a `@Composable` declaration.
 pub(super) struct Badge {
@@ -52,15 +46,73 @@ pub(super) struct ParamHint {
 /// Annotations of one tab, rebuilt only when its text, the index or the reports change.
 pub(super) struct Annotations {
     key: (u64, u64, u64),
-    pub(super) marks: Vec<Mark>,
     pub(super) badges: Vec<Badge>,
     /// Colour squares for lines that write a colour (`Color(0xFF…)`, `#RRGGBB`, `R.color.x`).
     pub(super) swatches: Vec<(usize, Color32)>,
-    /// `@Preview` functions: line and the name `PreviewActivity` runs (▶ in the gutter).
-    pub(super) previews: Vec<(usize, String)>,
+    /// The link rows, by the line they sit above.
+    pub(super) lenses: Vec<Lens>,
 }
 
-/// What a click in the gutter or the context menu asks for, run after the editor is drawn.
+/// One link above a line.
+pub(super) struct LensItem {
+    pub(super) text: String,
+    request: Request,
+}
+
+/// The links above one line: the first line of a declaration, its annotations included.
+pub(super) struct Lens {
+    pub(super) line: usize,
+    /// Leading whitespace of that line, in chars: the links start where its code starts.
+    indent: usize,
+    pub(super) items: Vec<LensItem>,
+}
+
+impl Lens {
+    pub(super) fn new(line: usize, line_text: &str, items: Vec<(String, Request)>) -> Lens {
+        Lens {
+            line,
+            indent: line_text.chars().take_while(|c| c.is_whitespace()).count(),
+            items: items
+                .into_iter()
+                .map(|(text, request)| LensItem { text, request })
+                .collect(),
+        }
+    }
+}
+
+/// The first line of the declaration whose name is on `line`: annotation lines above it count.
+fn head_line(lines: &[&str], line: usize) -> usize {
+    let mut l = line.min(lines.len().saturating_sub(1));
+    while l > 0 && lines[l - 1].trim_start().starts_with('@') {
+        l -= 1;
+    }
+    l
+}
+
+/// Height of a link row: a bit less than a code line.
+pub(super) fn lens_height(row_h: f32) -> f32 {
+    (row_h * 0.85).round()
+}
+
+/// The same galley with room for a link row above each of `lines` (sorted, one row per line:
+/// the editor never wraps). Painting, clicks and the cursor all follow the moved rows.
+pub(super) fn with_lens_room(g: &Galley, lines: &[usize], h: f32) -> Galley {
+    let mut g = g.clone();
+    let mut next = lines.iter().peekable();
+    let mut dy = 0.0;
+    for (i, row) in g.rows.iter_mut().enumerate() {
+        while next.next_if(|&&l| l <= i).is_some() {
+            dy += h;
+        }
+        row.pos.y += dy;
+    }
+    g.rect.max.y += dy;
+    g.mesh_bounds.max.y += dy;
+    g
+}
+
+/// What a click on a link or in the context menu asks for, run after the editor is drawn.
+#[derive(Clone)]
 pub(super) enum Request {
     Pick(String, Vec<Hit>),
     Run(Action),
@@ -68,6 +120,8 @@ pub(super) enum Request {
     Preview(String),
     /// Plugin test cases on one line (indexes into `Tests::marks`).
     Tests(Vec<usize>),
+    /// A JUnit class or test function, run with Gradle.
+    JUnit(TestTarget),
 }
 
 impl App {
@@ -105,14 +159,12 @@ impl App {
                 sets.dedup();
                 marks.push(Mark {
                     line,
-                    up: !expect,
                     tip: format!(
                         "{} in {}",
                         if expect { "Actual" } else { "Expected" },
                         sets.join(", ")
                     ),
                     targets: kmp,
-                    letter: Some(if expect { "E" } else { "A" }),
                 });
             }
             if d.kind.is_type() {
@@ -134,10 +186,8 @@ impl App {
                     };
                     marks.push(Mark {
                         line,
-                        up: true,
                         tip: format!("{verb} {}", d.supers.join(", ")),
                         targets: supers,
-                        letter: None,
                     });
                 }
                 let impls = self.index.implementations(&d.name);
@@ -149,14 +199,12 @@ impl App {
                     };
                     marks.push(Mark {
                         line,
-                        up: false,
                         tip: format!(
                             "{verb} {} {}",
                             impls.len(),
                             if impls.len() == 1 { "class" } else { "classes" }
                         ),
                         targets: impls,
-                        letter: None,
                     });
                 }
             } else if let Some(c) = &d.container
@@ -166,10 +214,8 @@ impl App {
                     if let Some(h) = self.index.overridden(c, &d.name) {
                         marks.push(Mark {
                             line,
-                            up: true,
                             tip: format!("Overrides {}", h.name),
                             targets: vec![h],
-                            letter: None,
                         });
                     }
                 } else {
@@ -177,14 +223,12 @@ impl App {
                     if !impls.is_empty() {
                         marks.push(Mark {
                             line,
-                            up: false,
                             tip: format!(
                                 "Implemented in {} {}",
                                 impls.len(),
                                 if impls.len() == 1 { "class" } else { "classes" }
                             ),
                             targets: impls,
-                            letter: None,
                         });
                     }
                 }
@@ -234,7 +278,7 @@ impl App {
                 });
             }
         }
-        let previews = t
+        let previews: Vec<(usize, String)> = t
             .syms
             .decls
             .iter()
@@ -248,6 +292,70 @@ impl App {
                 );
                 (line_of(d.offset), name)
             })
+            .collect();
+        // the links above each declaration, in this order: run, manifest, navigation, Hilt
+        let lines: Vec<&str> = t.text.split('\n').collect();
+        let mut rows: BTreeMap<usize, Vec<(String, Request)>> = BTreeMap::new();
+        let mut add = |line: usize, text: String, request: Request| {
+            rows.entry(head_line(&lines, line))
+                .or_default()
+                .push((text, request));
+        };
+        for (o, x) in crate::android_kit::test_targets(&t.path, &t.syms) {
+            let what = match &x.method {
+                Some(_) => "Run test",
+                None => "Run all tests",
+            };
+            let on = if x.device { " on the device" } else { "" };
+            add(
+                line_of(o),
+                format!("{}  {what}{on}", ic::PLAY),
+                Request::JUnit(x),
+            );
+        }
+        for (line, name) in &previews {
+            let text = format!("{}  Run preview on the device", ic::PLAY);
+            add(*line, text, Request::Preview(name.clone()));
+        }
+        for d in t
+            .syms
+            .decls
+            .iter()
+            .filter(|d| d.kind.is_type() && d.container.is_none())
+        {
+            if let Some((p, c)) = self.res.component(&crate::index::qualified(&t.syms, d)) {
+                let text = if c.launcher {
+                    "Launcher activity".to_string()
+                } else {
+                    format!("In AndroidManifest ({})", c.tag)
+                };
+                let hit = Hit {
+                    name: "AndroidManifest.xml".into(),
+                    detail: String::new(),
+                    path: p.clone(),
+                    offset: c.offset,
+                    score: 0,
+                };
+                add(
+                    line_of(d.offset),
+                    text,
+                    Request::Pick(String::new(), vec![hit]),
+                );
+            }
+        }
+        for m in &marks {
+            add(
+                m.line,
+                m.tip.clone(),
+                Request::Pick(m.tip.clone(), m.targets.clone()),
+            );
+        }
+        for (line, text, r) in self.hilt_links(&t.syms, &line_of) {
+            add(line, text, r);
+        }
+        let lenses = rows
+            .into_iter()
+            .map(|(line, items)| Lens::new(line, lines[line], items))
             .collect();
         let mut swatches = Vec::new();
         for (line, text) in t.text.lines().enumerate() {
@@ -268,10 +376,9 @@ impl App {
         if let Some(t) = self.tabs.get_mut(self.active) {
             t.annotations = Some(Annotations {
                 key,
-                marks,
                 badges,
                 swatches,
-                previews,
+                lenses,
             });
         }
     }
@@ -285,7 +392,76 @@ impl App {
             Request::Run(a) => self.run(a, ctx),
             Request::Preview(name) => self.run_on_device(crate::device::Launch::Preview(name), ctx),
             Request::Tests(marks) => self.gutter_tests(marks, ctx),
+            Request::JUnit(t) => self.run_junit(&t, ctx),
         }
+    }
+
+    /// Hilt / Dagger links of a file's declarations: where a provided or `@Inject` class is
+    /// injected, and what provides the dependencies of an `@Inject` class or field.
+    fn hilt_links(
+        &self,
+        syms: &crate::kotlin::FileSyms,
+        line_of: &dyn Fn(usize) -> usize,
+    ) -> Vec<(usize, String, Request)> {
+        let provides = |d: &crate::kotlin::Decl| match d.kind {
+            Kind::Fun if d.has_annotation("Provides") || d.has_annotation("Binds") => {
+                Some(type_name(&d.ty))
+            }
+            Kind::Class if d.has_annotation("Inject") => Some(d.name.clone()),
+            _ => None,
+        };
+        let needs = |d: &crate::kotlin::Decl| -> Vec<String> {
+            match d.kind {
+                Kind::Class if d.has_annotation("Inject") => {
+                    d.params.iter().map(|p| type_name(&p.ty)).collect()
+                }
+                Kind::Property if d.has_annotation("Inject") => vec![type_name(&d.ty)],
+                _ => Vec::new(),
+            }
+        };
+        let types: HashSet<String> = syms
+            .decls
+            .iter()
+            .flat_map(|d| provides(d).into_iter().chain(needs(d)))
+            .collect();
+        if types.is_empty() {
+            return Vec::new();
+        }
+        let (providers, injected) = self.index.hilt(&types);
+        let mut out = Vec::new();
+        for d in &syms.decls {
+            let line = line_of(d.offset);
+            if let Some(ty) = provides(d)
+                && let Some(h) = injected.get(&ty)
+            {
+                let n = h.len();
+                let text = format!("Injected in {n} place{}", if n == 1 { "" } else { "s" });
+                out.push((
+                    line,
+                    text,
+                    Request::Pick(format!("Where {ty} is injected"), h.clone()),
+                ));
+            }
+            let wanted: Vec<String> = needs(d)
+                .into_iter()
+                .filter(|t| providers.contains_key(t))
+                .collect();
+            if wanted.is_empty() {
+                continue;
+            }
+            let found: Vec<Hit> = wanted.iter().flat_map(|t| providers[t].clone()).collect();
+            let text = match (&found[..], d.kind) {
+                ([one], Kind::Property) => format!("Provided by {}", one.name),
+                (_, Kind::Property) => format!("{} providers", found.len()),
+                _ => format!("Dependencies: {}", wanted.join(", ")),
+            };
+            out.push((
+                line,
+                text,
+                Request::Pick(format!("Providers of {}", wanted.join(", ")), found),
+            ));
+        }
+        out
     }
 
     /// A popup to choose one of several targets (implementations, declarations).
@@ -338,146 +514,6 @@ fn hit_of(p: &std::path::Path, f: &crate::kotlin::FileSyms, d: &crate::kotlin::D
         offset: d.offset,
         score: 0,
     }
-}
-
-/// Paints the icons of the visible rows into `column`; returns what a click asks for.
-pub(super) fn paint_marks(
-    ui: &mut Ui,
-    a: &Annotations,
-    column: Rect,
-    galley: &Galley,
-    galley_pos: Pos2,
-) -> Option<Request> {
-    let clip = ui.clip_rect();
-    let mut out = None;
-    for (line, color) in &a.swatches {
-        let Some(row) = galley.rows.get(*line) else {
-            continue;
-        };
-        let y = galley_pos.y + row.pos.y;
-        if y > clip.bottom()
-            || y + row.rect().height() < clip.top()
-            || a.marks.iter().any(|m| m.line == *line)
-        {
-            continue;
-        }
-        let h = row.rect().height();
-        let r = Rect::from_center_size(
-            Pos2::new(column.left() + ICON_WIDTH * 0.5, y + h * 0.5),
-            egui::vec2(10.0, 10.0),
-        );
-        ui.painter().rect_filled(r, 2.0, *color);
-        ui.painter().rect_stroke(
-            r,
-            2.0,
-            egui::Stroke::new(1.0, crate::theme::t().border),
-            egui::StrokeKind::Outside,
-        );
-    }
-    for (line, name) in &a.previews {
-        let Some(row) = galley.rows.get(*line) else {
-            continue;
-        };
-        let y = galley_pos.y + row.pos.y;
-        if y > clip.bottom()
-            || y + row.rect().height() < clip.top()
-            || a.marks.iter().any(|m| m.line == *line)
-        {
-            continue;
-        }
-        let rect = ui.painter().text(
-            Pos2::new(column.left() + 1.0, y),
-            Align2::LEFT_TOP,
-            ic::PLAY,
-            FontId::proportional(crate::theme::font_size()),
-            DOWN,
-        );
-        let r = ui.interact(
-            rect.expand(2.0),
-            ui.scope_id().with(("preview", *line)),
-            Sense::click(),
-        );
-        if r.clicked() {
-            out = Some(Request::Preview(name.clone()));
-        }
-        r.on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text(format!("Show this preview on the device\n{name}"));
-    }
-    for m in &a.marks {
-        let Some(row) = galley.rows.get(m.line) else {
-            continue;
-        };
-        let y = galley_pos.y + row.pos.y;
-        if y > clip.bottom() || y + row.rect().height() < clip.top() {
-            continue;
-        }
-        // a class can both implement (up) and be implemented (down): then the down icon sits a bit
-        // right; an expect / actual letter moves right when an arrow shares its line
-        let shared = if m.letter.is_some() {
-            a.marks
-                .iter()
-                .any(|o| o.line == m.line && o.letter.is_none())
-        } else {
-            !m.up
-                && a.marks
-                    .iter()
-                    .any(|o| o.line == m.line && o.up && o.letter.is_none())
-        };
-        let pos = Pos2::new(
-            column.left() + 1.0 + if shared { ICON_WIDTH * 0.45 } else { 0.0 },
-            y,
-        );
-        let rect = if let Some(letter) = m.letter {
-            let size = crate::theme::font_size();
-            let r = Rect::from_min_size(pos + egui::vec2(0.0, 1.0), egui::vec2(size, size));
-            ui.painter().rect_filled(r, size * 0.3, KMP);
-            ui.painter().text(
-                r.center(),
-                Align2::CENTER_CENTER,
-                letter,
-                FontId::proportional(size * 0.75),
-                Color32::WHITE,
-            );
-            r
-        } else {
-            let (icon, color) = if m.up {
-                (ic::ARROW_CIRCLE_UP, UP)
-            } else {
-                (ic::ARROW_CIRCLE_DOWN, DOWN)
-            };
-            ui.painter().text(
-                pos,
-                Align2::LEFT_TOP,
-                icon,
-                FontId::proportional(crate::theme::font_size()),
-                color,
-            )
-        };
-        let r = ui.interact(
-            rect.expand(2.0),
-            ui.scope_id().with(("mark", m.line, m.up, m.letter)),
-            Sense::click(),
-        );
-        if r.clicked() {
-            out = Some(Request::Pick(m.tip.clone(), m.targets.clone()));
-        }
-        r.on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_ui(|ui| {
-                ui.label(RichText::new(&m.tip).strong());
-                for t in m.targets.iter().take(12) {
-                    ui.label(RichText::new(&t.name).monospace().small());
-                }
-                if m.targets.len() > 12 {
-                    ui.label(
-                        RichText::new(format!("… and {} more", m.targets.len() - 12))
-                            .weak()
-                            .small(),
-                    );
-                }
-                ui.label(RichText::new("Click to go there").weak().small());
-            });
-    }
-    out
 }
 
 /// Paints the stability badges after their declaration lines. Returns the right edge of a badge
@@ -627,6 +663,8 @@ pub(super) fn context_menu(
             ui.close();
         }
     };
+    item(ui, Action::QuickFix);
+    ui.separator();
     item(ui, Action::GotoDefinition);
     item(ui, Action::Implementations);
     item(ui, Action::References);
@@ -644,49 +682,148 @@ pub(super) fn context_menu(
     out
 }
 
-/// A ▶ on each row that plugin test cases name; `rows` comes from `Tests::marks_at`.
-pub(super) fn paint_tests(
+/// Paints the link rows above their lines (`lenses` may hold two rows for one line: they continue
+/// each other). Returns what a click asks for.
+pub(super) fn paint_lenses<'a>(
     ui: &mut Ui,
-    rows: &[(usize, Vec<usize>)],
-    labels: impl Fn(&[usize]) -> String,
-    column: Rect,
+    lenses: impl Iterator<Item = &'a Lens>,
     galley: &Galley,
     galley_pos: Pos2,
+    char_w: f32,
+    lens_h: f32,
 ) -> Option<Request> {
     let clip = ui.clip_rect();
+    let font = FontId::proportional(crate::theme::font_size() - 2.0);
+    let t = crate::theme::t();
+    let mut ends: HashMap<usize, f32> = HashMap::new();
     let mut out = None;
-    for (line, marks) in rows {
+    for lens in lenses {
+        let Some(row) = galley.rows.get(lens.line) else {
+            continue;
+        };
+        let top = galley_pos.y + row.pos.y - lens_h;
+        if top > clip.bottom() || top + lens_h < clip.top() {
+            continue;
+        }
+        let mut x = ends
+            .get(&lens.line)
+            .copied()
+            .unwrap_or(galley_pos.x + lens.indent as f32 * char_w);
+        let mid = top + lens_h * 0.5;
+        let mut first = !ends.contains_key(&lens.line);
+        for item in &lens.items {
+            if !std::mem::take(&mut first) {
+                let r = ui.painter().text(
+                    Pos2::new(x, mid),
+                    Align2::LEFT_CENTER,
+                    "  ·  ",
+                    font.clone(),
+                    t.weak,
+                );
+                x = r.right();
+            }
+            let g = ui
+                .painter()
+                .layout_no_wrap(item.text.clone(), font.clone(), t.weak);
+            let rect = Rect::from_min_size(Pos2::new(x, mid - g.size().y * 0.5), g.size());
+            let r = ui.interact(
+                rect,
+                ui.scope_id().with(("lens", lens.line, &item.text)),
+                Sense::click(),
+            );
+            let color = if r.hovered() { t.accent } else { t.weak };
+            ui.painter()
+                .galley_with_override_text_color(rect.min, g, color);
+            if r.hovered() {
+                ui.painter()
+                    .hline(rect.x_range(), rect.bottom(), egui::Stroke::new(1.0, color));
+            }
+            r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, &item.text));
+            if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                out = Some(item.request.clone());
+            }
+            x = rect.right();
+        }
+        ends.insert(lens.line, x);
+    }
+    out
+}
+
+/// A small colour square after each line that writes a colour. Returns its right edge on `line`.
+pub(super) fn paint_swatches(
+    ui: &mut Ui,
+    a: &Annotations,
+    galley: &Galley,
+    galley_pos: Pos2,
+    line_at: usize,
+) -> Option<f32> {
+    let clip = ui.clip_rect();
+    let mut right = None;
+    for (line, color) in &a.swatches {
         let Some(row) = galley.rows.get(*line) else {
             continue;
         };
-        let y = galley_pos.y + row.pos.y;
-        if y > clip.bottom() || y + row.rect().height() < clip.top() {
+        let rect = row.rect().translate(galley_pos.to_vec2());
+        if rect.top() > clip.bottom() || rect.bottom() < clip.top() {
             continue;
         }
-        let rect = ui.painter().text(
-            Pos2::new(column.left() + 1.0, y),
-            Align2::LEFT_TOP,
-            ic::PLAY,
-            FontId::proportional(crate::theme::font_size()),
-            DOWN,
+        let r = Rect::from_center_size(
+            Pos2::new(rect.right() + 14.0, rect.center().y),
+            egui::vec2(10.0, 10.0),
         );
-        let r = ui.interact(
-            rect.expand(2.0),
-            ui.scope_id().with(("test", *line)),
-            Sense::click(),
+        ui.painter().rect_filled(r, 2.0, *color);
+        ui.painter().rect_stroke(
+            r,
+            2.0,
+            egui::Stroke::new(1.0, crate::theme::t().border),
+            egui::StrokeKind::Outside,
         );
-        r.widget_info(|| {
-            egui::WidgetInfo::labeled(
-                egui::Role::Button,
-                true,
-                format!("Run tests on line {}", line + 1),
-            )
-        });
-        if r.clicked() {
-            out = Some(Request::Tests(marks.clone()));
+        if *line == line_at {
+            right = Some(r.right());
         }
-        r.on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text(labels(marks));
     }
-    out
+    right
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_rows_make_room_above_their_lines() {
+        let lines = [
+            "package a",
+            "",
+            "@Preview",
+            "@Composable",
+            "fun P() {}",
+            "  @Inject lateinit var x: X",
+        ];
+        assert_eq!(head_line(&lines, 4), 2, "above the annotations");
+        assert_eq!(head_line(&lines, 1), 1);
+        assert_eq!(Lens::new(5, lines[5], Vec::new()).indent, 2);
+        let ctx = egui::Context::default();
+        let mut g = None;
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            g = Some(ui.fonts_mut(|f| {
+                f.layout_no_wrap("a\nb\nc\nd".into(), FontId::monospace(13.0), Color32::WHITE)
+            }));
+        });
+        let g = g.unwrap();
+        let moved = with_lens_room(&g, &[0, 2], 10.0);
+        let ys: Vec<f32> = moved
+            .rows
+            .iter()
+            .zip(&g.rows)
+            .map(|(m, o)| m.pos.y - o.pos.y)
+            .collect();
+        assert_eq!(ys, [10.0, 10.0, 20.0, 20.0]);
+        assert_eq!(moved.rect.height(), g.rect.height() + 20.0);
+        // a click between rows lands on the nearest one
+        let row1 = moved.rows[2].pos.y;
+        assert_eq!(
+            moved.cursor_from_pos(egui::vec2(0.0, row1 - 4.0)).index.0,
+            4
+        );
+    }
 }

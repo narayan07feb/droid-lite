@@ -127,7 +127,7 @@ impl Fixture {
         let root = self.root.clone();
         let mut h = Harness::builder()
             .with_size([1440.0, 900.0])
-            .build_eframe(move |cc| App::new(cc, Some(root), false));
+            .build_eframe(move |cc| App::new(cc, Some(root)));
         wait(&mut h, "index", |a| {
             a.indexing.is_none() && a.index.symbol_count() > 0
         });
@@ -736,7 +736,7 @@ fn e2e_snapshot_for_review() {
         light: true,
         ..Default::default()
     }
-    .apply(&ctx, false);
+    .apply(&ctx);
     h.state_mut().tabs.iter_mut().for_each(|t| t.recolor = true);
     steps(&mut h, 5);
     if let Ok(dir) = std::env::var("DROID_LITE_SNAPSHOT_DIR") {
@@ -831,7 +831,7 @@ fn e2e_find_references_lists_code_and_xml_not_strings() {
     .unwrap();
     std::fs::write(
         f.path("app/src/main/java/com/demo/ui/Strings.kt"),
-        "package com.demo.ui\nval s = \"User\" // User\nval u: User? = null\n",
+        "package com.demo.ui\nimport com.demo.data.User\nval s = \"User\" // User\nval u: User? = null\n",
     )
     .unwrap();
     let mut h = f.harness();
@@ -852,8 +852,8 @@ fn e2e_find_references_lists_code_and_xml_not_strings() {
     );
     assert_eq!(
         in_file("Strings.kt"),
-        1,
-        "only the type, not the string or the comment"
+        2,
+        "the import and the type, not the string or the comment"
     );
     assert_eq!(in_file("user_card.xml"), 1, "XML is searched as text");
     h.get_by_label_contains("References to `User`");
@@ -998,51 +998,70 @@ fn click_at(h: &mut Harness<'static, App>, pos: egui::Pos2, button: egui::Pointe
     steps(h, 3);
 }
 
-/// Screen position of `line` (0-based) in the gutter icon column of the active editor.
-fn icon_pos(h: &mut Harness<'static, App>, line: usize) -> egui::Pos2 {
-    let editor = h
-        .get_by_role(egui::accesskit::Role::MultilineTextInput)
-        .rect();
-    let ctx = h.ctx.clone();
-    let font = egui::FontId::monospace(crate::theme::font_size());
-    let (row_h, char_w) = ctx.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
-    let lines = tab(h).text.matches('\n').count() + 1;
-    let gutter_w = char_w * lines.to_string().len().max(3) as f32 + 18.0;
-    egui::pos2(
-        editor.left() - gutter_w - gutter::ICON_WIDTH + 7.0,
-        editor.top() + row_h * (line as f32 + 0.5),
-    )
+/// The link rows above the active editor's lines: (line, texts).
+fn lenses(h: &Harness<'static, App>) -> Vec<(usize, Vec<String>)> {
+    tab(h)
+        .annotations
+        .as_ref()
+        .unwrap()
+        .lenses
+        .iter()
+        .map(|l| (l.line, l.items.iter().map(|i| i.text.clone()).collect()))
+        .collect()
+}
+
+/// Clicks the link `label`; the lowest one on screen when several have it.
+fn click_link(h: &mut Harness<'static, App>, label: &str, lowest: bool) {
+    let rects: Vec<egui::Rect> = h.get_all_by_label(label).map(|n| n.rect()).collect();
+    let r = if lowest {
+        rects.iter().max_by(|a, b| a.top().total_cmp(&b.top()))
+    } else {
+        rects.iter().min_by(|a, b| a.top().total_cmp(&b.top()))
+    };
+    let p = r.unwrap_or_else(|| panic!("no link {label}")).center();
+    click_at(h, p, egui::PointerButton::Primary);
 }
 
 #[test]
-fn e2e_gutter_icons_implementations_and_overrides() {
+fn e2e_links_above_declarations_implementations_and_overrides() {
     let f = Fixture::new("gutter");
     std::fs::write(f.path("app/src/main/java/com/demo/data/Repo.kt"), REPO_KT).unwrap();
     let mut h = f.harness();
     let repo = f.path("app/src/main/java/com/demo/data/Repo.kt");
     open(&mut h, &repo);
     steps(&mut h, 3);
-    let a = tab(&h).annotations.as_ref().unwrap();
-    let marks: Vec<(usize, bool, usize)> = a
-        .marks
-        .iter()
-        .map(|m| (m.line, m.up, m.targets.len()))
-        .collect();
-    // interface Repo (line 2): implemented by 2; fun load (3): implemented in 2;
-    // RealRepo (6) / FakeRepo (10): implement Repo; their load (7, 11): override
-    for want in [
-        (2, false, 2),
-        (3, false, 2),
-        (6, true, 1),
-        (7, true, 1),
-        (10, true, 1),
-        (11, true, 1),
-    ] {
-        assert!(marks.contains(&want), "missing {want:?} in {marks:?}");
-    }
-    // clicking the "implemented by" icon of `interface Repo` offers both classes
-    let p = icon_pos(&mut h, 2);
-    click_at(&mut h, p, egui::PointerButton::Primary);
+    // interface Repo (line 2) and its load (3): implemented in 2 classes;
+    // RealRepo (6) / FakeRepo (10): implement Repo; their load (7, 11): override it
+    let want = |s: &str| vec![s.to_string()];
+    assert_eq!(
+        lenses(&h),
+        [
+            (2, want("Implemented in 2 classes")),
+            (3, want("Implemented in 2 classes")),
+            (6, want("Implements / extends Repo")),
+            (7, want("Overrides Repo.load")),
+            (10, want("Implements / extends Repo")),
+            (11, want("Overrides Repo.load")),
+        ]
+    );
+    assert_eq!(
+        h.get_all_by_label("Implemented in 2 classes").count(),
+        2,
+        "links are drawn"
+    );
+    // the links sit in their own row: the code lines below them move down
+    let rows = &tab(&h)
+        .cache
+        .as_ref()
+        .unwrap()
+        .shown
+        .as_ref()
+        .unwrap()
+        .1
+        .rows;
+    assert!(rows[2].pos.y - rows[1].pos.y > rows[1].pos.y - rows[0].pos.y + 5.0);
+    // clicking "Implemented in 2 classes" of `interface Repo` offers both classes
+    click_link(&mut h, "Implemented in 2 classes", false);
     let s = h
         .state()
         .search
@@ -1051,9 +1070,8 @@ fn e2e_gutter_icons_implementations_and_overrides() {
     assert_eq!(s.kind, SearchKind::Pick);
     assert_eq!(s.hits.len(), 2);
     key(&mut h, Modifiers::NONE, Key::Escape);
-    // clicking the "overrides" icon of FakeRepo.load jumps to Repo.load
-    let p = icon_pos(&mut h, 11);
-    click_at(&mut h, p, egui::PointerButton::Primary);
+    // clicking "Overrides load" of FakeRepo.load jumps to Repo.load
+    click_link(&mut h, "Overrides Repo.load", true);
     assert!(
         tab(&h).text[tab(&h).cursor..].starts_with("load(): List<User>\n}"),
         "at the interface method"
@@ -2171,7 +2189,7 @@ fn e2e_logcat_streams_filters_opens_stack_frames_and_never_clears_the_phone() {
         "no adb call before the Logcat tab is opened"
     );
     h.get_by_label_contains("Logcat").click();
-    wait(&mut h, "log lines", |a| a.logcat.view.len() == 5);
+    wait(&mut h, "log lines", |a| a.logcat.view.len() == 7);
     steps(&mut h, 3);
     assert_eq!(
         h.state().logcat.device.as_deref(),
@@ -2213,7 +2231,7 @@ fn e2e_logcat_streams_filters_opens_stack_frames_and_never_clears_the_phone() {
     click_at(&mut h, input.center(), egui::PointerButton::Primary);
     steps(&mut h, 2);
     type_text(&mut h, "package:mine level:warn");
-    wait(&mut h, "filtered", |a| a.logcat.view.len() == 3);
+    wait(&mut h, "filtered", |a| a.logcat.view.len() == 5);
     steps(&mut h, 2);
     assert!(
         h.query_by_label_contains("ANR in com.other").is_none(),
@@ -2234,6 +2252,16 @@ fn e2e_logcat_streams_filters_opens_stack_frames_and_never_clears_the_phone() {
         7,
         "cursor on line 7"
     );
+
+    // the app's crash got a note, even with Logcat on screen; it opens the crash line
+    open(&mut h, &f.path("app/src/main/java/com/demo/data/User.kt"));
+    let note = h.get_by_label_contains("App crashed: IllegalStateException: boom at UserCard.kt:7");
+    note.click();
+    steps(&mut h, 3);
+    assert!(tab(&h).path.ends_with("UserCard.kt"));
+    let t = tab(&h);
+    assert_eq!(t.text[..t.cursor].matches('\n').count() + 1, 7);
+    assert!(h.state().toasts.is_empty(), "a clicked note goes");
 
     // Clear empties the view only
     h.get_by_label("Clear").click();
@@ -2426,15 +2454,11 @@ fn e2e_kmp_expect_actual_gutter_and_jump() {
     let mut h = f.harness();
     open(&mut h, &common);
     steps(&mut h, 3);
-    let marks: Vec<(usize, Option<&str>, usize)> = tab(&h)
-        .annotations
-        .as_ref()
-        .unwrap()
-        .marks
-        .iter()
-        .map(|m| (m.line, m.letter, m.targets.len()))
-        .collect();
-    assert_eq!(marks, [(2, Some("E"), 2)], "E on line 3 with both actuals");
+    assert_eq!(
+        lenses(&h),
+        [(2, vec!["Actual in androidMain, iosMain".to_string()])],
+        "the expect on line 3 links both actuals"
+    );
     // ⌥⌘B / ⌘T on the expect lists the actuals with their source sets
     place_cursor(&mut h, "platformName", 3);
     key(&mut h, Modifiers::COMMAND, Key::T); // Eclipse: implementations
@@ -2446,8 +2470,8 @@ fn e2e_kmp_expect_actual_gutter_and_jump() {
     open(&mut h, &android);
     steps(&mut h, 3);
     assert_eq!(
-        tab(&h).annotations.as_ref().unwrap().marks[0].letter,
-        Some("A")
+        lenses(&h),
+        [(2, vec!["Expected in commonMain".to_string()])]
     );
     place_cursor(&mut h, "platformName", 3);
     key(&mut h, Modifiers::COMMAND, Key::T);
@@ -2501,10 +2525,14 @@ fn e2e_run_app_and_preview_on_a_device() {
     let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
     open(&mut h, &card);
     steps(&mut h, 3);
-    let (line, name) = tab(&h).annotations.as_ref().unwrap().previews[0].clone();
-    assert_eq!(name, "com.demo.ui.UserCardKt.UserCardPreview");
-    let pos = icon_pos(&mut h, line);
-    click_at(&mut h, pos, egui::PointerButton::Primary);
+    let run = format!("{}  Run preview on the device", ic::PLAY);
+    // above `@Preview`, not the fun line under it
+    assert!(
+        lenses(&h).contains(&(12, vec![run.clone()])),
+        "{:?}",
+        lenses(&h)
+    );
+    h.get_by_label(&run).click();
     wait(&mut h, "preview shown", |a| {
         a.status.starts_with("Showing preview")
     });
@@ -2516,7 +2544,7 @@ fn e2e_run_app_and_preview_on_a_device() {
 
     // without ui-tooling in the debug app, the message says what to add
     unsafe { std::env::set_var("FAKE_NO_PREVIEW", "1") };
-    click_at(&mut h, pos, egui::PointerButton::Primary);
+    h.get_by_label(&run).click();
     wait(&mut h, "preview error", |a| a.status.contains("ui-tooling"));
     assert_eq!(h.state().bottom, Bottom::Build);
     unsafe {
@@ -2779,7 +2807,8 @@ fn e2e_plugin_tests_tab_runs_cases_from_list_gutter_views_and_actions() {
     let login = f.path("flows/login.yaml");
     h.state_mut().open_file(&login, None);
     steps(&mut h, 3);
-    h.get_by_label("Run tests on line 2").click();
+    h.get_by_label_contains(&format!("{}  Run a case: ", ic::PLAY))
+        .click();
     steps(&mut h, 3);
     assert_eq!(h.state().tests.only.len(), 2);
     h.get_by_label("Cases on this line");
@@ -2800,7 +2829,8 @@ fn e2e_plugin_tests_tab_runs_cases_from_list_gutter_views_and_actions() {
     h.state_mut().open_file(&f.path("flows/solo.yaml"), None);
     steps(&mut h, 3);
     h.state_mut().tests.plugins[0].status.clear();
-    h.get_by_label("Run tests on line 1").click();
+    h.get_by_label(&format!("{}  Run solo case", ic::PLAY))
+        .click();
     steps(&mut h, 2);
     wait(&mut h, "gutter run", |a| {
         a.tests.plugins[0].run.is_none() && a.tests.plugins[0].status.contains_key("solo")
@@ -2843,4 +2873,566 @@ fn e2e_plugin_tests_tab_runs_cases_from_list_gutter_views_and_actions() {
     assert!(h.state().tests.plugins.is_empty());
     assert!(!f.config.join("plugins/example-tests").exists());
     assert!(example.join("plugin.json").is_file());
+}
+
+#[test]
+fn e2e_action_palette_focus_mode_panel_toggles_and_build_toasts() {
+    let f = Fixture::new("gradle");
+    let mut h = f.harness();
+    let compose_tab = format!("{}  Compose", ic::CUBE);
+    h.get_by_label(&compose_tab);
+
+    // ⇧⌘A lists commands; Enter runs the picked one
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::A);
+    assert!(
+        h.state()
+            .search
+            .as_ref()
+            .is_some_and(|s| s.kind == SearchKind::Actions)
+    );
+    {
+        let s = h.state_mut().search.as_mut().unwrap();
+        s.query = "focus mode".into();
+        s.stale = true;
+    }
+    steps(&mut h, 2);
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    assert!(h.state().focus, "the palette ran Focus mode");
+    assert!(h.state().search.is_none());
+    steps(&mut h, 40); // the panels slide away
+    assert!(
+        h.query_by_label(&compose_tab).is_none(),
+        "focus mode hides the right panel"
+    );
+
+    // ⌘1 in focus mode leaves it with only the Project panel open
+    key(&mut h, Modifiers::COMMAND, Key::Num1);
+    let a = h.state();
+    assert!(!a.focus && a.show_project && !a.show_right && !a.show_bottom);
+
+    // the bottom panel is closed, so a finished build shows a note; a click opens the Build tab
+    h.state_mut().bottom = Bottom::Problems;
+    key(&mut h, Modifiers::CTRL | Modifiers::SHIFT, Key::R);
+    wait(&mut h, "build", |a| {
+        a.gradle.is_none() && !a.toasts.is_empty()
+    });
+    steps(&mut h, 3);
+    h.get_by_label_contains("assembleDebug finished in").click();
+    steps(&mut h, 3);
+    let a = h.state();
+    assert!(a.show_bottom && a.bottom == Bottom::Build && a.toasts.is_empty());
+
+    // with the Build tab on screen, the note would only cover it: none is shown
+    key(&mut h, Modifiers::CTRL | Modifiers::SHIFT, Key::R);
+    wait(&mut h, "second build", |a| {
+        a.gradle.is_none() && a.console.iter().any(|l| l.contains("Gradle finished: OK"))
+    });
+    assert!(h.state().toasts.is_empty());
+
+    // the status bar's panel buttons toggle too
+    h.get_by_label(ic::CUBE).click();
+    steps(&mut h, 2);
+    assert!(h.state().show_right);
+}
+
+#[test]
+fn e2e_welcome_screen_lists_recent_projects_and_opens_one() {
+    let f = Fixture::new("welcome");
+    save_setting("recent-projects", &f.root.to_string_lossy());
+    let mut h = Harness::builder()
+        .with_size([1440.0, 900.0])
+        .build_eframe(|cc| App::new(cc, None));
+    steps(&mut h, 3);
+    h.get_by_label(&format!("{}  Open project…", ic::FOLDER_OPEN));
+    if let Ok(dir) = std::env::var("DROID_LITE_SNAPSHOT_DIR") {
+        let img = h.render().unwrap();
+        img.save(Path::new(&dir).join("e2e-welcome.png")).unwrap();
+    }
+    let name = f.root.file_name().unwrap().to_string_lossy().into_owned();
+    h.get_by_label(&name).click();
+    wait(&mut h, "project", |a| {
+        a.indexing.is_none() && a.project.is_some()
+    });
+    assert_eq!(h.state().project.as_ref().unwrap().root, f.root);
+}
+
+#[test]
+fn e2e_kotlin_android_helpers_fixes_templates_new_file_variants_tests_and_manifest() {
+    let f = Fixture::new("kotlin-helpers");
+    let write = |rel: &str, text: &str| {
+        let p = f.path(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    };
+    write(
+        "app/build.gradle.kts",
+        "plugins { id(\"com.android.application\") }\nandroid {\n    namespace = \"com.demo\"\n    defaultConfig { applicationId = \"com.demo.app\" }\n    buildTypes {\n        create(\"staging\") { }\n    }\n}\n",
+    );
+    write(
+        "app/src/main/AndroidManifest.xml",
+        "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n    <application>\n        <activity android:name=\".MainActivity\" android:exported=\"true\">\n            <intent-filter>\n                <action android:name=\"android.intent.action.MAIN\" />\n                <category android:name=\"android.intent.category.LAUNCHER\" />\n            </intent-filter>\n        </activity>\n    </application>\n</manifest>\n",
+    );
+    write(
+        "app/src/main/java/com/demo/MainActivity.kt",
+        "package com.demo\n\nclass MainActivity : ComponentActivity()\n",
+    );
+    write(
+        "app/src/main/java/com/demo/ui/Counter.kt",
+        "package com.demo.ui\n\nimport androidx.compose.runtime.Composable\n\n@Composable\nfun Counter(label: String) {\n    val count = mutableStateOf(0)\n    Text(\"Hello there\")\n}\n",
+    );
+    write(
+        "app/src/test/java/com/demo/MathTest.kt",
+        "package com.demo\n\nclass MathTest {\n    @Test\n    fun adds() {}\n}\n",
+    );
+    let mut h = f.harness();
+    wait(&mut h, "manifest scan", |a| {
+        a.res.component("com.demo.MainActivity").is_some()
+    });
+
+    // build variants of the app module, in the toolbar
+    assert_eq!(h.state().variants, ["debug", "release", "staging"]);
+    h.get_by_label("Build variant");
+
+    // ⌥Enter on a Compose check: wrap in remember, with its import
+    open(&mut h, &f.path("app/src/main/java/com/demo/ui/Counter.kt"));
+    place_cursor(&mut h, "mutableStateOf", 2);
+    key(&mut h, Modifiers::ALT, Key::Enter);
+    h.get_by_label("Wrap in remember { }");
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    assert!(
+        tab(&h)
+            .text
+            .contains("val count = remember { mutableStateOf(0) }"),
+        "{}",
+        tab(&h).text
+    );
+    assert!(
+        tab(&h)
+            .text
+            .contains("import androidx.compose.runtime.remember\n")
+    );
+    assert!(h.state().fix_popup.is_none());
+
+    // extract a string: strings.xml gets it, the code uses stringResource and imports the module's R
+    place_cursor(&mut h, "Hello there", 3);
+    key(&mut h, Modifiers::ALT, Key::Enter);
+    if let Ok(dir) = std::env::var("DROID_LITE_SNAPSHOT_DIR") {
+        steps(&mut h, 3);
+        h.render()
+            .unwrap()
+            .save(Path::new(&dir).join("e2e-quick-fix.png"))
+            .unwrap();
+    }
+    h.get_by_label("Extract string resource `hello_there`")
+        .click();
+    steps(&mut h, 3);
+    let text = tab(&h).text.clone();
+    assert!(
+        text.contains("Text(stringResource(R.string.hello_there))"),
+        "{text}"
+    );
+    assert!(
+        text.contains("import com.demo.R\n")
+            && text.contains("import androidx.compose.ui.res.stringResource\n")
+    );
+    let strings = std::fs::read_to_string(f.path("app/src/main/res/values/strings.xml")).unwrap();
+    assert!(
+        strings.contains("<string name=\"hello_there\">Hello there</string>"),
+        "{strings}"
+    );
+
+    // a live template from the completion list: comp + Tab
+    let end = tab(&h).text.len();
+    h.state_mut()
+        .tabs
+        .iter_mut()
+        .for_each(|t| t.goto = Some(t.text.len()));
+    steps(&mut h, 3);
+    assert_eq!(tab(&h).cursor, end);
+    type_text(&mut h, "\n");
+    type_text(&mut h, "comp");
+    key(&mut h, Modifiers::NONE, Key::Tab);
+    let text = tab(&h).text.clone();
+    assert!(
+        text.ends_with("@Composable\nfun (modifier: Modifier = Modifier) {\n}"),
+        "{text}"
+    );
+    assert!(text.contains("import androidx.compose.ui.Modifier\n"));
+    let t = tab(&h);
+    assert!(
+        t.text[..t.cursor].ends_with("fun "),
+        "the cursor waits for the name"
+    );
+
+    // ▶ on a JUnit test runs it with Gradle for the variant; with the bottom panel hidden a note says how it went
+    key(&mut h, Modifiers::COMMAND, Key::Num4);
+    assert!(!h.state().show_bottom);
+    open(&mut h, &f.path("app/src/test/java/com/demo/MathTest.kt"));
+    h.get_by_label(&format!("{}  Run test", ic::PLAY)).click();
+    wait(&mut h, "gradle", |a| {
+        a.gradle.is_none()
+            && !a.console.is_empty()
+            && a.console.iter().any(|l| l.starts_with("Gradle finished"))
+    });
+    assert_eq!(
+        h.state().console[0],
+        "> ./gradlew :app:testDebugUnitTest --tests com.demo.MathTest.adds"
+    );
+    steps(&mut h, 2);
+    h.get_by_label_contains("Tests passed in");
+    h.get_by_label(&format!("{}  Run all tests", ic::PLAY));
+
+    // the launcher Activity links to its manifest entry
+    open(
+        &mut h,
+        &f.path("app/src/main/java/com/demo/MainActivity.kt"),
+    );
+    if let Ok(dir) = std::env::var("DROID_LITE_SNAPSHOT_DIR") {
+        steps(&mut h, 3);
+        h.render()
+            .unwrap()
+            .save(Path::new(&dir).join("e2e-manifest-chip.png"))
+            .unwrap();
+    }
+    h.get_by_label_contains("Launcher activity").click();
+    steps(&mut h, 3);
+    assert!(tab(&h).path.ends_with("AndroidManifest.xml"));
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("<activity android:name=\".MainActivity\""));
+
+    // ⌘N: a ViewModel next to the open file, with its package
+    open(
+        &mut h,
+        &f.path("app/src/main/java/com/demo/MainActivity.kt"),
+    );
+    key(&mut h, Modifiers::COMMAND, Key::N);
+    h.get_by_label("package com.demo");
+    type_text(&mut h, "Home");
+    h.get_by_label("ViewModel (with UI state)").click();
+    steps(&mut h, 2);
+    h.get_by_label("→ HomeViewModel.kt");
+    if let Ok(dir) = std::env::var("DROID_LITE_SNAPSHOT_DIR") {
+        steps(&mut h, 3);
+        h.render()
+            .unwrap()
+            .save(Path::new(&dir).join("e2e-new-file.png"))
+            .unwrap();
+    }
+    h.get_by_label("Create").click();
+    steps(&mut h, 3);
+    let vm = f.path("app/src/main/java/com/demo/HomeViewModel.kt");
+    assert!(tab(&h).path.ends_with("HomeViewModel.kt"));
+    assert!(
+        std::fs::read_to_string(&vm)
+            .unwrap()
+            .starts_with("package com.demo\n\nimport androidx.lifecycle.ViewModel\n")
+    );
+    // an Activity goes into the manifest too
+    key(&mut h, Modifiers::COMMAND, Key::N);
+    type_text(&mut h, "Settings");
+    h.get_by_label("Activity (Compose, added to the manifest)")
+        .click();
+    steps(&mut h, 2);
+    h.get_by_label("Create").click();
+    steps(&mut h, 3);
+    assert!(
+        f.path("app/src/main/java/com/demo/SettingsActivity.kt")
+            .exists()
+    );
+    let manifest = std::fs::read_to_string(f.path("app/src/main/AndroidManifest.xml")).unwrap();
+    assert!(
+        manifest.contains("android:name=\"com.demo.SettingsActivity\""),
+        "{manifest}"
+    );
+    // an existing name is refused
+    key(&mut h, Modifiers::COMMAND, Key::N);
+    type_text(&mut h, "Settings");
+    h.get_by_label("Activity (Compose, added to the manifest)")
+        .click();
+    h.get_by_label("Create").click();
+    steps(&mut h, 2);
+    h.get_by_label("SettingsActivity.kt is there already");
+}
+
+#[test]
+fn e2e_hilt_links_lint_in_problems_translations_emulator_and_deep_links() {
+    let f = Fixture::new("android-tools");
+    let write = |rel: &str, text: &str| {
+        let p = f.path(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    };
+    write(
+        "app/build.gradle.kts",
+        "plugins { id(\"com.android.application\") }\nandroid {\n    namespace = \"com.demo\"\n    defaultConfig { applicationId = \"com.demo.app\" }\n}\n",
+    );
+    write(
+        "app/src/main/AndroidManifest.xml",
+        "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n    <application>\n        <activity android:name=\".MainActivity\">\n            <intent-filter>\n                <action android:name=\"android.intent.action.VIEW\" />\n                <data android:scheme=\"demo\" android:host=\"home\" />\n            </intent-filter>\n        </activity>\n    </application>\n</manifest>\n",
+    );
+    write(
+        "app/src/main/java/com/demo/di/AppModule.kt",
+        "package com.demo.di\n\n@Module\nobject AppModule {\n    @Provides\n    fun provideRepo(): Repo = RealRepo()\n}\n",
+    );
+    write(
+        "app/src/main/java/com/demo/HomeViewModel.kt",
+        "package com.demo\n\n@HiltViewModel\nclass HomeViewModel @Inject constructor(private val repo: Repo) : ViewModel()\n",
+    );
+    write(
+        "app/src/main/java/com/demo/HomeFragment.kt",
+        "package com.demo\n\nclass HomeFragment : Fragment() {\n    @Inject lateinit var repo: Repo\n}\n",
+    );
+    write(
+        "app/src/main/res/values/strings.xml",
+        "<resources>\n    <string name=\"hello\">Hello</string>\n    <string name=\"bye\">Bye</string>\n    <string name=\"brand\" translatable=\"false\">Demo</string>\n</resources>\n",
+    );
+    write(
+        "app/src/main/res/values-hi/strings.xml",
+        "<resources>\n    <string name=\"hello\">Namaste</string>\n</resources>\n",
+    );
+    // a Gradle whose lint and detekt tasks write their reports
+    write(
+        "gradlew",
+        "#!/bin/sh\necho \"> Task $1\"\ncase \"$1\" in\n  lint) mkdir -p app/build/reports && printf '<issues>\\n<issue id=\"HardcodedText\" severity=\"Warning\" message=\"Hardcoded string &quot;Hi&quot;\">\\n<location file=\"app/src/main/java/com/demo/HomeFragment.kt\" line=\"3\" column=\"5\"/>\\n</issue>\\n</issues>\\n' > app/build/reports/lint-results-debug.xml;;\n  detekt) mkdir -p app/build/reports/detekt && printf '<checkstyle>\\n<file name=\"app/src/main/java/com/demo/HomeFragment.kt\">\\n<error line=\"4\" column=\"5\" severity=\"error\" message=\"Too long.\" source=\"detekt.LongMethod\"/>\\n</file>\\n</checkstyle>\\n' > app/build/reports/detekt/detekt.xml;;\nesac\necho 'BUILD SUCCESSFUL'\n",
+    );
+    let emulator_log = f.path("emulator-calls.txt");
+    write(
+        "fake-emulator",
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = -list-avds ]; then echo 'INFO    | Storing crashdata'; echo Pixel_8_API_35; else echo \"$@\" >> '{}'; fi\n",
+            emulator_log.display()
+        ),
+    );
+    for x in ["gradlew", "fake-emulator"] {
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(f.path(x))
+            .status()
+            .unwrap();
+    }
+    let adb_log = f.path("adb-calls.txt");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_adb.sh");
+    // SAFETY: tests run one at a time (SERIAL), so no other thread reads the environment now.
+    unsafe {
+        std::env::set_var("DROID_LITE_ADB", &script);
+        std::env::set_var("FAKE_ADB_LOG", &adb_log);
+        std::env::set_var("DROID_LITE_EMULATOR", f.path("fake-emulator"));
+    }
+    let mut h = f.harness();
+    wait(&mut h, "manifest scan", |a| !a.res.links.is_empty());
+    assert_eq!(h.state().res.links, ["demo://home"]);
+
+    // Hilt: the provider lists where Repo is injected; the injected places link back to it
+    open(
+        &mut h,
+        &f.path("app/src/main/java/com/demo/di/AppModule.kt"),
+    );
+    let texts = |h: &Harness<'static, App>| -> Vec<String> {
+        lenses(h).into_iter().flat_map(|(_, t)| t).collect()
+    };
+    assert_eq!(texts(&h), ["Injected in 2 places"]);
+    h.get_by_label("Injected in 2 places").click();
+    steps(&mut h, 3);
+    assert_eq!(h.state().search.as_ref().map(|s| s.pinned.len()), Some(2));
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    open(
+        &mut h,
+        &f.path("app/src/main/java/com/demo/HomeViewModel.kt"),
+    );
+    assert_eq!(texts(&h), ["Dependencies: Repo"]);
+    h.get_by_label("Dependencies: Repo").click();
+    steps(&mut h, 3);
+    assert!(
+        tab(&h).path.ends_with("AppModule.kt"),
+        "one provider opens at once"
+    );
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("provideRepo"));
+    open(
+        &mut h,
+        &f.path("app/src/main/java/com/demo/HomeFragment.kt"),
+    );
+    assert_eq!(texts(&h), ["Provided by provideRepo"]);
+
+    // lint and detekt reports land in Problems
+    for task in ["lint", "detekt"] {
+        h.state_mut().gradle_task = task.into();
+        let ctx = h.ctx.clone();
+        h.state_mut().run(Action::RunTask, &ctx);
+        wait(&mut h, task, |a| {
+            a.gradle.is_none() && a.console.iter().any(|l| l.starts_with("Gradle finished"))
+        });
+    }
+    steps(&mut h, 3);
+    let problems = &h.state().build_problems[&f.path("app/src/main/java/com/demo/HomeFragment.kt")];
+    assert_eq!(
+        problems,
+        &[(4, 5, 1, "[detekt LongMethod] Too long.".to_string())],
+        "only the last run's report"
+    );
+    assert_eq!(h.state().bottom, Bottom::Problems);
+    h.get_by_label_contains("[detekt LongMethod] Too long.");
+    h.state_mut().gradle_task = "lint".into();
+    let ctx = h.ctx.clone();
+    h.state_mut().run(Action::RunTask, &ctx);
+    wait(&mut h, "lint again", |a| {
+        a.gradle.is_none() && a.console.iter().any(|l| l.starts_with("Gradle finished"))
+    });
+    steps(&mut h, 3);
+    h.get_by_label_contains("[lint HardcodedText] Hardcoded string \"Hi\"");
+
+    // translations: the missing Hindi `bye` is marked; typing it writes values-hi
+    let ctx = h.ctx.clone();
+    h.state_mut().run(Action::Translations, &ctx);
+    steps(&mut h, 3);
+    h.get_by_label("3 strings · 1 language · 1 missing");
+    h.get_by_label("not translated");
+    if let Ok(dir) = std::env::var("DROID_LITE_SNAPSHOT_DIR") {
+        steps(&mut h, 3);
+        h.render()
+            .unwrap()
+            .save(Path::new(&dir).join("e2e-translations.png"))
+            .unwrap();
+    }
+
+    h.get_by_label("missing").click();
+    steps(&mut h, 3);
+    type_text(&mut h, "Alvida");
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    steps(&mut h, 3);
+    let hi = std::fs::read_to_string(f.path("app/src/main/res/values-hi/strings.xml")).unwrap();
+    assert!(hi.contains("<string name=\"bye\">Alvida</string>"), "{hi}");
+    wait(&mut h, "rescan", |a| a.res.get("string", "bye").len() == 2);
+    steps(&mut h, 3);
+    h.get_by_label("3 strings · 1 language · 0 missing");
+    h.state_mut().translations.open = false;
+
+    // the device picker lists the emulators and starts one
+    h.get_by_label("Run device").click();
+    steps(&mut h, 3);
+    h.get_by_label(&format!("{}  Pixel_8_API_35", ic::PLAY))
+        .click();
+    steps(&mut h, 3);
+    wait(&mut h, "emulator started", |_| emulator_log.exists());
+    assert_eq!(
+        std::fs::read_to_string(&emulator_log).unwrap().trim(),
+        "-avd Pixel_8_API_35"
+    );
+
+    // a deep link from the manifest opens in the app on the device
+    h.get_by_label("Run device").click();
+    steps(&mut h, 3);
+    if let Ok(dir) = std::env::var("DROID_LITE_SNAPSHOT_DIR") {
+        steps(&mut h, 3);
+        h.render()
+            .unwrap()
+            .save(Path::new(&dir).join("e2e-device-picker.png"))
+            .unwrap();
+    }
+    h.get_by_label("Open a deep link…").click();
+    steps(&mut h, 3);
+    h.get_by_label("Open on the device").click();
+    wait(&mut h, "link opened", |a| {
+        a.status.starts_with("Opened demo://home")
+    });
+    unsafe {
+        std::env::remove_var("FAKE_ADB_LOG");
+        std::env::remove_var("DROID_LITE_EMULATOR");
+    }
+    let log = std::fs::read_to_string(&adb_log).unwrap();
+    assert!(
+        log.contains(
+            "shell am start -W -a android.intent.action.VIEW -d 'demo://home' com.demo.app.debug"
+        ),
+        "{log}"
+    );
+}
+
+#[test]
+fn e2e_usages_of_a_member_skip_same_named_members_of_other_classes() {
+    let f = Fixture::new("same-name");
+    let write = |rel: &str, text: &str| {
+        let p = f.path(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    };
+    write(
+        "app/src/main/java/com/demo/data/UserDao.kt",
+        "package com.demo.data\n\ninterface UserDao {\n    fun insert(u: User)\n}\n",
+    );
+    write(
+        "app/src/main/java/com/demo/data/Cache.kt",
+        "package com.demo.data\n\nclass Cache {\n    fun insert(k: String) {}\n}\n",
+    );
+    write(
+        "app/src/main/java/com/demo/data/Saver.kt",
+        "package com.demo.data\n\nclass Saver(private val dao: UserDao, private val cache: Cache) {\n    fun save(u: User) {\n        dao.insert(u)\n        cache.insert(\"k\")\n    }\n}\n",
+    );
+    let mut h = f.harness();
+    let saver = f.path("app/src/main/java/com/demo/data/Saver.kt");
+    open(
+        &mut h,
+        &f.path("app/src/main/java/com/demo/data/UserDao.kt"),
+    );
+    place_cursor(&mut h, "insert", 0);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::G);
+    wait(&mut h, "references", |a| {
+        a.find_rx.is_none() && !a.found.is_empty()
+    });
+    let mut texts: Vec<String> = h
+        .state()
+        .found
+        .iter()
+        .map(|l| l.text.trim().to_string())
+        .collect();
+    texts.sort();
+    assert_eq!(
+        texts,
+        ["dao.insert(u)", "fun insert(u: User)"],
+        "not cache.insert"
+    );
+    // ⌘-hover counts the same way, and from a use it knows which insert is meant
+    open(&mut h, &saver);
+    let at = tab(&h).text.find("cache.insert").unwrap() + 6;
+    for _ in 0..500 {
+        if h.state_mut().usages_of("insert", at).is_some() {
+            break;
+        }
+        steps(&mut h, 1);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let found: Vec<String> = h
+        .state_mut()
+        .usages_of("insert", at)
+        .unwrap()
+        .iter()
+        .map(|l| l.text.trim().to_string())
+        .collect();
+    let mut found = found;
+    found.sort();
+    assert_eq!(found, ["cache.insert(\"k\")", "fun insert(k: String) {}"]);
+    // rename without kotlin-lsp: the other class's insert is listed, but unticked
+    open(&mut h, &f.path("app/src/main/java/com/demo/data/Cache.kt"));
+    place_cursor(&mut h, "insert", 0);
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::R);
+    for _ in 0.."insert".len() {
+        key(&mut h, Modifiers::NONE, Key::Backspace);
+    }
+    type_text(&mut h, "put");
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    wait(&mut h, "rename preview", |a| {
+        matches!(a.refactor, Some(refactor_ui::Refactor::Preview(_)))
+    });
+    let Some(refactor_ui::Refactor::Preview(p)) = &h.state().refactor else {
+        unreachable!()
+    };
+    let mut lines = p.lines();
+    lines.sort();
+    assert_eq!(
+        lines,
+        [
+            ("cache.[put](\"k\")".to_string(), true),
+            ("dao.[put](u)".to_string(), false),
+            ("fun [put](k: String) {}".to_string(), true),
+            ("fun [put](u: User)".to_string(), false),
+        ]
+    );
 }

@@ -56,6 +56,7 @@ impl App {
             self.res_stale |= ready.iter().any(|c| match c {
                 DiskChange::File(p, ..) | DiskChange::Gone(p) => {
                     p.components().any(|c| c.as_os_str() == "res")
+                        || p.file_name().is_some_and(|n| n == "AndroidManifest.xml")
                 }
             });
             self.apply_disk_changes(ready, ctx);

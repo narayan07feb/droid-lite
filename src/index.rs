@@ -386,6 +386,61 @@ fn share(f: &mut FileSyms, seen: &mut HashSet<Atom>) {
 
 /// `expect` or `actual`: the declaration's own modifier, or for a member, its class's `expect`
 /// (members of an `expect class` carry no modifier of their own).
+/// The simple name of a type: `List<Api>?` → `List`, `com.x.Api` → `Api`.
+pub fn type_name(ty: &str) -> String {
+    let t = ty.trim().trim_end_matches('?');
+    let t = t.split('<').next().unwrap_or(t);
+    t.rsplit('.').next().unwrap_or(t).trim().to_string()
+}
+
+impl Index {
+    /// Hilt / Dagger links for the given type names, in one pass over the project: what provides
+    /// each one (`@Provides` / `@Binds` functions, classes with an `@Inject constructor`) and where
+    /// it is injected (parameters of an `@Inject constructor`, `@Inject` fields).
+    pub fn hilt(
+        &self,
+        types: &HashSet<String>,
+    ) -> (HashMap<String, Vec<Hit>>, HashMap<String, Vec<Hit>>) {
+        let (mut providers, mut injected) = (HashMap::new(), HashMap::new());
+        let hit = |p: &PathBuf, f: &FileSyms, d: &Decl| Hit {
+            name: d.name.clone(),
+            detail: describe(f, d),
+            path: p.clone(),
+            offset: d.offset,
+            score: 0,
+        };
+        for (p, f, d) in self.decls() {
+            let provided = match d.kind {
+                Kind::Fun if d.has_annotation("Provides") || d.has_annotation("Binds") => {
+                    Some(type_name(&d.ty))
+                }
+                Kind::Class if d.has_annotation("Inject") => Some(d.name.clone()),
+                _ => None,
+            };
+            if let Some(t) = provided.filter(|t| types.contains(t)) {
+                providers
+                    .entry(t)
+                    .or_insert_with(Vec::new)
+                    .push(hit(p, f, d));
+            }
+            let wanted: Vec<String> = match d.kind {
+                Kind::Class if d.has_annotation("Inject") => {
+                    d.params.iter().map(|x| type_name(&x.ty)).collect()
+                }
+                Kind::Property if d.has_annotation("Inject") => vec![type_name(&d.ty)],
+                _ => Vec::new(),
+            };
+            for t in wanted.into_iter().filter(|t| types.contains(t)) {
+                injected
+                    .entry(t)
+                    .or_insert_with(Vec::new)
+                    .push(hit(p, f, d));
+            }
+        }
+        (providers, injected)
+    }
+}
+
 pub fn kmp_role(f: &FileSyms, d: &Decl) -> Option<&'static str> {
     if d.has_modifier("expect") {
         return Some("expect");
