@@ -56,7 +56,7 @@ To get a normal Mac app with the icon, run `scripts/bundle-mac.sh`, then copy `t
 | Autocomplete | Project symbols and keywords as you type (⌃Space to force). Adds the `import` for you. Type-aware items come from kotlin-lsp when it is installed |
 | Library symbols | The project's dependencies (and theirs, from the `.pom` files) are read from the Gradle cache for Go to class, Go to symbol and autocomplete: full declarations from source jars, class names and Kotlin top-level functions from jars and aars. Each artifact is read once and kept in `~/Library/Caches/droid-lite/libs` (Gradle never changes a downloaded artifact), so the next start takes about 0.2 s instead of about 5 s on a large project. A changed file is read again. Delete that folder to start fresh |
 | Compose analyser | The UI call tree of each composable. Parameter stability from skydoves' compose-stability-analyzer (`stabilityDump`) or Compose compiler reports, with a local guess when there is neither. Compose checks: `modifier` rules, naming, `mutableStateOf` without `remember`, effects without keys, `collectAsState` vs `collectAsStateWithLifecycle`, ViewModel parameters |
-| Preview render | Runs the module's screenshot task (Google's Compose Preview Screenshot Testing, Paparazzi or Roborazzi) and shows the PNGs for the previews in the open file |
+| Preview render | Only for a module that already applies a screenshot tool (Google's Compose Preview Screenshot Testing, Paparazzi or Roborazzi): the Compose panel runs that tool's task and shows the PNGs for the previews in the open file. Other modules get no image in the IDE, only "▶ Run preview on the device" (below). Rendering any module's previews in the IDE is in progress |
 | Refactor | Rename (⇧F6) with a preview of every change; you can untick lines. kotlin-lsp does the rename when it runs, else a code-only text search (strings and comments are skipped). It also renames `Old.kt` when the class matches the file. Extract variable (⌥⌘V), optimize imports (⌃⌥O, keeps the order), and undo the last refactoring from the Refactor menu |
 | Files on disk | The project folder is watched. An open file without edits reloads by itself; with edits you choose Reload or Keep mine. New and deleted files update the tree and the index. New stability dumps and compiler reports load by themselves |
 | Git (GitLens-style) | Grey "author, time • summary" after the cursor's line; hover for the full commit, click for its diff. A blame column with author and age per block (Pull request tab → Blame column). The Pull request tab lists every commit that changed the open file (follows renames). Blame uses the editor text, so unsaved lines show "Not committed yet". Change bars next to the line numbers (green added, blue changed, red deleted): bright for changes not committed yet (click to revert one), dim for what this branch changed since its base, the parent branch or PR set in the Pull request tab (else develop / main), so committed PR work stays visible |
@@ -137,8 +137,8 @@ Use it with `DROID_LITE_OPEN=<file>`, `DROID_LITE_SEARCH=<query>` or `DROID_LITE
 
 ## Limits (v0.1)
 
-- Live preview while you type is not built. The preview path renders through Gradle (a few seconds).
-- Without kotlin-lsp there is no member completion after `.`, and there are no compile errors in the editor.
+- Live preview while you type is not built. Preview images need a screenshot tool in the module (see Preview render) and come from a Gradle run, which takes from seconds to minutes.
+- Without kotlin-lsp there is no member completion after `.`, and no live errors while you type: compile errors show only after a Build (Gradle).
 - No debugger, Layout Inspector or emulator manager yet.
 - Rename without kotlin-lsp matches by name, so two different symbols with the same name both show up in the preview. Untick the wrong ones.
 - Optimize imports does not sort imports. This avoids fights with ktlint's import order.
