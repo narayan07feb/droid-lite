@@ -3436,3 +3436,77 @@ fn e2e_usages_of_a_member_skip_same_named_members_of_other_classes() {
         ]
     );
 }
+
+/// UX audit (not a check): renders every main screen and state at three widths in both themes into
+/// `DROID_LITE_AUDIT_DIR`. `DROID_LITE_AUDIT_PROJECT` adds a real project (opened read-only).
+/// Run: DROID_LITE_AUDIT_DIR=/tmp/a cargo test --release e2e_ux_audit -- --ignored --test-threads=1
+#[test]
+#[ignore]
+fn e2e_ux_audit() {
+    let Ok(dir) = std::env::var("DROID_LITE_AUDIT_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = Fixture::new("audit");
+    let mut projects: Vec<(&str, Option<PathBuf>, Option<PathBuf>)> = vec![
+        ("empty", None, None),
+        ("small", Some(f.root.clone()), Some(f.path("app/src/main/java/com/demo/ui/UserCard.kt"))),
+    ];
+    if let Ok(p) = std::env::var("DROID_LITE_AUDIT_PROJECT") {
+        let file = std::env::var("DROID_LITE_AUDIT_FILE").ok().map(PathBuf::from);
+        projects.push(("real", Some(PathBuf::from(p)), file));
+    }
+    for (name, root, file) in projects {
+        for width in [1280.0, 1600.0, 1920.0] {
+            for light in [false, true] {
+                let r = root.clone();
+                let mut h = Harness::builder()
+                    .with_size([width, 900.0])
+                    .build_eframe(move |cc| App::new(cc, r));
+                h.state_mut().settings.light = light;
+                let ctx = h.ctx.clone();
+                h.state().settings.apply(&ctx);
+                if root.is_some() {
+                    wait(&mut h, "index", |a| a.indexing.is_none() && a.index.symbol_count() > 0);
+                }
+                if let Some(file) = &file {
+                    open(&mut h, file);
+                }
+                steps(&mut h, 8);
+                let theme = if light { "light" } else { "dark" };
+                let shot = |h: &mut Harness<'static, App>, state: &str| {
+                    steps(h, 4);
+                    let img = h.render().expect("render needs the wgpu feature");
+                    img.save(dir.join(format!("{name}-{}-{theme}-{state}.png", width as u32))).unwrap();
+                };
+                shot(&mut h, "1-main");
+                if root.is_none() {
+                    continue;
+                }
+                h.state_mut().right = Right::PullRequest;
+                h.state_mut().show_right = true;
+                shot(&mut h, "2-pull-request");
+                h.state_mut().right = Right::Compose;
+                for (i, b) in [Bottom::Build, Bottom::Find, Bottom::Logcat, Bottom::Tests, Bottom::Performance]
+                    .into_iter()
+                    .enumerate()
+                {
+                    h.state_mut().bottom = b;
+                    h.state_mut().show_bottom = true;
+                    shot(&mut h, &format!("3{}-bottom-{b:?}", i + 1).to_lowercase());
+                }
+                h.state_mut().bottom = Bottom::Problems;
+                if width as u32 == 1600 {
+                    h.get_by_label("Help").click();
+                    shot(&mut h, "4-help-menu");
+                    key(&mut h, Modifiers::NONE, Key::Escape);
+                    key(&mut h, Modifiers::COMMAND, Key::O);
+                    type_text(&mut h, "Card");
+                    shot(&mut h, "5-search");
+                    key(&mut h, Modifiers::NONE, Key::Escape);
+                }
+            }
+        }
+    }
+}
