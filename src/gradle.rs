@@ -200,12 +200,10 @@ fn matches_preview(file: &str, name: &str) -> bool {
     })
 }
 
-pub const SETUP_HELP: &str = "This module has no preview screenshot tool.\n\n\
-Add one of these to the module's build.gradle.kts, then press Render again:\n\
-- Google's Compose Preview Screenshot Testing plugin, id \"com.android.compose.screenshot\".\n  \
-It renders the @Preview functions in src/screenshotTest. Setup and newest version:\n  \
-https://developer.android.com/studio/preview/compose-screenshot-testing\n\
-- Paparazzi (app.cash.paparazzi) or Roborazzi (io.github.takahirom.roborazzi).";
+pub const SETUP_HELP: &str = "Pictures of these previews need a screenshot tool in this module: \
+Google's Compose Preview Screenshot Testing plugin (com.android.compose.screenshot), Paparazzi or \
+Roborazzi. Add one to the module's build.gradle.kts, then press Render. Until then, use \
+\u{201c}Run preview on the device\u{201d} above each @Preview.";
 
 #[cfg(test)]
 mod tests {

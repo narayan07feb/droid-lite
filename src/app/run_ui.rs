@@ -117,7 +117,8 @@ impl App {
     }
 
     /// The device picker and ▶ App, in the toolbar (right to left).
-    pub(super) fn run_controls(&mut self, ui: &mut Ui) {
+    /// The run group, right to left: App, device, build variant, capture. `combo_w`: picker width.
+    pub(super) fn run_controls(&mut self, ui: &mut Ui, combo_w: f32) {
         let busy = self.gradle.is_some() || self.run.launching.is_some();
         if crate::theme::button(
             ui,
@@ -135,9 +136,11 @@ impl App {
             .as_ref()
             .and_then(|s| self.logcat.devices().iter().find(|d| &d.serial == s))
             .map_or_else(|| "No device".to_string(), |d| d.label.clone());
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let shown = crate::theme::elide(ui, &current, &font, combo_w - 30.0);
         let r = egui::ComboBox::from_id_salt("run_device")
-            .selected_text(current)
-            .width(170.0)
+            .selected_text(shown)
+            .width(combo_w)
             .show_ui(ui, |ui| {
                 let devices = self.logcat.devices().to_vec();
                 if devices.is_empty() {

@@ -3510,3 +3510,38 @@ fn e2e_ux_audit() {
         }
     }
 }
+
+#[test]
+fn e2e_toolbar_items_never_overlap_at_any_width() {
+    let f = Fixture::new("toolbar");
+    for width in [1024.0, 1280.0, 1600.0, 1920.0] {
+        let root = f.root.clone();
+        let mut h = Harness::builder()
+            .with_size([width, 900.0])
+            .build_eframe(move |cc| App::new(cc, Some(root)));
+        wait(&mut h, "index", |a| a.indexing.is_none() && a.index.symbol_count() > 0);
+        h.state_mut().branch =
+            Some("narayansoni/gro-13003-android-remove-india-p2p-screens-and-rename-shared-p2p".into());
+        steps(&mut h, 6); // the layout uses the widths of the last frame
+        let mut rects = Vec::new();
+        for label in ["Refactor", "Help", "»", "Search", "Gradle task", "Run task", "Run device", "App"] {
+            if let Some(n) = h.query_by_label(label) {
+                rects.push((label, n.rect()));
+            }
+        }
+        assert!(
+            rects.iter().any(|(l, _)| *l == "Refactor") || rects.iter().any(|(l, _)| *l == "»"),
+            "{width}: the menus are shown, in the bar or in »"
+        );
+        for (i, (a, ra)) in rects.iter().enumerate() {
+            assert!(ra.right() <= width + 0.5, "{width}: {a} goes past the window edge ({ra:?})");
+            for (b, rb) in &rects[i + 1..] {
+                assert!(!ra.intersects(*rb), "{width}: {a} {ra:?} overlaps {b} {rb:?}");
+            }
+        }
+        // where it does not fit, the long branch name is shortened instead of pushing the rest
+        if width <= 1600.0 {
+            assert!(h.query_by_label_contains("rename-shared-p2p").is_none(), "{width}: the branch name is elided");
+        }
+    }
+}

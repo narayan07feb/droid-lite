@@ -1834,15 +1834,49 @@ impl App {
 
     /// Three groups, like Android Studio's new UI: project and navigation on the left, search in
     /// the middle, Gradle task and device runs on the right.
+    /// The toolbar: project, branch, back/forward and the menus on the left, the search box in the
+    /// middle, the Gradle task and the run group on the right. Nothing ever overlaps: the widths of
+    /// the last frame decide what fits. When the window is narrow, first the branch name is
+    /// shortened (…, full name on hover), then the search box, then Refactor and Help move into a
+    /// "»" menu, then the search box goes (⌘O still opens it).
     fn top_bar(&mut self, ui: &mut Ui) {
+        const GAP: f32 = 4.0;
+        const NAV_W: f32 = 2.0 * 26.0 + GAP + 6.0;
+        const MORE_W: f32 = 30.0;
+        const SEARCH_MIN: f32 = 150.0;
+        const SEARCH_MAX: f32 = 260.0;
+        const BRANCH_MIN: f32 = 60.0;
+        let bar = ui.available_rect_before_wrap();
+        let id = |k: &str| egui::Id::unique(("top_bar_width", k));
+        let last = |ui: &Ui, k: &str, default: f32| ui.data(|d| d.get_temp(id(k))).unwrap_or(default);
+        let right_w = last(ui, "right", 560.0);
+        let menus_w = last(ui, "menus", 120.0);
+        let free = bar.width() - right_w - 16.0;
+        let name = self
+            .project
+            .as_ref()
+            .map_or("Open project…".to_string(), |p| p.name.clone());
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let project = theme::elide(ui, &name, &font, 180.0);
+        let project_w = theme::text_width(ui, &format!("{}  {project}  ▾", ic::FOLDER_OPEN), &font) + 16.0;
+        let base = project_w + NAV_W + 4.0 * GAP;
+        let menus_fit = free - base - menus_w - SEARCH_MIN - BRANCH_MIN >= 0.0;
+        let menus_used = if menus_fit { menus_w } else { MORE_W };
+        let room = free - base - menus_used - 2.0 * GAP;
+        // the branch keeps up to 200 pt of its name before the search box gives up its own room
+        let branch_want = self.branch.as_deref().map_or(0.0, |b| {
+            (theme::text_width(ui, &format!("{}  {b}", ic::GIT_BRANCH), &font) + 16.0).min(200.0)
+        });
+        let search_w = if room - BRANCH_MIN >= SEARCH_MIN {
+            (room - branch_want).clamp(SEARCH_MIN, SEARCH_MAX)
+        } else {
+            0.0
+        };
+        let branch_max = room - search_w - 8.0;
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let name = self
-                .project
-                .as_ref()
-                .map_or("Open project…".to_string(), |p| p.name.clone());
+            ui.spacing_mut().item_spacing.x = GAP;
             ui.menu_button(
-                RichText::new(format!("{}  {name}  ▾", ic::FOLDER_OPEN)).strong(),
+                RichText::new(format!("{}  {project}  ▾", ic::FOLDER_OPEN)).strong(),
                 |ui| {
                     if ui.button("Translations…").clicked() {
                         ui.close();
@@ -1870,15 +1904,22 @@ impl App {
                 },
             )
             .response
-            .on_hover_text("Open a project, or a second one in a new window");
-            if let Some(b) = self.branch.clone()
-                && theme::button(ui, true, format!("{}  {b}", ic::GIT_BRANCH))
-                    .on_hover_text("Show this branch's changes")
+            .on_hover_text(format!("{name}\nOpen a project, or a second one in a new window"));
+            if let Some(b) = self.branch.clone() {
+                let shown = if branch_max >= BRANCH_MIN {
+                    let text = theme::elide(ui, &b, &font, branch_max - 30.0);
+                    format!("{}  {text}", ic::GIT_BRANCH)
+                } else {
+                    ic::GIT_BRANCH.to_string()
+                };
+                if theme::button(ui, true, shown)
+                    .on_hover_text(format!("{b}\nShow this branch's changes"))
                     .clicked()
-            {
-                self.right = Right::PullRequest;
-                self.show_right = true;
-                self.focus = false;
+                {
+                    self.right = Right::PullRequest;
+                    self.show_right = true;
+                    self.focus = false;
+                }
             }
             ui.add_space(6.0);
             if theme::button(ui, !self.history.is_empty(), ic::ARROW_LEFT)
@@ -1893,33 +1934,44 @@ impl App {
             {
                 self.fwd();
             }
-            self.refactor_menu(ui);
-            self.help_menu(ui);
-            // search box in the middle of the window, moved left when the run group needs the room
-            // (its width is known from the last frame)
-            let w = 260.0;
-            let right_id = egui::Id::unique("top_bar_right_width");
-            let right_w: f32 = ui.data(|d| d.get_temp(right_id)).unwrap_or(0.0);
-            let left = (ui.max_rect().center().x - w / 2.0)
-                .min(ui.max_rect().right() - right_w - 16.0 - w);
-            ui.add_space((left - ui.cursor().left()).max(8.0));
-            if search_box(ui, w)
-                .on_hover_text("Go to class  ⌘O\nGo to file  ⇧⌘O\nSearch everywhere  ⇧⇧")
-                .clicked()
-            {
-                self.search = Some(Search {
-                    kind: SearchKind::Everywhere,
-                    query: String::new(),
-                    hits: Vec::new(),
-                    selected: 0,
-                    stale: true,
-                    pinned: Vec::new(),
-                    title: None,
-                });
+            if menus_fit {
+                let x = ui.cursor().left();
+                self.refactor_menu(ui);
+                self.help_menu(ui);
+                let w = ui.cursor().left() - x;
+                ui.data_mut(|d| d.insert_temp(id("menus"), w));
+            } else {
+                ui.menu_button("»", |ui| {
+                    self.refactor_menu(ui);
+                    self.help_menu(ui);
+                })
+                .response
+                .on_hover_text("Refactor and Help (the window is too narrow to show them)");
+            }
+            if search_w > 0.0 {
+                // in the middle of the window when there is room, else right after the menus
+                let left = (bar.center().x - search_w / 2.0).min(bar.right() - right_w - 16.0 - search_w);
+                ui.add_space((left - ui.cursor().left()).max(8.0));
+                if search_box(ui, search_w)
+                    .on_hover_text("Go to class  ⌘O\nGo to file  ⇧⌘O\nSearch everywhere  ⇧⇧")
+                    .clicked()
+                {
+                    self.search = Some(Search {
+                        kind: SearchKind::Everywhere,
+                        query: String::new(),
+                        hits: Vec::new(),
+                        selected: 0,
+                        stale: true,
+                        pinned: Vec::new(),
+                        title: None,
+                    });
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.run_controls(ui);
-                ui.add_space(10.0);
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let combo_w = if bar.width() < 1500.0 { 120.0 } else { 170.0 };
+                self.run_controls(ui, combo_w);
+                ui.add_space(6.0);
                 if self.gradle.is_some() {
                     if theme::button(
                         ui,
@@ -1943,9 +1995,10 @@ impl App {
                     let t = self.gradle_task.clone();
                     self.run_gradle(t, &ui.ctx().clone());
                 }
+                let task = theme::elide(ui, &self.gradle_task, &font, combo_w - 40.0);
                 let r = egui::ComboBox::from_id_salt("gradle_task")
-                    .selected_text(format!("{}  {}", ic::WRENCH, self.gradle_task))
-                    .width(170.0)
+                    .selected_text(format!("{}  {task}", ic::WRENCH))
+                    .width(combo_w)
                     .show_ui(ui, |ui| {
                         for t in [
                             "assembleDebug",
@@ -1969,7 +2022,7 @@ impl App {
                     });
                 run_ui::name_combo(&r.response, "Gradle task");
                 let used = ui.min_rect().width();
-                ui.data_mut(|d| d.insert_temp(right_id, used));
+                ui.data_mut(|d| d.insert_temp(id("right"), used));
             });
         });
     }
@@ -3216,12 +3269,18 @@ impl App {
                         .id_salt("composables")
                         .max_height(220.0)
                         .show(ui, |ui| {
+                            let font = egui::TextStyle::Body.resolve(ui.style());
                             for d in &composables {
-                                let mut label = RichText::new(&d.name).monospace();
-                                if d.is_preview() {
-                                    label = label.italics();
-                                }
-                                if ui.selectable_label(d.name == current, label).clicked() {
+                                // one font for the list; a preview gets the image icon, and a long name ends
+                                // in "…" (full name on hover) instead of breaking mid-word
+                                let icon = if d.is_preview() { ic::IMAGE } else { ic::CUBE };
+                                let room = ui.available_width() - 34.0;
+                                let label = format!("{icon}  {}", theme::elide(ui, &d.name, &font, room));
+                                if ui
+                                    .selectable_label(d.name == current, label)
+                                    .on_hover_text(&d.name)
+                                    .clicked()
+                                {
                                     pick = Some(d.name.clone());
                                     jump = Some(d.offset);
                                 }
@@ -3287,8 +3346,10 @@ impl App {
                 if previews.is_empty() {
                     ui.label(RichText::new("No @Preview functions in this file.").weak());
                 }
+                let font = egui::TextStyle::Body.resolve(ui.style());
                 for p in &previews {
-                    if ui.link(RichText::new(p).monospace()).clicked() {
+                    let room = ui.available_width() - 8.0;
+                    if ui.link(theme::elide(ui, p, &font, room)).on_hover_text(p).clicked() {
                         jump = tab
                             .syms
                             .decls
@@ -3322,7 +3383,12 @@ impl App {
                         }
                     }
                     None if !previews.is_empty() => {
-                        ui.label(RichText::new(gradle::SETUP_HELP).small());
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(gradle::SETUP_HELP).weak());
+                        ui.hyperlink_to(
+                            "Setup and newest version",
+                            "https://developer.android.com/studio/preview/compose-screenshot-testing",
+                        );
                     }
                     _ => {}
                 }
@@ -4114,13 +4180,22 @@ fn texture(
     Some(h)
 }
 
+/// One UI tree row, in the UI font. A leaf leaves the room of the ▸ arrow empty, so it lines up with
+/// the names of headers at the same level instead of with their arrows.
 fn node_ui(ui: &mut Ui, n: &compose::Node, jump: &mut Option<usize>) {
+    let font = egui::TextStyle::Body.resolve(ui.style());
     if n.children.is_empty() {
-        if ui.link(RichText::new(&n.name).monospace()).clicked() {
-            *jump = Some(n.offset);
-        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().interact_size.y = 0.0; // as tall as a header row, not a button
+            ui.add_space(ui.spacing().icon_width + ui.spacing().icon_spacing - ui.spacing().item_spacing.x);
+            let room = ui.available_width() - 8.0;
+            if ui.link(theme::elide(ui, &n.name, &font, room)).on_hover_text(&n.name).clicked() {
+                *jump = Some(n.offset);
+            }
+        });
     } else {
-        let r = egui::CollapsingHeader::new(RichText::new(&n.name).monospace())
+        let room = ui.available_width() - 30.0;
+        let r = egui::CollapsingHeader::new(theme::elide(ui, &n.name, &font, room))
             .id_salt(n.offset)
             .default_open(true)
             .show(ui, |ui| {
