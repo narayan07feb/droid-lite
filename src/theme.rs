@@ -434,7 +434,9 @@ mod tests {
                 time: Some(time),
                 ..Default::default()
             };
-            let _ = ctx.run_ui(input, |ui| v = super::ease(ui.ctx(), id, target, 0.2));
+            ctx.run_ui(input, |ui| v = super::ease(ui.ctx(), id, target, 0.2))
+                .textures_delta
+                .clear(); // no renderer here to take the font texture
             v
         };
         assert_eq!(at(0.0, 0.0), 0.0);

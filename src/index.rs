@@ -248,11 +248,21 @@ impl Index {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut queue = std::collections::VecDeque::from([name.to_string()]);
+        let fun_interface = self
+            .named(name)
+            .any(|(_, _, d)| d.kind == Kind::Interface && d.has_modifier("fun"));
         while let Some(n) = queue.pop_front() {
             for p in self.subtypes.get(&n).into_iter().flatten() {
                 let Some((p, f)) = self.files.get_key_value(&**p) else {
                     continue;
                 };
+                if fun_interface && n == name {
+                    for &(_, at) in f.sams.iter().filter(|(s, _)| **s == *n) {
+                        if seen.insert((p.clone(), at)) {
+                            out.push(sam_hit(p, f, &n, at));
+                        }
+                    }
+                }
                 for d in f
                     .decls
                     .iter()
@@ -474,10 +484,26 @@ fn supers_of(f: &FileSyms) -> Vec<String> {
         .decls
         .iter()
         .flat_map(|d| d.supers.iter().cloned())
+        .chain(f.sams.iter().map(|(n, _)| n.to_string()))
         .collect();
     v.sort_unstable();
     v.dedup();
     v
+}
+
+/// A `Name { … }` lambda, named after the declaration it is in.
+fn sam_hit(p: &Path, f: &FileSyms, name: &str, at: usize) -> Hit {
+    let inside = f.decls.iter().rfind(|d| d.offset < at);
+    Hit {
+        name: match inside {
+            Some(d) => format!("{name} {{ }} in {}", d.name),
+            None => format!("{name} {{ }}"),
+        },
+        detail: inside.map_or(String::new(), |d| describe(f, d)),
+        path: p.to_path_buf(),
+        offset: at,
+        score: 0,
+    }
 }
 
 fn hit(p: &Path, f: &FileSyms, d: &Decl) -> Hit {
@@ -734,6 +760,39 @@ mod tests {
         assert_eq!(m, vec!["Impl.load", "Other.load"]);
         i.remove(Path::new("/p/Impl.kt"));
         assert_eq!(names(i.implementations("Api")), vec!["Base"]);
+    }
+
+    #[test]
+    fn fun_interface_is_implemented_by_its_lambdas() {
+        let mut i = Index::default();
+        i.update(
+            Path::new("/p/V.kt"),
+            "internal fun interface ScreenValidator {\n    fun validate(s: Int): Int\n}\n\nfun validator(): ScreenValidator = ScreenValidator { s ->\n    s\n}\n",
+        );
+        i.update(
+            Path::new("/p/Use.kt"),
+            "fun run() {\n    load(ScreenValidator { it })\n    if (x) { }\n    ScreenValidator { }\n}\ninterface Plain\nval p = Plain { }\n",
+        );
+        let d = i.named("ScreenValidator").next().unwrap().2;
+        assert_eq!(d.kind, Kind::Interface, "`fun interface` is a declaration");
+        assert!(d.has_modifier("fun"));
+        let mut impls: Vec<String> = i
+            .implementations("ScreenValidator")
+            .into_iter()
+            .map(|h| h.name)
+            .collect();
+        impls.sort();
+        assert_eq!(
+            impls,
+            [
+                "ScreenValidator { } in run",
+                "ScreenValidator { } in validator"
+            ]
+        );
+        assert!(
+            i.implementations("Plain").is_empty(),
+            "only a `fun interface` has lambda implementations"
+        );
     }
 
     #[test]
