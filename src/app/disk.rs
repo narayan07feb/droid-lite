@@ -64,6 +64,17 @@ impl App {
     }
 
     fn apply_disk_changes(&mut self, changes: Vec<DiskChange>, ctx: &egui::Context) {
+        if let Some(l) = self.lsp.as_mut() {
+            let watched: Vec<(PathBuf, u8)> = changes
+                .iter()
+                .filter_map(|c| match c {
+                    DiskChange::File(p, _, Some(_)) => Some((p.clone(), 2)),
+                    DiskChange::Gone(p) => Some((p.clone(), 3)),
+                    DiskChange::File(..) => None,
+                })
+                .collect();
+            l.files_changed(&watched);
+        }
         let mut tree_dirty = false;
         let mut reports = false;
         for change in changes {

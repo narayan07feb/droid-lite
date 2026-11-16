@@ -655,6 +655,32 @@ fn e2e_kotlin_lsp_completion_diagnostics_definition_rename() {
     wait(&mut h, "lsp references", |a| {
         a.found.len() == 2 && a.status.contains("kotlin-lsp")
     });
+    steps(&mut h, 5);
+    assert!(
+        h.state().found.iter().all(|l| !l.path.ends_with("Gone.kt")),
+        "a place the server knows in a deleted file is dropped"
+    );
+    // a file deleted on disk is reported to the server
+    std::fs::remove_file(&card).unwrap();
+    wait(&mut h, "server told of the delete", |a| {
+        a.tabs
+            .iter()
+            .any(|t| t.path == card && t.diagnostics.iter().any(|d| d.2 == "watched 3"))
+    });
+    // its tab stays open, but its places no longer count as references
+    wait(&mut h, "tab marked deleted", |a| {
+        a.tabs.iter().any(|t| t.path == card && t.deleted)
+    });
+    h.state_mut().found.clear();
+    place_cursor(&mut h, "user.name", 1);
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::G);
+    wait(&mut h, "search done", |a| a.find_rx.is_none());
+    steps(&mut h, 20);
+    assert!(
+        h.state().found.iter().all(|l| l.path != card),
+        "{:?}",
+        h.state().found.iter().map(|l| &l.path).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -862,9 +888,14 @@ fn e2e_find_references_lists_code_and_xml_not_strings() {
         let font = egui::FontId::monospace(crate::theme::font_size());
         let step =
             h.ctx.fonts_mut(|f| f.row_height(&font)) + h.ctx.global_style().spacing.item_spacing.y;
+        // the result rows, not the links above the code
+        let editor = h
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .rect();
         let rows: Vec<f32> = h
             .get_all_by_role(egui::accesskit::Role::Link)
             .map(|n| n.rect().center().y)
+            .filter(|&y| y > editor.bottom())
             .collect();
         assert!(rows.len() >= 3, "{rows:?}");
         for w in rows.windows(2) {
@@ -999,14 +1030,49 @@ fn click_at(h: &mut Harness<'static, App>, pos: egui::Pos2, button: egui::Pointe
 }
 
 /// The link rows above the active editor's lines: (line, texts).
+/// Screen y of the middle of `line` (0-based) in the active editor, link rows included.
+fn line_y(h: &Harness<'static, App>, editor: egui::Rect, line: usize) -> f32 {
+    let font = egui::FontId::monospace(crate::theme::font_size());
+    let row_h = h.ctx.fonts_mut(|f| f.row_height(&font));
+    let rows = &tab(h)
+        .cache
+        .as_ref()
+        .unwrap()
+        .shown
+        .as_ref()
+        .unwrap()
+        .1
+        .rows;
+    editor.top() + rows[line].pos.y + row_h * 0.5
+}
+
+/// The links of the active tab, as (line, full words). Usage counts arrive in the background
+/// and are left out (`usage_links` reads them).
 fn lenses(h: &Harness<'static, App>) -> Vec<(usize, Vec<String>)> {
+    link_items(h, false)
+        .into_iter()
+        .map(|(l, i)| (l, i.into_iter().map(|(_, tip)| tip).collect()))
+        .filter(|(_, i): &(usize, Vec<String>)| !i.is_empty())
+        .collect()
+}
+
+/// (line, [(shown, full words)]) of the usage links, or of all the others.
+fn link_items(h: &Harness<'static, App>, usages: bool) -> Vec<(usize, Vec<(String, String)>)> {
     tab(h)
         .annotations
         .as_ref()
         .unwrap()
         .lenses
         .iter()
-        .map(|l| (l.line, l.items.iter().map(|i| i.text.clone()).collect()))
+        .map(|l| {
+            let items = l
+                .items
+                .iter()
+                .filter(|i| i.text.starts_with(ic::LINK_SIMPLE) == usages)
+                .map(|i| (i.text.clone(), i.tip.clone()))
+                .collect();
+            (l.line, items)
+        })
         .collect()
 }
 
@@ -1020,6 +1086,80 @@ fn click_link(h: &mut Harness<'static, App>, label: &str, lowest: bool) {
     };
     let p = r.unwrap_or_else(|| panic!("no link {label}")).center();
     click_at(h, p, egui::PointerButton::Primary);
+}
+
+#[test]
+fn e2e_usage_counts_above_declarations() {
+    let f = Fixture::new("usage-links");
+    let write = |rel: &str, text: &str| std::fs::write(f.path(rel), text).unwrap();
+    write(
+        "app/src/main/java/com/demo/data/Dao.kt",
+        "package com.demo.data\n\nclass Dao {\n    fun insert(u: User) {}\n    fun unused() {}\n}\n\nclass Cache {\n    fun insert(k: String) {}\n}\n\nopen class Base {\n    open fun close() {}\n}\n\nclass Impl : Base() {\n    override fun close() {}\n}\n",
+    );
+    write(
+        "app/src/main/java/com/demo/data/Saver.kt",
+        "package com.demo.data\n\nclass Saver(private val dao: Dao, private val cache: Cache) {\n    fun save(u: User) {\n        dao.insert(u)\n        dao.insert(u)\n        cache.insert(\"k\")\n    }\n}\n",
+    );
+    let mut h = f.harness();
+    open(&mut h, &f.path("app/src/main/java/com/demo/data/Dao.kt"));
+    wait(&mut h, "usage counts", |a| a.decl_usages.is_some());
+    steps(&mut h, 3);
+    let link = |n: usize, tip: &str| vec![(format!("{}  {n}", ic::LINK_SIMPLE), tip.to_string())];
+    assert_eq!(
+        link_items(&h, true)
+            .into_iter()
+            .filter(|(_, i)| !i.is_empty())
+            .collect::<Vec<_>>(),
+        [
+            (2, link(1, "1 usage")),   // class Dao: the Saver parameter
+            (3, link(2, "2 usages")),  // Dao.insert, not Cache.insert
+            (4, link(0, "No usages")), // unused
+            (7, link(1, "1 usage")),   // class Cache
+            (8, link(1, "1 usage")),   // Cache.insert
+            (11, link(1, "1 usage")),  // open class Base: Impl extends it
+            (12, link(0, "No usages")),
+            (15, link(0, "No usages")), // and none on Impl's override
+        ]
+    );
+    // a click lists the places
+    click_link(&mut h, "2 usages", false);
+    steps(&mut h, 3);
+    let s = h.state().search.as_ref().unwrap();
+    assert_eq!(s.title.as_deref(), Some("Usages of insert"));
+    let mut places: Vec<&str> = s.pinned.iter().map(|x| x.detail.as_str()).collect();
+    places.sort();
+    assert_eq!(
+        places,
+        [
+            "app/src/main/java/com/demo/data/Saver.kt:5",
+            "app/src/main/java/com/demo/data/Saver.kt:6"
+        ]
+    );
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    // a new use, saved or not, is counted after the edit settles
+    open(&mut h, &f.path("app/src/main/java/com/demo/data/Saver.kt"));
+    steps(&mut h, 3);
+    let on_class_line: Vec<_> = link_items(&h, true)
+        .into_iter()
+        .filter(|(l, _)| *l == 2)
+        .flat_map(|(_, i)| i)
+        .collect();
+    assert_eq!(
+        on_class_line.len(),
+        1,
+        "one count for `class Saver(val dao, val cache)`"
+    );
+    place_cursor(&mut h, "cache.insert", 0);
+    type_text(&mut h, "dao.unused(); ");
+    h.state_mut().settle(true);
+    open(&mut h, &f.path("app/src/main/java/com/demo/data/Dao.kt"));
+    wait(&mut h, "recount", |a| {
+        a.decl_usages.as_ref().is_some_and(|u| {
+            u.by_decl
+                .get(&(Some("Dao".to_string()), "unused".to_string()))
+                .is_some_and(|v| v.len() == 1)
+        })
+    });
 }
 
 #[test]
@@ -1048,6 +1188,27 @@ fn e2e_links_above_declarations_implementations_and_overrides() {
         h.get_all_by_label("Implemented in 2 classes").count(),
         2,
         "links are drawn"
+    );
+    // they show an icon and a count or name; the words are the hover tip
+    let shown: Vec<Vec<String>> = link_items(&h, false)
+        .into_iter()
+        .map(|(_, i)| i.into_iter().map(|(text, _)| text).collect())
+        .filter(|i: &Vec<String>| !i.is_empty())
+        .collect();
+    let (down, up) = (
+        |s: &str| format!("{}  {s}", ic::ARROW_DOWN),
+        |s: &str| format!("{}  {s}", ic::ARROW_UP),
+    );
+    assert_eq!(
+        shown,
+        [
+            vec![down("2")],
+            vec![down("2")],
+            vec![up("Repo")],
+            vec![up("Repo.load")],
+            vec![up("Repo")],
+            vec![up("Repo.load")],
+        ]
     );
     // the links sit in their own row: the code lines below them move down
     let rows = &tab(&h)
@@ -1090,15 +1251,9 @@ fn e2e_right_click_menu_runs_commands() {
     let editor = h
         .get_by_role(egui::accesskit::Role::MultilineTextInput)
         .rect();
-    let ctx = h.ctx.clone();
-    let row_h =
-        ctx.fonts_mut(|f| f.row_height(&egui::FontId::monospace(crate::theme::font_size())));
     // right-click on line 9 (`Text(user.name)`) moves the cursor there and opens the menu
-    click_at(
-        &mut h,
-        egui::pos2(editor.left() + 120.0, editor.top() + row_h * 8.5),
-        egui::PointerButton::Secondary,
-    );
+    let pos = egui::pos2(editor.left() + 120.0, line_y(&h, editor, 8));
+    click_at(&mut h, pos, egui::PointerButton::Secondary);
     for label in [
         "Go to declaration",
         "Go to implementations",
@@ -1210,9 +1365,9 @@ fn e2e_cmd_hover_shows_declaration_and_usages() {
         .rect();
     let ctx = h.ctx.clone();
     let font = egui::FontId::monospace(crate::theme::font_size());
-    let (row_h, char_w) = ctx.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
+    let char_w = ctx.fonts_mut(|f| f.glyph_width(&font, '0'));
     // "fun UserCard(user: User" : hover the type `User` at column 20 of line 6 with ⌘ held
-    let pos = egui::pos2(editor.left() + char_w * 21.5, editor.top() + row_h * 5.5);
+    let pos = egui::pos2(editor.left() + char_w * 21.5, line_y(&h, editor, 5));
     h.event(Event::PointerMoved(pos));
     h.event(Event::ModifiersChanged(Modifiers::COMMAND));
     for _ in 0..80 {
@@ -1633,9 +1788,9 @@ fn e2e_ctrl_and_cmd_click_open_the_declaration() {
             .rect();
         let ctx = h.ctx.clone();
         let font = egui::FontId::monospace(crate::theme::font_size());
-        let (row_h, char_w) = ctx.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
+        let char_w = ctx.fonts_mut(|f| f.glyph_width(&font, '0'));
         // the type `User` in "fun UserCard(user: User, …)" on line 6
-        let pos = egui::pos2(editor.left() + char_w * 21.5, editor.top() + row_h * 5.5);
+        let pos = egui::pos2(editor.left() + char_w * 21.5, line_y(&h, editor, 5));
         h.event(Event::ModifiersChanged(mods));
         h.event(Event::PointerMoved(pos));
         steps(&mut h, 2);
@@ -1806,9 +1961,9 @@ fn e2e_android_resources_catalog_and_swatches() {
         .rect();
     let ctx = h.ctx.clone();
     let font = egui::FontId::monospace(crate::theme::font_size());
-    let (row_h, char_w) = ctx.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
+    let char_w = ctx.fonts_mut(|f| f.glyph_width(&font, '0'));
     let col = "    val name = stringResource(R.string.".len() as f32 + 2.0;
-    let pos = egui::pos2(editor.left() + char_w * col, editor.top() + row_h * 3.5);
+    let pos = egui::pos2(editor.left() + char_w * col, line_y(&h, editor, 3));
     h.event(Event::ModifiersChanged(Modifiers::COMMAND));
     h.event(Event::PointerMoved(pos));
     steps(&mut h, 30);
@@ -2525,7 +2680,7 @@ fn e2e_run_app_and_preview_on_a_device() {
     let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
     open(&mut h, &card);
     steps(&mut h, 3);
-    let run = format!("{}  Run preview on the device", ic::PLAY);
+    let run = "Run preview on the device".to_string();
     // above `@Preview`, not the fun line under it
     assert!(
         lenses(&h).contains(&(12, vec![run.clone()])),
@@ -2807,8 +2962,7 @@ fn e2e_plugin_tests_tab_runs_cases_from_list_gutter_views_and_actions() {
     let login = f.path("flows/login.yaml");
     h.state_mut().open_file(&login, None);
     steps(&mut h, 3);
-    h.get_by_label_contains(&format!("{}  Run a case: ", ic::PLAY))
-        .click();
+    h.get_by_label_contains("Run a case: ").click();
     steps(&mut h, 3);
     assert_eq!(h.state().tests.only.len(), 2);
     h.get_by_label("Cases on this line");
@@ -2829,8 +2983,7 @@ fn e2e_plugin_tests_tab_runs_cases_from_list_gutter_views_and_actions() {
     h.state_mut().open_file(&f.path("flows/solo.yaml"), None);
     steps(&mut h, 3);
     h.state_mut().tests.plugins[0].status.clear();
-    h.get_by_label(&format!("{}  Run solo case", ic::PLAY))
-        .click();
+    h.get_by_label("Run solo case").click();
     steps(&mut h, 2);
     wait(&mut h, "gutter run", |a| {
         a.tests.plugins[0].run.is_none() && a.tests.plugins[0].status.contains_key("solo")
@@ -3068,7 +3221,7 @@ fn e2e_kotlin_android_helpers_fixes_templates_new_file_variants_tests_and_manife
     key(&mut h, Modifiers::COMMAND, Key::Num4);
     assert!(!h.state().show_bottom);
     open(&mut h, &f.path("app/src/test/java/com/demo/MathTest.kt"));
-    h.get_by_label(&format!("{}  Run test", ic::PLAY)).click();
+    h.get_by_label("Run test").click();
     wait(&mut h, "gradle", |a| {
         a.gradle.is_none()
             && !a.console.is_empty()
@@ -3080,7 +3233,7 @@ fn e2e_kotlin_android_helpers_fixes_templates_new_file_variants_tests_and_manife
     );
     steps(&mut h, 2);
     h.get_by_label_contains("Tests passed in");
-    h.get_by_label(&format!("{}  Run all tests", ic::PLAY));
+    h.get_by_label("Run all tests");
 
     // the launcher Activity links to its manifest entry
     open(
@@ -3347,6 +3500,50 @@ fn e2e_hilt_links_lint_in_problems_translations_emulator_and_deep_links() {
 }
 
 #[test]
+fn e2e_usages_drop_a_file_deleted_on_disk() {
+    let f = Fixture::new("deleted-use");
+    let write = |rel: &str, text: &str| std::fs::write(f.path(rel), text).unwrap();
+    write(
+        "app/src/main/java/com/demo/data/Dao.kt",
+        "package com.demo.data\n\ninterface Dao {\n    fun insert(u: User)\n}\n",
+    );
+    for name in ["A", "B"] {
+        write(
+            &format!("app/src/main/java/com/demo/data/{name}.kt"),
+            &format!(
+                "package com.demo.data\n\nclass {name}(val dao: Dao) {{\n    fun go(u: User) = dao.insert(u)\n}}\n"
+            ),
+        );
+    }
+    let mut h = f.harness();
+    let b = f.path("app/src/main/java/com/demo/data/B.kt");
+    open(&mut h, &b);
+    let at = tab(&h).text.find("dao.insert").unwrap() + 4;
+    let count = |h: &mut Harness<'static, App>| {
+        for _ in 0..500 {
+            if let Some(v) = h.state_mut().usages_of("insert", at) {
+                let mut v: Vec<String> = v.iter().map(|l| l.path.display().to_string()).collect();
+                v.sort();
+                return v;
+            }
+            steps(h, 1);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("no usages");
+    };
+    assert_eq!(count(&mut h).len(), 3, "the declaration, A and B");
+    std::fs::remove_file(f.path("app/src/main/java/com/demo/data/A.kt")).unwrap();
+    wait(&mut h, "the delete is seen", |a| {
+        a.project
+            .as_ref()
+            .is_some_and(|p| p.files.iter().all(|x| !x.ends_with("A.kt")))
+    });
+    let left = count(&mut h);
+    assert!(left.iter().all(|p| !p.ends_with("A.kt")), "{left:?}");
+    assert_eq!(left.len(), 2);
+}
+
+#[test]
 fn e2e_usages_of_a_member_skip_same_named_members_of_other_classes() {
     let f = Fixture::new("same-name");
     let write = |rel: &str, text: &str| {
@@ -3435,4 +3632,20 @@ fn e2e_usages_of_a_member_skip_same_named_members_of_other_classes() {
             ("fun [put](u: User)".to_string(), false),
         ]
     );
+    // an unsaved use counts too: the count reads open tabs, not the files on disk
+    h.state_mut().refactor = None;
+    open(&mut h, &saver);
+    place_cursor(&mut h, "cache.insert", 0);
+    type_text(&mut h, "cache.insert(\"j\"); ");
+    h.state_mut().settle(true);
+    let at = tab(&h).text.find("cache.insert").unwrap() + 6;
+    for _ in 0..500 {
+        if h.state_mut().usages_of("insert", at).is_some() {
+            break;
+        }
+        steps(&mut h, 1);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let found = h.state_mut().usages_of("insert", at).unwrap().len();
+    assert_eq!(found, 3, "the unsaved cache.insert(\"j\") is counted");
 }

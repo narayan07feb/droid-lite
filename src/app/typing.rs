@@ -4,6 +4,7 @@ use super::{App, FoundLine, found_line, word_bounds};
 use crate::edit;
 use crate::project::is_code;
 use egui::{Event, Key, Modifiers, RichText, Ui};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::channel;
 
@@ -100,19 +101,30 @@ impl App {
             Some(t) => format!("{word}\u{0}{}:{}", t.path.display(), t.offset),
             None => word.to_string(),
         };
-        if !self.usages.contains_key(&key) {
+        // an answer from before the last edit or disk change is stale
+        if self.usages.get(&key).is_none_or(|(g, _)| *g != index_gen) {
             self.usages.insert(key.clone(), (index_gen, None));
             let files: Vec<PathBuf> = self
                 .project
                 .as_ref()
                 .map(|p| p.files.iter().filter(|f| is_code(f)).cloned().collect())
                 .unwrap_or_default();
+            // open tabs count as they are now, saved or not
+            let open: HashMap<PathBuf, String> = self
+                .tabs
+                .iter()
+                .map(|t| (t.path.clone(), t.text.clone()))
+                .collect();
             let (tx, rx) = channel();
             let (w, k, c) = (word.to_string(), key.clone(), self.ctx.clone());
             std::thread::spawn(move || {
                 let mut found = Vec::new();
                 for f in files {
-                    let Ok(text) = std::fs::read_to_string(&f) else {
+                    let Some(text) = open
+                        .get(&f)
+                        .cloned()
+                        .or_else(|| std::fs::read_to_string(&f).ok())
+                    else {
                         continue;
                     };
                     let hits = crate::refactor::occurrences(&text, &w);

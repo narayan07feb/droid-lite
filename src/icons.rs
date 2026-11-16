@@ -50,3 +50,11 @@ pub const GEAR: &str = "\u{E270}";
 pub const BROADCAST: &str = "\u{E0F2}";
 pub const ROCKET: &str = "\u{E3FC}";
 pub const DATABASE: &str = "\u{E1DE}";
+/// Links above declarations: implementations, supertypes / overrides, Hilt, KMP, manifest.
+pub const ARROW_DOWN: &str = "\u{E03E}";
+pub const ARROW_UP: &str = "\u{E08E}";
+pub const SYRINGE: &str = "\u{E968}";
+pub const PLUGS_CONNECTED: &str = "\u{EB5A}";
+pub const DEVICES: &str = "\u{EBA4}";
+pub const ANDROID_LOGO: &str = "\u{E008}";
+pub const LINK_SIMPLE: &str = "\u{E2E6}";

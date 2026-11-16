@@ -18,6 +18,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// A link to related code: implementations, overrides, Kotlin Multiplatform expect / actual.
 struct Mark {
     line: usize,
+    /// Icon and a count or name, as the link shows it.
+    short: String,
     tip: String,
     targets: Vec<Hit>,
 }
@@ -45,7 +47,7 @@ pub(super) struct ParamHint {
 
 /// Annotations of one tab, rebuilt only when its text, the index or the reports change.
 pub(super) struct Annotations {
-    key: (u64, u64, u64),
+    key: (u64, u64, u64, u64),
     pub(super) badges: Vec<Badge>,
     /// Colour squares for lines that write a colour (`Color(0xFF…)`, `#RRGGBB`, `R.color.x`).
     pub(super) swatches: Vec<(usize, Color32)>,
@@ -53,9 +55,33 @@ pub(super) struct Annotations {
     pub(super) lenses: Vec<Lens>,
 }
 
+/// Where the open file's declarations are used, counted in the background.
+pub(super) struct DeclUsages {
+    /// File, text version and index generation it was counted for.
+    key: (std::path::PathBuf, u64, u64),
+    /// By container and name, so the counts stay on screen while a newer count runs.
+    pub(super) by_decl: HashMap<(Option<String>, String), Vec<Hit>>,
+}
+
+/// Whether a declaration gets a usages link: not overrides (their callers go through the
+/// base), previews or tests (nothing calls them).
+fn wants_usages(d: &crate::kotlin::Decl) -> bool {
+    (matches!(d.kind, Kind::Fun | Kind::Property) || d.kind.is_type() && d.name != "Companion")
+        && !d.has_modifier("override")
+        && !d.is_preview()
+        && !d.has_annotation("Test")
+}
+
+fn usage_key(d: &crate::kotlin::Decl) -> (Option<String>, String) {
+    (d.container.as_deref().map(String::from), d.name.clone())
+}
+
 /// One link above a line.
 pub(super) struct LensItem {
+    /// Icon and a count or name, as drawn.
     pub(super) text: String,
+    /// The full words, shown on hover and read by screen readers.
+    pub(super) tip: String,
     request: Request,
 }
 
@@ -68,13 +94,13 @@ pub(super) struct Lens {
 }
 
 impl Lens {
-    pub(super) fn new(line: usize, line_text: &str, items: Vec<(String, Request)>) -> Lens {
+    pub(super) fn new(line: usize, line_text: &str, items: Vec<(String, String, Request)>) -> Lens {
         Lens {
             line,
             indent: line_text.chars().take_while(|c| c.is_whitespace()).count(),
             items: items
                 .into_iter()
-                .map(|(text, request)| LensItem { text, request })
+                .map(|(text, tip, request)| LensItem { text, tip, request })
                 .collect(),
         }
     }
@@ -127,10 +153,16 @@ pub(super) enum Request {
 impl App {
     /// Builds the active tab's annotations when they are stale.
     pub(super) fn refresh_annotations(&mut self) {
+        self.count_decl_usages();
         let Some(t) = self.tabs.get(self.active) else {
             return;
         };
-        let key = (t.rev, self.index.generation, self.outputs_gen);
+        let key = (
+            t.rev,
+            self.index.generation,
+            self.outputs_gen,
+            self.decl_usages_gen,
+        );
         if t.annotations.as_ref().is_some_and(|a| a.key == key) {
             return;
         }
@@ -159,6 +191,7 @@ impl App {
                 sets.dedup();
                 marks.push(Mark {
                     line,
+                    short: format!("{}  {}", ic::DEVICES, sets.join(", ")),
                     tip: format!(
                         "{} in {}",
                         if expect { "Actual" } else { "Expected" },
@@ -186,6 +219,7 @@ impl App {
                     };
                     marks.push(Mark {
                         line,
+                        short: format!("{}  {}", ic::ARROW_UP, d.supers.join(", ")),
                         tip: format!("{verb} {}", d.supers.join(", ")),
                         targets: supers,
                     });
@@ -197,13 +231,17 @@ impl App {
                     } else {
                         "Subclassed by"
                     };
+                    // a `fun interface` is also implemented by `Name { … }` lambdas
+                    let what = match (d.has_modifier("fun"), impls.len()) {
+                        (true, 1) => "place",
+                        (true, _) => "places",
+                        (false, 1) => "class",
+                        (false, _) => "classes",
+                    };
                     marks.push(Mark {
                         line,
-                        tip: format!(
-                            "{verb} {} {}",
-                            impls.len(),
-                            if impls.len() == 1 { "class" } else { "classes" }
-                        ),
+                        short: format!("{}  {}", ic::ARROW_DOWN, impls.len()),
+                        tip: format!("{verb} {} {what}", impls.len()),
                         targets: impls,
                     });
                 }
@@ -214,6 +252,7 @@ impl App {
                     if let Some(h) = self.index.overridden(c, &d.name) {
                         marks.push(Mark {
                             line,
+                            short: format!("{}  {}", ic::ARROW_UP, h.name),
                             tip: format!("Overrides {}", h.name),
                             targets: vec![h],
                         });
@@ -223,6 +262,7 @@ impl App {
                     if !impls.is_empty() {
                         marks.push(Mark {
                             line,
+                            short: format!("{}  {}", ic::ARROW_DOWN, impls.len()),
                             tip: format!(
                                 "Implemented in {} {}",
                                 impls.len(),
@@ -295,27 +335,61 @@ impl App {
             .collect();
         // the links above each declaration, in this order: run, manifest, navigation, Hilt
         let lines: Vec<&str> = t.text.split('\n').collect();
-        let mut rows: BTreeMap<usize, Vec<(String, Request)>> = BTreeMap::new();
-        let mut add = |line: usize, text: String, request: Request| {
+        let mut rows: BTreeMap<usize, Vec<(String, String, Request)>> = BTreeMap::new();
+        let mut add = |line: usize, text: String, tip: String, request: Request| {
             rows.entry(head_line(&lines, line))
                 .or_default()
-                .push((text, request));
+                .push((text, tip, request));
         };
+        // usages first, like the code vision of Android Studio; the bare icon holds the row
+        // until the count arrives, so the code does not jump down then
+        let counted = self.decl_usages.as_ref().filter(|u| u.key.0 == t.path);
+        let mut counted_lines = HashSet::new();
+        for d in t.syms.decls.iter().filter(|d| wants_usages(d)) {
+            // one count per line: a class, not also each `val` of its constructor
+            if !counted_lines.insert(line_of(d.offset)) {
+                continue;
+            }
+            let (text, tip, hits) = match counted.and_then(|u| u.by_decl.get(&usage_key(d))) {
+                Some(hits) => (
+                    format!("{}  {}", ic::LINK_SIMPLE, hits.len()),
+                    match hits.len() {
+                        0 => "No usages".to_string(),
+                        1 => "1 usage".to_string(),
+                        n => format!("{n} usages"),
+                    },
+                    hits.clone(),
+                ),
+                None => (ic::LINK_SIMPLE.into(), "Counting usages".into(), Vec::new()),
+            };
+            add(
+                line_of(d.offset),
+                text,
+                tip,
+                Request::Pick(format!("Usages of {}", d.name), hits),
+            );
+        }
         for (o, x) in crate::android_kit::test_targets(&t.path, &t.syms) {
             let what = match &x.method {
                 Some(_) => "Run test",
                 None => "Run all tests",
             };
             let on = if x.device { " on the device" } else { "" };
+            let short = if x.method.is_some() { "test" } else { "tests" };
             add(
                 line_of(o),
-                format!("{}  {what}{on}", ic::PLAY),
+                format!("{}  {short}", ic::PLAY),
+                format!("{what}{on}"),
                 Request::JUnit(x),
             );
         }
         for (line, name) in &previews {
-            let text = format!("{}  Run preview on the device", ic::PLAY);
-            add(*line, text, Request::Preview(name.clone()));
+            add(
+                *line,
+                format!("{}  preview", ic::PLAY),
+                "Run preview on the device".into(),
+                Request::Preview(name.clone()),
+            );
         }
         for d in t
             .syms
@@ -336,8 +410,10 @@ impl App {
                     offset: c.offset,
                     score: 0,
                 };
+                let short = if c.launcher { "launcher" } else { c.tag };
                 add(
                     line_of(d.offset),
+                    format!("{}  {short}", ic::ANDROID_LOGO),
                     text,
                     Request::Pick(String::new(), vec![hit]),
                 );
@@ -346,12 +422,13 @@ impl App {
         for m in &marks {
             add(
                 m.line,
+                m.short.clone(),
                 m.tip.clone(),
                 Request::Pick(m.tip.clone(), m.targets.clone()),
             );
         }
-        for (line, text, r) in self.hilt_links(&t.syms, &line_of) {
-            add(line, text, r);
+        for (line, short, tip, r) in self.hilt_links(&t.syms, &line_of) {
+            add(line, short, tip, r);
         }
         let lenses = rows
             .into_iter()
@@ -383,6 +460,101 @@ impl App {
         }
     }
 
+    /// Takes a finished count, and starts one for the active tab when its count is stale. One
+    /// count runs at a time: edits made meanwhile are counted when it ends.
+    fn count_decl_usages(&mut self) {
+        if let Some(rx) = &self.decl_usages_rx {
+            match rx.try_recv() {
+                Ok(u) => {
+                    self.decl_usages = Some(u);
+                    self.decl_usages_gen += 1;
+                    self.decl_usages_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(_) => self.decl_usages_rx = None,
+            }
+        }
+        let (Some(t), Some(p)) = (self.tabs.get(self.active), &self.project) else {
+            return;
+        };
+        let key = (t.path.clone(), t.rev, self.index.generation);
+        if t.readonly
+            || !crate::project::is_code(&t.path)
+            || self.decl_usages.as_ref().is_some_and(|u| u.key == key)
+        {
+            return;
+        }
+        let targets: Vec<((Option<String>, String), crate::usage::Target)> = t
+            .syms
+            .decls
+            .iter()
+            .filter(|d| wants_usages(d))
+            .map(|d| {
+                let target = crate::usage::Target::new(&self.index, &t.path, &t.syms, d, &t.text);
+                (usage_key(d), target)
+            })
+            .collect();
+        let files: Vec<std::path::PathBuf> = p
+            .files
+            .iter()
+            .filter(|f| crate::project::is_code(f))
+            .cloned()
+            .collect();
+        let open: HashMap<std::path::PathBuf, String> = self
+            .tabs
+            .iter()
+            .filter(|t| !t.deleted)
+            .map(|t| (t.path.clone(), t.text.clone()))
+            .collect();
+        let root = p.root.clone();
+        let ctx = self.ctx.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut by_decl: HashMap<(Option<String>, String), Vec<Hit>> = targets
+                .iter()
+                .map(|(k, _)| (k.clone(), Vec::new()))
+                .collect();
+            for f in files {
+                let Some(text) = open
+                    .get(&f)
+                    .cloned()
+                    .or_else(|| std::fs::read_to_string(&f).ok())
+                else {
+                    continue;
+                };
+                let mut syms = None;
+                for (k, target) in &targets {
+                    if !text.contains(&target.name) {
+                        continue;
+                    }
+                    let syms = syms.get_or_insert_with(|| crate::kotlin::scan(&text));
+                    for r in crate::refactor::occurrences(&text, &target.name) {
+                        let at = r.start;
+                        if f == target.path && at == target.offset
+                            || !target.is_use(&f, &text, syms, at)
+                        {
+                            continue;
+                        }
+                        let l = super::found_line(&f, &text, at);
+                        let rel = f.strip_prefix(&root).unwrap_or(&f);
+                        by_decl.get_mut(k).unwrap().push(Hit {
+                            name: l.text,
+                            detail: format!("{}:{}", rel.display(), l.line),
+                            path: f.clone(),
+                            offset: at,
+                            score: 0,
+                        });
+                    }
+                }
+            }
+            let _ = tx.send(DeclUsages { key, by_decl });
+            if let Some(c) = ctx {
+                c.request_repaint();
+            }
+        });
+        self.decl_usages_rx = Some(rx);
+    }
+
     pub(super) fn handle(&mut self, r: Request, ctx: &egui::Context) {
         match r {
             Request::Pick(_, hits) if hits.len() == 1 => {
@@ -402,7 +574,7 @@ impl App {
         &self,
         syms: &crate::kotlin::FileSyms,
         line_of: &dyn Fn(usize) -> usize,
-    ) -> Vec<(usize, String, Request)> {
+    ) -> Vec<(usize, String, String, Request)> {
         let provides = |d: &crate::kotlin::Decl| match d.kind {
             Kind::Fun if d.has_annotation("Provides") || d.has_annotation("Binds") => {
                 Some(type_name(&d.ty))
@@ -435,10 +607,10 @@ impl App {
                 && let Some(h) = injected.get(&ty)
             {
                 let n = h.len();
-                let text = format!("Injected in {n} place{}", if n == 1 { "" } else { "s" });
                 out.push((
                     line,
-                    text,
+                    format!("{}  {n}", ic::SYRINGE),
+                    format!("Injected in {n} place{}", if n == 1 { "" } else { "s" }),
                     Request::Pick(format!("Where {ty} is injected"), h.clone()),
                 ));
             }
@@ -450,14 +622,19 @@ impl App {
                 continue;
             }
             let found: Vec<Hit> = wanted.iter().flat_map(|t| providers[t].clone()).collect();
-            let text = match (&found[..], d.kind) {
+            let tip = match (&found[..], d.kind) {
                 ([one], Kind::Property) => format!("Provided by {}", one.name),
                 (_, Kind::Property) => format!("{} providers", found.len()),
                 _ => format!("Dependencies: {}", wanted.join(", ")),
             };
+            let short = match &found[..] {
+                [one] => one.name.clone(),
+                _ => found.len().to_string(),
+            };
             out.push((
                 line,
-                text,
+                format!("{}  {short}", ic::PLUGS_CONNECTED),
+                tip,
                 Request::Pick(format!("Providers of {}", wanted.join(", ")), found),
             ));
         }
@@ -711,7 +888,7 @@ pub(super) fn paint_lenses<'a>(
             .unwrap_or(galley_pos.x + lens.indent as f32 * char_w);
         let mid = top + lens_h * 0.5;
         let mut first = !ends.contains_key(&lens.line);
-        for item in &lens.items {
+        for (i, item) in lens.items.iter().enumerate() {
             if !std::mem::take(&mut first) {
                 let r = ui.painter().text(
                     Pos2::new(x, mid),
@@ -728,7 +905,7 @@ pub(super) fn paint_lenses<'a>(
             let rect = Rect::from_min_size(Pos2::new(x, mid - g.size().y * 0.5), g.size());
             let r = ui.interact(
                 rect,
-                ui.scope_id().with(("lens", lens.line, &item.text)),
+                ui.scope_id().with(("lens", lens.line, i, &item.tip)),
                 Sense::click(),
             );
             let color = if r.hovered() { t.accent } else { t.weak };
@@ -738,8 +915,11 @@ pub(super) fn paint_lenses<'a>(
                 ui.painter()
                     .hline(rect.x_range(), rect.bottom(), egui::Stroke::new(1.0, color));
             }
-            r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, &item.text));
-            if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, &item.tip));
+            if r.on_hover_text(&item.tip)
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
                 out = Some(item.request.clone());
             }
             x = rect.right();
@@ -804,11 +984,13 @@ mod tests {
         assert_eq!(Lens::new(5, lines[5], Vec::new()).indent, 2);
         let ctx = egui::Context::default();
         let mut g = None;
-        let _ = ctx.run_ui(Default::default(), |ui| {
+        ctx.run_ui(Default::default(), |ui| {
             g = Some(ui.fonts_mut(|f| {
                 f.layout_no_wrap("a\nb\nc\nd".into(), FontId::monospace(13.0), Color32::WHITE)
             }));
-        });
+        })
+        .textures_delta
+        .clear(); // no renderer here to take the font texture
         let g = g.unwrap();
         let moved = with_lens_room(&g, &[0, 2], 10.0);
         let ys: Vec<f32> = moved

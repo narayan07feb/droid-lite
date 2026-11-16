@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """A tiny fake Kotlin language server for Droid Lite's end-to-end tests.
 
-It speaks LSP over stdio and answers initialize, completion, definition and rename, and it
-publishes one diagnostic when a document opens. Every answer is fixed or derived from the
+It speaks LSP over stdio and answers initialize, completion, definition, references and rename.
+It publishes one diagnostic when a document opens, and one per file change it is told about. Every answer is fixed or derived from the
 text the editor sent, so the tests can assert exact results."""
 import json
 import re
@@ -63,7 +63,13 @@ while True:
         for i, row in enumerate(text.split("\n")):
             for m in re.finditer(r"\b%s\b" % re.escape(old), row):
                 refs.append({"uri": uri, "range": {"start": {"line": i, "character": m.start()}, "end": {"line": i, "character": m.end()}}})
+        # like a real server whose index lags: one place in a file that no longer exists
+        refs.append({"uri": uri.rsplit("/", 1)[0] + "/Gone.kt", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}})
         send({"jsonrpc": "2.0", "id": mid, "result": refs})
+    elif method == "workspace/didChangeWatchedFiles":
+        for c in params["changes"]:
+            send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": c["uri"], "diagnostics": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 3, "message": "watched %d" % c["type"]}]}})
     elif method == "textDocument/rename":
         uri, pos, new = params["textDocument"]["uri"], params["position"], params["newName"]
         text = docs.get(uri, "")

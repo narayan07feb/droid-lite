@@ -93,6 +93,9 @@ pub struct FileSyms {
     pub package: String,
     pub imports: Vec<Atom>,
     pub decls: Vec<Decl>,
+    /// `Name { … }` lambdas passed or assigned where a value goes (`= Name {`, `(Name {`): the
+    /// implementations of a `fun interface` named `Name`. Name and offset.
+    pub sams: Vec<(Atom, usize)>,
 }
 
 const MODIFIERS: &[&str] = &[
@@ -495,6 +498,10 @@ pub fn scan(src: &str) -> FileSyms {
                     pending_body = Some(name.into());
                 }
             }
+            "fun" if s.is(s.i + 1, "interface") => {
+                modifiers.push(w.into());
+                s.i += 1;
+            }
             "fun" => {
                 s.i += 1;
                 if s.is(s.i, "<") {
@@ -514,7 +521,7 @@ pub fn scan(src: &str) -> FileSyms {
                 let Some(ni) = name_i.filter(|_| s.is(s.i, "(")) else {
                     annotations.clear();
                     modifiers.clear();
-                    continue; // `fun interface` or broken code
+                    continue; // broken code
                 };
                 let params = s.params();
                 let mut ty = String::new();
@@ -683,6 +690,19 @@ pub fn scan(src: &str) -> FileSyms {
                 modifiers.clear();
                 s.i += 1;
             }
+        }
+    }
+    // bodies are skipped above, so the lambdas are found in a pass of their own
+    for i in 1..s.t.len().saturating_sub(1) {
+        let w = s.text(i);
+        let prev = s.text(i - 1);
+        if s.kind(i) == Some(Tok::Ident)
+            && w.starts_with(char::is_uppercase)
+            && s.is(i + 1, "{")
+            && (matches!(prev, "=" | "(" | "," | "return")
+                || prev == ">" && i > 1 && s.is(i - 2, "-"))
+        {
+            out.sams.push((w.into(), s.t[i].range.start));
         }
     }
     out

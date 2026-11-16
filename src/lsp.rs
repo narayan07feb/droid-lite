@@ -223,6 +223,22 @@ impl Lsp {
         );
     }
 
+    /// Files created (1), changed (2) or deleted (3) on disk, so the server's own index does not
+    /// keep answering with files that are gone.
+    pub fn files_changed(&mut self, changes: &[(PathBuf, u8)]) {
+        if changes.is_empty() {
+            return;
+        }
+        let changes: Vec<Value> = changes
+            .iter()
+            .map(|(p, kind)| json!({ "uri": uri(p), "type": kind }))
+            .collect();
+        self.notify(
+            "workspace/didChangeWatchedFiles",
+            json!({ "changes": changes }),
+        );
+    }
+
     /// `at` is the byte offset the answer belongs to, so a late answer can be ignored.
     pub fn completion(&mut self, path: &Path, line: u32, col: u32, at: usize) {
         self.request("textDocument/completion", json!({ "textDocument": { "uri": uri(path) }, "position": { "line": line, "character": col } }), Pending::Completion(at), false);

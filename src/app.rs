@@ -358,6 +358,10 @@ pub struct App {
     branch: Option<String>,
     /// Bumped when a build or a report reload may have changed previews and stability.
     outputs_gen: u64,
+    /// Usage counts of the open file's declarations, for the links above them.
+    decl_usages: Option<gutter::DeclUsages>,
+    decl_usages_rx: Option<Receiver<gutter::DeclUsages>>,
+    decl_usages_gen: u64,
     /// Android resources of the project (values, files, ids).
     res: crate::resources::Resources,
     res_rx: Option<Receiver<crate::resources::Resources>>,
@@ -470,6 +474,9 @@ impl App {
             git: Default::default(),
             branch: None,
             outputs_gen: 0,
+            decl_usages: None,
+            decl_usages_rx: None,
+            decl_usages_gen: 0,
             res: Default::default(),
             res_rx: None,
             res_stale: false,
@@ -1228,18 +1235,19 @@ impl App {
                 }
                 lsp::Event::Rename(edits) => self.on_lsp_rename(edits),
                 lsp::Event::References(locs) => {
-                    let mut texts: HashMap<PathBuf, String> = HashMap::new();
+                    let mut texts: HashMap<PathBuf, Option<String>> = HashMap::new();
                     let mut found = Vec::new();
                     for (p, line, col) in locs {
+                        // the server's index can lag behind the disk: skip files that are gone
                         let text = texts.entry(p.clone()).or_insert_with(|| {
-                            self.tabs
-                                .iter()
-                                .find(|t| t.path == p)
-                                .map(|t| t.text.clone())
-                                .or_else(|| std::fs::read_to_string(&p).ok())
-                                .unwrap_or_default()
+                            match self.tabs.iter().find(|t| t.path == p && !t.deleted) {
+                                Some(t) => Some(t.text.clone()),
+                                None => std::fs::read_to_string(&p).ok(),
+                            }
                         });
-                        found.push(found_line(&p, text, lsp::offset(text, line, col)));
+                        if let Some(text) = text {
+                            found.push(found_line(&p, text, lsp::offset(text, line, col)));
+                        }
                     }
                     if self.find_rx.is_some() {
                         self.lsp_found = Some(found);
@@ -2441,11 +2449,15 @@ impl App {
                         .iter()
                         .map(|&i| self.tests.marks[i].label.as_str())
                         .collect();
-                    let text = match names[..] {
-                        [one] => format!("{}  Run {one}", ic::PLAY),
-                        _ => format!("{}  Run a case: {}", ic::PLAY, names.join(", ")),
+                    let (short, tip) = match names[..] {
+                        [one] => (one.to_string(), format!("Run {one}")),
+                        _ => (
+                            format!("{} cases", names.len()),
+                            format!("Run a case: {}", names.join(", ")),
+                        ),
                     };
-                    gutter::Lens::new(l, lines[l], vec![(text, gutter::Request::Tests(m))])
+                    let short = format!("{}  {short}", ic::PLAY);
+                    gutter::Lens::new(l, lines[l], vec![(short, tip, gutter::Request::Tests(m))])
                 })
                 .collect()
         };
