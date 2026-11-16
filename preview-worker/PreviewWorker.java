@@ -232,6 +232,7 @@ public class PreviewWorker {
                 LocalActivityResultRegistryOwner provides results,
                 LocalOnBackPressedDispatcherOwner provides back,
                 LocalInspectionMode provides true,
+                VM_OWNER
             ) {
                 CMP_CONTEXT
                 content()
@@ -241,6 +242,9 @@ public class PreviewWorker {
     /** Compose Multiplatform resources read images and strings through an Android context that only an
      *  app start sets; previews set it with this effect (as Android Studio's preview does). */
     static final String CMP_CONTEXT = "@OptIn(org.jetbrains.compose.resources.ExperimentalResourceApi::class) org.jetbrains.compose.resources.PreviewContextConfigurationEffect()";
+    /** A ViewModel store, as Android Studio's preview gives one: composables that take a viewModel()
+     *  draw (one that needs Hilt's still cannot, as in Android Studio). */
+    static final String VM_OWNER = "androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner provides object : androidx.lifecycle.ViewModelStoreOwner { override val viewModelStore = androidx.lifecycle.ViewModelStore() },";
     static Path host;
     static boolean hostTried;
 
@@ -253,7 +257,12 @@ public class PreviewWorker {
             Files.createDirectories(src.getParent());
             // with the Compose Multiplatform context first; a project without compose-resources gets
             // the plain host
-            for (String hostSource : List.of(HOST.replace("CMP_CONTEXT", CMP_CONTEXT), HOST.replace("CMP_CONTEXT", ""))) {
+            // the richest host the project's libraries allow: Compose Multiplatform context and a
+            // ViewModel store, then without one of them, then plain
+            List<String> variants = new ArrayList<>();
+            for (String cmp : List.of(CMP_CONTEXT, ""))
+                for (String vm : List.of(VM_OWNER, "")) variants.add(HOST.replace("CMP_CONTEXT", cmp).replace("VM_OWNER", vm));
+            for (String hostSource : variants) {
                 Files.writeString(src, hostSource);
                 deleteTree(out);
                 List<String> args = new ArrayList<>(List.of(src.toString(), "-d", out.toString(), "-classpath", cp, "-no-stdlib",

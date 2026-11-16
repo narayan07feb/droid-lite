@@ -11,7 +11,7 @@ pub struct Packages {
     /// The names each file declares (classes, functions, properties, type aliases).
     names: HashMap<PathBuf, BTreeSet<String>>,
     /// Module namespace (from `namespace = "…"`) -> the module's res folder.
-    res_by_namespace: HashMap<String, PathBuf>,
+    res_by_namespace: HashMap<String, Vec<PathBuf>>,
     /// The project's annotation classes (a multipreview like `@ThemePreviews`): name -> the annotations
     /// written above it.
     pub annotation_classes: HashMap<String, String>,
@@ -89,7 +89,8 @@ fn imports_of(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim)
         .filter_map(|l| l.strip_prefix("import "))
-        .map(|i| i.trim_end_matches(';').split(" as ").next().unwrap_or("").trim().to_string())
+        // Java's `import static a.b.C.x;` points into a.b like any other import
+        .map(|i| i.trim_start_matches("static ").trim_end_matches(';').split(" as ").next().unwrap_or("").trim().to_string())
         .collect()
 }
 
@@ -119,8 +120,10 @@ impl Packages {
                         x.split("package=\"").nth(1)?.split('"').next().map(String::from)
                     })
                 });
-                let res = ["src/main/res", "res"].iter().map(|r| dir.join(r)).find(|r| r.is_dir());
-                if let (Some(ns), Some(res)) = (ns, res) {
+                let res = res_dirs(dir);
+                if let Some(ns) = ns
+                    && !res.is_empty()
+                {
                     res_by_namespace.insert(ns, res);
                 }
             }
@@ -170,11 +173,15 @@ impl Packages {
             }
             let mut take: Vec<&PathBuf> = Vec::new();
             for (p, name) in &wanted {
-                for g in self.by_package.get(p).into_iter().flatten() {
-                    let decl = &self.names[g];
-                    if name.as_ref().is_none_or(|n| decl.contains(n)) {
-                        take.push(g);
-                    }
+                let files = self.by_package.get(p).map(Vec::as_slice).unwrap_or_default();
+                let declaring: Vec<&PathBuf> = files.iter().filter(|g| name.as_ref().is_none_or(|n| self.names[*g].contains(n))).collect();
+                if !declaring.is_empty() {
+                    take.extend(declaring);
+                } else if let Some(n) = name {
+                    // nobody declares it: Java calling a Kotlin file's facade class (`FooKt`, `@file:JvmName`)
+                    let stem = n.strip_suffix("Kt").unwrap_or(n);
+                    let by_file: Vec<&PathBuf> = files.iter().filter(|g| g.file_stem().is_some_and(|s| s == stem)).collect();
+                    take.extend(if by_file.is_empty() { files.iter().collect() } else { by_file });
                 }
             }
             for g in self.by_package.get(&own).into_iter().flatten() {
@@ -193,13 +200,50 @@ impl Packages {
                 }
             }
         }
+        // project code that calls back into the open file (an Activity that shows the open screen):
+        // the open file must be compiled with it, or that code does not compile
+        let own = declared(open_text);
+        if files.iter().any(|f| std::fs::read_to_string(f).is_ok_and(|t| own.iter().any(|n| words(&t).contains(n.as_str())))) {
+            files.insert(open.to_path_buf());
+        }
         Ok((files.into_iter().collect(), r.into_iter().collect()))
     }
 
-    /// Every module's namespace and res folder.
-    pub fn modules(&self) -> impl Iterator<Item = (&String, &PathBuf)> {
+    /// Every module's namespace and res folders.
+    pub fn modules(&self) -> impl Iterator<Item = (&String, &Vec<PathBuf>)> {
         self.res_by_namespace.iter()
     }
+}
+
+/// A module's res folders: `src/main/res` and `src/debug/res`, and in a module with its own layout
+/// every `res` folder under it (core-ui keeps `java/<part>/res`), not those of a module inside it
+/// (a folder with its own build file), of tests, or of build output.
+fn res_dirs(module: &Path) -> Vec<PathBuf> {
+    fn walk(d: &Path, root: bool, depth: u32, out: &mut Vec<PathBuf>) {
+        if depth > 7 || (!root && (d.join("build.gradle.kts").exists() || d.join("build.gradle").exists())) {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(d) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let n = e.file_name().to_string_lossy().to_lowercase();
+            if n == "build" || n.starts_with('.') || n.ends_with("test") || n.ends_with("tests") || n == "release" || n == "staging" {
+                continue;
+            }
+            if n == "res" {
+                out.push(p);
+            } else {
+                walk(&p, false, depth + 1, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(module, true, 0, &mut out);
+    out.sort();
+    out
 }
 
 /// `namespace = "co.branch.feature.onboarding"` (or `android.namespace = …`) in a build file.
@@ -215,13 +259,16 @@ fn namespace_of(build: &str) -> Option<String> {
 /// compile code that uses `R.string.x`, `R.drawable.y`, `R.styleable.Z_a`.
 /// Ids come from `next`, so they are unique across all the project's modules (the renderer maps each id
 /// back to one resource).
-pub fn r_java(namespace: &str, res: &Path, next: &mut u32) -> String {
+pub fn r_java(namespace: &str, res_dirs: &[PathBuf], next: &mut u32) -> String {
     let mut types: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
     let mut styleables: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut add = |t: &'static str, n: &str| {
         types.entry(t).or_default().insert(n.replace(['.', '-'], "_"));
     };
-    let dirs = std::fs::read_dir(res).map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>()).unwrap_or_default();
+    let dirs: Vec<PathBuf> = res_dirs
+        .iter()
+        .flat_map(|res| std::fs::read_dir(res).map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>()).unwrap_or_default())
+        .collect();
     for d in dirs {
         let kind = d.file_name().map_or(String::new(), |n| n.to_string_lossy().split('-').next().unwrap_or("").to_string());
         let files = std::fs::read_dir(&d).map(|x| x.flatten().map(|e| e.path()).collect::<Vec<_>>()).unwrap_or_default();
@@ -367,11 +414,50 @@ mod tests {
         assert_eq!(files, [model, state, helper], "imported names, used same-package names, and theirs; no tests (javatest too), no flavor copy, no unused file of an imported package (sorted)");
         assert_eq!(r, ["a.ui"]);
         assert!(pk.closure(&screen, &text, 2).is_err(), "a limit stops a closure that grows too big");
+        // a file the open one needs that calls back into it: the open file is compiled with the project code
+        let host = write(&d, "feature/ui/src/main/kotlin/a/ui/Host.kt", "package a.ui\n\nfun host() { PrimerScreen() }\n");
+        let primer = write(&d, "feature/ui/src/main/kotlin/a/ui/PrimerScreen.kt", "package a.ui\n\ninternal fun PrimerScreen() { host() }\n");
+        let pk3 = Packages::read(&[host.clone(), primer.clone()]);
+        let (f3, _) = pk3.closure(&primer, &std::fs::read_to_string(&primer).unwrap(), 10).unwrap();
+        assert_eq!(f3, [host, primer.clone()], "the open file comes along when project code calls it");
+        let (f4, _) = pk.closure(&screen, &text, 100).unwrap();
+        assert!(!f4.contains(&screen), "not when nothing calls back");
         let fq = write(&d, "feature/ui/src/main/kotlin/a/ui/sub/Font.kt", "package a.ui.sub\n\nval f = a.ui.R.font.x\n");
         let pk2 = Packages::read(&[fq.clone(), d.join("feature/ui/build.gradle.kts")]);
         let (_, r2) = pk2.closure(&fq, &std::fs::read_to_string(&fq).unwrap(), 10).unwrap();
         assert_eq!(r2, ["a.ui"], "a fully qualified R counts too");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_module_with_its_own_layout_has_all_its_res_folders() {
+        let d = std::env::temp_dir().join(format!("dl-resdirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for f in ["core-ui/java/typography/res/values/a.xml", "core-ui/java/theme/res/values/b.xml", "core-ui/javatest/res/values/c.xml",
+            "core-ui/build/res/values/d.xml", "core-ui/sub/build.gradle.kts", "core-ui/sub/src/main/res/values/e.xml"] {
+            write(&d, f, "x");
+        }
+        let dirs = res_dirs(&d.join("core-ui"));
+        assert_eq!(dirs, [d.join("core-ui/java/theme/res"), d.join("core-ui/java/typography/res")], "own ones only: no test, build or inner module");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_kotlin_facade_class_import_takes_its_file() {
+        let d = std::env::temp_dir().join(format!("dl-facade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let java = write(&d, "a/src/main/java/a/ui/Frag.java", "package a.ui;\n\nimport static a.ktx.FragmentExtKt.show;\n\nclass Frag {}\n");
+        let ext = write(&d, "b/src/main/kotlin/a/ktx/FragmentExt.kt", "package a.ktx\n\nfun show() {}\n");
+        let other = write(&d, "b/src/main/kotlin/a/ktx/Other.kt", "package a.ktx\n\nfun other() {}\n");
+        let pk = Packages::read(&[java.clone(), ext.clone(), other]);
+        let (f, _) = pk.closure(&java, &std::fs::read_to_string(&java).unwrap(), 10).unwrap();
+        assert_eq!(f, [ext], "FragmentExtKt is FragmentExt.kt");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn java_static_imports_point_into_their_package() {
+        assert_eq!(imports_of("import static co.b.views.Helper.show;\nimport a.B;\n"), ["co.b.views.Helper.show", "a.B"]);
     }
 
     #[test]
@@ -402,7 +488,7 @@ mod tests {
         write(&d, "drawable-night/ic_phone.xml", "<vector/>");
         write(&d, "layout/row.xml", "<LinearLayout android:id=\"@+id/row_root\"/>");
         let mut next = 0x7f00_0000;
-        let java = r_java("a.ui", &d, &mut next);
+        let java = r_java("a.ui", &[d.clone()], &mut next);
         for want in ["package a.ui;", "class string", "phone_title", "class plurals", "days", "class style", "Theme_App",
             "class drawable", "ic_phone", "class layout", "row", "row_root", "anchor", "int[] Neem = new int[2]",
             "Neem_tint = 0", "Neem_android_text = 1", "class attr", "tint"] {

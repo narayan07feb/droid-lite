@@ -528,12 +528,12 @@ fn java() -> PathBuf {
 /// and build tools (KSP, Lint, detekt, annotation processors, Gradle plugins). Several of them bundle a
 /// whole Kotlin compiler, which the worker's compiler then loads as a plugin and crashes on.
 fn build_or_test_only(f: &Path) -> bool {
-    const PARTS: [&str; 19] = [
+    const PARTS: [&str; 20] = [
         "/kotlin-test", "/junit", "/mockk", "/robolectric", "/espresso", "/truth/", "/turbine/", "/kotest",
         "/com.google.devtools.ksp/", "/com.android.tools.lint/", "/com.android.tools.build/",
         "/io.gitlab.arturbosch.detekt/", "/com.pinterest", "gradle-plugin", "/org.jetbrains.kotlin/kotlin-scripting",
         "/org.jetbrains.kotlin/kotlin-compiler", "/org.jetbrains.kotlin/kotlin-annotation-processing",
-        "/com.squareup/kotlinpoet", "/com.google.auto",
+        "/com.squareup/kotlinpoet", "/com.google.auto.service/auto-service/", "/com.google.auto.value/auto-value/",
     ];
     let s = f.to_string_lossy();
     let artifact = f.parent().and_then(Path::parent).and_then(Path::parent).and_then(|d| d.file_name()).map_or(String::new(), |n| n.to_string_lossy().into_owned());
@@ -578,7 +578,7 @@ impl ProjectRuntime {
 /// of every library (from their R.txt), compiled once with javac into one folder: the renderer loads
 /// them from the worker's main class loader to map ids back to resources. Also the R package names.
 fn project_r(pk: &crate::preview_src::Packages, lib_r: &[String]) -> Result<(PathBuf, Vec<String>, Vec<String>), String> {
-    let mut modules: Vec<(&String, &PathBuf)> = pk.modules().collect();
+    let mut modules: Vec<(&String, &Vec<PathBuf>)> = pk.modules().collect();
     modules.sort();
     let mut next = 0x7f00_0000u32;
     let mut sources = Vec::new();
@@ -593,7 +593,7 @@ fn project_r(pk: &crate::preview_src::Packages, lib_r: &[String]) -> Result<(Pat
         }
         sources.push(path.to_string_lossy().into_owned());
         packages.push(ns.clone());
-        res.push(dir.to_string_lossy().into_owned());
+        res.extend(dir.iter().map(|d| d.to_string_lossy().into_owned()));
     }
     for r in lib_r {
         if let Some(pkg) = std::fs::read_to_string(r).ok().and_then(|s| s.lines().next().map(|l| l.trim_start_matches("package ").trim_end_matches(';').to_string())) {
@@ -863,7 +863,8 @@ mod tests {
             assert!(build_or_test_only(Path::new(&format!("{c}/{no}"))), "{no}");
         }
         for yes in ["androidx.compose.runtime/runtime-android/1.9/h/x.aar", "com.google.dagger/dagger/2.60.1/h/dagger-2.60.1.jar",
-            "org.jetbrains.kotlinx/kotlinx-serialization-core-jvm/1.8/h/x.jar"] {
+            "org.jetbrains.kotlinx/kotlinx-serialization-core-jvm/1.8/h/x.jar",
+            "com.google.auto.service/auto-service-annotations/1.1/h/x.jar"] {
             assert!(!build_or_test_only(Path::new(&format!("{c}/{yes}"))), "{yes}");
         }
     }
