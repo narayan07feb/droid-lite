@@ -488,7 +488,7 @@ mod tests {
         write(&d, "drawable-night/ic_phone.xml", "<vector/>");
         write(&d, "layout/row.xml", "<LinearLayout android:id=\"@+id/row_root\"/>");
         let mut next = 0x7f00_0000;
-        let java = r_java("a.ui", &[d.clone()], &mut next);
+        let java = r_java("a.ui", std::slice::from_ref(&d), &mut next);
         for want in ["package a.ui;", "class string", "phone_title", "class plurals", "days", "class style", "Theme_App",
             "class drawable", "ic_phone", "class layout", "row", "row_root", "anchor", "int[] Neem = new int[2]",
             "Neem_tint = 0", "Neem_android_text = 1", "class attr", "tint"] {
