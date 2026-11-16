@@ -259,7 +259,7 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   const props = pkg.contributes.configuration.properties;
   check('enginePath is a machine setting', props['droidLite.enginePath'].scope === 'machine');
   check('logcatMaxLines setting', props['droidLite.logcatMaxLines'].default === 20000);
-  check('version 0.5.0', pkg.version === '0.5.0');
+  check('version 0.5.1', pkg.version === '0.5.1');
   check('Allow… on a test item that needs an OK', pkg.contributes.menus['testing/item/context']
     .some((m) => m.command === 'droidLite.allowTestPlugin' && /testId =~ \/\^needs-ok:\//.test(m.when)));
 
@@ -302,6 +302,16 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
     ? p.paths.map((x) => path.relative(dir, x)) : path.relative(dir, p.path), ...(p.text ? [p.text] : [])])) === JSON.stringify([
     ['remove', ['A', 'C.kt']], ['update', 'A/z.kt', 'z1'], ['update', 'B.kt', 'b2'], ['update', 'C.kt'],
   ]));
+  // a remove drops the waiting update of its path, and of any path below it (a grandparent too)
+  queued.length = 0;
+  queue(path.join(dir, 'D.kt'), 'update', () => 'd1');
+  queue(path.join(dir, 'D.kt'), 'remove');
+  queue(path.join(dir, 'a', 'b', 'X.kt'), 'update', () => 'x1');
+  queue(path.join(dir, 'a'), 'remove');
+  await until('the queue to drain', () => queued.length === 1, 2000).catch(() => {});
+  await sleep(50);
+  check('update then remove of a path (or a grandparent) sends only the remove', JSON.stringify(queued.map(([m, p]) => [m, p.paths
+    ?.map((x) => path.relative(dir, x))])) === JSON.stringify([['remove', ['D.kt', 'a']]]));
 
   // the rest runs on the fake engine
   cfg.enginePath = fakeEngine;
@@ -334,6 +344,12 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   files.ls.Change({ fsPath: outside });
   files.ls.Create({ fsPath: '/elsewhere/B.kt' });
   all.ls.Delete({ fsPath: path.join(dir, '..', 'gone') });
+  // a folder deleted and made again within the 400 ms debounce (a branch switch, a re-extract):
+  // only its update goes. The engine forgets a folder before it walks it again, so files that did
+  // not come back leave the index, and a file in it never drops out between a remove and an update.
+  fs.mkdirSync(path.join(src, 'redo'), { recursive: true });
+  all.ls.Delete({ fsPath: path.join(src, 'redo') });
+  all.ls.Create({ fsPath: path.join(src, 'redo') });
   let reads = 0;
   const editDoc = (scheme, text, file = api) => ({
     uri: { scheme, fsPath: file }, getText: () => { reads++; return text; }, version: 2,
@@ -363,6 +379,8 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   check('node_modules and hidden folders are skipped', !sent.some(([, p]) => /(^|\/)(node_modules|\.cxx|\.hidden|\.idea)(\/|$)/.test(p)));
   check('every deleted path sends remove (folders with a dot too)', ['demo/old', 'demo/old.dir', 'Gone.kt', 'notes.txt']
     .every((f) => sent.some(([m, p]) => m === 'remove' && p.endsWith(f))));
+  check('a folder deleted and made again within the debounce sends only update', sent.filter(([, p]) => p.endsWith('demo/redo'))
+    .map(([m]) => m).join() === 'update');
   check('no update with empty text', !sent.some(([m, , t]) => m === 'update' && t === ''));
   check('paths outside the project folder are not sent', sent.length && !sent.some(([, p]) => p.startsWith('..') || path.isAbsolute(p)));
   check('a lone surrogate goes as U+FFFD', sent.some(([m, p, t]) => m === 'update' && p.endsWith('Emoji.kt')

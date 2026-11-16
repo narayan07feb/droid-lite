@@ -20,16 +20,21 @@ fs.writeFileSync(path.join(project, '.droid-lite', 'plugins', 'broken', 'plugin.
 fs.mkdirSync(path.join(project, '.droid-lite', 'plugins', 'badrun'));
 fs.writeFileSync(path.join(project, '.droid-lite', 'plugins', 'badrun', 'plugin.json'), JSON.stringify({ name: 'Bad run', run: './t.sh' }));
 // a plugin whose watch ends at once (its pid goes to <plugin>/qwatch)
+// (plugins keep their state outside their folder: any change in it asks for the OK again)
 const quickDir = path.join(project, '.droid-lite', 'plugins', 'quick');
+const quickState = path.join(tmp, 'quick-state');
 fs.mkdirSync(quickDir);
-fs.writeFileSync(path.join(quickDir, 'plugin.json'), JSON.stringify({ name: 'Quick', watch: ['sh', '-c', 'echo $$ >> "$0/qwatch"', '{plugin}'] }));
+fs.mkdirSync(quickState);
+fs.writeFileSync(path.join(quickDir, 'plugin.json'), JSON.stringify({ name: 'Quick', watch: ['sh', '-c', 'echo $$ >> "$0/qwatch"', quickState] }));
 // a plugin whose commands start child processes (their pids go to <plugin>/pids), watch every 0.2 s,
 // count view runs, print a huge line and garbage places
 const toolsDir = path.join(project, '.droid-lite', 'plugins', 'tools');
+const toolsState = path.join(tmp, 'tools-state');
 fs.mkdirSync(toolsDir);
-const sh = (...a) => ['sh', '{plugin}/tools.sh', ...a, '{plugin}'];
+fs.mkdirSync(toolsState);
+const sh = (...a) => ['sh', '{plugin}/tools.sh', ...a, toolsState];
 fs.writeFileSync(path.join(toolsDir, 'plugin.json'), JSON.stringify({
-  name: 'Tools', list: sh('list'), run: ['sh', '{plugin}/tools.sh', 'run', '{plugin}', '{id}'], watch: sh('watch'),
+  name: 'Tools', list: sh('list'), run: ['sh', '{plugin}/tools.sh', 'run', toolsState, '{id}'], watch: sh('watch'),
   views: [{ name: 'Count', run: sh('count') }, { name: 'Hang', run: sh('hang') }],
   actions: [{ name: 'Slow', run: sh('slow') }, { name: 'Stubborn', run: sh('stubborn') }],
 }));
@@ -61,14 +66,23 @@ fs.writeFileSync(path.join(missingDir, 'plugin.json'), JSON.stringify({
   watch: ['/nonexistent/droid-lite-watch'], actions: [{ name: 'Gone', run: ['/nonexistent/droid-lite-action'] }],
 }));
 process.env.HOME = home;
-// the OKs for project plugins, shared with the app: real folder -> sha256 of its plugin.json
+delete process.env.DROID_LITE_CONFIG_DIR; // its own check sets it
+const real = (p) => fs.realpathSync.native(p);
+const TRUST = "Allowing trusts this plugin's folder. Commands may also run project code outside it (for example a script in the repo); changes to that code do not ask again.";
+// the OKs for project plugins, shared with the app:
+// {"version":2,"approved":{"<project real path>":{"<plugin folder real path>":"<tree hash>"}}}
 const store = path.join(home, '.config', 'droid-lite', 'approved-plugins.json');
-const readStore = () => (fs.existsSync(store) ? JSON.parse(fs.readFileSync(store, 'utf8')) : {});
-const sha = (folder) => crypto.createHash('sha256').update(fs.readFileSync(path.join(folder, 'plugin.json'))).digest('hex');
+const readStore = (file = store) => (fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {});
+const writeStore = (s) => { fs.mkdirSync(path.dirname(store), { recursive: true }); fs.writeFileSync(store, JSON.stringify(s)); };
+const okOf = (s, projectDir, folder) => s.approved?.[real(projectDir)]?.[real(folder)];
+let hashOf; // the folder's tree hash (tests.treeHash, pinned by a fixed vector below)
+// allows a project plugin as the extension would: <project>/.droid-lite/plugins/<name>
 const approve = (folder) => {
-  const s = { ...readStore(), [fs.realpathSync(folder)]: sha(folder) };
-  fs.mkdirSync(path.dirname(store), { recursive: true });
-  fs.writeFileSync(store, JSON.stringify(s));
+  const s = readStore();
+  const all = s.version === 2 ? s : { version: 2, approved: {} };
+  const p = real(path.resolve(folder, '..', '..', '..'));
+  all.approved[p] = { ...all.approved[p], [real(folder)]: hashOf(folder) };
+  writeStore(all);
 };
 
 class Pos { constructor(l, c) { this.line = l; this.character = c; } }
@@ -122,6 +136,7 @@ const fake = {
 const load = Module._load;
 Module._load = function (req, ...rest) { return req === 'vscode' ? fake : load.call(this, req, ...rest); };
 const tests = require('../tests.js');
+hashOf = (folder) => tests.treeHash(real(folder)).hash;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const until = async (what, ok, ms = 5000) => {
   for (const end = Date.now() + ms; !ok();) {
@@ -131,7 +146,7 @@ const until = async (what, ok, ms = 5000) => {
 };
 const pidsIn = (f) => (fs.existsSync(f) ? fs.readFileSync(f, 'utf8').trim().split('\n').filter(Boolean).map(Number) : []);
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-const pids = path.join(toolsDir, 'pids');
+const pids = path.join(toolsState, 'pids');
 // a plugin's id: its folder's real path
 const idOf = (n) => fs.realpathSync(path.join(project, '.droid-lite', 'plugins', n));
 let checks = 0;
@@ -282,7 +297,7 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   ev = await Promise.race([go([toolCase('left')]), sleep(4000).then(() => 'stuck')]);
   check('a run settles on exit, not on closed output', ev !== 'stuck' && Date.now() - t0 < 3000
     && quiet(ev).some((e) => e[0] === 'passed'));
-  pidsIn(path.join(toolsDir, 'left')).forEach((pid) => { try { process.kill(pid, 'SIGKILL'); } catch { /* ended */ } });
+  pidsIn(path.join(toolsState, 'left')).forEach((pid) => { try { process.kill(pid, 'SIGKILL'); } catch { /* ended */ } });
 
   // one huge line is cut, the next line still comes
   ev = await go([toolCase('long')]);
@@ -331,7 +346,7 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   const kids = async () => tree.getChildren(row);
   check('watch lines update the live state', /^tick [1-9]/.test((await kids())[0].label));
   const countView = (await kids()).find((i) => i.label === 'Count');
-  const viewRuns = () => pidsIn(path.join(toolsDir, 'views')).length;
+  const viewRuns = () => pidsIn(path.join(toolsState, 'views')).length;
   const entries = await tree.getChildren(countView);
   await tree.getChildren(countView);
   check('a view runs once until refreshed', viewRuns() === 1 && entries[0].label === 'one');
@@ -347,14 +362,14 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   tests.limits.json = 120000; // the list calls of the next load
   fs.rmSync(pids);
   // plugins added or removed: the watchers start again
-  const firstWatch = pidsIn(path.join(toolsDir, 'watch'));
+  const firstWatch = pidsIn(path.join(toolsState, 'watch'));
   await api.load();
-  await until('a new watcher', () => pidsIn(path.join(toolsDir, 'watch')).length === 2);
+  await until('a new watcher', () => pidsIn(path.join(toolsState, 'watch')).length === 2);
   await until('the old watcher to end', () => !firstWatch.some(alive), 2000).catch(() => {});
   check('load restarts the watchers', firstWatch.length === 1 && !firstWatch.some(alive));
 
   // a plugin whose watch cannot start does not stop the others
-  const watchFile = path.join(toolsDir, 'watch');
+  const watchFile = path.join(toolsState, 'watch');
   const example = (await rowsOf()).find((r) => r.label === 'Example tests').plugin;
   const exampleWatch = example.spec.watch;
   example.spec.watch = 'not a list';
@@ -365,7 +380,7 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   check('one watch that cannot start does not stop the others', pidsIn(watchFile).length === watchCount + 1);
 
   // a watcher that ended is never signalled again (its group id may be another process's by then)
-  const qwatch = path.join(quickDir, 'qwatch');
+  const qwatch = path.join(quickState, 'qwatch');
   const quickGone = () => { const q = pidsIn(qwatch).at(-1); return q && ![...tests.procs].some((x) => x.pid === q); };
   await until('the quick watcher to end', quickGone, 3000);
   const quickPid = pidsIn(qwatch).at(-1);
@@ -487,7 +502,10 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   const gateSpec = { name: 'Gate', list: mark('list'), run: mark('run'), watch: mark('watch'),
     views: [{ name: 'V', run: mark('view') }], actions: [{ name: 'A', run: mark('action') }] };
   fs.writeFileSync(path.join(gateDir, 'plugin.json'), JSON.stringify(gateSpec));
-  fs.writeFileSync(store, JSON.stringify({ ...readStore(), '/some/app/plugin': 'abc123' })); // another entry (the app's)
+  { // another project's entry (the app's)
+    const s = readStore();
+    writeStore({ ...s, approved: { ...s.approved, '/some/app': { '/some/app/.droid-lite/plugins/p': 'abc123' } } });
+  }
   const ctx3 = { subscriptions: [] };
   const api3 = tests.setup(ctx3, () => project3);
   fs.writeFileSync(path.join(raceDir, 'plugin.json'), raceSpec('new', 0));
@@ -504,7 +522,7 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   const gateId = fs.realpathSync(gateDir);
   const gateRoot = ctrl.items.get(`needs-ok:${gateId}`);
   check('a project plugin not allowed shows "Needs your OK" in the Test Explorer', gateRoot?.description === 'Needs your OK'
-    && /Needs your OK/.test(gateRoot.error) && !ctrl.items.get(`plugin:${gateId}`));
+    && /Needs your OK/.test(gateRoot.error) && gateRoot.error.includes(TRUST) && !ctrl.items.get(`plugin:${gateId}`));
   const gateRow = (await tree.getChildren()).find((r) => r.label === 'Gate');
   check('and in the sidebar, with only Allow…', gateRow?.description === 'Needs your OK'
     && (await tree.getChildren(gateRow)).map((i) => `${i.label}>${i.command?.command}`).join() === 'Allow…>droidLite.allowTestPlugin');
@@ -517,20 +535,23 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   // Cancel allows nothing; Allow (from the Test Explorer item) shows the folder and every command
   fake.answer = undefined;
   await commands['droidLite.allowTestPlugin'](gateRow.pending);
-  check('Cancel allows nothing', !readStore()[gateId] && !fs.existsSync(marks));
+  check('Cancel allows nothing', !okOf(readStore(), project3, gateDir) && !fs.existsSync(marks));
   fake.answer = 'Allow';
   await commands['droidLite.allowTestPlugin'](gateRoot);
   const { o: modal, buttons } = fake.asked;
-  check('the OK is a modal with the folder and the commands', modal.modal && buttons.includes('Allow') && modal.detail.includes(gateId)
+  check('the OK is a modal with what it trusts, the folder and the commands', modal.modal && buttons.includes('Allow')
+    && modal.detail.includes(TRUST) && modal.detail.includes(gateId)
     && ['list', 'run', 'watch'].every((k) => modal.detail.includes(`${k}: ${JSON.stringify(gateSpec[k])}`))
     && modal.detail.includes(JSON.stringify(gateSpec.views[0].run)) && modal.detail.includes(JSON.stringify(gateSpec.actions[0].run)));
   await until('the list to run', () => fs.existsSync(marks), 3000).catch(() => {});
   check('Allow runs list', fs.existsSync(marks) && fs.readFileSync(marks, 'utf8').includes('list')
     && ctrl.items.get(`plugin:${gateId}`)?.children.get(`${gateId}\u0000g`));
   const saved = readStore();
-  check('the store keeps other entries, holds the sha256 of plugin.json, no temp file left', saved['/some/app/plugin'] === 'abc123'
-    && saved[raceId] === sha(raceDir) && saved[gateId] === sha(gateDir)
-    && fs.readdirSync(path.dirname(store)).every((n) => !n.endsWith('.tmp')));
+  check('the store (v2, 0600) keeps other entries, holds the tree hash per project, no temp or lock file left',
+    saved.version === 2 && saved.approved['/some/app']['/some/app/.droid-lite/plugins/p'] === 'abc123'
+    && okOf(saved, project3, raceDir) === hashOf(raceDir) && okOf(saved, project3, gateDir) === hashOf(gateDir)
+    && (fs.statSync(store).mode & 0o777) === 0o600
+    && fs.readdirSync(path.dirname(store)).every((n) => !n.endsWith('.tmp') && !n.endsWith('.lock')));
   // a changed plugin.json asks again
   await sleep(300); // the watch started by the load ends
   fs.rmSync(marks);
@@ -545,7 +566,152 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   check('a broken store is not overwritten', fs.readFileSync(store, 'utf8') === 'not json' && /could not save the OK/.test(fake.err));
   fs.writeFileSync(store, JSON.stringify(saved));
   // the user's own plugins need no OK
-  check('a user plugin needs no OK', !(userDup in readStore()) && ctrl.items.get(`plugin:${userDup}`)?.children.get(`${userDup}\u0000c`));
+  check('a user plugin needs no OK', !JSON.stringify(readStore()).includes(userDup) && ctrl.items.get(`plugin:${userDup}`)?.children.get(`${userDup}\u0000c`));
+  const allowGate = async () => {
+    fake.answer = 'Allow';
+    await commands['droidLite.allowTestPlugin']((await tree.getChildren()).find((r) => r.label === 'Gate' && r.pending).pending);
+  };
+  const gateNeedsOk = () => !!ctrl.items.get(`needs-ok:${gateId}`) && !ctrl.items.get(`plugin:${gateId}`);
+  // any file in the plugin's folder (a script it runs, in a subfolder too) is in the OK
+  fs.mkdirSync(path.join(gateDir, 'lib'));
+  fs.writeFileSync(path.join(gateDir, 'lib', 'helper.sh'), 'echo 1\n');
+  await api3.load();
+  check('a new script in the folder asks again', gateNeedsOk());
+  await allowGate();
+  check('Allow runs it again', ctrl.items.get(`plugin:${gateId}`) && !gateNeedsOk());
+  fs.writeFileSync(path.join(gateDir, 'lib', 'helper.sh'), 'echo 2\n');
+  await api3.load();
+  check('a changed script in the folder asks again', gateNeedsOk());
+  // an old (v1) store, a flat map folder -> hash, allows nothing; the first Allow replaces it with v2
+  writeStore({ [gateId]: hashOf(gateDir) });
+  await api3.load();
+  check('a v1 store asks again', gateNeedsOk());
+  await allowGate();
+  check('Allow replaces a v1 store with v2', readStore().version === 2 && !(gateId in readStore())
+    && okOf(readStore(), project3, gateDir) === hashOf(gateDir) && !gateNeedsOk());
+  // an OK is for one project: the same folder's OK under another project's key allows nothing
+  const projectB = path.join(tmp, 'projectB');
+  const bDir = path.join(projectB, '.droid-lite', 'plugins', 'gate');
+  fs.cpSync(gateDir, bDir, { recursive: true });
+  const bOk = () => tests.readPlugins(projectB).find((x) => x.folder === real(bDir));
+  writeStore({ version: 2, approved: { [real(project3)]: { [real(bDir)]: hashOf(bDir) } } });
+  check('an OK for project A does not allow a plugin of project B', bOk()?.needsOk && hashOf(bDir) === hashOf(gateDir));
+  approve(bDir);
+  check('its own project\'s OK does', bOk()?.spec && !bOk().needsOk);
+  // a project plugin that links outside the project's .droid-lite/plugins can never run or be
+  // allowed, even with an entry in the store
+  const outDir = path.join(tmp, 'outside-plugin');
+  fs.mkdirSync(outDir);
+  fs.writeFileSync(path.join(outDir, 'plugin.json'), JSON.stringify({ name: 'Outside', list: mark('outside') }));
+  const outLink = path.join(project3, '.droid-lite', 'plugins', 'outside');
+  fs.symlinkSync(outDir, outLink);
+  writeStore({ version: 2, approved: { [real(project3)]: { [gateId]: hashOf(gateDir), [real(outDir)]: hashOf(outDir) } } });
+  fs.rmSync(marks, { force: true });
+  await api3.load();
+  const outId = real(outDir);
+  check('a plugin linked outside the project is refused', /plugin\.json: links outside the project$/.test(ctrl.items.get(`plugin:${outId}`)?.error)
+    && !ctrl.items.get(`needs-ok:${outId}`) && (await tree.getChildren()).some((r) => r.iconPath?.id === 'warning' && /links outside the project/.test(r.label)));
+  fake.asked = undefined;
+  await commands['droidLite.allowTestPlugin']({ folder: outId });
+  await sleep(300);
+  check('and cannot be allowed or run', !fake.asked && !(fs.existsSync(marks) && fs.readFileSync(marks, 'utf8').includes('outside')));
+  fs.unlinkSync(outLink);
+  // nor can a project whose .droid-lite (or plugins folder) links outside it
+  const projectL = path.join(tmp, 'projectL');
+  fs.mkdirSync(projectL);
+  fs.symlinkSync(path.join(project3, '.droid-lite'), path.join(projectL, '.droid-lite'));
+  check('a project whose .droid-lite links outside is refused', tests.readPlugins(projectL)
+    .filter((x) => x.folder.startsWith(real(project3))).every((x) => /links outside the project$/.test(x.error)));
+  // a link inside the folder, more than 2000 files or 8 MiB: too risky or too big to check
+  const projectT = path.join(tmp, 'projectT');
+  const tPlugin = (n, files) => {
+    const d = path.join(projectT, '.droid-lite', 'plugins', n);
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, 'plugin.json'), JSON.stringify({ name: n }));
+    files(d);
+    return real(d);
+  };
+  const tLink = tPlugin('link', (d) => { fs.mkdirSync(path.join(d, 'sub')); fs.symlinkSync('/etc/hosts', path.join(d, 'sub', 'h')); });
+  const tMany = tPlugin('many', (d) => { for (let i = 0; i < 2000; i++) fs.writeFileSync(path.join(d, `f${i}`), ''); });
+  const tBig = tPlugin('big', (d) => fs.writeFileSync(path.join(d, 'blob'), Buffer.alloc((8 << 20) + 1)));
+  const tFit = tPlugin('fit', (d) => { for (let i = 0; i < 1999; i++) fs.writeFileSync(path.join(d, `f${i}`), ''); });
+  const tOf = (id) => tests.readPlugins(projectT).find((x) => x.folder === id);
+  check('a link inside a plugin folder is refused', /contains links$/.test(tOf(tLink)?.error));
+  check('more than 2000 files or 8 MiB is refused', /too big to check$/.test(tOf(tMany)?.error) && /too big to check$/.test(tOf(tBig)?.error)
+    && tOf(tFit)?.needsOk);
+  // the tree hash: a fixed vector, the same in the app
+  const vec = path.join(tmp, 'vector');
+  fs.mkdirSync(path.join(vec, 'sub'), { recursive: true });
+  fs.writeFileSync(path.join(vec, 'plugin.json'), '{"name":"V","list":["sh","list.sh"]}');
+  fs.writeFileSync(path.join(vec, 'list.sh'), 'echo []\n');
+  fs.writeFileSync(path.join(vec, 'sub', 'a.txt'), 'a');
+  // (and the app's own: '.' sorts before '/')
+  const vec2 = path.join(tmp, 'vector2');
+  fs.mkdirSync(path.join(vec2, 'a'), { recursive: true });
+  fs.writeFileSync(path.join(vec2, 'a.txt'), 'x');
+  fs.writeFileSync(path.join(vec2, 'a', 'b'), '');
+  fs.writeFileSync(path.join(vec2, 'plugin.json'), '{"name":"T"}');
+  check('the tree hash matches the shared vectors', tests.treeHash(real(vec)).hash === '85cf4b35bd11fc3ed3e9c64b0ad55846b230a2bd35e7fbf70122b98e1b8f3a5a'
+    && tests.treeHash(real(vec2)).hash === '785f791d17fa1ef53828f417bb59ba3da0d7e7e426a16e1839df07d75c88577f');
+  // keys are real paths with the on-disk case (a project opened as /x/caseproj is /x/CaseProj)
+  const caseDir = path.join(tmp, 'CaseProj');
+  fs.mkdirSync(path.join(caseDir, '.droid-lite', 'plugins', 'Cased'), { recursive: true });
+  fs.writeFileSync(path.join(caseDir, '.droid-lite', 'plugins', 'Cased', 'plugin.json'), JSON.stringify({ name: 'Cased' }));
+  const lower = path.join(tmp, 'caseproj');
+  if (fs.existsSync(lower)) { // a case-insensitive disk (macOS default)
+    const c = tests.readPlugins(lower).find((x) => x.name === 'Cased');
+    check('keys use the on-disk case', c?.needsOk && c.project === real(caseDir) && c.project.endsWith('/CaseProj')
+      && c.folder === path.join(real(caseDir), '.droid-lite', 'plugins', 'Cased'));
+  } else console.log('skip: the disk is case-sensitive');
+  // writes take <store>.lock: an Allow waits while another process holds it, then keeps its entry
+  const lock = `${store}.lock`;
+  const P = real(project3);
+  const before = readStore();
+  fs.writeFileSync(lock, '');
+  let done = false;
+  const pending = tests.approve(P, '/x/a', 'ha').then(() => { done = true; });
+  await sleep(300);
+  check('an Allow waits for the lock', !done && !readStore().approved[P]['/x/a']);
+  writeStore({ ...before, approved: { ...before.approved, [P]: { ...before.approved[P], '/x/b': 'hb' } } }); // the other process's write
+  fs.unlinkSync(lock);
+  await pending;
+  check('and keeps what the lock holder wrote', readStore().approved[P]['/x/a'] === 'ha' && readStore().approved[P]['/x/b'] === 'hb' && !fs.existsSync(lock));
+  // a lock left by a process that died (older than 30 s) is removed
+  fs.writeFileSync(lock, '');
+  fs.utimesSync(lock, new Date(Date.now() - 60000), new Date(Date.now() - 60000));
+  const staleT0 = Date.now();
+  await tests.approve(P, '/x/c', 'hc');
+  check('a stale lock is removed', Date.now() - staleT0 < 2000 && readStore().approved[P]['/x/c'] === 'hc' && !fs.existsSync(lock));
+  // two Allows at once in one process, and two processes allowing 20 folders each: every entry kept
+  await Promise.all([tests.approve(P, '/x/d', 'hd'), tests.approve('/y', '/y/.droid-lite/plugins/e', 'he')]);
+  check('two interleaved Allows keep both', readStore().approved[P]['/x/d'] === 'hd' && readStore().approved['/y']['/y/.droid-lite/plugins/e'] === 'he');
+  const child = path.join(tmp, 'allow-child.js');
+  fs.writeFileSync(child, `const Module = require('module');
+const load = Module._load;
+Module._load = function (r, ...a) { return r === 'vscode' ? {} : load.call(this, r, ...a); };
+const t = require(process.argv[2]);
+(async () => { for (let i = 0; i < 20; i++) await t.approve('/two', '/two/.droid-lite/plugins/' + process.argv[3] + i, 'h'); })()
+  .catch((e) => { console.error(e); process.exit(1); });
+`);
+  const codes = await Promise.all(['a', 'b'].map((k) => new Promise((resolve) => {
+    require('child_process').spawn(process.execPath, [child, path.join(__dirname, '..', 'tests.js'), k], { stdio: 'inherit' }).on('exit', resolve);
+  })));
+  const two = readStore().approved['/two'] || {};
+  check('two processes allowing at once keep every entry', codes.every((c) => c === 0) && Object.keys(two).length === 40
+    && readStore().approved[P]['/x/a'] === 'ha');
+  // $DROID_LITE_CONFIG_DIR is the config folder: user plugins and the store
+  const cfg = path.join(tmp, 'cfg');
+  fs.mkdirSync(path.join(cfg, 'plugins', 'mine'), { recursive: true });
+  fs.writeFileSync(path.join(cfg, 'plugins', 'mine', 'plugin.json'), JSON.stringify({ name: 'Mine' }));
+  const homeStore = fs.readFileSync(store, 'utf8');
+  process.env.DROID_LITE_CONFIG_DIR = cfg;
+  await api3.load();
+  check('DROID_LITE_CONFIG_DIR: its plugins folder and store are read', roots().some((i) => i.label === 'Mine')
+    && !roots().some((i) => i.label === 'Dup') && gateNeedsOk());
+  await allowGate();
+  check('and Allow writes there', okOf(readStore(path.join(cfg, 'approved-plugins.json')), project3, gateDir) === hashOf(gateDir)
+    && fs.readFileSync(store, 'utf8') === homeStore && !gateNeedsOk());
+  delete process.env.DROID_LITE_CONFIG_DIR;
   ctx3.subscriptions.forEach((d) => d.dispose?.());
   await until('no tracked process', () => tests.procs.size === 0, 8000).catch(() => {});
   check('no plugin process left after the OK checks', tests.procs.size === 0);
@@ -556,9 +722,9 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   console.error(e);
   // a failed check leaves no plugin process behind
   tests.procs.forEach((p) => { try { process.kill(-p.pid, 'SIGKILL'); } catch { /* ended */ } });
-  pidsIn(path.join(quickDir, 'qwatch')).forEach((pid) => { try { process.kill(pid, 'SIGKILL'); } catch { /* ended */ } });
+  pidsIn(path.join(quickState, 'qwatch')).forEach((pid) => { try { process.kill(pid, 'SIGKILL'); } catch { /* ended */ } });
   for (const f of ['pids', 'left', 'watch']) {
-    pidsIn(path.join(toolsDir, f)).forEach((pid) => { try { process.kill(pid, 'SIGKILL'); } catch { /* ended */ } });
+    pidsIn(path.join(toolsState, f)).forEach((pid) => { try { process.kill(pid, 'SIGKILL'); } catch { /* ended */ } });
   }
   process.exit(1);
 });

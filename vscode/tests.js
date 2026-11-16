@@ -1,10 +1,11 @@
 // Droid Lite test plugins (docs/PLUGINS.md) in VS Code's Test Explorer: the same plugin.json files
-// the app reads (~/.config/droid-lite/plugins/<name>/ and <project>/.droid-lite/plugins/<name>/),
-// so a plugin added in either one shows in both. Cases come from `list`, runs from `run` (JSON
-// lines), extra lists (`views`), buttons (`actions`), `links` and the live state (`watch`) go in
-// the Droid Lite sidebar. A project plugin runs nothing until the user allows it once (shared with
-// the app: ~/.config/droid-lite/approved-plugins.json, its real folder -> sha256 of its plugin.json);
-// a changed plugin.json asks again. The user's own plugins need no OK.
+// the app reads (<config>/plugins/<name>/ and <project>/.droid-lite/plugins/<name>/), so a plugin
+// added in either one shows in both. Cases come from `list`, runs from `run` (JSON lines), extra
+// lists (`views`), buttons (`actions`), `links` and the live state (`watch`) go in the Droid Lite
+// sidebar. A project plugin runs nothing until the user allows it once for that project (shared
+// with the app: <config>/approved-plugins.json, see `approve`); any change to a file in its folder
+// asks again. The user's own plugins need no OK. <config> is $DROID_LITE_CONFIG_DIR, else
+// ~/.config/droid-lite.
 const vscode = require('vscode');
 const cp = require('child_process');
 const crypto = require('crypto');
@@ -14,38 +15,122 @@ const path = require('path');
 const { EventEmitter } = require('events');
 const { PassThrough } = require('stream');
 
-const userDir = () => path.join(os.homedir(), '.config', 'droid-lite', 'plugins');
-const storeFile = () => path.join(os.homedir(), '.config', 'droid-lite', 'approved-plugins.json');
-const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
+const configDir = () => process.env.DROID_LITE_CONFIG_DIR || path.join(os.homedir(), '.config', 'droid-lite');
+const userDir = () => path.join(configDir(), 'plugins');
+const storeFile = () => path.join(configDir(), 'approved-plugins.json');
+const realpath = (p) => fs.realpathSync.native(p); // the on-disk case, like the app
+const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const inside = (dir, p) => { const r = path.relative(dir, p); return !!r && !r.startsWith('..') && !path.isAbsolute(r); };
+// what a trust OK covers (the Allow modal and "Needs your OK")
+const TRUST = "Allowing trusts this plugin's folder. Commands may also run project code outside it (for example a script in the repo); changes to that code do not ask again.";
+const MAX_TREE_FILES = 2000;
+const MAX_TREE_BYTES = 8 << 20;
 
-// the allowed project plugins: { "<real folder>": "<sha256 of plugin.json>" }. `strict`: a store
-// that is not a JSON object throws (a write never drops what the app saved); else it allows none
-function approvals(strict = false) {
-  let store;
-  try { store = JSON.parse(fs.readFileSync(storeFile(), 'utf8')); } catch (e) {
-    if (e.code === 'ENOENT' || !strict) return {};
-    throw new Error(`${storeFile()}: ${e.message}`);
+// the tree hash of a plugin folder (shared with the app, byte for byte): SHA-256 over every regular
+// file under it, sorted by relative path ('/' separators) compared as UTF-8 bytes; per file its
+// path, one 0 byte, its length (8 bytes, big-endian) and its bytes. Lowercase hex. A link anywhere
+// inside, or more than 2000 files or 8 MiB, throws. Also gives the plugin.json bytes it hashed, so
+// what the user sees is what the OK covers.
+function treeHash(folder) {
+  const files = []; // [relative path, absolute path], as bytes
+  let total = 0;
+  const walk = (abs, rel) => {
+    for (const n of fs.readdirSync(abs, { encoding: 'buffer' })) {
+      const a = Buffer.concat([abs, Buffer.from(path.sep), n]);
+      const r = rel ? Buffer.concat([rel, Buffer.from('/'), n]) : n;
+      const st = fs.lstatSync(a);
+      if (st.isSymbolicLink()) throw new Error('contains links');
+      if (st.isDirectory()) walk(a, r);
+      else if (st.isFile() && (files.push([r, a]) > MAX_TREE_FILES || (total += st.size) > MAX_TREE_BYTES)) {
+        throw new Error('too big to check');
+      }
+    }
+  };
+  walk(Buffer.from(folder), null);
+  files.sort(([a], [b]) => Buffer.compare(a, b));
+  const h = crypto.createHash('sha256');
+  let manifest;
+  total = 0;
+  for (const [r, a] of files) {
+    let fd;
+    try { fd = fs.openSync(a, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); } catch (e) {
+      throw e.code === 'ELOOP' ? new Error('contains links') : e;
+    }
+    let bytes;
+    try { bytes = fs.readFileSync(fd); } finally { fs.closeSync(fd); }
+    if ((total += bytes.length) > MAX_TREE_BYTES) throw new Error('too big to check'); // grew since the walk
+    const len = Buffer.alloc(8);
+    len.writeBigUInt64BE(BigInt(bytes.length));
+    h.update(r).update(Buffer.of(0)).update(len).update(bytes);
+    if (r.toString() === 'plugin.json') manifest = bytes;
   }
-  if (store && typeof store === 'object' && !Array.isArray(store)) return store;
-  if (strict) throw new Error(`${storeFile()} is not a JSON object`);
-  return {};
+  return { hash: h.digest('hex'), manifest };
 }
 
-// allows `folder` with plugin.json bytes of this hash, keeping every other entry; written to a
-// temporary file and renamed, so a reader (the app) never sees half a file
-function approve(folder, hash) {
-  const file = storeFile();
-  const store = approvals(true);
-  store[folder] = hash;
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-  try {
-    fs.writeFileSync(tmp, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
-    fs.renameSync(tmp, file);
-  } catch (e) {
-    try { fs.unlinkSync(tmp); } catch { /* not written */ }
-    throw e;
+// the store: {"version":2,"approved":{"<project real path>":{"<plugin folder real path>":"<tree hash>"}}}.
+// Any other shape (an old flat map too) allows none. `strict`: a file that is not a JSON object
+// throws (a write never drops what the app saved); another object is replaced on write.
+function readStore(strict = false) {
+  const empty = { version: 2, approved: {} };
+  let store;
+  try { store = JSON.parse(fs.readFileSync(storeFile(), 'utf8')); } catch (e) {
+    if (e.code === 'ENOENT' || !strict) return empty;
+    throw new Error(`${storeFile()}: ${e.message}`);
   }
+  if (!isObject(store)) {
+    if (strict) throw new Error(`${storeFile()} is not a JSON object`);
+    return empty;
+  }
+  return store.version === 2 && isObject(store.approved) ? store : empty;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// runs `f` holding <store>.lock (created with 'wx'; the app takes the same lock), waiting up to
+// about 5 s; a lock older than 30 s is from a process that died and is removed
+async function locked(f) {
+  const lock = `${storeFile()}.lock`;
+  fs.mkdirSync(path.dirname(lock), { recursive: true });
+  for (let wait = 10, end = Date.now() + 5000; ; wait = Math.min(wait * 2, 250)) {
+    try { fs.closeSync(fs.openSync(lock, 'wx', 0o600)); break; } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+    }
+    try {
+      if (Date.now() - fs.statSync(lock).mtimeMs > 30000) { fs.unlinkSync(lock); continue; }
+    } catch { continue; } // gone meanwhile: try again at once
+    if (Date.now() > end) throw new Error(`${lock} is held by another Droid Lite; try again`);
+    await sleep(wait);
+  }
+  try { return f(); } finally { try { fs.unlinkSync(lock); } catch { /* removed as stale */ } }
+}
+
+// allows the plugin folder `folder` of project `project` (both real paths) with this tree hash,
+// keeping every other entry: read, changed and written under the lock, through a 0600 temp file
+// and a rename, so a reader (the app) never sees half a file
+function approve(project, folder, hash) {
+  return locked(() => {
+    const file = storeFile();
+    const store = readStore(true);
+    const out = { version: 2, approved: store.approved };
+    if (!isObject(out.approved[project])) out.approved[project] = {};
+    out.approved[project][folder] = hash;
+    const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+    try {
+      fs.writeFileSync(tmp, `${JSON.stringify(out, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+      fs.renameSync(tmp, file);
+    } catch (e) {
+      try { fs.unlinkSync(tmp); } catch { /* not written */ }
+      throw e;
+    }
+  });
+}
+
+// a project plugin as it is on disk now: { real, hash, manifest } or a thrown reason it can never
+// run (its real folder is not inside the project's real .droid-lite/plugins, a link inside it, too big)
+function inspect(project, folder) {
+  const real = realpath(folder);
+  const plugins = realpath(path.join(project, '.droid-lite', 'plugins'));
+  if (!inside(realpath(project), plugins) || !inside(plugins, real)) throw new Error('links outside the project');
+  return { real, ...treeHash(real) };
 }
 const MAX_LOG = 20000; // lines kept per run in the test output
 const MAX_LOG_CHARS = 8 << 20; // and characters (about 8 MB) in all
@@ -89,11 +174,13 @@ function budget() {
 }
 
 // every plugin: { name, folder, cwd, spec }, { error, folder } or, a project plugin not allowed
-// (yet, or since its plugin.json changed), { name, folder, file, needsOk } with no spec, so nothing
-// of it can run; `folder` (its real path) is its id, two plugins may share a name
+// for this project (yet, or since a file in its folder changed), { name, folder, project, file,
+// needsOk } with no spec, so nothing of it can run; `folder` (its real path) is its id, two plugins
+// may share a name. A project plugin that links outside the project's .droid-lite/plugins, holds a
+// link or is too big to check is an error: it can never run or be allowed.
 function readPlugins(project) {
   const roots = [userDir(), project && path.join(project, '.droid-lite', 'plugins')].filter(Boolean);
-  const allowed = approvals();
+  const approved = readStore().approved;
   const out = [];
   for (const root of roots) {
     const own = root === userDir();
@@ -105,13 +192,23 @@ function readPlugins(project) {
       if (!fs.existsSync(file)) continue;
       let real = folder;
       try {
-        real = fs.realpathSync(folder);
-        const bytes = fs.readFileSync(file);
+        real = realpath(folder);
+        let bytes;
+        let ok = own;
+        let key;
+        if (own) bytes = fs.readFileSync(file);
+        else {
+          key = realpath(project);
+          const seen = inspect(project, folder);
+          bytes = seen.manifest;
+          if (!bytes) throw new Error('not a file');
+          ok = approved[key]?.[real] === seen.hash;
+        }
         const spec = JSON.parse(bytes.toString('utf8'));
         const bad = problem(spec);
         if (bad) throw new Error(bad);
-        if (!own && allowed[real] !== sha256(bytes)) {
-          out.push({ name: spec.name, folder: real, file, needsOk: true });
+        if (!ok) {
+          out.push({ name: spec.name, folder: real, project: key, file, needsOk: true });
           continue;
         }
         const dir = spec.dir ? spec.dir.replace(/^~\//, `${os.homedir()}/`) : '.';
@@ -269,7 +366,7 @@ function setup(ctx, projectOf) {
       if (p.needsOk) { // right-click > Allow… (package.json: testing/item/context)
         const root = ctrl.createTestItem(`needs-ok:${p.folder}`, label);
         root.description = 'Needs your OK';
-        root.error = `Needs your OK: this project plugin runs nothing until you allow it (right-click > Allow…, or Allow… under Test plugins in the Droid Lite sidebar). ${p.folder}`;
+        root.error = `Needs your OK: this project plugin runs nothing until you allow it (right-click > Allow…, or Allow… under Test plugins in the Droid Lite sidebar). ${TRUST} ${p.folder}`;
         ctrl.items.add(root);
         return;
       }
@@ -416,7 +513,7 @@ function setup(ctx, projectOf) {
           const g = new vscode.TreeItem(p.name, vscode.TreeItemCollapsibleState.Expanded);
           g.iconPath = new vscode.ThemeIcon('shield');
           g.description = 'Needs your OK';
-          g.tooltip = `${p.folder}\nThis project plugin runs nothing until you allow it.`;
+          g.tooltip = `${p.folder}\nThis project plugin runs nothing until you allow it. ${TRUST}`;
           g.pending = p;
           return g;
         }));
@@ -517,17 +614,18 @@ function setup(ctx, projectOf) {
       viewCache.delete(`${node.plugin.folder}\u0000${node.view.name}`);
       sidebar.fire(node);
     }),
-    // Allow: shows the commands of the plugin.json on disk now and allows exactly those bytes; from
-    // the sidebar (the plugin) or the Test Explorer (its test item)
+    // Allow: shows the commands of the plugin.json on disk now and allows exactly the folder's tree
+    // it read them from, for this project only; from the sidebar (the plugin) or the Test Explorer
+    // (its test item)
     vscode.commands.registerCommand('droidLite.allowTestPlugin', async (arg) => {
       const folder = arg?.id?.startsWith?.('needs-ok:') ? arg.id.slice('needs-ok:'.length) : arg?.folder;
       const p = plugins.find((x) => x.needsOk && x.folder === folder);
       if (!p) return;
-      let bytes;
+      let seen;
       let spec;
-      try {
-        bytes = fs.readFileSync(p.file);
-        spec = JSON.parse(bytes.toString('utf8'));
+      try { // the folder as it is now: the OK covers exactly the tree shown
+        seen = inspect(p.project, p.folder);
+        spec = JSON.parse(seen.manifest.toString('utf8'));
         const bad = problem(spec);
         if (bad) throw new Error(bad);
       } catch (e) {
@@ -535,6 +633,8 @@ function setup(ctx, projectOf) {
       }
       const cmd = (v) => JSON.stringify(v);
       const detail = [
+        TRUST,
+        '',
         `Folder: ${p.folder}`,
         ...(spec.dir ? [`Runs in: ${path.resolve(p.folder, spec.dir.replace(/^~\//, `${os.homedir()}/`))}`] : []),
         ...['list', 'run', 'watch'].filter((k) => spec[k]).map((k) => `${k}: ${cmd(spec[k])}`),
@@ -545,7 +645,7 @@ function setup(ctx, projectOf) {
         `Allow the project's test plugin "${spec.name}" to run these commands on your Mac?`,
         { modal: true, detail }, 'Allow');
       if (ok !== 'Allow') return;
-      try { approve(p.folder, sha256(bytes)); } catch (e) {
+      try { await approve(p.project, seen.real, seen.hash); } catch (e) {
         return vscode.window.showErrorMessage(`Droid Lite: could not save the OK: ${e.message}`);
       }
       await load();
@@ -573,7 +673,7 @@ function setup(ctx, projectOf) {
       let names = [];
       try { names = fs.readdirSync(userDir()); } catch { /* no user plugins: it comes with the project */ }
       const links = names.map((n) => path.join(userDir(), n))
-        .filter((l) => { try { return fs.realpathSync(l) === p.folder; } catch { return false; } });
+        .filter((l) => { try { return realpath(l) === p.folder; } catch { return false; } });
       if (!links.length) return vscode.window.showInformationMessage(`${p.name} comes with the project (.droid-lite/plugins): remove it there.`);
       const ok = await vscode.window.showWarningMessage(`Remove ${p.name}? Only the link goes; the tool's folder stays.`, { modal: true }, 'Remove');
       if (ok !== 'Remove') return;
@@ -585,4 +685,4 @@ function setup(ctx, projectOf) {
   return { load, readPlugins, loaded };
 }
 
-module.exports = { setup, readPlugins, argv, findPluginJson, location, limits, procs };
+module.exports = { setup, readPlugins, argv, findPluginJson, location, limits, procs, treeHash, approve };
