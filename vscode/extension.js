@@ -4,12 +4,14 @@ const cp = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const readline = require('readline');
+const preview = require('./preview');
 
 let engine; // { proc, pending, nextId }
 let ready; // Promise of the initialize reply
 let recording; // serial while a screen recording runs
 let logcat; // running `adb logcat` process
 const changed = new vscode.EventEmitter();
+const events = new vscode.EventEmitter(); // engine lines without an id (preview progress)
 
 function enginePath(ctx) {
   const set = vscode.workspace.getConfiguration('droidLite').get('enginePath');
@@ -24,6 +26,7 @@ function start(ctx) {
   readline.createInterface({ input: proc.stdout }).on('line', (line) => {
     let msg;
     try { msg = JSON.parse(line); } catch { return; }
+    if (msg.event) { events.fire(msg); return; }
     const p = pending.get(msg.id);
     if (!p) return;
     pending.delete(msg.id);
@@ -206,6 +209,7 @@ function activate(ctx) {
   const out = vscode.window.createOutputChannel('Logcat', 'log');
   // the Droid Lite icon in the activity bar: one click per tool
   const tools = [
+    ['Compose preview', 'droidLite.preview', 'open-preview'],
     ['Device screenshot', 'droidLite.screenshot', 'device-camera'],
     ['Start screen recording', 'droidLite.recordStart', 'record'],
     ['Stop screen recording', 'droidLite.recordStop', 'debug-stop'],
@@ -231,6 +235,7 @@ function activate(ctx) {
     }, 400));
   };
   paintStability(ctx, vscode.window.activeTextEditor);
+  preview.setup(ctx, project, events);
   const watcher = vscode.workspace.createFileSystemWatcher('**/*.{kt,kts,java}');
 
   ctx.subscriptions.push(

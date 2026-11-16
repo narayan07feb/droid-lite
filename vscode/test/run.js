@@ -42,6 +42,7 @@ const fake = {
     workspaceFolders: [{ uri: { fsPath: dir } }],
     getConfiguration: () => ({ get: (k) => (k === 'enginePath' ? path.resolve(process.env.DROID_LITE_ENGINE) : 500) }),
     onDidChangeTextDocument: () => ({ dispose() {} }),
+    onDidSaveTextDocument: () => ({}),
     createFileSystemWatcher: () => ({ onDidCreate: () => ({}), onDidChange: () => ({}), onDidDelete: () => ({}), dispose() {} }),
   },
   languages: {
@@ -54,6 +55,7 @@ const fake = {
   window: {
     activeTextEditor: undefined,
     onDidChangeActiveTextEditor: () => ({}),
+    createWebviewPanel: () => { throw new Error('not in this test'); },
     createTextEditorDecorationType: (o) => ({ o, dispose() {} }),
     createStatusBarItem: () => ({ show() {}, hide() {}, dispose() {} }),
     createOutputChannel: () => ({ dispose() {} }),
@@ -111,7 +113,7 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   ]);
   // every tool in the sidebar runs a registered command
   const items = tree.getChildren();
-  assert.strictEqual(items.length, 6);
+  assert.strictEqual(items.length, 7);
   for (const i of items) assert.ok(commands[i.command.command], i.command.command);
   for (const s of ctx.subscriptions) s.dispose?.();
   fs.rmSync(dir, { recursive: true, force: true });
