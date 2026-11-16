@@ -10,6 +10,7 @@ let engine; // { proc, pending, nextId }
 let ready; // Promise of the initialize reply
 let indexing; // that promise while the engine has not answered it (one initialize at a time)
 let recording; // serial while a screen recording runs (UNKNOWN: record_start did not answer)
+let saving = false; // a recording is being saved (record_stop may take ~16 min): device calls wait
 const UNKNOWN = '?';
 let logcat; // running `adb logcat` process
 let onStopped = () => {}; // the current engine stopped (set in activate)
@@ -60,8 +61,8 @@ const limits = {
   initialize: 600000, ping: 15000, update: 15000, remove: 15000, lenses: 15000, stability: 15000, implementations: 15000,
   previews: 180000, devices: 60000, adb: 60000, screenshot: 60000, record_start: 60000, record_stop: 1080000, // engine worst case ~976 s (pull capped at 15 min)
 };
-// a previews call starts its limit again on each progress line for its file (a first run downloads
-// and compiles), up to this cap (ms)
+// a previews call starts its limit again on each progress line, for any file (a first run downloads
+// and compiles; a file queued behind another waits while that one draws), up to this cap (ms)
 const caps = { previews: 900000 };
 // how often the device in the status bar is looked up (ms)
 const every = { devices: 20000 };
@@ -87,11 +88,7 @@ function call(ctx, method, params = {}) {
         reject(new Error(`Droid Lite engine did not answer ${method} in ${(left < ms ? cap : ms) / 1000} s`));
       }, Math.min(ms, left));
     };
-    const real = cap && (() => { try { return fs.realpathSync(params.path); } catch { return params.path; } })();
-    // older engines name no file
-    const progress = cap && events.event((m) => {
-      if (m.event === 'preview_status' && [undefined, params.path, real].includes(m.file)) arm();
-    });
+    const progress = cap && events.event((m) => { if (m.event === 'preview_status') arm(); });
     if (method !== 'initialize') arm();
     const done = (f) => (v) => { clearTimeout(timer); progress?.dispose(); f(v); };
     e.pending.set(id, { resolve: done(resolve), reject: done(reject) });
@@ -120,6 +117,63 @@ const within = (p, ms, method) => new Promise((resolve, reject) => {
   const t = setTimeout(() => reject(new Error(`Droid Lite engine did not answer ${method} in ${ms / 1000} s`)), ms);
   p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
 });
+
+// index updates waiting to go to the engine, one request at a time (a lens or badge call waits
+// behind one at most). Removes go first, up to `chunk` paths in one request (a branch switch
+// deletes thousands); then updates, oldest first. A newer update replaces a waiting one for its
+// path; a removed folder takes the waiting requests under it along, and a remove under a folder
+// that waits to be removed is dropped. A path is looked up by its folders (O(depth)), never by a
+// scan of the queue. `text` is a function read when the update goes, not on every keystroke.
+function writeQueue(send, chunk = 5000) {
+  const updates = new Map(); // path -> text function (or undefined), oldest first
+  const removes = new Set();
+  const below = new Map(); // folder -> the waiting paths under it
+  const folders = (p) => { // every folder above an absolute path, nearest first (not the disk root)
+    const out = [];
+    for (let i = p.lastIndexOf(path.sep); i > 0; i = p.lastIndexOf(path.sep, i - 1)) out.push(p.slice(0, i));
+    return out;
+  };
+  const waits = (p) => updates.has(p) || removes.has(p);
+  const track = (p, on) => {
+    for (const d of folders(p)) {
+      let s = below.get(d);
+      if (on) { if (!s) below.set(d, (s = new Set())); s.add(p); } else if (s) { s.delete(p); if (!s.size) below.delete(d); }
+    }
+  };
+  const take = (p, f) => { f(); if (!waits(p)) track(p, false); };
+  let sending = false;
+  let soon = false;
+  const pump = () => {
+    soon = false;
+    if (sending) return;
+    let req;
+    if (removes.size) {
+      const paths = [];
+      for (const p of removes) { if (paths.length === chunk) break; paths.push(p); }
+      for (const p of paths) take(p, () => removes.delete(p));
+      req = send('remove', { paths });
+    } else if (updates.size) {
+      const [p, text] = updates.entries().next().value;
+      take(p, () => updates.delete(p));
+      req = send('update', { path: p, ...(text && { text: wellFormed(text()) }) });
+    } else return;
+    sending = true;
+    Promise.resolve(req).catch(() => {}).finally(() => { sending = false; pump(); });
+  };
+  return (p, method, text) => {
+    if (method === 'remove') {
+      for (const q of [p, ...(below.get(p) || [])]) take(q, () => { updates.delete(q); removes.delete(q); });
+      if (folders(p).some((d) => removes.has(d))) return; // a folder above it is removed first
+      removes.add(p);
+      track(p, true);
+    } else {
+      if (!waits(p)) track(p, true);
+      updates.delete(p); // to the end: the newest goes last
+      updates.set(p, text);
+    }
+    if (!soon) { soon = true; setImmediate(pump); } // after the other requests of this batch of events
+  };
+}
 
 // project calls wait for the index; device tools do not
 function project(ctx, method, params) {
@@ -243,6 +297,11 @@ function lenses(ctx) {
 }
 
 async function pickDevice(ctx) {
+  // a device call would wait behind record_stop (minutes) and then fail
+  if (saving) {
+    vscode.window.showInformationMessage('Droid Lite: the recording is still being saved. Please wait until it is done.');
+    return undefined;
+  }
   const online = (await call(ctx, 'devices')).filter((d) => d.online);
   if (!online.length) throw new Error('No device is connected (adb devices shows none online)');
   if (online.length === 1) return online[0].serial;
@@ -290,6 +349,7 @@ function activate(ctx) {
   // one lookup at a time: a slow adb never piles up calls
   let looking;
   const findDevice = () => {
+    if (saving) return Promise.resolve(); // it would wait behind record_stop
     looking ??= call(ctx, 'devices').then((all) => {
       const on = all.filter((d) => d.online);
       device = on.length === 1 ? on[0].label.replace(/ \(.*\)$/, '') : on.length ? `${on.length} devices` : 'No device';
@@ -331,32 +391,10 @@ function activate(ctx) {
   refresh();
   onStopped = refresh; // a recording ends with its engine
 
-  // keep the index in step with unsaved edits and files changed outside the editor; one request
-  // per path, so a newer one replaces an unsent older one (outputs and tool folders never count).
-  // `text` is a function read when the request goes, not on every keystroke.
-  // The requests go one at a time, so a lens or badge call waits behind one at most (a branch
-  // switch changes thousands of files); a removed folder takes the waiting requests under it along.
+  // keep the index in step with unsaved edits and files changed outside the editor (outputs and
+  // tool folders never count); see writeQueue
   const timers = new Map();
-  const queue = []; // { p, method, text }, oldest first
-  let sending = false;
-  const under = (d, p) => p === d || p.startsWith(d + path.sep); // p is d or inside it
-  const pump = () => {
-    if (sending || !queue.length) return;
-    sending = true;
-    const { p, method, text } = queue.shift();
-    project(ctx, method, { path: p, ...(text && { text: wellFormed(text()) }) })
-      .then(changedSoon, () => {})
-      .finally(() => { sending = false; pump(); });
-  };
-  const enqueue = (w) => {
-    for (let i = queue.length - 1; i >= 0; i--) {
-      if (w.method === 'remove' ? under(w.p, queue[i].p) : queue[i].p === w.p) queue.splice(i, 1);
-    }
-    // a folder above it is removed first: nothing after that brings it back
-    if (w.method === 'remove' && queue.some((q) => q.method === 'remove' && under(q.p, w.p))) return;
-    queue.push(w);
-    setImmediate(pump); // after the other requests of this batch of events
-  };
+  const enqueue = writeQueue((method, params) => project(ctx, method, params).then(changedSoon));
   const source = (p) => /\.(kt|kts|java)$/.test(p);
   // only paths under the project folder (another folder of a multi-root workspace is not indexed)
   const indexed = (p) => {
@@ -370,7 +408,7 @@ function activate(ctx) {
     clearTimeout(timers.get(p));
     timers.set(p, setTimeout(() => {
       timers.delete(p);
-      enqueue({ p, method, text });
+      enqueue(p, method, text);
     }, 400));
   };
   // an open file with unsaved edits: its text, so a late watcher event never undoes them
@@ -378,6 +416,7 @@ function activate(ctx) {
     .find((d) => d.isDirty && !d.isClosed && d.uri.scheme === 'file' && d.uri.fsPath === p);
   // no text: the engine reads the disk (a folder: every source file under it)
   const update = (p, text) => {
+    if (!ready || !indexed(p)) return; // no document lookup for build outputs and other folders
     const d = !text && unsaved(p);
     send(p, 'update', d ? () => d.getText() : text);
   };
@@ -430,7 +469,7 @@ function activate(ctx) {
     watcher.onDidChange((u) => update(u.fsPath)),
     paths,
     // a folder created, renamed or moved in: the engine indexes every source file under it
-    paths.onDidCreate((u) => { if (!source(u.fsPath) && isDir(u.fsPath)) update(u.fsPath); }),
+    paths.onDidCreate(({ fsPath: p }) => { if (ready && !source(p) && indexed(p) && isDir(p)) update(p); }),
     paths.onDidDelete((u) => remove(u.fsPath)),
     out,
     vscode.commands.registerCommand('droidLite.goTo', guard(goTo)),
@@ -468,6 +507,7 @@ function activate(ctx) {
       recording = undefined;
       refresh();
       let file;
+      saving = true;
       try {
         file = await vscode.window.withProgress(
           { location: vscode.ProgressLocation.Notification, title: 'Saving the recording…' },
@@ -477,6 +517,8 @@ function activate(ctx) {
           return vscode.window.showInformationMessage('Droid Lite: no recording was running.');
         }
         throw e;
+      } finally {
+        saving = false;
       }
       revealFile(file, 'Recording');
     })),
@@ -519,4 +561,4 @@ function activate(ctx) {
   );
 }
 
-module.exports = { activate, deactivate() {}, limits, caps, every };
+module.exports = { activate, deactivate() {}, limits, caps, every, writeQueue };

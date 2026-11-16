@@ -3,6 +3,7 @@
 // Run: node test/plugins.js
 const Module = require('module');
 const assert = require('assert');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -60,6 +61,15 @@ fs.writeFileSync(path.join(missingDir, 'plugin.json'), JSON.stringify({
   watch: ['/nonexistent/droid-lite-watch'], actions: [{ name: 'Gone', run: ['/nonexistent/droid-lite-action'] }],
 }));
 process.env.HOME = home;
+// the OKs for project plugins, shared with the app: real folder -> sha256 of its plugin.json
+const store = path.join(home, '.config', 'droid-lite', 'approved-plugins.json');
+const readStore = () => (fs.existsSync(store) ? JSON.parse(fs.readFileSync(store, 'utf8')) : {});
+const sha = (folder) => crypto.createHash('sha256').update(fs.readFileSync(path.join(folder, 'plugin.json'))).digest('hex');
+const approve = (folder) => {
+  const s = { ...readStore(), [fs.realpathSync(folder)]: sha(folder) };
+  fs.mkdirSync(path.dirname(store), { recursive: true });
+  fs.writeFileSync(store, JSON.stringify(s));
+};
 
 class Pos { constructor(l, c) { this.line = l; this.character = c; } }
 const commands = {};
@@ -104,6 +114,8 @@ const fake = {
     createTreeView: (_id, o) => { tree = o.treeDataProvider; return { onDidChangeVisibility: (l) => { visibility = l; return {}; }, dispose() {} }; },
     createOutputChannel: () => ({ appendLine(l) { output.push(l); }, show() {}, dispose() {} }),
     showInformationMessage: (m) => { fake.info = m; },
+    showErrorMessage: (m) => { fake.err = m; },
+    showWarningMessage: (m, o, ...buttons) => { fake.asked = { m, o, buttons }; return Promise.resolve(fake.answer); },
   },
   commands: { registerCommand: (n, f) => { commands[n] = f; return {}; } },
 };
@@ -172,9 +184,12 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   assert.deepStrictEqual(tests.argv(['x', '{plugin}/a', '{id}', '{project}'], { folder: '/p' }, '/proj', 'case 1'), ['x', '/p/a', 'case 1', '/proj']);
   assert.ok(tests.findPluginJson(path.join(project, '.droid-lite', 'plugins', 'example')));
 
+  // the project's plugins below are allowed (the OK itself is checked at the end)
+  const pluginsOf = (p) => fs.readdirSync(path.join(p, '.droid-lite', 'plugins')).map((n) => path.join(p, '.droid-lite', 'plugins', n));
+  pluginsOf(project).forEach(approve);
   const ctx = { subscriptions: [] };
   const api = tests.setup(ctx, () => project);
-  await api.load();
+  await api.loaded;
   const ex = idOf('example');
   const root = ctrl.items.get(`plugin:${ex}`);
   assert.ok(root && !root.error && root.label === 'Example tests', 'example plugin listed');
@@ -424,9 +439,10 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   const userDup = dup(path.join(home, '.config', 'droid-lite', 'plugins', 'dup'));
   const projectDup = dup(path.join(project2, '.droid-lite', 'plugins', 'dup'));
   let current = project;
+  approve(path.join(project2, '.droid-lite', 'plugins', 'dup'));
   const ctx2 = { subscriptions: [] };
   const api2 = tests.setup(ctx2, () => current);
-  await api2.load();
+  await api2.loaded;
   const roots = () => { const r = []; ctrl.items.forEach((i) => r.push(i)); return r; };
   check('the first project\'s plugins load', roots().some((i) => i.label === 'Tools'));
   current = project2;
@@ -453,6 +469,86 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   ctx2.subscriptions.forEach((d) => d.dispose?.());
   await until('no tracked process', () => tests.procs.size === 0, 8000).catch(() => {});
   check('no plugin process left', tests.procs.size === 0);
+
+  // overlapping loads (a refresh while a slow list runs): the older one ends last and writes nothing
+  const project3 = path.join(tmp, 'project3');
+  const raceDir = path.join(project3, '.droid-lite', 'plugins', 'race');
+  fs.mkdirSync(raceDir, { recursive: true });
+  const raceOut = path.join(tmp, 'race-out');
+  const raceSpec = (v, wait) => JSON.stringify({ name: 'Race', list: ['sh', '-c', `sleep ${wait}; echo '[{"id":"c","label":"${v}"}]'`],
+    run: ['sh', '-c', `echo ${v} >> "$0"`, raceOut] });
+  fs.writeFileSync(path.join(raceDir, 'plugin.json'), raceSpec('old', 1));
+  approve(raceDir);
+  // a project plugin not allowed: each of its commands would leave a mark
+  const gateDir = path.join(project3, '.droid-lite', 'plugins', 'gate');
+  fs.mkdirSync(gateDir);
+  const marks = path.join(tmp, 'gate-marks');
+  const mark = (what) => ['sh', '-c', `echo ${what} >> "$0"; echo '[{"id":"g","label":"g"}]'`, marks];
+  const gateSpec = { name: 'Gate', list: mark('list'), run: mark('run'), watch: mark('watch'),
+    views: [{ name: 'V', run: mark('view') }], actions: [{ name: 'A', run: mark('action') }] };
+  fs.writeFileSync(path.join(gateDir, 'plugin.json'), JSON.stringify(gateSpec));
+  fs.writeFileSync(store, JSON.stringify({ ...readStore(), '/some/app/plugin': 'abc123' })); // another entry (the app's)
+  const ctx3 = { subscriptions: [] };
+  const api3 = tests.setup(ctx3, () => project3);
+  fs.writeFileSync(path.join(raceDir, 'plugin.json'), raceSpec('new', 0));
+  approve(raceDir);
+  await api3.load();
+  await api3.loaded;
+  const raceId = fs.realpathSync(raceDir);
+  const raceCase = ctrl.items.get(`plugin:${raceId}`)?.children.get(`${raceId}\u0000c`);
+  ev = await go([raceCase]);
+  check('an older load that ends last does not win: the run uses the newest plugin.json', raceCase?.label === 'new'
+    && fs.readFileSync(raceOut, 'utf8').trim() === 'new' && quiet(ev).some((e) => e[0] === 'passed'));
+
+  // an unapproved project plugin: "Needs your OK" in the Test Explorer and the sidebar, nothing runs
+  const gateId = fs.realpathSync(gateDir);
+  const gateRoot = ctrl.items.get(`needs-ok:${gateId}`);
+  check('a project plugin not allowed shows "Needs your OK" in the Test Explorer', gateRoot?.description === 'Needs your OK'
+    && /Needs your OK/.test(gateRoot.error) && !ctrl.items.get(`plugin:${gateId}`));
+  const gateRow = (await tree.getChildren()).find((r) => r.label === 'Gate');
+  check('and in the sidebar, with only Allow…', gateRow?.description === 'Needs your OK'
+    && (await tree.getChildren(gateRow)).map((i) => `${i.label}>${i.command?.command}`).join() === 'Allow…>droidLite.allowTestPlugin');
+  visibility({ visible: true }); // watchers start
+  commands['droidLite.testAction']({ folder: gateId, name: 'Gate', spec: gateSpec }, gateSpec.actions[0]);
+  ev = await go([gateRoot]);
+  await sleep(500);
+  check('a project plugin not allowed runs nothing (list, watch, action, run)', !fs.existsSync(marks)
+    && quiet(ev).every((e) => e[0] !== 'started'));
+  // Cancel allows nothing; Allow (from the Test Explorer item) shows the folder and every command
+  fake.answer = undefined;
+  await commands['droidLite.allowTestPlugin'](gateRow.pending);
+  check('Cancel allows nothing', !readStore()[gateId] && !fs.existsSync(marks));
+  fake.answer = 'Allow';
+  await commands['droidLite.allowTestPlugin'](gateRoot);
+  const { o: modal, buttons } = fake.asked;
+  check('the OK is a modal with the folder and the commands', modal.modal && buttons.includes('Allow') && modal.detail.includes(gateId)
+    && ['list', 'run', 'watch'].every((k) => modal.detail.includes(`${k}: ${JSON.stringify(gateSpec[k])}`))
+    && modal.detail.includes(JSON.stringify(gateSpec.views[0].run)) && modal.detail.includes(JSON.stringify(gateSpec.actions[0].run)));
+  await until('the list to run', () => fs.existsSync(marks), 3000).catch(() => {});
+  check('Allow runs list', fs.existsSync(marks) && fs.readFileSync(marks, 'utf8').includes('list')
+    && ctrl.items.get(`plugin:${gateId}`)?.children.get(`${gateId}\u0000g`));
+  const saved = readStore();
+  check('the store keeps other entries, holds the sha256 of plugin.json, no temp file left', saved['/some/app/plugin'] === 'abc123'
+    && saved[raceId] === sha(raceDir) && saved[gateId] === sha(gateDir)
+    && fs.readdirSync(path.dirname(store)).every((n) => !n.endsWith('.tmp')));
+  // a changed plugin.json asks again
+  await sleep(300); // the watch started by the load ends
+  fs.rmSync(marks);
+  fs.writeFileSync(path.join(gateDir, 'plugin.json'), `${JSON.stringify(gateSpec)} `);
+  await api3.load();
+  await sleep(500);
+  check('a changed plugin.json asks again', ctrl.items.get(`needs-ok:${gateId}`) && !ctrl.items.get(`plugin:${gateId}`) && !fs.existsSync(marks));
+  // a store that is not a JSON object is never overwritten (it may be the app's)
+  fs.writeFileSync(store, 'not json');
+  fake.err = '';
+  await commands['droidLite.allowTestPlugin']((await tree.getChildren()).find((r) => r.label === 'Gate').pending);
+  check('a broken store is not overwritten', fs.readFileSync(store, 'utf8') === 'not json' && /could not save the OK/.test(fake.err));
+  fs.writeFileSync(store, JSON.stringify(saved));
+  // the user's own plugins need no OK
+  check('a user plugin needs no OK', !(userDup in readStore()) && ctrl.items.get(`plugin:${userDup}`)?.children.get(`${userDup}\u0000c`));
+  ctx3.subscriptions.forEach((d) => d.dispose?.());
+  await until('no tracked process', () => tests.procs.size === 0, 8000).catch(() => {});
+  check('no plugin process left after the OK checks', tests.procs.size === 0);
 
   fs.rmSync(tmp, { recursive: true, force: true });
   console.log(`ok: test plugins, ${checks} checks`);

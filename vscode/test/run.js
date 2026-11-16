@@ -40,6 +40,7 @@ require('readline').createInterface({ input: process.stdin }).on('line', (l) => 
   const prog = method === 'previews' && fs.existsSync(${JSON.stringify(progressFile)})
     && JSON.parse(fs.readFileSync(${JSON.stringify(progressFile)}, 'utf8'));
   if (prog) {
+    if (prog.wait) console.log(JSON.stringify({ event: 'preview_status', file: fs.realpathSync(params.path), text: 'Waiting for ' + prog.wait }));
     let i = 0;
     const t = setInterval(() => {
       console.log(JSON.stringify({ event: 'preview_status', file: prog.other ? '/elsewhere/Other.kt' : fs.realpathSync(params.path), text: 'tick' }));
@@ -65,7 +66,10 @@ process.stderr.write('e'.repeat(1 << 20) + '\\n', () => {
   }, 30);
 });
 `, { mode: 0o755 });
-const requests = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : []);
+const raw = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : []);
+// one entry per path: a remove of many paths counts as one remove of each
+const requests = () => raw().flatMap((r) => (Array.isArray(r.params?.paths)
+  ? r.params.paths.map((p) => ({ ...r, params: { path: p } })) : [r]));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const until = async (what, ok, ms = 5000) => {
   for (const end = Date.now() + ms; !ok();) {
@@ -255,7 +259,49 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   const props = pkg.contributes.configuration.properties;
   check('enginePath is a machine setting', props['droidLite.enginePath'].scope === 'machine');
   check('logcatMaxLines setting', props['droidLite.logcatMaxLines'].default === 20000);
-  check('version 0.4.3', pkg.version === '0.4.3');
+  check('version 0.5.0', pkg.version === '0.5.0');
+  check('Allow… on a test item that needs an OK', pkg.contributes.menus['testing/item/context']
+    .some((m) => m.command === 'droidLite.allowTestPlugin' && /testId =~ \/\^needs-ok:\//.test(m.when)));
+
+  // the write queue: 20k removes and 20k updates (a branch switch) each in well under a second;
+  // the removes of one tick go 5000 to a request (the old queue scanned itself per request: ~20 s)
+  const queued = [];
+  // (an engine that answers at once: the time is the queue's own)
+  const queue = ext.writeQueue((method, params) => { queued.push([method, params]); return Promise.resolve(); });
+  const many = (i) => path.join(dir, 'app/src/main/java', `p${i % 50}`, `q${i % 7}`, `F${i}.kt`);
+  const removedPaths = () => queued.flatMap(([m, p]) => (m === 'remove' ? p.paths : [])).length;
+  // (CPU time of this process: a busy machine does not count)
+  const cpuMs = (t) => { const u = process.cpuUsage(t); return (u.user + u.system) / 1000; };
+  let t0 = process.cpuUsage();
+  for (let i = 0; i < 20000; i++) queue(many(i), 'remove');
+  await until('20k removes', () => removedPaths() === 20000, 10000);
+  const removeMs = cpuMs(t0);
+  t0 = process.cpuUsage();
+  for (let i = 0; i < 20000; i++) queue(many(i), 'update', () => 'x');
+  await until('20k updates', () => queued.filter(([m]) => m === 'update').length === 20000, 10000);
+  const updateMs = cpuMs(t0);
+  console.log(`write queue (CPU): 20k removes ${removeMs.toFixed(0)} ms, 20k updates ${updateMs.toFixed(0)} ms`);
+  check('20k removes and 20k updates take under 0.5 s each', removeMs < 500 && updateMs < 500);
+  const removeBatches = queued.filter(([m]) => m === 'remove');
+  check('removes go 5000 to a request', removeBatches.length === 4 && removeBatches.every(([, p]) => p.paths.length === 5000));
+  // order: removes first; a removed folder takes what waits under it; a remove under a folder that
+  // waits to be removed is dropped; a later update under it stays and goes after; the newest text wins
+  queued.length = 0;
+  const A = path.join(dir, 'A');
+  queue(path.join(A, 'x.kt'), 'update', () => 'x1');
+  queue(path.join(dir, 'B.kt'), 'update', () => 'b1');
+  queue(path.join(A, 'w.kt'), 'remove');
+  queue(A, 'remove');
+  queue(path.join(A, 'y.kt'), 'remove');
+  queue(path.join(A, 'z.kt'), 'update', () => 'z1');
+  queue(path.join(dir, 'B.kt'), 'update', () => 'b2');
+  queue(path.join(dir, 'C.kt'), 'remove');
+  queue(path.join(dir, 'C.kt'), 'update');
+  await until('the queue to drain', () => queued.length === 4, 2000).catch(() => {});
+  check('the queue keeps its order rules', JSON.stringify(queued.map(([m, p]) => [m, p.paths
+    ? p.paths.map((x) => path.relative(dir, x)) : path.relative(dir, p.path), ...(p.text ? [p.text] : [])])) === JSON.stringify([
+    ['remove', ['A', 'C.kt']], ['update', 'A/z.kt', 'z1'], ['update', 'B.kt', 'b2'], ['update', 'C.kt'],
+  ]));
 
   // the rest runs on the fake engine
   cfg.enginePath = fakeEngine;
@@ -327,6 +373,23 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   check('the newest file: edit wins',
     apiUpdates.length === 1 && apiUpdates[0][2] === 'package demo\n// 2\n');
 
+  // a path outside the index costs no disk or document lookup (a branch switch in build/ sends thousands)
+  const realStat = fs.statSync;
+  let stats = 0;
+  let docLookups = 0;
+  fs.statSync = (...a) => { stats++; return realStat(...a); };
+  Object.defineProperty(fake.workspace, 'textDocuments', { configurable: true, get: () => { docLookups++; return []; } });
+  for (let i = 0; i < 100; i++) {
+    all.ls.Create({ fsPath: path.join(dir, 'app/build/tmp', `d${i}`) });
+    all.ls.Create({ fsPath: path.join(`${dir}-other`, `d${i}`) });
+    files.ls.Change({ fsPath: path.join(dir, 'app/build/gen', `G${i}.kt`) });
+    files.ls.Create({ fsPath: path.join('/elsewhere', `E${i}.kt`) });
+  }
+  fs.statSync = realStat;
+  delete fake.workspace.textDocuments;
+  fake.workspace.textDocuments = [];
+  check('paths outside the index: no stat, no document lookup', stats === 0 && docLookups === 0);
+
   // a closed tab with unsaved text: the index goes back to the disk text (a plain update)
   const before = requests().length;
   change('file', 'package demo\n// unsaved\n');
@@ -371,8 +434,10 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   all.ls.Delete({ fsPath: path.join(src, 'gone2') });
   for (let i = 0; i < 200; i++) all.ls.Delete({ fsPath: path.join(src, 'gone2', `F${i}.kt`) });
   await sleep(700);
-  check('a removed folder takes the removes under it along', removes(/\/gone2?(\/|$)/) < 10
-    && removes(/\/gone$/) === 1 && removes(/\/gone2$/) === 1);
+  // (the debounce timers may end in two ticks: removes of the first one go before the folder's,
+  // in one request; the queue check above pins what a waiting folder remove takes along)
+  check('a removed folder goes once, the removes under it in a few requests', raw().filter((r) => r.method === 'remove'
+    && r.params.paths?.some((p) => /\/gone2?(\/|$)/.test(p))).length < 5 && removes(/\/gone$/) === 1 && removes(/\/gone2$/) === 1);
   // a folder removed, then a file made in it again: the remove goes first
   all.ls.Delete({ fsPath: path.join(src, 'again') });
   await sleep(20);
@@ -380,14 +445,18 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   await sleep(700);
   const again = requests().filter((r) => r.params?.path?.includes(`${path.sep}again`)).map((r) => r.method);
   check('a remove and a later update of a file in that folder keep their order', again.join() === 'remove,update');
-  // many removes (no folder): they go one at a time, so a lens call does not wait behind all of them
-  fs.writeFileSync(delayFile, '{"remove":5}');
-  for (let i = 0; i < 200; i++) all.ls.Delete({ fsPath: path.join(src, `d${i}`, 'X.kt') });
+  // many removes (no folder): up to 5000 to a request, one request at a time, so a lens call
+  // waits behind one at most
+  fs.writeFileSync(delayFile, '{"remove":300}');
+  for (let i = 0; i < 12000; i++) all.ls.Delete({ fsPath: path.join(src, `d${i}`, 'X.kt') });
   await until('the first remove', () => removes(/\/d\d+\/X\.kt$/) > 0);
   const lensDone = provider.provideCodeLenses(doc('Api.kt'));
-  await until('every remove', () => removes(/\/d\d+\/X\.kt$/) === 200, 10000);
+  await until('every remove', () => removes(/\/d\d+\/X\.kt$/) === 12000, 10000);
   await lensDone;
-  const order = requests().map((r) => r.method);
+  const order = raw().map((r) => r.method);
+  const batches = raw().filter((r) => r.method === 'remove' && r.params.paths?.some((p) => /\/d\d+\/X\.kt$/.test(p)));
+  check('many removes go in a few requests of 5000 at most', batches.length >= 3 && batches.length < 20
+    && batches.every((r) => r.params.paths.length <= 5000));
   check('a lens call does not wait behind every remove', order.lastIndexOf('lenses') < order.lastIndexOf('remove'));
   fs.rmSync(delayFile);
 
@@ -450,8 +519,13 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   ext.limits.previews = 300;
   const [withProgress] = await previewError({ n: 8, every: 100 }); // last line at 0.8 s: ends at about 1.1 s
   check('progress for the file starts the previews limit again', withProgress >= 900);
+  // a file queued behind another waits while that one draws: any file's progress starts it again
   const [otherProgress] = await previewError({ n: 8, every: 100, other: true });
-  check("another file's progress does not", otherProgress < 750);
+  check("another file's progress starts it again too", otherProgress >= 900);
+  const waitFrom = panel.posted.length;
+  await previewError({ n: 1, every: 50, wait: '/elsewhere/Other.kt' });
+  check('a queued file says which file it waits for', panel.posted.slice(waitFrom)
+    .some((m) => m.type === 'status' && m.text === 'Waiting for Other.kt…'));
   ext.caps.previews = 600;
   const [capped, cappedText] = await previewError({ n: 20, every: 100 });
   check('previews end at the cap', capped < 1300 && /in 0\.6 s/.test(cappedText));
@@ -599,6 +673,30 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   await sleep(600);
   const polls = requests().slice(beforePoll).filter((r) => r.method === 'devices').length;
   check('no new devices poll while one waits', polls === 1);
+
+  // a recording being saved (record_stop may take ~16 min): no devices poll and no screenshot
+  // waits behind it; the user is told to wait
+  fs.rmSync(silent);
+  const devicesCalls = () => requests().filter((r) => r.method === 'devices').length;
+  process.kill(requests().filter((r) => r.method === 'devices').at(-1).pid); // ends the unanswered call
+  let polled = devicesCalls();
+  await until('the polls to go on', () => devicesCalls() > polled + 1, 3000);
+  await commands['droidLite.recordStart']();
+  fs.writeFileSync(delayFile, '{"record_stop":1000}');
+  infos.length = 0;
+  const saved = commands['droidLite.recordStop']();
+  await sleep(100);
+  polled = devicesCalls();
+  const shots = requests().filter((r) => r.method === 'screenshot').length;
+  await commands['droidLite.screenshot']();
+  await sleep(500);
+  check('no devices poll while a recording is saved', devicesCalls() === polled);
+  check('a screenshot during the save waits for nothing: the user is told to wait',
+    requests().filter((r) => r.method === 'screenshot').length === shots && infos.some((m) => /still being saved/.test(m)));
+  await saved;
+  await until('the polls after the save', () => devicesCalls() > polled, 2000).catch(() => {});
+  check('the polls come back after the save', devicesCalls() > polled);
+  fs.rmSync(delayFile);
   fake.window.state.focused = false;
   ctx2.subscriptions.push(...ctx3.subscriptions);
 

@@ -105,9 +105,11 @@ function setup(ctx, project, events) {
       if (e && e.document === d) render(e);
     }),
     events.event((m) => {
-      // progress of another file's drawing is not shown (older engines send no "file")
+      // progress of another file's drawing is not shown (older engines send no "file"); a file
+      // queued behind another says which one it waits for
       if (panel && m.event === 'preview_status' && (m.file === undefined || m.file === file || m.file === real)) {
-        panel.webview.postMessage({ type: 'status', ...m });
+        const wait = /^Waiting for (.+?)(?:…|\.\.\.)?$/.exec(m.text || '');
+        panel.webview.postMessage({ type: 'status', ...m, ...(wait && { text: `Waiting for ${path.basename(wait[1])}…` }) });
       }
     }),
     { dispose: () => panel?.dispose() },

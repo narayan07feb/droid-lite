@@ -2,9 +2,12 @@
 // the app reads (~/.config/droid-lite/plugins/<name>/ and <project>/.droid-lite/plugins/<name>/),
 // so a plugin added in either one shows in both. Cases come from `list`, runs from `run` (JSON
 // lines), extra lists (`views`), buttons (`actions`), `links` and the live state (`watch`) go in
-// the Droid Lite sidebar.
+// the Droid Lite sidebar. A project plugin runs nothing until the user allows it once (shared with
+// the app: ~/.config/droid-lite/approved-plugins.json, its real folder -> sha256 of its plugin.json);
+// a changed plugin.json asks again. The user's own plugins need no OK.
 const vscode = require('vscode');
 const cp = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -12,6 +15,38 @@ const { EventEmitter } = require('events');
 const { PassThrough } = require('stream');
 
 const userDir = () => path.join(os.homedir(), '.config', 'droid-lite', 'plugins');
+const storeFile = () => path.join(os.homedir(), '.config', 'droid-lite', 'approved-plugins.json');
+const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
+
+// the allowed project plugins: { "<real folder>": "<sha256 of plugin.json>" }. `strict`: a store
+// that is not a JSON object throws (a write never drops what the app saved); else it allows none
+function approvals(strict = false) {
+  let store;
+  try { store = JSON.parse(fs.readFileSync(storeFile(), 'utf8')); } catch (e) {
+    if (e.code === 'ENOENT' || !strict) return {};
+    throw new Error(`${storeFile()}: ${e.message}`);
+  }
+  if (store && typeof store === 'object' && !Array.isArray(store)) return store;
+  if (strict) throw new Error(`${storeFile()} is not a JSON object`);
+  return {};
+}
+
+// allows `folder` with plugin.json bytes of this hash, keeping every other entry; written to a
+// temporary file and renamed, so a reader (the app) never sees half a file
+function approve(folder, hash) {
+  const file = storeFile();
+  const store = approvals(true);
+  store[folder] = hash;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* not written */ }
+    throw e;
+  }
+}
 const MAX_LOG = 20000; // lines kept per run in the test output
 const MAX_LOG_CHARS = 8 << 20; // and characters (about 8 MB) in all
 const MAX_LINE = 64 << 10; // longest line kept (chars); the rest of a longer one is dropped
@@ -53,12 +88,15 @@ function budget() {
   return (line) => ++n <= MAX_LOG && (chars += line.length) <= MAX_LOG_CHARS;
 }
 
-// every plugin: { name, folder, cwd, spec } or { error, folder }; `folder` (its real path) is its
-// id, two plugins may share a name
+// every plugin: { name, folder, cwd, spec }, { error, folder } or, a project plugin not allowed
+// (yet, or since its plugin.json changed), { name, folder, file, needsOk } with no spec, so nothing
+// of it can run; `folder` (its real path) is its id, two plugins may share a name
 function readPlugins(project) {
   const roots = [userDir(), project && path.join(project, '.droid-lite', 'plugins')].filter(Boolean);
+  const allowed = approvals();
   const out = [];
   for (const root of roots) {
+    const own = root === userDir();
     let names = [];
     try { names = fs.readdirSync(root); } catch { continue; }
     for (const n of names.sort()) {
@@ -68,9 +106,14 @@ function readPlugins(project) {
       let real = folder;
       try {
         real = fs.realpathSync(folder);
-        const spec = JSON.parse(fs.readFileSync(file, 'utf8'));
+        const bytes = fs.readFileSync(file);
+        const spec = JSON.parse(bytes.toString('utf8'));
         const bad = problem(spec);
         if (bad) throw new Error(bad);
+        if (!own && allowed[real] !== sha256(bytes)) {
+          out.push({ name: spec.name, folder: real, file, needsOk: true });
+          continue;
+        }
         const dir = spec.dir ? spec.dir.replace(/^~\//, `${os.homedir()}/`) : '.';
         out.push({ name: spec.name, folder: real, cwd: path.resolve(real, dir), spec });
       } catch (e) {
@@ -212,25 +255,38 @@ function setup(ctx, projectOf) {
     }
   };
 
+  // loads may overlap (a refresh while a slow list runs): only the newest one writes its results
+  let loads = 0;
   async function load() {
+    const mine = ++loads;
+    const stale = () => mine !== loads;
     project = projectOf();
     plugins = readPlugins(project);
     meta.clear();
     ctrl.items.replace([]);
     await Promise.all(plugins.map(async (p) => {
       const label = p.name || path.basename(p.folder);
+      if (p.needsOk) { // right-click > Allow… (package.json: testing/item/context)
+        const root = ctrl.createTestItem(`needs-ok:${p.folder}`, label);
+        root.description = 'Needs your OK';
+        root.error = `Needs your OK: this project plugin runs nothing until you allow it (right-click > Allow…, or Allow… under Test plugins in the Droid Lite sidebar). ${p.folder}`;
+        ctrl.items.add(root);
+        return;
+      }
       const root = ctrl.createTestItem(`plugin:${p.folder}`, label);
       ctrl.items.add(root);
       if (p.error) { root.error = p.error; return; }
       if (!p.spec.list) return;
       root.busy = true;
-      try {
-        addCases(p, root.children, await json(argv(p.spec.list, p, project), p, project));
-      } catch (e) {
-        root.error = `list: ${e.message}`;
-      }
+      let cases;
+      let error;
+      try { cases = await json(argv(p.spec.list, p, project), p, project); } catch (e) { error = e; }
+      if (stale()) return;
+      if (error) root.error = `list: ${error.message}`;
+      else addCases(p, root.children, cases);
       root.busy = false;
     }));
+    if (stale()) return;
     viewCache.clear();
     for (const folder of live.keys()) if (!plugins.some((p) => p.folder === folder)) live.delete(folder);
     sidebar.fire();
@@ -356,6 +412,14 @@ function setup(ctx, projectOf) {
       };
       if (!node) {
         const rows = plugins.filter((p) => p.error).map((p) => item(p.error, 'warning'));
+        rows.push(...plugins.filter((p) => p.needsOk).map((p) => {
+          const g = new vscode.TreeItem(p.name, vscode.TreeItemCollapsibleState.Expanded);
+          g.iconPath = new vscode.ThemeIcon('shield');
+          g.description = 'Needs your OK';
+          g.tooltip = `${p.folder}\nThis project plugin runs nothing until you allow it.`;
+          g.pending = p;
+          return g;
+        }));
         rows.push(...plugins.filter((p) => p.spec).map((p) => {
           const g = new vscode.TreeItem(p.name, vscode.TreeItemCollapsibleState.Expanded);
           g.plugin = p;
@@ -366,6 +430,7 @@ function setup(ctx, projectOf) {
         rows.push(item('Open Test Explorer', 'beaker', 'workbench.view.testing.focus'));
         return rows;
       }
+      if (node.pending) return [item('Allow…', 'unlock', 'droidLite.allowTestPlugin', [node.pending])];
       if (node.plugin && !node.view) {
         const p = node.plugin;
         const out = [];
@@ -423,7 +488,11 @@ function setup(ctx, projectOf) {
     view.onDidChangeVisibility((e) => { watching = e.visible; if (watching) startWatch(); else stopWatch(); }),
     // every process group a plugin started ends with the extension
     { dispose: () => { watching = false; procs.forEach((p) => stop(p, true)); } },
-    vscode.commands.registerCommand('droidLite.testAction', (p, a) => {
+    vscode.commands.registerCommand('droidLite.testAction', (given, act) => {
+      // only a loaded plugin that may run (a project plugin not allowed has no spec), its own action
+      const p = plugins.find((x) => x.spec && x.folder === given?.folder);
+      const a = p?.spec.actions?.find((x) => x.name === act?.name);
+      if (!a) return;
       const key = `${p.folder}\u0000${a.name}`;
       out.show(true);
       if (actions.has(key)) return out.appendLine(`${a.name} is still running`);
@@ -447,6 +516,39 @@ function setup(ctx, projectOf) {
     vscode.commands.registerCommand('droidLite.refreshTestView', (node) => {
       viewCache.delete(`${node.plugin.folder}\u0000${node.view.name}`);
       sidebar.fire(node);
+    }),
+    // Allow: shows the commands of the plugin.json on disk now and allows exactly those bytes; from
+    // the sidebar (the plugin) or the Test Explorer (its test item)
+    vscode.commands.registerCommand('droidLite.allowTestPlugin', async (arg) => {
+      const folder = arg?.id?.startsWith?.('needs-ok:') ? arg.id.slice('needs-ok:'.length) : arg?.folder;
+      const p = plugins.find((x) => x.needsOk && x.folder === folder);
+      if (!p) return;
+      let bytes;
+      let spec;
+      try {
+        bytes = fs.readFileSync(p.file);
+        spec = JSON.parse(bytes.toString('utf8'));
+        const bad = problem(spec);
+        if (bad) throw new Error(bad);
+      } catch (e) {
+        return vscode.window.showErrorMessage(`${p.file}: ${e.message}`);
+      }
+      const cmd = (v) => JSON.stringify(v);
+      const detail = [
+        `Folder: ${p.folder}`,
+        ...(spec.dir ? [`Runs in: ${path.resolve(p.folder, spec.dir.replace(/^~\//, `${os.homedir()}/`))}`] : []),
+        ...['list', 'run', 'watch'].filter((k) => spec[k]).map((k) => `${k}: ${cmd(spec[k])}`),
+        ...(spec.views || []).map((v) => `view "${v.name}": ${cmd(v.run)}`),
+        ...(spec.actions || []).map((x) => `action "${x.name}": ${cmd(x.run)}`),
+      ].join('\n');
+      const ok = await vscode.window.showWarningMessage(
+        `Allow the project's test plugin "${spec.name}" to run these commands on your Mac?`,
+        { modal: true, detail }, 'Allow');
+      if (ok !== 'Allow') return;
+      try { approve(p.folder, sha256(bytes)); } catch (e) {
+        return vscode.window.showErrorMessage(`Droid Lite: could not save the OK: ${e.message}`);
+      }
+      await load();
     }),
     // Add: link the tool's plugin folder into the shared folder the app reads too
     vscode.commands.registerCommand('droidLite.addTestPlugin', async () => {
@@ -479,8 +581,8 @@ function setup(ctx, projectOf) {
       await load();
     }),
   );
-  load();
-  return { load, readPlugins };
+  const loaded = load();
+  return { load, readPlugins, loaded };
 }
 
 module.exports = { setup, readPlugins, argv, findPluginJson, location, limits, procs };

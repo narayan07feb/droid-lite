@@ -2,7 +2,7 @@
   "name": "droid-lite",
   "displayName": "Droid Lite",
   "description": "Android tools for VS Code and Cursor: test tools in the Test Explorer, Compose previews without Gradle, implementation links, Compose stability, device screenshot, screen recording and logcat.",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "publisher": "forgebyte",
   "license": "MIT",
   "repository": {
@@ -82,6 +82,10 @@
         "command": "droidLite.refreshTestView",
         "title": "Refresh",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "droidLite.allowTestPlugin",
+        "title": "Allow…"
       }
     ],
     "configuration": {
@@ -161,6 +165,12 @@
           "group": "navigation"
         }
       ],
+      "testing/item/context": [
+        {
+          "command": "droidLite.allowTestPlugin",
+          "when": "controllerId == droidLite.tests && testId =~ /^needs-ok:/"
+        }
+      ],
       "view/item/context": [
         {
           "command": "droidLite.refreshTestView",
@@ -183,6 +193,10 @@
         },
         {
           "command": "droidLite.refreshTestView",
+          "when": "false"
+        },
+        {
+          "command": "droidLite.allowTestPlugin",
           "when": "false"
         }
       ]
