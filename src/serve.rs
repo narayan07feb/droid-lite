@@ -8,6 +8,10 @@
 //! Methods: `ping`, `initialize {root}`, `update {path, text}`, `lenses {path, text?}`,
 //! `implementations {name, member?}`, `stability {path, text?}`; device tools without a project:
 //! `adb`, `devices`, `screenshot {serial}`, `record_start {serial}`, `record_stop`.
+//!
+//! `previews {path}` answers when the pictures are drawn (seconds), while other requests go on;
+//! meanwhile it sends `{"event":"preview_status","file","text","done"?,"total"?}` lines. A newer
+//! request for the same file answers the older one with an error.
 
 use crate::capture::{self, Recording};
 use crate::compose::{self, Stability, Verdict};
@@ -17,7 +21,8 @@ use crate::project::Project;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 pub struct Server {
@@ -26,6 +31,99 @@ pub struct Server {
     reports: HashMap<String, Stability>,
     open: bool,
     recording: Option<Recording>,
+    project: Option<crate::preview::ProjectRef>,
+    previews: Option<Arc<Mutex<crate::preview::Client>>>,
+    /// Preview requests waiting for their pictures: file → request id.
+    waiting: Arc<Mutex<HashMap<PathBuf, Value>>>,
+}
+
+/// One JSON line on stdout; the preview thread writes too, so each line is written whole.
+fn emit(v: &Value) {
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{v}");
+    let _ = out.flush();
+}
+
+/// Saves the pictures as PNGs (new names each time, so an editor never shows a cached one) and
+/// deletes this file's older ones.
+fn save_cards(file: &Path, cards: Vec<(String, Result<egui::ColorImage, String>)>) -> Vec<Value> {
+    let dir = crate::preview::dir().join("vscode");
+    let _ = std::fs::create_dir_all(&dir);
+    let key = format!("{:016x}", {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        file.hash(&mut h);
+        h.finish()
+    });
+    if let Ok(old) = std::fs::read_dir(&dir) {
+        for e in old.flatten() {
+            if e.file_name().to_string_lossy().starts_with(&key) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    cards
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, pic))| {
+            let png = pic.and_then(|img| {
+                let [w, h] = img.size;
+                let raw: Vec<u8> = img
+                    .pixels
+                    .iter()
+                    .flat_map(|c| c.to_srgba_unmultiplied())
+                    .collect();
+                let path = dir.join(format!("{key}-{stamp}-{i}.png"));
+                image::RgbaImage::from_raw(w as u32, h as u32, raw)
+                    .ok_or("bad picture size")?
+                    .save(&path)
+                    .map_err(|e| e.to_string())?;
+                Ok(path)
+            });
+            match png {
+                Ok(p) => json!({ "name": name, "png": p }),
+                Err(e) => json!({ "name": name, "error": e }),
+            }
+        })
+        .collect()
+}
+
+/// Sends the preview worker's progress and answers as they come.
+fn relay(client: Arc<Mutex<crate::preview::Client>>, waiting: Arc<Mutex<HashMap<PathBuf, Value>>>) {
+    use crate::preview::Event;
+    loop {
+        let event = client.lock().ok().and_then(|c| c.poll());
+        let Some(event) = event else {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            continue;
+        };
+        let take = |f: &Path| waiting.lock().ok().and_then(|mut w| w.remove(f));
+        match event {
+            Event::Status(text, progress) => {
+                let mut v = json!({ "event": "preview_status", "text": text });
+                if let Some((done, total)) = progress {
+                    v["done"] = json!(done);
+                    v["total"] = json!(total);
+                }
+                emit(&v);
+            }
+            Event::Done { file, cards } => {
+                if let Some(id) = take(&file) {
+                    emit(
+                        &json!({ "id": id, "result": { "file": file, "cards": save_cards(&file, cards) } }),
+                    );
+                }
+            }
+            Event::Failed { file, error } => {
+                if let Some(id) = take(&file) {
+                    emit(&json!({ "id": id, "error": error }));
+                }
+            }
+        }
+    }
 }
 
 /// 0-based line and character column of byte `offset` in `text`.
@@ -104,6 +202,16 @@ impl Server {
                 self.index = Index::build(&p.files);
                 let dirs: Vec<_> = p.modules.iter().map(|m| m.dir.clone()).collect();
                 self.reports = compose::load_reports(&dirs);
+                self.project = Some(crate::preview::ProjectRef {
+                    root: p.root.clone(),
+                    scripts: p
+                        .files
+                        .iter()
+                        .filter(|f| f.extension().is_some_and(|e| e == "kts" || e == "gradle"))
+                        .cloned()
+                        .collect(),
+                    files: Arc::new(p.files.clone()),
+                });
                 self.open = true;
                 Ok(json!({
                     "files": p.files.len(),
@@ -249,6 +357,58 @@ impl Server {
         }
     }
 
+    /// Starts drawing a file's previews. `Ok(Some)` answers now (no previews); `Ok(None)` means the
+    /// answer comes later from the preview thread.
+    pub fn previews(&mut self, id: &Value, params: &Value) -> Result<Option<Value>, String> {
+        if !self.open {
+            return Err("call initialize first".into());
+        }
+        let path = canon(params["path"].as_str().ok_or("missing \"path\"")?);
+        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let syms = crate::kotlin::scan(&text);
+        let previews: Vec<String> = syms
+            .decls
+            .iter()
+            .filter(|d| d.is_preview() && d.container.is_none())
+            .map(|d| d.name.clone())
+            .collect();
+        if previews.is_empty() {
+            return Ok(Some(json!({ "file": path, "cards": [] })));
+        }
+        let class = crate::device::preview_name(&syms.package, &path, None, "x")
+            .trim_end_matches(".x")
+            .to_string();
+        let client = self
+            .previews
+            .get_or_insert_with(|| {
+                let c = Arc::new(Mutex::new(crate::preview::Client::new(
+                    &egui::Context::default(),
+                )));
+                let (c2, w) = (c.clone(), self.waiting.clone());
+                std::thread::spawn(move || relay(c2, w));
+                c
+            })
+            .clone();
+        let older = self
+            .waiting
+            .lock()
+            .map_err(|e| e.to_string())?
+            .insert(path.clone(), id.clone());
+        if let Some(older) = older {
+            emit(&json!({ "id": older, "error": "replaced by a newer request" }));
+        }
+        client
+            .lock()
+            .map_err(|e| e.to_string())?
+            .request(crate::preview::Request {
+                file: path,
+                class,
+                previews,
+                project: self.project.clone(),
+            });
+        Ok(None)
+    }
+
     /// Answers one request line.
     pub fn reply(&mut self, line: &str) -> Value {
         let req: Value = match serde_json::from_str(line) {
@@ -266,13 +426,20 @@ impl Server {
 /// Reads requests from stdin until it closes.
 pub fn run() {
     let mut server = Server::default();
-    let mut out = std::io::stdout().lock();
     for line in std::io::stdin().lock().lines().map_while(Result::ok) {
         if line.trim().is_empty() {
             continue;
         }
-        let _ = writeln!(out, "{}", server.reply(&line));
-        let _ = out.flush();
+        let req: Value = serde_json::from_str(&line).unwrap_or_default();
+        if req["method"] == "previews" {
+            match server.previews(&req["id"], &req["params"]) {
+                Ok(Some(result)) => emit(&json!({ "id": req["id"], "result": result })),
+                Ok(None) => {}
+                Err(e) => emit(&json!({ "id": req["id"], "error": e })),
+            }
+            continue;
+        }
+        emit(&server.reply(&line));
     }
 }
 
@@ -307,6 +474,10 @@ mod tests {
     fn answers_over_json_lines() {
         let root = project();
         let mut s = Server::default();
+        assert_eq!(
+            s.previews(&json!(1), &json!({ "path": "x" })),
+            Err("call initialize first".into())
+        );
         // device tools need no project
         assert_eq!(
             s.reply(r#"{"id":0,"method":"record_stop"}"#)["error"],
@@ -394,6 +565,10 @@ mod tests {
         ));
         assert!(r["error"].is_null(), "{r}");
         assert_eq!(lenses(&mut s, "Api.kt")[0].1, "↓ Implemented in 1 class");
+        // a file without @Preview answers at once, with no cards
+        let api = root.join("app/src/main/java/demo/Api.kt");
+        let r = s.previews(&json!(10), &json!({ "path": api }));
+        assert_eq!(r.unwrap().unwrap()["cards"], json!([]));
         // unsaved editor text: a second class implementing Api
         let other = root.join("app/src/main/java/demo/Other.kt");
         let r = s.reply(&format!(
