@@ -25,6 +25,19 @@ of the tool also updates its plugin. **Remove** in the tab drops only the link, 
 Droid Lite reads them when a project opens, and again when you press ⟳ in the Tests tab.
 A broken `plugin.json` shows as an error in the tab, with its path.
 
+## Project plugins need your OK once
+
+A plugin that comes with a project (`<project>/.droid-lite/plugins/`) runs commands from a repo you
+may have just cloned, so nothing of it runs until you allow it. The Tests tab (and VS Code's Test
+Explorer and Droid Lite sidebar) shows it as **Needs your OK**, with its folder and every command
+it would run; **Allow** runs it from then on. When its `plugin.json` changes, it asks again.
+
+Plugins you add yourself (`~/.config/droid-lite/plugins/`, **Add plugin…**) need no OK.
+
+The OKs are kept in `~/.config/droid-lite/approved-plugins.json`, shared by the app and the VS Code
+extension: a JSON object from the plugin folder's real path to the SHA-256 of its `plugin.json`.
+Delete an entry to be asked again.
+
 ## plugin.json
 
 ```json
