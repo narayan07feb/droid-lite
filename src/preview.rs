@@ -316,30 +316,94 @@ fn ask(w: &mut UnixStream, rd: &mut BufReader<UnixStream>, id: u64, r: &Request)
     }
 }
 
-/// The compiler's text for a card: the file's own path shortened to its name, at most 12 lines.
+/// The compiler's text for a card, grouped: what is missing (packages of the imports that do not
+/// resolve, with a count each), then the first error lines with paths cut to the file name.
+/// (The compiler prints paths relative to the worker's folder, so a full path may come without its
+/// leading "/": every path is cut to its file name, whatever its form.)
 fn short_error(text: &str, file: &Path) -> String {
-    let full = file.to_string_lossy();
-    let name = file.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
-    let lines: Vec<String> = text.lines().map(|l| l.replace(full.as_ref(), &name)).collect();
-    let mut out = lines.iter().take(12).cloned().collect::<Vec<_>>().join("\n");
-    if lines.len() > 12 {
-        out.push_str(&format!("\n… {} more lines", lines.len() - 12));
+    let _ = file;
+    let lines: Vec<String> = text.lines().map(file_names_only).collect();
+    let mut missing: Vec<(String, usize)> = Vec::new();
+    for w in text.lines().collect::<Vec<_>>().windows(2) {
+        if w[0].contains("unresolved reference")
+            && let Some(import) = w[1].trim().strip_prefix("import ")
+        {
+            // the last part is the imported name (a class or a function), never the package
+            let parts: Vec<&str> = import.split('.').collect();
+            let pkg: Vec<&str> = parts[..parts.len().saturating_sub(1)]
+                .iter()
+                .copied()
+                .take_while(|s| s.starts_with(|c: char| c.is_lowercase()))
+                .collect();
+            let group = pkg.iter().take(4).copied().collect::<Vec<_>>().join(".");
+            match missing.iter_mut().find(|(g, _)| *g == group) {
+                Some((_, n)) => *n += 1,
+                None => missing.push((group, 1)),
+            }
+        }
     }
-    out
+    let errors = lines.iter().filter(|l| l.contains("error:")).count();
+    let mut out = String::new();
+    if !missing.is_empty() {
+        out.push_str(&format!("Not found ({} packages):\n", missing.len()));
+        for (g, n) in missing.iter().take(6) {
+            out.push_str(&format!("  {g} ({n})\n"));
+        }
+        if missing.len() > 6 {
+            out.push_str(&format!("  … {} more\n", missing.len() - 6));
+        }
+        out.push('\n');
+    }
+    let first: Vec<&String> = lines.iter().filter(|l| l.contains("error:")).take(3).collect();
+    for l in &first {
+        out.push_str(l);
+        out.push('\n');
+    }
+    if errors > first.len() {
+        out.push_str(&format!("… {} more errors", errors - first.len()));
+    }
+    if out.is_empty() {
+        out = lines.iter().take(12).cloned().collect::<Vec<_>>().join("\n");
+    }
+    out.trim_end().to_string()
+}
+
+/// `a/b/Card.kt:3:5: error: …` (with or without the leading "/") -> `Card.kt:3:5: error: …`.
+fn file_names_only(line: &str) -> String {
+    match line.find(".kt:").or_else(|| line.find(".java:")) {
+        Some(end) => {
+            let start = line[..end].rfind(['/', ' ']).map_or(0, |i| i + 1);
+            if line[..start].contains(' ') && !line[..start].trim_end().ends_with(':') {
+                return line.to_string(); // a path in the middle of a sentence: leave it
+            }
+            line[start..].to_string()
+        }
+        None => line.to_string(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn compiler_errors_name_the_file_not_its_whole_path() {
-        let f = Path::new("/Users/n/code/app/src/main/kotlin/a/Card.kt");
-        let text = format!("{}:3:34: error: unresolved reference 'MaterialTheme'.\nimport x\n", f.display());
-        assert_eq!(short_error(&text, f), "Card.kt:3:34: error: unresolved reference 'MaterialTheme'.\nimport x");
-        let long: String = (0..20).map(|i| format!("line {i}\n")).collect();
-        assert!(short_error(&long, f).ends_with("… 8 more lines"));
-    }
-
     use super::*;
+
+    #[test]
+    fn compiler_errors_are_grouped_by_what_is_missing_and_paths_cut_to_the_file() {
+        let f = Path::new("/Users/n/a/Screen.kt");
+        let text = "Users/n/a/Screen.kt:5:30: error: unresolved reference 'compose'.\n\
+import androidx.activity.compose.rememberLauncherForActivityResult\n\
+                             ^^^^^^^\n\
+Users/n/a/Screen.kt:6:30: error: unresolved reference 'result'.\n\
+import androidx.activity.result.IntentSenderRequest\n\
+/Users/n/a/Screen.kt:17:22: error: unresolved reference 'designsystem'.\n\
+import co.branch.designsystem.neem.component.scaffold.Scaffold\n\
+/Users/n/a/Screen.kt:18:22: error: unresolved reference 'designsystem'.\n\
+import co.branch.designsystem.neem.component.toast.ToastVariant\n";
+        let s = short_error(text, f);
+        assert!(s.starts_with("Not found (3 packages):\n  androidx.activity.compose (1)\n  androidx.activity.result (1)\n  co.branch.designsystem.neem (2)"), "{s}");
+        assert!(s.contains("\nScreen.kt:5:30: error: unresolved reference 'compose'."), "{s}");
+        assert!(!s.contains("Users/n"), "paths cut to the file name, with or without the leading /: {s}");
+        assert!(s.ends_with("… 1 more errors"), "{s}");
+    }
 
     #[test]
     fn mac_guard_status_decides_whether_previews_run() {
