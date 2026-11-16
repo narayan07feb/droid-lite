@@ -23,6 +23,7 @@ function start(ctx) {
   if (!fs.existsSync(bin)) throw new Error(`Droid Lite engine not found: ${bin}`);
   const proc = cp.spawn(bin, ['serve'], { stdio: ['pipe', 'pipe', 'ignore'] });
   const pending = new Map();
+  const e = { proc, pending, nextId: 1 };
   readline.createInterface({ input: proc.stdout }).on('line', (line) => {
     let msg;
     try { msg = JSON.parse(line); } catch { return; }
@@ -32,13 +33,20 @@ function start(ctx) {
     pending.delete(msg.id);
     msg.error === undefined ? p.resolve(msg.result) : p.reject(new Error(msg.error));
   });
-  proc.on('exit', () => {
-    for (const p of pending.values()) p.reject(new Error('Droid Lite engine stopped'));
+  // the next call starts a new engine and indexes again
+  const stop = (why) => {
+    for (const p of pending.values()) p.reject(new Error(why));
     pending.clear();
-    if (engine && engine.proc === proc) engine = undefined;
-  });
-  engine = { proc, pending, nextId: 1 };
+    if (engine === e) { engine = undefined; ready = undefined; }
+  };
+  proc.on('exit', () => stop('Droid Lite engine stopped'));
+  proc.on('error', (err) => stop(`Droid Lite engine could not run: ${err.message}`));
+  proc.stdin.on('error', (err) => stop(`Droid Lite engine stopped: ${err.message}`));
+  engine = e;
 }
+
+// longest wait for an answer (ms); calls not listed (indexing, lenses) have no limit
+const limits = { previews: 180000, devices: 60000, adb: 60000, screenshot: 60000, record_start: 60000, record_stop: 60000 };
 
 function call(ctx, method, params = {}) {
   if (!engine) {
@@ -48,7 +56,13 @@ function call(ctx, method, params = {}) {
   const e = engine;
   return new Promise((resolve, reject) => {
     const id = e.nextId++;
-    e.pending.set(id, { resolve, reject });
+    const ms = limits[method];
+    const timer = ms && setTimeout(() => {
+      e.pending.delete(id);
+      reject(new Error(`Droid Lite engine did not answer ${method} in ${ms / 1000} s`));
+    }, ms);
+    const done = (f) => (v) => { clearTimeout(timer); f(v); };
+    e.pending.set(id, { resolve: done(resolve), reject: done(reject) });
     e.proc.stdin.write(JSON.stringify({ id, method, params }) + '\n');
   });
 }
@@ -253,20 +267,26 @@ function activate(ctx) {
   findDevice();
   refresh();
 
-  // keep the index in step with unsaved edits and files changed outside the editor
+  // keep the index in step with unsaved edits and files changed outside the editor; one request
+  // per path, so a newer one replaces an unsent older one (outputs and tool folders never count)
   const timers = new Map();
-  const update = (p, text) => {
-    if (!ready) return;
+  const source = (p) => /\.(kt|kts|java)$/.test(p);
+  const ignored = (p) => /(^|[\\/])(build|\.gradle|\.idea|\.git)([\\/]|$)/.test(path.relative(root() || '', p));
+  const send = (p, method, params) => {
+    if (!ready || ignored(p)) return;
     clearTimeout(timers.get(p));
     timers.set(p, setTimeout(() => {
       timers.delete(p);
-      project(ctx, 'update', text === undefined ? { path: p } : { path: p, text })
-        .then(() => changed.fire(), () => {});
+      project(ctx, method, { path: p, ...params }).then(() => changed.fire(), () => {});
     }, 400));
   };
+  const update = (p, text) => send(p, 'update', text === undefined ? {} : { text });
+  // a deleted folder takes every file under it out of the index
+  const remove = (p) => { if (source(p) || !path.extname(p)) send(p, 'remove'); };
   paintStability(ctx, vscode.window.activeTextEditor);
   preview.setup(ctx, project, events);
-  const watcher = vscode.workspace.createFileSystemWatcher('**/*.{kt,kts,java}');
+  const watcher = vscode.workspace.createFileSystemWatcher('**/*.{kt,kts,java}', false, false, true);
+  const deletes = vscode.workspace.createFileSystemWatcher('**/*', true, true, false);
 
   ctx.subscriptions.push(
     vscode.window.registerTreeDataProvider('droidLite.tools', tree),
@@ -282,13 +302,15 @@ function activate(ctx) {
     vscode.languages.registerCodeLensProvider(sel, lenses(ctx)),
     vscode.window.onDidChangeActiveTextEditor((e) => paintStability(ctx, e)),
     changed.event(() => paintStability(ctx, vscode.window.activeTextEditor)),
-    vscode.workspace.onDidChangeTextDocument((e) => {
-      if (/\.(kt|kts|java)$/.test(e.document.uri.fsPath)) update(e.document.uri.fsPath, e.document.getText());
+    vscode.workspace.onDidChangeTextDocument(({ document: d }) => {
+      // only files on disk: a git: diff side shares the path
+      if (d.uri.scheme === 'file' && source(d.uri.fsPath)) update(d.uri.fsPath, d.getText());
     }),
     watcher,
     watcher.onDidCreate((u) => update(u.fsPath)),
     watcher.onDidChange((u) => update(u.fsPath)),
-    watcher.onDidDelete((u) => update(u.fsPath, '')),
+    deletes,
+    deletes.onDidDelete((u) => remove(u.fsPath)),
     out,
     vscode.commands.registerCommand('droidLite.goTo', guard(goTo)),
     vscode.commands.registerCommand('droidLite.reindex', guard(async () => {
@@ -325,11 +347,25 @@ function activate(ctx) {
       if (!serial) return;
       logcat?.kill();
       const adb = await call(ctx, 'adb');
-      const history = vscode.workspace.getConfiguration('droidLite').get('logcatHistory');
+      const config = vscode.workspace.getConfiguration('droidLite');
+      const max = config.get('logcatMaxLines') || 20000;
       out.clear();
       out.show(true);
-      const proc = cp.spawn(adb, ['-s', serial, 'logcat', '-v', 'threadtime', '-T', String(history)]);
-      proc.stdout.setEncoding('utf8').on('data', (d) => out.append(d));
+      const proc = cp.spawn(adb, ['-s', serial, 'logcat', '-v', 'threadtime', '-T', String(config.get('logcatHistory'))]);
+      // the channel keeps at most `max` lines; adb's errors go there too, so no pipe fills
+      let lines = 0;
+      const write = (d) => {
+        const n = d.split('\n').length - 1;
+        if (lines + n > max) {
+          out.clear();
+          out.appendLine('[older lines cleared]');
+          lines = 0;
+        }
+        lines += n;
+        out.append(d);
+      };
+      proc.stdout.setEncoding('utf8').on('data', write);
+      proc.stderr.setEncoding('utf8').on('data', write);
       proc.on('exit', () => { if (logcat === proc) { logcat = undefined; out.appendLine('[logcat stopped]'); refresh(); } });
       logcat = proc;
       refresh();
@@ -339,4 +375,4 @@ function activate(ctx) {
   );
 }
 
-module.exports = { activate, deactivate() {} };
+module.exports = { activate, deactivate() {}, limits };

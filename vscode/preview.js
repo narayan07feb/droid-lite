@@ -3,12 +3,15 @@
 const vscode = require('vscode');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 
 const previewDir = () =>
   process.env.DROID_LITE_PREVIEW_DIR || path.join(os.homedir(), 'Library/Caches/droid-lite/previews');
 
 function html(webview) {
-  const csp = `default-src 'none'; img-src ${webview.cspSource}; style-src 'unsafe-inline'; script-src 'unsafe-inline'`;
+  // only the one script below may run
+  const nonce = crypto.randomBytes(16).toString('base64');
+  const csp = `default-src 'none'; img-src ${webview.cspSource}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'`;
   return `<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="${csp}">
 <style>
@@ -22,7 +25,7 @@ function html(webview) {
   .busy .card { opacity: .45; }
 </style></head><body>
 <div id="status">Open a Kotlin file with @Preview functions.</div><div id="bar"></div><div id="cards"></div>
-<script>
+<script nonce="${nonce}">
   const status = document.getElementById('status'), bar = document.getElementById('bar'), cards = document.getElementById('cards');
   window.addEventListener('message', ({ data: m }) => {
     if (m.type === 'start') { document.body.classList.add('busy'); status.textContent = 'Drawing ' + m.file + '…'; bar.style.width = '5%'; }

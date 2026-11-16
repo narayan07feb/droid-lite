@@ -2,7 +2,7 @@
   "name": "droid-lite",
   "displayName": "Droid Lite",
   "description": "Android tools for VS Code and Cursor: Compose previews without Gradle, implementation links, Compose stability, device screenshot, screen recording and logcat.",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "publisher": "forgebyte",
   "license": "MIT",
   "repository": {
@@ -68,12 +68,18 @@
         "droidLite.enginePath": {
           "type": "string",
           "default": "",
+          "scope": "machine",
           "description": "Path to the droid-lite binary. Empty: the one inside this extension."
         },
         "droidLite.logcatHistory": {
           "type": "number",
           "default": 500,
           "description": "Logcat lines to show from before the stream starts."
+        },
+        "droidLite.logcatMaxLines": {
+          "type": "number",
+          "default": 20000,
+          "description": "Most logcat lines the Logcat output keeps; older lines are cleared."
         }
       }
     },
