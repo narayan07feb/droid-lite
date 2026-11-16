@@ -3887,7 +3887,8 @@ fn e2e_sidebar_pull_requests_open_a_file_diff_beside_the_editor() {
         author: "ana".into(),
         draft: false,
         url: String::new(),
-        review: "APPROVED".into(),
+        review: if n == 7 { "APPROVED".into() } else { String::new() },
+        approvals: u32::from(n == 7) * 2,
     };
     {
         let s = h.state_mut();
@@ -3902,6 +3903,15 @@ fn e2e_sidebar_pull_requests_open_a_file_diff_beside_the_editor() {
         .click();
     steps(&mut h, 3);
     assert!(h.query_by_label("#7 Fix login").is_some(), "your PRs first");
+    // an approved PR shows it at a glance, and the Approved tab lists only those
+    assert!(h.query_by_label("Approved by 2").is_some(), "approvals counted");
+    h.state_mut().prs.lists.insert(
+        crate::git::PrFilter::Approved,
+        Ok(vec![item(7, "Fix login")]),
+    );
+    h.get_by_label("Approved").click();
+    steps(&mut h, 3);
+    assert!(h.query_by_label("#7 Fix login").is_some(), "the approved filter");
     h.get_by_label("Awaiting your review").click();
     steps(&mut h, 3);
     assert!(h.query_by_label("#7 Fix login").is_none());

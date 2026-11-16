@@ -364,6 +364,8 @@ pub enum PrFilter {
     Mine,
     /// Waiting for your review.
     Review,
+    /// Yours and approved: ready to merge.
+    Approved,
 }
 
 impl PrFilter {
@@ -371,6 +373,7 @@ impl PrFilter {
         match self {
             PrFilter::Mine => "Your PRs",
             PrFilter::Review => "Awaiting your review",
+            PrFilter::Approved => "Approved",
         }
     }
 }
@@ -385,21 +388,39 @@ pub struct PrItem {
     pub url: String,
     /// APPROVED, CHANGES_REQUESTED, REVIEW_REQUIRED or empty.
     pub review: String,
+    /// Reviewers whose latest review approves it.
+    pub approvals: u32,
 }
 
-/// `gh pr list --json number,title,author,isDraft,url,reviewDecision` output.
+/// `gh pr list --json number,title,author,isDraft,url,reviewDecision,latestReviews` output.
+/// GitHub leaves `reviewDecision` empty when the branch rules ask for no review: then the
+/// reviewers' latest reviews decide (any change request wins over approvals).
 pub fn parse_pr_items(json: &[u8]) -> Vec<PrItem> {
     serde_json::from_slice::<Vec<serde_json::Value>>(json)
         .unwrap_or_default()
         .iter()
         .filter_map(|v| {
+            let latest = v["latestReviews"].as_array().cloned().unwrap_or_default();
+            let count = |state: &str| latest.iter().filter(|r| r["state"] == state).count() as u32;
+            let approvals = count("APPROVED");
+            let decision = v["reviewDecision"].as_str().unwrap_or("");
+            let review = if !decision.is_empty() {
+                decision
+            } else if count("CHANGES_REQUESTED") > 0 {
+                "CHANGES_REQUESTED"
+            } else if approvals > 0 {
+                "APPROVED"
+            } else {
+                ""
+            };
             Some(PrItem {
+                approvals,
                 number: v["number"].as_u64()?,
                 title: v["title"].as_str().unwrap_or("").to_string(),
                 author: v["author"]["login"].as_str().unwrap_or("").to_string(),
                 draft: v["isDraft"].as_bool().unwrap_or(false),
                 url: v["url"].as_str().unwrap_or("").to_string(),
-                review: v["reviewDecision"].as_str().unwrap_or("").to_string(),
+                review: review.to_string(),
             })
         })
         .collect()
@@ -425,11 +446,17 @@ pub fn list_prs(root: &Path, filter: PrFilter) -> Result<Vec<PrItem>, String> {
     let who = match filter {
         PrFilter::Mine => ["--author", "@me"],
         PrFilter::Review => ["--search", "review-requested:@me"],
+        PrFilter::Approved => ["--author", "@me"],
     };
     let mut args = vec!["pr", "list", "--state", "open", "--limit", "100"];
     args.extend(who);
-    args.extend(["--json", "number,title,author,isDraft,url,reviewDecision"]);
-    gh(root, &args).map(|o| parse_pr_items(&o))
+    args.extend(["--json", "number,title,author,isDraft,url,reviewDecision,latestReviews"]);
+    let prs = gh(root, &args).map(|o| parse_pr_items(&o))?;
+    // decided here, not by GitHub's search, so it matches the ✓ in the other lists
+    Ok(match filter {
+        PrFilter::Approved => prs.into_iter().filter(|p| p.review == "APPROVED").collect(),
+        _ => prs,
+    })
 }
 
 /// A pull request's whole diff (`gh pr diff`), split into one diff per file.
@@ -760,6 +787,7 @@ mod tests {
                 draft: true,
                 url: "https://x/7".into(),
                 review: "APPROVED".into(),
+                approvals: 0,
             }
         );
         assert_eq!(
@@ -767,6 +795,26 @@ mod tests {
             (8, false, "")
         );
         assert_eq!(PrFilter::Review.label(), "Awaiting your review");
+    }
+
+    #[test]
+    fn without_a_review_decision_the_latest_reviews_decide() {
+        let prs = parse_pr_items(
+            br#"[{"number":1,"reviewDecision":"","latestReviews":[{"state":"APPROVED"},{"state":"APPROVED"},{"state":"COMMENTED"}]},
+                 {"number":2,"reviewDecision":"","latestReviews":[{"state":"APPROVED"},{"state":"CHANGES_REQUESTED"}]},
+                 {"number":3,"reviewDecision":"REVIEW_REQUIRED","latestReviews":[{"state":"APPROVED"}]},
+                 {"number":4}]"#,
+        );
+        let got: Vec<(u64, &str, u32)> = prs.iter().map(|p| (p.number, p.review.as_str(), p.approvals)).collect();
+        assert_eq!(
+            got,
+            [
+                (1, "APPROVED", 2),
+                (2, "CHANGES_REQUESTED", 1),
+                (3, "REVIEW_REQUIRED", 1),
+                (4, "", 0)
+            ]
+        );
     }
 
     #[test]

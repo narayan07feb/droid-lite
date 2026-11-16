@@ -35,9 +35,11 @@ fn open_url(url: &str) {
     }
 }
 
+const APPROVED: egui::Color32 = egui::Color32::from_rgb(0x5F, 0xB8, 0x65);
+
 fn review_text(r: &str) -> Option<(&'static str, egui::Color32)> {
     match r {
-        "APPROVED" => Some(("Approved", egui::Color32::from_rgb(0x5F, 0xB8, 0x65))),
+        "APPROVED" => Some(("Approved", APPROVED)),
         "CHANGES_REQUESTED" => Some(("Changes requested", crate::highlight::ERROR)),
         "REVIEW_REQUIRED" => Some(("Review required", crate::highlight::WARN)),
         _ => None,
@@ -54,7 +56,7 @@ impl App {
         let mut refresh = false;
         ui.horizontal(|ui| {
             let mut tabs = crate::theme::Tabs::new(ui, "pr-filter");
-            for f in [PrFilter::Mine, PrFilter::Review] {
+            for f in [PrFilter::Mine, PrFilter::Review, PrFilter::Approved] {
                 if tabs.tab(ui, filter == f, f.label()).clicked() {
                     self.prs.filter = Some(f);
                 }
@@ -119,6 +121,7 @@ impl App {
                 RichText::new(match filter {
                     PrFilter::Mine => "You have no open pull requests.",
                     PrFilter::Review => "No pull requests wait for your review.",
+                    PrFilter::Approved => "None of your open pull requests is approved yet.",
                 })
                 .weak(),
             );
@@ -148,6 +151,11 @@ impl App {
                                 ui.with_layout(
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
+                                        // approved at a glance: a green check before the title
+                                        if p.review == "APPROVED" {
+                                            ui.label(RichText::new(ic::CHECK).color(APPROVED))
+                                                .on_hover_text("Approved");
+                                        }
                                         ui.add(
                                             egui::Label::new(format!("#{} {}", p.number, p.title))
                                                 .truncate()
@@ -173,6 +181,11 @@ impl App {
                             ui.label(RichText::new("Draft").weak().small());
                         }
                         if let Some((t, c)) = review_text(&p.review) {
+                            let t = if p.approvals > 0 && p.review == "APPROVED" {
+                                format!("Approved by {}", p.approvals)
+                            } else {
+                                t.to_string()
+                            };
                             ui.label(RichText::new(t).small().color(c));
                         }
                     });
