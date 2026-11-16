@@ -27,11 +27,17 @@ mod project;
 mod refactor;
 mod reports;
 mod resources;
+mod serve;
 mod theme;
 mod usage;
 mod watch;
 
 fn main() -> eframe::Result {
+    // the engine without the window, for the VS Code / Cursor plugin
+    if std::env::args().nth(1).as_deref() == Some("serve") {
+        serve::run();
+        return Ok(());
+    }
     if let Some(dir) = std::env::args()
         .nth(1)
         .filter(|a| a == "--bench")
