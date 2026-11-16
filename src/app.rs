@@ -3584,7 +3584,7 @@ impl App {
         let p = &mut self.previews;
         while let Some(e) = p.client.as_ref().and_then(crate::preview::Client::poll) {
             match e {
-                crate::preview::Event::Status(s, progress) => {
+                crate::preview::Event::Status(_, s, progress) => {
                     p.busy = !s.starts_with("Skipped");
                     p.note = s;
                     p.progress = progress;

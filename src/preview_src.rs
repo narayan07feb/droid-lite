@@ -132,7 +132,7 @@ impl Packages {
     }
 
     /// The package an import points into: the longest prefix that is a project package.
-    fn package_for(&self, import: &str) -> Option<&str> {
+    pub fn package_for(&self, import: &str) -> Option<&str> {
         let parts: Vec<&str> = import.trim_end_matches(".*").split('.').collect();
         (1..=parts.len())
             .rev()

@@ -131,9 +131,10 @@ fn own_code(pk: &crate::preview_src::Packages, open: &Path) -> Result<Own, Strin
 
 /// What comes back, by message only.
 pub enum Event {
-    /// The real step in words ("Compiling the project code (42 files)", "Drawing 2 of 3 previews"),
-    /// with (done, total) when the count is known; or a reason it cannot run ("Skipped: …").
-    Status(String, Option<(u64, u64)>),
+    /// The real step in words ("Compiling the project code (42 files)", "Drawing 2 of 3 previews")
+    /// for the request of that file, with (done, total) when the count is known; or a reason it
+    /// cannot run ("Skipped: …").
+    Status(PathBuf, String, Option<(u64, u64)>),
     /// One picture or one error text per preview, in request order.
     Done { file: PathBuf, seq: u64, cards: Vec<(String, Result<egui::ColorImage, String>)> },
     /// The whole request failed (compile error, missing class): the text for the cards.
@@ -214,10 +215,15 @@ pub fn room() -> String {
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
     let guard = std::env::var_os("DROID_LITE_MAC_GUARD")
         .map_or_else(|| home.join(".local/bin/mac-guard"), PathBuf::from);
-    let Ok(out) = Command::new(&guard).arg("status").output() else {
-        return String::new(); // no mac-guard: nothing says no
-    };
-    room_from_status(&String::from_utf8_lossy(&out.stdout))
+    room_from(&guard, Duration::from_secs(3))
+}
+
+/// `guard status`, stopped after `limit`: no mac-guard, or one that hangs, says nothing against.
+fn room_from(guard: &Path, limit: Duration) -> String {
+    match crate::capture::output_within(Command::new(guard).arg("status"), limit) {
+        Ok(out) => room_from_status(&String::from_utf8_lossy(&out.stdout)),
+        Err(_) => String::new(),
+    }
 }
 
 fn room_from_status(status: &str) -> String {
@@ -248,7 +254,7 @@ fn next_job(jobs: &Receiver<Request>, send: &dyn Fn(Event), room: &dyn Fn() -> S
         if why.is_empty() {
             return Some(r);
         }
-        send(Event::Status(why.clone(), None));
+        send(Event::Status(r.file.clone(), why.clone(), None));
         send(Event::Skipped { file: r.file, seq: r.seq, reason: why });
     }
 }
@@ -262,79 +268,124 @@ fn cache_key(draw: &[&str], rt: &ProjectRuntime, worker: &str, renderer: &str) -
     crate::preview_cache::key(&parts)
 }
 
+/// A status line, with (done, total) when the count is known.
+type StatusLine<'a> = dyn Fn(&str, Option<(u64, u64)>) + 'a;
+
 /// What the run loop reads once per project (the libraries, the packages) and the compilers it found.
 #[derive(Default)]
 struct Reads {
     libs: Option<(PathBuf, LibraryCode)>,
     packages: Option<(PathBuf, crate::preview_src::Packages)>,
+    /// The project files the packages were read from; another list (files added or removed) reads them again.
+    files: Option<std::sync::Arc<Vec<PathBuf>>>,
     kotlins: std::collections::HashMap<String, Result<Kotlin, String>>,
 }
 
 impl Reads {
-    /// After a failed request (no Compose in the Gradle cache yet, no compiler, unresolved code) the
-    /// next one reads again, so "build once with Gradle, then open the preview again" works.
+    /// After a request that failed for want of libraries or a compiler (no Compose in the Gradle cache
+    /// yet, no compiler, an import of a package the project does not have) the next one reads again,
+    /// so "build once with Gradle, then open the preview again" works.
     fn forget_errors(&mut self) {
         self.libs = None;
         self.packages = None;
+        self.files = None;
         self.kotlins.retain(|_, k| k.is_ok());
+    }
+
+    /// The project's libraries (once per project root) and its packages (again when files were
+    /// added or removed since: a new screen, a moved folder).
+    fn refresh(&mut self, p: &ProjectRef, status: &StatusLine<'_>) {
+        if self.libs.as_ref().is_none_or(|(r0, _)| *r0 != p.root) {
+            status("Reading the project's libraries", None);
+            let progress = |i: usize, n: usize| status("Unpacking the project's libraries", Some((i as u64, n as u64)));
+            self.libs = Some((p.root.clone(), library_classpath(&p.root, &p.scripts, &progress)));
+            self.files = None;
+        }
+        if self.files.as_ref().is_none_or(|f| !std::sync::Arc::ptr_eq(f, &p.files) && **f != *p.files) {
+            self.packages = Some((p.root.clone(), crate::preview_src::Packages::read(&p.files)));
+            self.files = Some(p.files.clone());
+        }
     }
 }
 
+/// Whether a failed request was about the libraries or the compiler (read them again for the next
+/// one), not an ordinary compile error in the user's code: the missing Compose or compiler texts, or
+/// an unresolved import of a package that is not the project's (a library not in the Gradle cache).
+fn library_trouble(error: &str, unresolved_imports: &[String], packages: Option<&crate::preview_src::Packages>) -> bool {
+    error == NO_COMPOSE
+        || error.contains("is not on this Mac yet")
+        || error.contains("is not in the Gradle cache yet")
+        || unresolved_imports.iter().any(|i| packages.is_none_or(|p| p.package_for(i).is_none()))
+}
+
 fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
-    let failed = std::cell::Cell::new(false);
     let send = |e: Event| {
-        if matches!(e, Event::Failed { .. }) {
-            failed.set(true);
-        }
         let _ = events.send(e);
         ctx.request_repaint();
     };
-    let mut conn: Option<(UnixStream, BufReader<UnixStream>)> = None;
-    let mut id = 0u64;
-    // the project's libraries, read once per project root (again after a failed request)
-    let mut reads = Reads::default();
-    let mut assets: Vec<String> = Vec::new();
-    let (mut res_packages, mut module_res, mut exploded): (Vec<String>, Vec<String>, Vec<String>) = Default::default();
-    let mut conn_version = String::new();
-    while let Some(r) = next_job(&jobs, &send, &room) {
-        if failed.take() {
-            reads.forget_errors();
+    let mut state = State::default();
+    serve_jobs(&jobs, &send, &room, &mut |r| state.draw(r, &send));
+}
+
+/// Draws each request the loop takes. A panic in one (a bug) answers that request Failed and the
+/// loop goes on, so no caller waits for an answer that never comes.
+fn serve_jobs(jobs: &Receiver<Request>, send: &dyn Fn(Event), room: &dyn Fn() -> String, draw: &mut dyn FnMut(&Request)) {
+    while let Some(r) = next_job(jobs, send, room) {
+        if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| draw(&r))) {
+            let why = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
+            send(Event::Failed { file: r.file.clone(), seq: r.seq, error: format!("internal error: {why}") });
+        }
+    }
+}
+
+/// What the run loop keeps between requests: the worker connection and what it read of the project.
+#[derive(Default)]
+struct State {
+    conn: Option<(UnixStream, BufReader<UnixStream>)>,
+    conn_version: String,
+    id: u64,
+    reads: Reads,
+    /// The last request failed for want of libraries or a compiler: read them again.
+    forget: bool,
+    assets: Vec<String>,
+    res_packages: Vec<String>,
+    module_res: Vec<String>,
+    exploded: Vec<String>,
+}
+
+impl State {
+    /// Draws one request and answers it once (Done or Failed).
+    fn draw(&mut self, r: &Request, send: &dyn Fn(Event)) {
+        if std::mem::take(&mut self.forget) {
+            self.reads.forget_errors();
         }
         let fail = |error: String| Event::Failed { file: r.file.clone(), seq: r.seq, error };
         let (cp, own) = match &r.project {
             Some(p) => {
-                if reads.libs.as_ref().is_none_or(|(r0, _)| *r0 != p.root) {
-                    send(Event::Status("Reading the project's libraries".into(), None));
-                    let progress = |i: usize, n: usize| send(Event::Status("Unpacking the project's libraries".into(), Some((i as u64, n as u64))));
-                    reads.libs = Some((p.root.clone(), library_classpath(&p.root, &p.scripts, &progress)));
-                    reads.packages = Some((p.root.clone(), crate::preview_src::Packages::read(&p.files)));
-                }
-                let lc = reads.libs.as_ref().map(|(_, l)| l.clone()).unwrap_or_default();
+                self.reads.refresh(p, &|t, n| send(Event::Status(r.file.clone(), t.into(), n)));
+                let lc = self.reads.libs.as_ref().map(|(_, l)| l.clone()).unwrap_or_default();
                 let (mut cp, lib_r) = (lc.jars, lc.rjava);
-                assets = lc.assets;
+                self.assets = lc.assets;
                 // the project's own Compose runs the preview when the Gradle cache has it
                 if cp.iter().any(|j| j.contains("/androidx.compose.runtime/")) {
-                    match project_r(&reads.packages.as_ref().unwrap().1, &lib_r) {
+                    match project_r(&self.reads.packages.as_ref().unwrap().1, &lib_r) {
                         Ok((rs, pkgs, res)) => {
                             cp.push(rs.to_string_lossy().into_owned());
-                            res_packages = pkgs;
-                            module_res = res;
-                            exploded = lc.exploded.clone();
+                            self.res_packages = pkgs;
+                            self.module_res = res;
+                            self.exploded = lc.exploded.clone();
                         }
                         Err(e) => {
-                            send(fail(e));
-                            continue;
+                            self.forget = true; // the libraries' R classes
+                            return send(fail(e));
                         }
                     }
                 } else {
                     cp.clear(); // not usable on its own: the base pack's Compose instead
                 }
-                match own_code(&reads.packages.as_ref().unwrap().1, &r.file) {
+                match own_code(&self.reads.packages.as_ref().unwrap().1, &r.file) {
                     Ok(o) => (cp, Some(o)),
-                    Err(e) => {
-                        send(fail(e));
-                        continue;
-                    }
+                    Err(e) => return send(fail(e)),
                 }
             }
             None => (Vec::new(), None),
@@ -342,16 +393,17 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
         let version = kotlin_version(r.project.as_ref().map(|p| p.root.as_path()));
         let stand_in = std::env::var_os("DROID_LITE_PREVIEW_WORKER").is_some(); // tests: no compiler needed
         if cp.is_empty() && !stand_in && base_jars("compose").is_empty() {
-            send(fail(NO_COMPOSE.into()));
-            continue;
+            self.forget = true;
+            return send(fail(NO_COMPOSE.into()));
         }
-        let kt = match reads.kotlins.entry(version.clone()).or_insert_with(|| {
+        let kt = match self.reads.kotlins.entry(version.clone()).or_insert_with(|| {
             if stand_in { Ok(Kotlin { version: version.clone(), ..Default::default() }) } else { kotlin(&version) }
         }) {
             Ok(k) => k.clone(),
             Err(e) => {
-                send(fail(e.clone()));
-                continue;
+                let e = e.clone();
+                self.forget = true;
+                return send(fail(e));
             }
         };
         // never Kotlin's own compiler-side jars on the worker's classpath: the worker's compiler would
@@ -359,15 +411,15 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
         let text = std::fs::read_to_string(&r.file).unwrap_or_default();
         let specs = {
             let empty = std::collections::HashMap::new();
-            let classes = reads.packages.as_ref().map_or(&empty, |(_, p)| &p.annotation_classes);
+            let classes = self.reads.packages.as_ref().map_or(&empty, |(_, p)| &p.annotation_classes);
             specs_for(&text, &r.previews, classes)
         };
         let rt = ProjectRuntime {
             jars: cp.iter().filter(|j| !j.contains("/org.jetbrains.kotlin/")).cloned().collect(),
-            assets: if cp.is_empty() { Vec::new() } else { assets.clone() },
-            res_packages: if cp.is_empty() { Vec::new() } else { res_packages.clone() },
-            module_res: if cp.is_empty() { Vec::new() } else { module_res.clone() },
-            exploded: if cp.is_empty() { Vec::new() } else { exploded.clone() },
+            assets: if cp.is_empty() { Vec::new() } else { self.assets.clone() },
+            res_packages: if cp.is_empty() { Vec::new() } else { self.res_packages.clone() },
+            module_res: if cp.is_empty() { Vec::new() } else { self.module_res.clone() },
+            exploded: if cp.is_empty() { Vec::new() } else { self.exploded.clone() },
         };
         // the same file, project code, previews, libraries, worker, renderer and resources as a recent
         // draw: its pictures at once
@@ -376,14 +428,14 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
         let draw = [file.as_ref(), &text, own.as_ref().map_or("", |o| o.key.as_str()), &specs_text, &version];
         let cache_key = cache_key(&draw, &rt, WORKER_SOURCE, &crate::preview_base::fingerprint());
         if !stand_in && let Some(cards) = crate::preview_cache::lookup(&cache_dir, &cache_key, crate::preview_cache::now_secs()) {
-            send(Event::Done { file: r.file.clone(), seq: r.seq, cards });
-            continue;
+            return send(Event::Done { file: r.file.clone(), seq: r.seq, cards });
         }
         let worker_id = format!("{version}-{:08x}", rt.key());
-        if conn_version != worker_id {
-            conn = None; // another project's Kotlin or libraries: its own worker
-            conn_version = worker_id;
+        if self.conn_version != worker_id {
+            self.conn = None; // another project's Kotlin or libraries: its own worker
+            self.conn_version = worker_id;
         }
+        let sock = socket(&kt, &rt);
         // the worker may have ended (idle exit, a crash) or never started: start it and connect by
         // itself, up to 3 tries with a short back-off, then the error goes on the card
         let mut last_error = String::new();
@@ -392,10 +444,11 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_millis(500 << attempt));
             }
-            if conn.is_none() {
-                match connect_or_start(&send, &kt, &rt, &mut base) {
-                    Ok(c) => conn = Some(c),
+            if self.conn.is_none() {
+                match connect_or_start(send, &r.file, &sock, &kt, &rt, &mut base) {
+                    Ok(c) => self.conn = Some(c),
                     Err(e) => {
+                        self.forget |= e.contains("is not in the Gradle cache yet"); // the Compose compiler plugin
                         last_error = e;
                         if base.is_none() && !stand_in {
                             break; // the renderer's files are missing: the card says which, no retry
@@ -404,22 +457,29 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
                     }
                 }
             }
-            send(Event::Status(format!("Sending {} preview(s) to the worker", r.previews.len()), None));
-            id += 1;
-            let (w, rd) = conn.as_mut().unwrap();
-            match ask(w, rd, id, &r, &specs, &cp, own.as_ref(), &send) {
-                Ok(e) => {
-                    if let Event::Done { file, cards, .. } = &e
-                        && !stand_in
-                    {
-                        crate::preview_cache::store(&cache_dir, &cache_key, file, cards, crate::preview_cache::now_secs());
+            send(Event::Status(r.file.clone(), format!("Sending {} preview(s) to the worker", r.previews.len()), None));
+            self.id += 1;
+            let (w, rd) = self.conn.as_mut().unwrap();
+            match ask(w, rd, self.id, r, &specs, &cp, own.as_ref(), send) {
+                Ok((e, unresolved)) => {
+                    match &e {
+                        Event::Done { file, cards, .. } if !stand_in => store_if_current(&cache_dir, &cache_key, file, &text, cards),
+                        Event::Failed { error, .. } => self.forget = library_trouble(error, &unresolved, self.reads.packages.as_ref().map(|(_, p)| p)),
+                        _ => {}
                     }
                     send(e);
                     last_error.clear();
                     break;
                 }
-                Err(e) => {
-                    conn = None;
+                Err(NoAnswer::Replaced) => {
+                    self.conn = None;
+                    last_error = "The preview worker stopped: another window's request replaced this one".into();
+                }
+                Err(NoAnswer::Stopped(e)) => {
+                    // a hung worker would take the next connection too: stop it, so the next try
+                    // starts a fresh one
+                    self.conn = None;
+                    stop_worker(&sock, STOP_GRACE);
                     last_error = format!("The preview worker stopped: {e}");
                 }
             }
@@ -430,33 +490,84 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
     }
 }
 
+/// Stores the pictures under `key` only when the file still has the text the key was made from: the
+/// worker reads the file itself, so after a save while it drew the pictures may show the new text,
+/// and must not be kept under the old text's key.
+fn store_if_current(cache_dir: &Path, key: &str, file: &Path, text: &str, cards: &crate::preview_cache::Cards) {
+    if std::fs::read_to_string(file).is_ok_and(|now| now == text) {
+        crate::preview_cache::store(cache_dir, key, file, cards, crate::preview_cache::now_secs());
+    }
+}
+
+/// One socket per worker source, Kotlin version and libraries: after an update, or for a project on
+/// another Kotlin, a new worker starts; an old one exits when idle.
+fn socket(kt: &Kotlin, rt: &ProjectRuntime) -> PathBuf {
+    let plugins = format!("{:?}{:?}{:?}", kt.compose_plugin, kt.parcelize_plugin, kt.serialization_plugin);
+    dir().join(format!("w-{:08x}-{}-{:08x}.sock", (fnv(WORKER_SOURCE) ^ fnv(&plugins)) as u32, kt.version, rt.key()))
+}
+
+/// How long a stopped worker gets to end after SIGTERM before SIGKILL.
+const STOP_GRACE: Duration = Duration::from_secs(3);
+
+/// Stops the worker serving `sock` (it hung, closed the connection or sent garbage): SIGTERM, then
+/// SIGKILL after `grace`, then its socket goes, so the next try starts a fresh worker instead of
+/// connecting to the hung one. Found by its command line (the socket is its argument), like
+/// [`stop_other_workers`]; worker.pid names only the newest worker.
+fn stop_worker(sock: &Path, grace: Duration) {
+    let mut pids = worker_pids(sock);
+    for p in &pids {
+        unsafe { libc::kill(*p, libc::SIGTERM) };
+    }
+    let until = Instant::now() + grace;
+    while !pids.is_empty() && Instant::now() < until {
+        pids.retain(|p| unsafe { libc::kill(*p, 0) } == 0);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for p in &pids {
+        unsafe { libc::kill(*p, libc::SIGKILL) };
+    }
+    let _ = std::fs::remove_file(sock);
+}
+
+/// The processes whose command line names `sock` (never this one).
+fn worker_pids(sock: &Path) -> Vec<i32> {
+    let Ok(out) = Command::new("ps").args(["-axww", "-o", "pid=,command="]).output() else { return Vec::new() };
+    let (sock, me) = (sock.to_string_lossy().into_owned(), std::process::id());
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let (pid, cmd) = l.trim_start().split_once(' ')?;
+            let pid = pid.parse::<i32>().ok()?;
+            (pid as u32 != me && format!(" {cmd} ").contains(&format!(" {sock} "))).then_some(pid)
+        })
+        .collect()
+}
+
 fn connect_or_start(
     send: &dyn Fn(Event),
+    file: &Path,
+    sock: &Path,
     kt: &Kotlin,
     rt: &ProjectRuntime,
     base: &mut Option<crate::preview_base::Base>,
 ) -> Result<(UnixStream, BufReader<UnixStream>), String> {
-    // one socket per worker source and Kotlin version: after an update, or for a project on another
-    // Kotlin, a new worker starts; an old one exits when idle
-    let plugins = format!("{:?}{:?}{:?}", kt.compose_plugin, kt.parcelize_plugin, kt.serialization_plugin);
-    let sock = dir().join(format!("w-{:08x}-{}-{:08x}.sock", (fnv(WORKER_SOURCE) ^ fnv(&plugins)) as u32, kt.version, rt.key()));
-    if let Ok(s) = UnixStream::connect(&sock) {
+    if let Ok(s) = UnixStream::connect(sock) {
         let rd = BufReader::new(s.try_clone().map_err(|e| e.to_string())?);
         return Ok((s, rd));
     }
     // the renderer's files, checked at every worker start: one that went away is found again or
     // downloaded; never a start with a partial set
     if base.is_none() && std::env::var_os("DROID_LITE_PREVIEW_WORKER").is_none() {
-        let status = |t: String, n| send(Event::Status(t, n));
+        let status = |t: String, n| send(Event::Status(file.to_path_buf(), t, n));
         *base = Some(crate::preview_base::ensure(&base_dir(), &dir().join("m2"), &status)?);
     }
-    send(Event::Status("Starting the preview worker".into(), None));
-    stop_other_workers(&sock);
-    let mut child = start_worker(&sock, kt, rt, base.as_ref())?;
+    send(Event::Status(file.to_path_buf(), "Starting the preview worker".into(), None));
+    stop_other_workers(sock);
+    let mut child = start_worker(sock, kt, rt, base.as_ref())?;
     let _ = std::fs::write(dir().join("worker.pid"), format!("{} {}", child.id(), sock.display()));
     let until = Instant::now() + Duration::from_secs(60);
     while Instant::now() < until {
-        if let Ok(s) = UnixStream::connect(&sock) {
+        if let Ok(s) = UnixStream::connect(sock) {
             std::thread::spawn(move || child.wait()); // reap it when it ends (idle exit)
             let rd = BufReader::new(s.try_clone().map_err(|e| e.to_string())?);
             return Ok((s, rd));
@@ -864,6 +975,17 @@ fn fnv(s: &str) -> u64 {
 /// How long the worker may be silent before it counts as stopped.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 120 });
 
+/// Why [`ask`] got no answer.
+#[derive(Debug, PartialEq)]
+enum NoAnswer {
+    /// Another client's request took the worker's one waiting place: ask again, the worker is fine.
+    Replaced,
+    /// The worker was silent past the reply timeout, closed the connection or sent garbage.
+    Stopped(String),
+}
+
+/// Sends one request and waits for its answer, with the imports the compiler could not resolve
+/// when it failed (so the caller can tell a missing library from an error in the user's code).
 #[allow(clippy::too_many_arguments)]
 fn ask(
     w: &mut UnixStream,
@@ -874,7 +996,8 @@ fn ask(
     cp: &[String],
     own: Option<&Own>,
     send: &dyn Fn(Event),
-) -> Result<Event, String> {
+) -> Result<(Event, Vec<String>), NoAnswer> {
+    let stopped = |e: std::io::Error| NoAnswer::Stopped(e.to_string());
     let line = serde_json::json!({
         "id": id, "file": r.file, "class": r.class, "cp": cp,
         "previews": specs.iter().map(crate::preview_spec::Spec::json).collect::<Vec<_>>(),
@@ -883,30 +1006,30 @@ fn ask(
         "key": own.map_or("", |o| o.key.as_str()),
     });
     // a worker that hangs is given up (a cold compile takes about 25 s between lines)
-    rd.get_ref().set_read_timeout(Some(REPLY_TIMEOUT)).map_err(|e| e.to_string())?;
-    writeln!(w, "{line}").map_err(|e| e.to_string())?;
+    rd.get_ref().set_read_timeout(Some(REPLY_TIMEOUT)).map_err(stopped)?;
+    writeln!(w, "{line}").map_err(stopped)?;
     loop {
         let mut reply = String::new();
-        if rd.read_line(&mut reply).map_err(|e| e.to_string())? == 0 {
-            return Err("no answer".into());
+        if rd.read_line(&mut reply).map_err(stopped)? == 0 {
+            return Err(NoAnswer::Stopped("no answer".into()));
         }
-        let v: serde_json::Value = serde_json::from_str(&reply).map_err(|e| e.to_string())?;
+        let v: serde_json::Value = serde_json::from_str(&reply).map_err(|e| NoAnswer::Stopped(e.to_string()))?;
         if v["id"].as_u64() != Some(id) {
             continue; // an older answer
         }
         if v["skipped"].as_bool() == Some(true) {
-            // another client's request took the worker's one waiting place: ask again
-            return Err("another window's request replaced this one".into());
+            return Err(NoAnswer::Replaced);
         }
         if let Some(step) = v["status"].as_str() {
             // the worker's real step, while it works
             let n = (v["done"].as_u64().unwrap_or(0), v["total"].as_u64().unwrap_or(0));
-            send(Event::Status(step.to_string(), (n.1 > 0).then_some(n)));
+            send(Event::Status(r.file.clone(), step.to_string(), (n.1 > 0).then_some(n)));
             continue;
         }
         if v["ok"].as_bool() != Some(true) {
-            let error = short_error(v["error"].as_str().unwrap_or("The preview failed."), &r.file);
-            return Ok(Event::Failed { file: r.file.clone(), seq: r.seq, error });
+            let raw = v["error"].as_str().unwrap_or("The preview failed.");
+            let error = short_error(raw, &r.file);
+            return Ok((Event::Failed { file: r.file.clone(), seq: r.seq, error }, unresolved_imports(raw)));
         }
         let cards = v["images"]
             .as_array()
@@ -930,8 +1053,19 @@ fn ask(
                 (name, pic)
             })
             .collect();
-        return Ok(Event::Done { file: r.file.clone(), seq: r.seq, cards });
+        return Ok((Event::Done { file: r.file.clone(), seq: r.seq, cards }, Vec::new()));
     }
+}
+
+/// The imports the compiler could not resolve: an "unresolved reference" error line followed by the
+/// source line it points at, an `import`.
+fn unresolved_imports(text: &str) -> Vec<String> {
+    text.lines()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .filter(|w| w[0].contains("unresolved reference"))
+        .filter_map(|w| w[1].trim().strip_prefix("import ").map(|i| i.split_whitespace().next().unwrap_or("").to_string()))
+        .collect()
 }
 
 /// The compiler's text for a card, grouped: what is missing (packages of the imports that do not
@@ -1051,7 +1185,7 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         (log, move |e: Event| {
             let row = match e {
                 Event::Skipped { seq, reason, .. } => ("skipped".into(), seq, reason),
-                Event::Status(t, _) => ("status".into(), 0, t),
+                Event::Status(_, t, _) => ("status".into(), 0, t),
                 Event::Done { seq, .. } => ("done".into(), seq, String::new()),
                 Event::Failed { seq, error, .. } => ("failed".into(), seq, error),
             };
@@ -1097,7 +1231,7 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
             let _ = done.send(ask(&mut w, &mut rd, 7, &request(1), &[], &[], None, &|_| {}).err());
         });
         let err = got.recv_timeout(Duration::from_secs(10)).expect("an answer, not a hang");
-        assert!(err.as_deref().is_some_and(|e| e.contains("replaced")), "{err:?}");
+        assert_eq!(err, Some(NoAnswer::Replaced));
         drop(worker.join());
     }
 
@@ -1170,5 +1304,160 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         assert!(room_from_status(critical).contains("memory is critical"));
         let disk = "level Warn\nMemory 50% free · swap 1.0 GB free · disk 7 GB free\n";
         assert!(room_from_status(disk).contains("7 GB free"));
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("dl-pv-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_hung_worker_is_stopped_and_the_retry_starts_a_fresh_one() {
+        let _lock = crate::app::test_lock();
+        let d = tmp("hung");
+        let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_preview_worker.py");
+        // the first worker takes the connection and never answers; the next one draws
+        let hang = "import socket,sys,time,signal; signal.alarm(30); s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(5); c=s.accept(); time.sleep(30)";
+        let script = d.join("w.sh");
+        std::fs::write(&script, format!("if [ ! -e \"$0.hung\" ]; then touch \"$0.hung\"; exec python3 -c '{hang}' \"$@\"; fi\nexec python3 {} \"$@\"\n", fake.display())).unwrap();
+        let vars = ["DROID_LITE_PREVIEW_DIR", "DROID_LITE_PREVIEW_WORKER", "FAKE_PREVIEW_PNG"];
+        let old: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        // SAFETY: the test lock is held, so no other test reads the environment meanwhile.
+        unsafe {
+            std::env::set_var(vars[0], d.join("pv"));
+            std::env::set_var(vars[1], format!("sh {}", script.display()));
+            std::env::set_var(vars[2], Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icon-256.png"));
+        }
+        let (log, send) = record();
+        let mut state = State::default();
+        state.draw(&request(1), &send);
+        let kinds: Vec<(String, u64)> = log.borrow().iter().filter(|e| e.0 != "status").map(|e| (e.0.clone(), e.1)).collect();
+        assert_eq!(kinds, [("done".to_string(), 1)], "{:?}", log.borrow());
+        // an ordinary compile error in the user's code reads nothing again
+        let broken = Request { class: "BrokenKt".into(), ..request(2) };
+        state.draw(&broken, &send);
+        assert_eq!(log.borrow().last().map(|e| e.0.as_str()), Some("failed"));
+        assert!(!state.forget, "an error in the user's code is not a missing library");
+        for e in std::fs::read_dir(d.join("pv")).unwrap().flatten() {
+            if e.path().extension().is_some_and(|x| x == "sock") {
+                stop_worker(&e.path(), Duration::from_secs(1));
+            }
+        }
+        for (k, v) in vars.iter().zip(old) {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn stopping_a_worker_ends_it_even_when_it_ignores_sigterm_and_removes_its_socket() {
+        let d = tmp("stop");
+        let sock = d.join("w-test.sock");
+        std::fs::write(&sock, "").unwrap();
+        let mut child = Command::new("perl").args(["-e", "$SIG{TERM} = 'IGNORE'; sleep 60"]).arg(&sock).spawn().unwrap();
+        let pid = child.id() as i32;
+        let reaper = std::thread::spawn(move || child.wait());
+        let until = Instant::now() + Duration::from_secs(5);
+        while worker_pids(&sock).is_empty() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(worker_pids(&sock), [pid], "found by its socket argument");
+        let t = Instant::now();
+        stop_worker(&sock, Duration::from_millis(300));
+        assert!(reaper.join().unwrap().is_ok());
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert!(!sock.exists(), "the next try must not connect to it");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_panic_while_drawing_answers_that_request_and_the_loop_goes_on() {
+        let (tx, jobs) = channel();
+        tx.send(request(1)).unwrap();
+        let tx = std::cell::RefCell::new(Some(tx));
+        let (log, send) = record();
+        let mut draw = |r: &Request| {
+            if r.seq == 1 {
+                tx.borrow().as_ref().unwrap().send(request(2)).unwrap();
+                panic!("boom");
+            }
+            tx.borrow_mut().take(); // the last request: the loop ends after it
+            send(Event::Done { file: r.file.clone(), seq: r.seq, cards: vec![] });
+        };
+        serve_jobs(&jobs, &send, &String::new, &mut draw);
+        let failed = ("failed".to_string(), 1, "internal error: boom".to_string());
+        assert_eq!(*log.borrow(), vec![failed, ("done".to_string(), 2, String::new())]);
+    }
+
+    #[test]
+    fn a_mac_guard_that_hangs_says_go_after_the_limit() {
+        let d = tmp("guard");
+        let (hang, critical) = (d.join("hang"), d.join("critical"));
+        std::fs::write(&hang, "#!/bin/sh\nexec sleep 10\n").unwrap();
+        std::fs::write(&critical, "#!/bin/sh\necho 'level Critical'\n").unwrap();
+        for f in [&hang, &critical] {
+            std::fs::set_permissions(f, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        }
+        let t = Instant::now();
+        assert_eq!(room_from(&hang, Duration::from_millis(300)), "");
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert!(room_from(&critical, Duration::from_secs(5)).contains("memory is critical"));
+        assert_eq!(room_from(&d.join("none"), Duration::from_secs(1)), "", "no mac-guard");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn pictures_of_a_file_saved_while_drawing_are_not_kept_under_the_old_texts_key() {
+        let d = tmp("race");
+        let (f, cache) = (d.join("Card.kt"), d.join("cache"));
+        std::fs::write(&f, "B").unwrap(); // saved while the worker drew text "A"
+        let cards: crate::preview_cache::Cards = vec![("P".into(), Ok(egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE])))];
+        store_if_current(&cache, "k-a", &f, "A", &cards);
+        let now = crate::preview_cache::now_secs();
+        assert!(crate::preview_cache::lookup(&cache, "k-a", now).is_none());
+        store_if_current(&cache, "k-b", &f, "B", &cards);
+        assert!(crate::preview_cache::lookup(&cache, "k-b", now).is_some(), "unchanged: kept");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn only_library_or_compiler_failures_read_the_project_again() {
+        let d = tmp("trouble");
+        let f = d.join("app/src/main/java/demo/Card.kt");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, "package demo\nclass Thing\n").unwrap();
+        let pk = crate::preview_src::Packages::read(std::slice::from_ref(&f));
+        let trouble = |raw: &str| library_trouble(&short_error(raw, &f), &unresolved_imports(raw), Some(&pk));
+        assert!(!trouble("Card.kt:3:5: error: unresolved reference 'Oops'.\n    Oops()\n"), "the user's code");
+        assert!(!trouble("Card.kt:1:8: error: unresolved reference 'Thing'.\nimport demo.Thing\n"), "a project package");
+        assert!(trouble("Card.kt:1:8: error: unresolved reference 'compose'.\nimport androidx.activity.compose.X\n"), "a library");
+        assert!(library_trouble(NO_COMPOSE, &[], Some(&pk)));
+        assert!(library_trouble("The Kotlin 2.3.0 compiler is not on this Mac yet (it comes …).", &[], Some(&pk)));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn files_added_since_are_read_into_the_packages_and_the_libraries_are_kept() {
+        let d = tmp("refresh");
+        let src = d.join("app/src/main/java");
+        std::fs::create_dir_all(src.join("demo/extra")).unwrap();
+        std::fs::write(src.join("demo/Card.kt"), "package demo\nclass Card\n").unwrap();
+        std::fs::write(src.join("demo/extra/New.kt"), "package demo.extra\nclass New\n").unwrap();
+        let p = |files: Vec<PathBuf>| ProjectRef { root: d.clone(), scripts: vec![], files: std::sync::Arc::new(files) };
+        let lib = LibraryCode { jars: vec!["/lib.jar".into()], ..Default::default() };
+        let mut reads = Reads { libs: Some((d.clone(), lib)), ..Default::default() };
+        let no_status = |_: &str, _| panic!("the libraries are read once per project");
+        reads.refresh(&p(vec![src.join("demo/Card.kt")]), &no_status);
+        let pk = |r: &Reads| r.packages.as_ref().unwrap().1.package_for("demo.extra.New").map(String::from);
+        assert_eq!(pk(&reads).as_deref(), Some("demo"), "not read yet: only the outer package");
+        reads.refresh(&p(vec![src.join("demo/Card.kt"), src.join("demo/extra/New.kt")]), &no_status);
+        assert_eq!(pk(&reads).as_deref(), Some("demo.extra"), "the new folder's package");
+        assert_eq!(reads.libs.as_ref().unwrap().1.jars, ["/lib.jar"]);
+        let _ = std::fs::remove_dir_all(d);
     }
 }
