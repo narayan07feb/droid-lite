@@ -50,6 +50,21 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+/// The path as the index keeps it (the project root is opened canonical, e.g. /private/var on
+/// macOS); a deleted file keeps its canonical folder.
+fn canon(p: &str) -> std::path::PathBuf {
+    let p = Path::new(p);
+    std::fs::canonicalize(p).unwrap_or_else(|_| {
+        match (
+            p.parent().and_then(|d| std::fs::canonicalize(d).ok()),
+            p.file_name(),
+        ) {
+            (Some(d), Some(n)) => d.join(n),
+            _ => p.to_path_buf(),
+        }
+    })
+}
+
 fn adb() -> Result<std::path::PathBuf, String> {
     crate::logcat::adb().ok_or_else(|| "adb not found: set ANDROID_HOME or DROID_LITE_ADB".into())
 }
@@ -97,14 +112,14 @@ impl Server {
                 }))
             }
             "update" => {
-                let path = Path::new(s("path")?);
+                let path = &canon(s("path")?);
                 self.index.update(path, &text(path)?);
                 Ok(Value::Null)
             }
             // Droid Lite's gutter links for one file: expect/actual, supertypes, implementations,
             // overrides
             "lenses" => {
-                let path = Path::new(s("path")?);
+                let path = &canon(s("path")?);
                 let text = text(path)?;
                 let syms = crate::kotlin::scan(&text);
                 let mut out = Vec::new();
@@ -176,7 +191,7 @@ impl Server {
             }
             // each composable of a file with its parameters' stability (report, else a guess)
             "stability" => {
-                let path = Path::new(s("path")?);
+                let path = &canon(s("path")?);
                 let text = text(path)?;
                 let syms = crate::kotlin::scan(&text);
                 let out: Vec<Value> = syms
@@ -370,6 +385,15 @@ mod tests {
                 (5, "↑ Overrides Api.load".to_string())
             ]
         );
+        // the editor's path may go through a symlink (/var vs /private/var on macOS): the
+        // same file, not a second copy in the index
+        let real = root.join("app/src/main/java/demo/RealApi.kt");
+        let r = s.reply(&format!(
+            r#"{{"id":9,"method":"update","params":{{"path":{:?}}}}}"#,
+            real.to_str().unwrap()
+        ));
+        assert!(r["error"].is_null(), "{r}");
+        assert_eq!(lenses(&mut s, "Api.kt")[0].1, "↓ Implemented in 1 class");
         // unsaved editor text: a second class implementing Api
         let other = root.join("app/src/main/java/demo/Other.kt");
         let r = s.reply(&format!(

@@ -1,0 +1,44 @@
+{
+  "name": "droid-lite",
+  "displayName": "Droid Lite",
+  "description": "Android tools for VS Code and Cursor: implementation links, Compose stability, device screenshot, screen recording and logcat.",
+  "version": "0.1.0",
+  "publisher": "forgebyte",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/narayan07feb/droid-lite" },
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Programming Languages", "Other"],
+  "main": "./extension.js",
+  "activationEvents": [
+    "workspaceContains:**/settings.gradle",
+    "workspaceContains:**/settings.gradle.kts",
+    "onLanguage:kotlin",
+    "onLanguage:java"
+  ],
+  "extensionPack": ["GitHub.vscode-pull-request-github"],
+  "contributes": {
+    "commands": [
+      { "command": "droidLite.screenshot", "title": "Droid Lite: Device Screenshot" },
+      { "command": "droidLite.recordStart", "title": "Droid Lite: Start Screen Recording" },
+      { "command": "droidLite.recordStop", "title": "Droid Lite: Stop Screen Recording" },
+      { "command": "droidLite.logcat", "title": "Droid Lite: Show Logcat" },
+      { "command": "droidLite.logcatStop", "title": "Droid Lite: Stop Logcat" },
+      { "command": "droidLite.reindex", "title": "Droid Lite: Index the Project Again" }
+    ],
+    "configuration": {
+      "title": "Droid Lite",
+      "properties": {
+        "droidLite.enginePath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the droid-lite binary. Empty: the one inside this extension."
+        },
+        "droidLite.logcatHistory": {
+          "type": "number",
+          "default": 500,
+          "description": "Logcat lines to show from before the stream starts."
+        }
+      }
+    }
+  }
+}
