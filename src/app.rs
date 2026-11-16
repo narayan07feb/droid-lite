@@ -298,6 +298,27 @@ struct Previews {
     /// The latest status or skip reason, and whether a render is under way.
     note: String,
     busy: bool,
+    /// The file and the hash of its saved text last sent, so each open or save renders once.
+    sent: Option<(PathBuf, u64)>,
+}
+
+/// What the worker needs to draw a tab's previews: its top-level `@Preview` functions (their class is
+/// the file's `…Kt` class); None when it has none.
+fn preview_request(tab: &Tab) -> Option<crate::preview::Request> {
+    let previews: Vec<String> = tab
+        .syms
+        .decls
+        .iter()
+        .filter(|d| d.is_preview() && d.container.is_none())
+        .map(|d| d.name.clone())
+        .collect();
+    (!previews.is_empty()).then(|| crate::preview::Request {
+        file: tab.path.clone(),
+        class: crate::device::preview_name(&tab.syms.package, &tab.path, None, "x")
+            .trim_end_matches(".x")
+            .to_string(),
+        previews,
+    })
 }
 
 /// The ⌘-hovered name, a resource reference it may be (kind, name), and its response.
@@ -3366,29 +3387,12 @@ impl App {
                             .map(|d| d.offset);
                     }
                 }
-                // only top-level previews for now: their class is the file's `…Kt` class
-                let top: Vec<String> = tab
-                    .syms
-                    .decls
-                    .iter()
-                    .filter(|d| d.is_preview() && d.container.is_none())
-                    .map(|d| d.name.clone())
-                    .collect();
-                if !top.is_empty() {
+                render_req = preview_request(tab);
+                if render_req.is_some() {
                     render = ui
-                        .add_enabled(
-                            !self.previews.busy,
-                            egui::Button::new(format!("{}  Render previews", ic::IMAGE)),
-                        )
-                        .on_hover_text("Draw these previews here (no Gradle; the first one takes a few seconds)")
+                        .add_enabled(!self.previews.busy, egui::Button::new(format!("{}  Render again", ic::IMAGE)))
+                        .on_hover_text("Previews are drawn by themselves when the file opens or is saved")
                         .clicked();
-                    render_req = Some(crate::preview::Request {
-                        file: tab.path.clone(),
-                        class: crate::device::preview_name(&tab.syms.package, &tab.path, None, "x")
-                            .trim_end_matches(".x")
-                            .to_string(),
-                        previews: top,
-                    });
                 }
                 if previews.len() > render_req.as_ref().map_or(0, |r| r.previews.len()) {
                     ui.label(RichText::new("Previews inside a class or object are not drawn yet.").weak());
@@ -3458,6 +3462,19 @@ impl App {
     /// Preview worker messages: status lines, pictures (decoded off the UI thread; only the texture
     /// upload happens here) and error texts for the cards.
     fn poll_previews(&mut self, ctx: &egui::Context) {
+        // by itself: a file with previews that was just opened or saved (no unsaved edits) is drawn
+        if let Some(tab) = self.tabs.get(self.active)
+            && tab.text == tab.saved
+            && let Some(r) = preview_request(tab)
+        {
+            let key = (tab.path.clone(), hash(&tab.saved));
+            if self.previews.sent.as_ref() != Some(&key) {
+                self.previews.sent = Some(key);
+                self.previews.busy = true;
+                self.previews.note = "Waiting for the preview worker…".into();
+                self.previews.client.get_or_insert_with(|| crate::preview::Client::new(ctx)).request(r);
+            }
+        }
         let p = &mut self.previews;
         while let Some(e) = p.client.as_ref().and_then(crate::preview::Client::poll) {
             match e {

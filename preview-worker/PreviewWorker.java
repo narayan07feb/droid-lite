@@ -106,7 +106,10 @@ public class PreviewWorker {
                 if (sdk == null) {
                     Environment env = new Environment(work.toString(), "droidlite.preview", 35,
                         List.of(), List.of(), List.of(), List.of(), List.of(), List.of());
-                    sdk = new PaparazziSdk(env, DeviceConfig.PIXEL_5, img -> { frame = img; return kotlin.Unit.INSTANCE; });
+                    // SHRINK: the picture is as big as the content (like Android Studio's preview), not a whole phone
+                    sdk = new PaparazziSdk(env, DeviceConfig.PIXEL_5, "android:Theme.Material.NoActionBar.Fullscreen",
+                        com.android.ide.common.rendering.api.SessionParams.RenderingMode.SHRINK,
+                        img -> { frame = img; return kotlin.Unit.INSTANCE; });
                     sdk.setup();
                 }
                 reply(r.out, handle(r, work, sdk));

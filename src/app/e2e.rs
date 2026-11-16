@@ -105,6 +105,18 @@ impl Fixture {
         unsafe { std::env::set_var("DROID_LITE_LSP", "/nonexistent/droid-lite-no-lsp") };
         // nor any real phone: adb is missing unless a Logcat test sets the fake one
         unsafe { std::env::set_var("DROID_LITE_ADB", "/nonexistent/droid-lite-no-adb") };
+        // previews draw by themselves: every test gets the stand-in worker and its own preview folder,
+        // never the real JVM worker or ~/Library/Caches
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        unsafe {
+            std::env::set_var("DROID_LITE_PREVIEW_DIR", std::env::temp_dir().join(format!("dlpv-{name}-{}", std::process::id())));
+            std::env::set_var(
+                "DROID_LITE_PREVIEW_WORKER",
+                format!("python3 {}", manifest.join("tests/fixtures/fake_preview_worker.py").display()),
+            );
+            std::env::set_var("FAKE_PREVIEW_PNG", manifest.join("assets/icon-256.png"));
+            std::env::set_var("DROID_LITE_MAC_GUARD", "/nonexistent/mac-guard");
+        }
         // and never index the real Gradle cache of this Mac
         unsafe {
             std::env::set_var(
@@ -392,19 +404,7 @@ fn e2e_compose_panel_tree_stability_lints_preview_render() {
         rules.contains(&"remember-state") && rules.contains(&"modifier-default"),
         "{rules:?}"
     );
-    // Render previews draws them in the panel through the preview worker (a stand-in here), no Gradle
-    let pv = std::env::temp_dir().join(format!("dlpv-{}", std::process::id()));
-    let worker = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_preview_worker.py");
-    let png = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icon-256.png");
-    // SAFETY: the SERIAL lock (held by the fixture) keeps other tests from reading the environment
-    unsafe {
-        std::env::set_var("DROID_LITE_PREVIEW_DIR", &pv);
-        std::env::set_var("DROID_LITE_PREVIEW_WORKER", format!("python3 {}", worker.display()));
-        std::env::set_var("FAKE_PREVIEW_PNG", &png);
-        std::env::set_var("DROID_LITE_MAC_GUARD", "/nonexistent/mac-guard");
-    }
-    h.get_by_label(&format!("{}  Render previews", ic::IMAGE)).click();
-    steps(&mut h, 2);
+    // previews draw by themselves (no click) through the preview worker (the fixture's stand-in), no Gradle
     wait(&mut h, "preview picture", |a| {
         matches!(a.previews.cards.as_slice(), [(name, Ok(_))] if name == "UserCardPreview")
     });
@@ -418,13 +418,10 @@ fn e2e_compose_panel_tree_stability_lints_preview_render() {
     )
     .unwrap();
     open(&mut h, &broken);
-    steps(&mut h, 3);
-    h.get_by_label(&format!("{}  Render previews", ic::IMAGE)).click();
     wait(&mut h, "error card", |a| {
         a.previews.file.as_deref() == Some(broken.as_path())
             && matches!(a.previews.cards.as_slice(), [(_, Err(e))] if e.contains("unresolved reference 'Oops'"))
     });
-    let _ = std::fs::remove_dir_all(&pv);
 }
 
 #[test]
@@ -3774,4 +3771,46 @@ fn e2e_toolbar_items_never_overlap_at_any_width() {
             assert!(h.query_by_label_contains("rename-shared-p2p").is_none(), "{width}: the branch name is elided");
         }
     }
+}
+
+/// Real preview check (not run by default): opens `DROID_LITE_SHOT_PROJECT`, the Kotlin file
+/// `DROID_LITE_SHOT_FILE`, presses Render previews with the real worker and base pack, and saves the
+/// window to `DROID_LITE_SHOT_OUT` once the cards are there (up to 3 min). Headless, no window.
+#[test]
+#[ignore]
+fn e2e_real_preview_shot() {
+    let (Ok(project), Ok(file), Ok(out)) = (
+        std::env::var("DROID_LITE_SHOT_PROJECT"),
+        std::env::var("DROID_LITE_SHOT_FILE"),
+        std::env::var("DROID_LITE_SHOT_OUT"),
+    ) else {
+        return;
+    };
+    let _f = Fixture::new("real-preview"); // the lock and a throwaway config dir
+    // SAFETY: the SERIAL lock is held
+    unsafe {
+        std::env::remove_var("DROID_LITE_PREVIEW_WORKER");
+        std::env::remove_var("DROID_LITE_PREVIEW_DIR");
+        std::env::remove_var("DROID_LITE_MAC_GUARD");
+    }
+    let root = PathBuf::from(project);
+    let mut h = Harness::builder()
+        .with_size([1600.0, 1000.0])
+        .build_eframe(move |cc| App::new(cc, Some(root)));
+    wait(&mut h, "index", |a| a.indexing.is_none() && a.index.symbol_count() > 0);
+    open(&mut h, Path::new(&file));
+    steps(&mut h, 5);
+    let started = std::time::Instant::now(); // drawn by itself once the file is open
+    while started.elapsed() < Duration::from_secs(180) {
+        h.step();
+        if !h.state().previews.busy && !h.state().previews.cards.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let p = &h.state().previews;
+    eprintln!("preview: {:.1} s, note {:?}, cards {:?}", started.elapsed().as_secs_f32(), p.note,
+        p.cards.iter().map(|(n, c)| (n.clone(), c.as_ref().err().cloned())).collect::<Vec<_>>());
+    steps(&mut h, 4);
+    h.render().expect("render needs the wgpu feature").save(&out).unwrap();
 }

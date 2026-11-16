@@ -4,8 +4,11 @@ name containing "Broken" answers with a compile error instead."""
 import json
 import os
 import shutil
+import signal
 import socket
 import sys
+
+signal.alarm(60)  # a test lasts seconds; never leave a stand-in running
 
 sock_path, work = sys.argv[1], sys.argv[2]
 os.makedirs(work, exist_ok=True)

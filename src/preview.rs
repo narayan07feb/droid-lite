@@ -132,24 +132,39 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
             send(Event::Status(why));
             continue;
         }
-        if conn.is_none() {
-            match connect_or_start(&send) {
-                Ok(c) => conn = Some(c),
+        // the worker may have ended (idle exit, a crash) or never started: start it and connect by
+        // itself, up to 3 tries with a short back-off, then the error goes on the card
+        let mut last_error = String::new();
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(500 << attempt));
+            }
+            if conn.is_none() {
+                match connect_or_start(&send) {
+                    Ok(c) => conn = Some(c),
+                    Err(e) => {
+                        last_error = e;
+                        continue;
+                    }
+                }
+            }
+            send(Event::Status(format!("Rendering {} preview(s)…", r.previews.len())));
+            id += 1;
+            let (w, rd) = conn.as_mut().unwrap();
+            match ask(w, rd, id, &r) {
+                Ok(e) => {
+                    send(e);
+                    last_error.clear();
+                    break;
+                }
                 Err(e) => {
-                    send(Event::Failed { file: r.file.clone(), error: e });
-                    continue;
+                    conn = None;
+                    last_error = format!("The preview worker stopped: {e}");
                 }
             }
         }
-        send(Event::Status(format!("Rendering {} preview(s)…", r.previews.len())));
-        id += 1;
-        let (w, rd) = conn.as_mut().unwrap();
-        match ask(w, rd, id, &r) {
-            Ok(e) => send(e),
-            Err(e) => {
-                conn = None; // the worker ended (idle exit or a crash): start it again next time
-                send(Event::Failed { file: r.file.clone(), error: format!("The preview worker stopped: {e}") });
-            }
+        if !last_error.is_empty() {
+            send(Event::Failed { file: r.file.clone(), error: last_error });
         }
     }
 }
