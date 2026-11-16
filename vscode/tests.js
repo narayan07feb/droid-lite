@@ -8,10 +8,14 @@ const cp = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const readline = require('readline');
+const { EventEmitter } = require('events');
+const { PassThrough } = require('stream');
 
 const userDir = () => path.join(os.homedir(), '.config', 'droid-lite', 'plugins');
 const MAX_LOG = 20000; // lines kept per run in the test output
+const MAX_LINE = 64 << 10; // longest line kept (chars); the rest of a longer one is dropped
+const limits = { json: 120000, grace: 500, kill: 5000 }; // ms: list/view time, output after exit, TERM -> KILL
+const procs = new Set(); // every plugin process group still running (runs, actions, watch, list, views)
 
 // plugin.json of `dir`, or of its droid-lite-plugin/ folder
 function findPluginJson(dir) {
@@ -50,36 +54,94 @@ function argv(cmd, plugin, project, id = '') {
     .replaceAll('{id}', id));
 }
 
-// runs a command in its own process group (Stop reaches the tools it started), stdin empty
-function spawn(cmd, plugin, project) {
-  const [bin, ...args] = cmd;
-  return cp.spawn(bin, args, {
-    cwd: plugin.cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, DROID_LITE_PROJECT: project || '' },
-  });
-}
-
-function stop(proc) {
-  try { process.kill(-proc.pid, 'SIGTERM'); } catch { /* already ended */ }
-}
-
-// stdout of a command as JSON, with a time limit
-function json(cmd, plugin, project, ms = 120000) {
-  return new Promise((resolve, reject) => {
-    const [bin, ...args] = cmd;
-    cp.execFile(bin, args, {
-      cwd: plugin.cwd, timeout: ms, maxBuffer: 32 << 20,
+// runs a command in its own process group (Stop reaches the tools it started), stdin empty.
+// `onEnd(code, error)` runs once: after the exit plus a short grace for the last output (a tool
+// it left running may hold the pipes), or when it could not start.
+function spawn(cmd, plugin, project, onEnd = () => {}) {
+  const [bin, ...args] = Array.isArray(cmd) ? cmd.map(String) : [];
+  let proc;
+  try {
+    proc = cp.spawn(bin, args, {
+      cwd: plugin.cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, DROID_LITE_PROJECT: project || '' },
-    }, (err, stdout) => {
-      try { resolve(JSON.parse(stdout)); } catch { reject(err || new Error('no JSON from the plugin')); }
     });
+  } catch (err) { // no command at all: fails like a missing one
+    proc = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough() });
+    proc.stdout.end();
+    proc.stderr.end();
+    process.nextTick(() => { proc.emit('error', err); proc.emit('close'); });
+  }
+  let ended = false;
+  const end = (code, err) => { if (!ended) { ended = true; onEnd(code, err); } };
+  procs.add(proc);
+  proc.on('close', () => procs.delete(proc));
+  proc.on('error', (err) => end(undefined, err));
+  proc.on('exit', (code, signal) => setTimeout(() => {
+    proc.stdout.destroy();
+    proc.stderr.destroy();
+    end(code ?? signal);
+  }, limits.grace));
+  return proc;
+}
+
+// SIGTERM to the whole group, SIGKILL after a while if any of it is still there
+function stop(proc) {
+  if (!proc.pid) return;
+  try { process.kill(-proc.pid, 'SIGTERM'); } catch { return; /* already ended */ }
+  setTimeout(() => { try { process.kill(-proc.pid, 'SIGKILL'); } catch { /* ended */ } }, limits.kill).unref();
+}
+
+// lines of a stream; a line longer than MAX_LINE is cut there (memory stays bounded)
+function lines(stream, onLine) {
+  let buf = '';
+  let cut = false; // dropping the rest of a long line
+  stream.setEncoding('utf8');
+  stream.on('data', (d) => {
+    const parts = (buf + d).split(/\r?\n/);
+    buf = parts.pop();
+    for (const l of parts) {
+      if (!cut) onLine(l);
+      cut = false;
+    }
+    if (buf.length > MAX_LINE) {
+      if (!cut) onLine(`${buf.slice(0, MAX_LINE)} … [line cut]`);
+      buf = '';
+      cut = true;
+    }
+  });
+  stream.on('end', () => { if (buf && !cut) onLine(buf); });
+}
+
+// stdout of a command as JSON, with a time limit that ends its whole process group
+function json(cmd, plugin, project, ms = limits.json) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    let why; // set when it was stopped
+    const proc = spawn(cmd, plugin, project, (code, err) => {
+      clearTimeout(timer);
+      if (err || why) return reject(err || new Error(why));
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch {
+        reject(new Error(code ? `exit code ${code}` : 'no JSON from the plugin'));
+      }
+    });
+    const timer = setTimeout(() => { why = `no answer in ${ms / 1000} s`; stop(proc); }, ms);
+    proc.stdout.on('data', (d) => {
+      size += d.length;
+      if (size <= 32 << 20) chunks.push(d);
+      else if (!why) { why = 'more than 32 MB of output'; stop(proc); }
+    });
+    proc.stderr.resume();
   });
 }
 
+// a place in a file, or none when `file` or `line` is not usable
 function location(project, file, line) {
-  if (!file) return undefined;
+  if (typeof file !== 'string' || !file) return undefined;
+  const n = line === undefined || line === null ? 1 : Number(line);
+  if (!Number.isFinite(n)) return undefined;
   const uri = vscode.Uri.file(path.isAbsolute(file) ? file : path.join(project || '', file));
-  return new vscode.Location(uri, new vscode.Position(Math.max((line || 1) - 1, 0), 0));
+  return new vscode.Location(uri, new vscode.Position(Math.max(Math.floor(n) - 1, 0), 0));
 }
 
 function setup(ctx, project) {
@@ -88,7 +150,12 @@ function setup(ctx, project) {
   let plugins = [];
   const meta = new Map(); // test item id -> { plugin, caseId }
   const live = new Map(); // plugin name -> latest watch state
+  const pluginRows = new Map(); // plugin name -> its sidebar row (to refresh only that row)
+  const viewCache = new Map(); // plugin + view name -> its entries until that view is refreshed
+  const actions = new Map(); // plugin + action name -> its running process
   let watchers = [];
+  let watching = false; // the sidebar shows
+  const fireRow = (name) => { const r = pluginRows.get(name); if (r) sidebar.fire(r); };
 
   const addCases = (plugin, parent, cases) => {
     for (const c of cases || []) {
@@ -121,7 +188,10 @@ function setup(ctx, project) {
       }
       root.busy = false;
     }));
+    viewCache.clear();
+    for (const name of live.keys()) if (!plugins.some((p) => p.name === name)) live.delete(name);
     sidebar.fire();
+    if (watching) startWatch(); // plugins came or went
   }
 
   // one run of one case or group: JSON lines set the tree's icons and the results
@@ -134,15 +204,26 @@ function setup(ctx, project) {
       const walk = (i) => { const c = meta.get(i.id)?.caseId; if (c) byCase.set(c, i); i.children.forEach(walk); };
       walk(item);
       const ended = new Set();
-      let lines = 0;
-      const proc = spawn(argv(p.spec.run, p, project, caseId), p, project);
-      token.onCancellationRequested(() => stop(proc));
+      let logged = 0;
+      let cancel;
+      const proc = spawn(argv(p.spec.run, p, project, caseId), p, project, (code, err) => {
+        cancel.dispose(); // a later cancel never signals a pid that is free again
+        if (err) run.errored(item, new vscode.TestMessage(err.message));
+        // the exit code decides for the case it ran when no final status came
+        else if (!ended.has(item)) {
+          if (token.isCancellationRequested) run.skipped(item);
+          else if (code === 0) run.passed(item);
+          else run.failed(item, new vscode.TestMessage(`exit code ${code}`));
+        }
+        resolve();
+      });
+      cancel = token.onCancellationRequested(() => stop(proc));
       const onLine = (line) => {
         let m;
         try { m = JSON.parse(line); } catch { m = { log: line }; }
         if (typeof m !== 'object' || m === null) m = { log: line };
         if (m.log !== undefined || !m.status) {
-          if (lines++ < MAX_LOG) run.appendOutput(`${m.log ?? line}\r\n`);
+          if (logged++ < MAX_LOG) run.appendOutput(`${m.log ?? line}\r\n`);
           return;
         }
         const target = byCase.get(m.case) || (m.case ? undefined : item);
@@ -153,24 +234,14 @@ function setup(ctx, project) {
         else if (m.status === 'passed') { run.passed(target); ended.add(target); }
         else if (m.status === 'skipped') { run.skipped(target); ended.add(target); }
         else if (m.status === 'failed') {
-          const msg = new vscode.TestMessage(m.message || 'failed');
+          const msg = new vscode.TestMessage(String(m.message || 'failed'));
           msg.location = location(project, m.file, m.line);
           run.failed(target, msg);
           ended.add(target);
         }
       };
-      readline.createInterface({ input: proc.stdout }).on('line', onLine);
-      readline.createInterface({ input: proc.stderr }).on('line', onLine);
-      proc.on('error', (e) => { run.errored(item, new vscode.TestMessage(e.message)); resolve(); });
-      proc.on('close', (code) => {
-        // the exit code decides for the case it ran when no final status came
-        if (!ended.has(item)) {
-          if (token.isCancellationRequested) run.skipped(item);
-          else if (code === 0) run.passed(item);
-          else run.failed(item, new vscode.TestMessage(`exit code ${code}`));
-        }
-        resolve();
-      });
+      lines(proc.stdout, onLine);
+      lines(proc.stderr, onLine);
     });
   }
 
@@ -189,13 +260,16 @@ function setup(ctx, project) {
   }, true);
   ctrl.refreshHandler = load;
 
-  // live state while the Droid Lite sidebar shows, one `watch` per plugin
+  // live state while the Droid Lite sidebar shows, one `watch` per plugin; a line redraws only
+  // that plugin's row
   function startWatch() {
     stopWatch();
     for (const p of plugins.filter((x) => x.spec?.watch)) {
       const proc = spawn(argv(p.spec.watch, p, project), p, project);
-      readline.createInterface({ input: proc.stdout }).on('line', (l) => {
-        try { live.set(p.name, JSON.parse(l)); sidebar.fire(); } catch { /* not a state line */ }
+      lines(proc.stdout, (l) => {
+        let state;
+        try { state = JSON.parse(l); } catch { return; /* not a state line */ }
+        if (state && typeof state === 'object') { live.set(p.name, state); fireRow(p.name); }
       });
       proc.stderr.resume();
       watchers.push(proc);
@@ -222,6 +296,7 @@ function setup(ctx, project) {
         const rows = plugins.filter((p) => p.spec).map((p) => {
           const g = new vscode.TreeItem(p.name, vscode.TreeItemCollapsibleState.Expanded);
           g.plugin = p;
+          pluginRows.set(p.name, g);
           return g;
         });
         rows.push(item('Add test plugin…', 'add', 'droidLite.addTestPlugin'));
@@ -233,25 +308,34 @@ function setup(ctx, project) {
         const out = [];
         const state = live.get(p.name);
         if (state) {
-          const s = item(state.title || 'Live', 'pulse', undefined, undefined, state.status);
-          s.tooltip = (state.rows || []).map((r) => r.join(': ')).join('\n');
+          const stateRows = (Array.isArray(state.rows) ? state.rows : []).map((r) => (Array.isArray(r) ? r : [r]).map(String));
+          const s = item(String(state.title || 'Live'), 'pulse', undefined, undefined, state.status);
+          s.tooltip = stateRows.map((r) => r.join(': ')).join('\n');
           out.push(s);
-          for (const r of state.rows || []) out.push(item(r[0], 'blank', undefined, undefined, r[1]));
+          for (const r of stateRows) out.push(item(r[0], 'blank', undefined, undefined, r[1]));
         }
         for (const v of p.spec.views || []) {
           const i = new vscode.TreeItem(v.name, vscode.TreeItemCollapsibleState.Collapsed);
           i.iconPath = new vscode.ThemeIcon('list-unordered');
+          i.contextValue = 'droidLiteView'; // its inline Refresh button
           i.plugin = p; i.view = v;
           out.push(i);
         }
-        for (const a of p.spec.actions || []) out.push(item(a.name, 'play', 'droidLite.testAction', [p, a]));
+        for (const a of p.spec.actions || []) {
+          out.push(actions.has(`${p.name}\u0000${a.name}`)
+            ? item(`Stop ${a.name}`, 'debug-stop', 'droidLite.stopTestAction', [p, a], 'running')
+            : item(a.name, 'play', 'droidLite.testAction', [p, a]));
+        }
         for (const l of p.spec.links || []) out.push(item(l.name, 'link-external', 'vscode.open', [vscode.Uri.parse(l.url)]));
         out.push(item('Remove', 'trash', 'droidLite.removeTestPlugin', [p]));
         return out;
       }
       if (node.view) {
+        const key = `${node.plugin.name}\u0000${node.view.name}`;
+        if (!viewCache.has(key)) viewCache.set(key, json(argv(node.view.run, node.plugin, project), node.plugin, project));
         try {
-          const entries = await json(argv(node.view.run, node.plugin, project), node.plugin, project);
+          const entries = await viewCache.get(key);
+          if (!Array.isArray(entries)) throw new Error('not a JSON list');
           return entries.map((e) => {
             const icon = { failed: 'error', passed: 'pass', skipped: 'circle-slash', running: 'sync' }[e.status] || 'circle-small';
             const loc = location(project, e.file, e.line);
@@ -268,21 +352,38 @@ function setup(ctx, project) {
     },
   };
   const view = vscode.window.createTreeView('droidLite.testPlugins', { treeDataProvider: tree });
+  watching = Boolean(view.visible);
 
   const out = vscode.window.createOutputChannel('Droid Lite tests');
   ctx.subscriptions.push(
     ctrl, view, out,
-    view.onDidChangeVisibility((e) => (e.visible ? startWatch() : stopWatch())),
-    { dispose: stopWatch },
+    view.onDidChangeVisibility((e) => { watching = e.visible; if (watching) startWatch(); else stopWatch(); }),
+    // every process group a plugin started ends with the extension
+    { dispose: () => { watching = false; procs.forEach(stop); } },
     vscode.commands.registerCommand('droidLite.testAction', (p, a) => {
+      const key = `${p.name}\u0000${a.name}`;
       out.show(true);
+      if (actions.has(key)) return out.appendLine(`${a.name} is still running`);
       out.appendLine(`▶ ${p.name}: ${a.name}`);
-      const proc = spawn(argv(a.run, p, project), p, project);
-      let lines = 0;
-      const log = (l) => { if (lines++ < MAX_LOG) out.appendLine(l); };
-      readline.createInterface({ input: proc.stdout }).on('line', log);
-      readline.createInterface({ input: proc.stderr }).on('line', log);
-      proc.on('close', (code) => out.appendLine(`■ ${a.name} ended (exit code ${code})`));
+      let logged = 0;
+      const proc = spawn(argv(a.run, p, project), p, project, (code, err) => {
+        actions.delete(key);
+        out.appendLine(err ? `■ ${a.name} could not start: ${err.message}` : `■ ${a.name} ended (exit code ${code})`);
+        fireRow(p.name);
+      });
+      actions.set(key, proc);
+      fireRow(p.name);
+      const log = (l) => { if (logged++ < MAX_LOG) out.appendLine(l); };
+      lines(proc.stdout, log);
+      lines(proc.stderr, log);
+    }),
+    vscode.commands.registerCommand('droidLite.stopTestAction', (p, a) => {
+      const proc = actions.get(`${p.name}\u0000${a.name}`);
+      if (proc) stop(proc);
+    }),
+    vscode.commands.registerCommand('droidLite.refreshTestView', (node) => {
+      viewCache.delete(`${node.plugin.name}\u0000${node.view.name}`);
+      sidebar.fire(node);
     }),
     // Add: link the tool's plugin folder into the shared folder the app reads too
     vscode.commands.registerCommand('droidLite.addTestPlugin', async () => {
@@ -317,4 +418,4 @@ function setup(ctx, project) {
   return { load, readPlugins };
 }
 
-module.exports = { setup, readPlugins, argv, findPluginJson };
+module.exports = { setup, readPlugins, argv, findPluginJson, location, limits, procs };

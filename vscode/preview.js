@@ -1,9 +1,11 @@
 // Compose previews in a panel beside the editor, drawn by Droid Lite's preview worker (no Gradle).
-// The open .kt file is drawn when the panel opens, when another .kt file becomes active, and on save.
+// The open .kt file is drawn when the panel opens or shows again, when another .kt file becomes
+// active, and on save; never while the panel is hidden.
 const vscode = require('vscode');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const fs = require('fs');
 
 const previewDir = () =>
   process.env.DROID_LITE_PREVIEW_DIR || path.join(os.homedir(), 'Library/Caches/droid-lite/previews');
@@ -50,11 +52,13 @@ function html(webview) {
 function setup(ctx, project, events) {
   let panel;
   let file; // the file drawn last
+  let real; // its real path: the engine names the file it draws by that one
 
   async function render(editor) {
-    if (!panel || !editor || !/\.kt$/.test(editor.document.uri.fsPath)) return;
+    if (!panel?.visible || !editor || !/\.kt$/.test(editor.document.uri.fsPath)) return;
     const p = editor.document.uri.fsPath;
     file = p;
+    try { real = fs.realpathSync(p); } catch { real = p; }
     const name = path.basename(p);
     panel.webview.postMessage({ type: 'start', file: name });
     try {
@@ -84,6 +88,11 @@ function setup(ctx, project, events) {
       panel.iconPath = vscode.Uri.file(path.join(ctx.extensionPath, 'media', 'icon.png'));
       panel.webview.html = html(panel.webview);
       panel.onDidDispose(() => { panel = undefined; });
+      let shown = true;
+      panel.onDidChangeViewState(({ webviewPanel: w }) => {
+        if (w.visible && !shown) render(vscode.window.activeTextEditor);
+        shown = w.visible;
+      });
     }
     render(vscode.window.activeTextEditor);
   }
@@ -96,7 +105,10 @@ function setup(ctx, project, events) {
       if (e && e.document === d) render(e);
     }),
     events.event((m) => {
-      if (panel && m.event === 'preview_status') panel.webview.postMessage({ type: 'status', ...m });
+      // progress of another file's drawing is not shown (older engines send no "file")
+      if (panel && m.event === 'preview_status' && (m.file === undefined || m.file === file || m.file === real)) {
+        panel.webview.postMessage({ type: 'status', ...m });
+      }
     }),
     { dispose: () => panel?.dispose() },
   );

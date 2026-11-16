@@ -10,6 +10,7 @@ let engine; // { proc, pending, nextId }
 let ready; // Promise of the initialize reply
 let recording; // serial while a screen recording runs
 let logcat; // running `adb logcat` process
+let onStopped = () => {}; // the current engine stopped (set in activate)
 const changed = new vscode.EventEmitter();
 const events = new vscode.EventEmitter(); // engine lines without an id (preview progress)
 
@@ -37,7 +38,7 @@ function start(ctx) {
   const stop = (why) => {
     for (const p of pending.values()) p.reject(new Error(why));
     pending.clear();
-    if (engine === e) { engine = undefined; ready = undefined; }
+    if (engine === e) { engine = undefined; ready = undefined; recording = undefined; onStopped(); }
   };
   proc.on('exit', () => stop('Droid Lite engine stopped'));
   proc.on('error', (err) => stop(`Droid Lite engine could not run: ${err.message}`));
@@ -45,19 +46,22 @@ function start(ctx) {
   engine = e;
 }
 
-// longest wait for an answer (ms); calls not listed (indexing, lenses) have no limit
-const limits = { previews: 180000, devices: 60000, adb: 60000, screenshot: 60000, record_start: 60000, record_stop: 60000 };
+// longest wait for an answer (ms), so no waiting call outlives a stuck engine; others wait 15 s
+const limits = {
+  initialize: 60000, ping: 15000, update: 15000, remove: 15000, lenses: 15000, stability: 15000, implementations: 15000,
+  previews: 180000, devices: 60000, adb: 60000, screenshot: 60000, record_start: 60000, record_stop: 120000,
+};
 
 function call(ctx, method, params = {}) {
   if (!engine) {
-    start(ctx);
+    try { start(ctx); } catch (err) { return Promise.reject(err); }
     ready = undefined;
   }
   const e = engine;
   return new Promise((resolve, reject) => {
     const id = e.nextId++;
-    const ms = limits[method];
-    const timer = ms && setTimeout(() => {
+    const ms = limits[method] || 15000;
+    const timer = setTimeout(() => {
       e.pending.delete(id);
       reject(new Error(`Droid Lite engine did not answer ${method} in ${ms / 1000} s`));
     }, ms);
@@ -67,19 +71,30 @@ function call(ctx, method, params = {}) {
   });
 }
 
+// the project folder (the one with settings.gradle), kept until the workspace folders change
+let rootDir = null;
 function root() {
-  const folders = vscode.workspace.workspaceFolders || [];
-  const gradle = folders.find((f) =>
-    ['settings.gradle', 'settings.gradle.kts'].some((n) => fs.existsSync(path.join(f.uri.fsPath, n))));
-  return (gradle || folders[0])?.uri.fsPath;
+  if (rootDir === null) {
+    const folders = vscode.workspace.workspaceFolders || [];
+    const gradle = folders.find((f) =>
+      ['settings.gradle', 'settings.gradle.kts'].some((n) => fs.existsSync(path.join(f.uri.fsPath, n))));
+    rootDir = (gradle || folders[0])?.uri.fsPath;
+  }
+  return rootDir;
 }
+
+// the engine reads UTF-8: a lone surrogate (half an emoji mid-edit) becomes U+FFFD
+const wellFormed = (s) => (s.toWellFormed ? s.toWellFormed()
+  : s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD'));
 
 // project calls wait for the index; device tools do not
 function project(ctx, method, params) {
   if (!ready) {
     const dir = root();
-    ready = dir ? call(ctx, 'initialize', { root: dir }) : Promise.reject(new Error('Open a folder first'));
-    ready.then(() => changed.fire(), () => {});
+    const r = dir ? call(ctx, 'initialize', { root: dir }) : Promise.reject(new Error('Open a folder first'));
+    ready = r;
+    // a failed index is not kept: the next project call tries again
+    r.then(() => changed.fire(), () => { if (ready === r) ready = undefined; });
   }
   return ready.then(() => call(ctx, method, params));
 }
@@ -151,7 +166,7 @@ async function paintStability(ctx, editor) {
   if (!editor || !/\.kts?$/.test(editor.document.uri.fsPath)) return;
   const doc = editor.document;
   const version = doc.version;
-  const funs = await project(ctx, 'stability', { path: doc.uri.fsPath, text: doc.getText() }).catch(() => []);
+  const funs = await project(ctx, 'stability', { path: doc.uri.fsPath, text: wellFormed(doc.getText()) }).catch(() => []);
   if (doc.version !== version) return; // a newer paint follows
   const badges = new Map();
   const lines = new Map();
@@ -182,7 +197,7 @@ function lenses(ctx) {
   return {
     onDidChangeCodeLenses: changed.event,
     async provideCodeLenses(doc) {
-      const links = await project(ctx, 'lenses', { path: doc.uri.fsPath, text: doc.getText() }).catch(() => []);
+      const links = await project(ctx, 'lenses', { path: doc.uri.fsPath, text: wellFormed(doc.getText()) }).catch(() => []);
       return links.map((l) => new vscode.CodeLens(new vscode.Range(l.line, 0, l.line, 0), {
         title: l.title, command: 'droidLite.goTo', arguments: [doc.uri, l.line, l.targets],
       }));
@@ -266,29 +281,33 @@ function activate(ctx) {
   const timer = setInterval(() => { if (vscode.window.state.focused) findDevice(); }, 20000);
   findDevice();
   refresh();
+  onStopped = refresh; // a recording ends with its engine
 
   // keep the index in step with unsaved edits and files changed outside the editor; one request
-  // per path, so a newer one replaces an unsent older one (outputs and tool folders never count)
+  // per path, so a newer one replaces an unsent older one (outputs and tool folders never count).
+  // `text` is a function read when the request goes, not on every keystroke.
   const timers = new Map();
   const source = (p) => /\.(kt|kts|java)$/.test(p);
   const ignored = (p) => /(^|[\\/])(build|\.gradle|\.idea|\.git)([\\/]|$)/.test(path.relative(root() || '', p));
-  const send = (p, method, params) => {
+  const send = (p, method, text) => {
     if (!ready || ignored(p)) return;
     clearTimeout(timers.get(p));
     timers.set(p, setTimeout(() => {
       timers.delete(p);
-      project(ctx, method, { path: p, ...params }).then(() => changed.fire(), () => {});
+      project(ctx, method, { path: p, ...(text && { text: wellFormed(text()) }) }).then(() => changed.fire(), () => {});
     }, 400));
   };
-  const update = (p, text) => send(p, 'update', text === undefined ? {} : { text });
-  // a deleted folder takes every file under it out of the index
-  const remove = (p) => { if (source(p) || !path.extname(p)) send(p, 'remove'); };
+  // no text: the engine reads the disk (a folder: every source file under it)
+  const update = (p, text) => send(p, 'update', text);
+  // any deleted path: a folder (its name may have a dot) takes every file under it out of the index
+  const remove = (p) => send(p, 'remove');
+  const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
   paintStability(ctx, vscode.window.activeTextEditor);
   preview.setup(ctx, project, events);
   // test tools in Droid Lite's plugin format (docs/PLUGINS.md), in the Test Explorer
   if (vscode.tests) require('./tests').setup(ctx, root());
   const watcher = vscode.workspace.createFileSystemWatcher('**/*.{kt,kts,java}', false, false, true);
-  const deletes = vscode.workspace.createFileSystemWatcher('**/*', true, true, false);
+  const paths = vscode.workspace.createFileSystemWatcher('**/*', false, true, false);
 
   ctx.subscriptions.push(
     vscode.window.registerTreeDataProvider('droidLite.tools', tree),
@@ -306,13 +325,23 @@ function activate(ctx) {
     changed.event(() => paintStability(ctx, vscode.window.activeTextEditor)),
     vscode.workspace.onDidChangeTextDocument(({ document: d }) => {
       // only files on disk: a git: diff side shares the path
-      if (d.uri.scheme === 'file' && source(d.uri.fsPath)) update(d.uri.fsPath, d.getText());
+      if (d.uri.scheme === 'file' && source(d.uri.fsPath)) update(d.uri.fsPath, () => d.getText());
+    }),
+    // a closed tab drops its unsaved text: the index goes back to the file on disk
+    vscode.workspace.onDidCloseTextDocument((d) => {
+      if (d.uri.scheme === 'file' && source(d.uri.fsPath)) update(d.uri.fsPath);
+    }),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      rootDir = null;
+      if (!ready) project(ctx, 'ping').catch(() => {}); // a folder to index may have appeared
     }),
     watcher,
     watcher.onDidCreate((u) => update(u.fsPath)),
     watcher.onDidChange((u) => update(u.fsPath)),
-    deletes,
-    deletes.onDidDelete((u) => remove(u.fsPath)),
+    paths,
+    // a folder created, renamed or moved in: the engine indexes every source file under it
+    paths.onDidCreate((u) => { if (!source(u.fsPath) && isDir(u.fsPath)) update(u.fsPath); }),
+    paths.onDidDelete((u) => remove(u.fsPath)),
     out,
     vscode.commands.registerCommand('droidLite.goTo', guard(goTo)),
     vscode.commands.registerCommand('droidLite.reindex', guard(async () => {
