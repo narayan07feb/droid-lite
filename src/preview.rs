@@ -874,8 +874,11 @@ fn stop_other_workers(sock: &Path) -> Result<(), String> {
         }
         let theirs = args.get(at + 1).map(Path::new);
         let clients = theirs
-            .and_then(|s| std::fs::read_to_string(format!("{}.clients", s.display())).ok())
-            .and_then(|n| n.trim().parse().ok())
+            .and_then(|s| {
+                let f = format!("{}.clients", s.display());
+                let file_age = std::fs::metadata(&f).and_then(|m| m.modified()).ok()?.elapsed().map_or(0, |d| d.as_secs());
+                Some(clients_of(&std::fs::read_to_string(&f).ok()?, file_age, pid, age))
+            })
             .unwrap_or(0);
         others.push(Other { pid, age, same_socket: theirs == Some(sock), clients });
     }
@@ -890,6 +893,17 @@ fn stop_other_workers(sock: &Path) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(100));
     }
     Ok(())
+}
+
+/// The windows connected to worker `pid` (started `age` s ago) by its `<socket>.clients` text,
+/// `<count> <pid>` (an older build's: `<count>`), written `file_age` s ago. 0 when the file is not
+/// this worker's: another pid's (a worker gone without deleting it), or older than the worker.
+fn clients_of(text: &str, file_age: u64, pid: i32, age: u64) -> usize {
+    let mut it = text.split_whitespace();
+    let count = it.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+    let other_pid = it.next().is_some_and(|p| p.parse::<i32>().ok() != Some(pid));
+    // `ps` gives whole seconds: a file written just after the start may look a little older
+    if other_pid || file_age > age + 2 { 0 } else { count }
 }
 
 /// Of the other workers, the ones to stop before a new one starts: every one on its socket; of the
@@ -1863,6 +1877,22 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         assert!(e.contains("Too many preview workers") && e.contains("Close a window"), "{e}");
         // the count each worker keeps next to its socket
         assert!(WORKER_SOURCE.contains("clientsFile = Path.of(sock + \".clients\");"));
+    }
+
+    #[test]
+    fn a_clients_file_counts_only_for_the_worker_that_wrote_it() {
+        assert_eq!(clients_of("2 41", 5, 41, 60), 2);
+        assert_eq!(clients_of("2", 5, 41, 60), 2, "an older build's file has no pid");
+        assert_eq!(clients_of("2 40", 5, 41, 60), 0, "another worker's (gone) file");
+        assert_eq!(clients_of("2 41", 600, 41, 60), 0, "older than the worker");
+        assert_eq!(clients_of("2", 600, 41, 60), 0, "older than the worker");
+        assert_eq!(clients_of("2 41", 61, 41, 60), 2, "ps rounds to whole seconds");
+        assert_eq!(clients_of("x", 0, 41, 60), 0);
+        // the worker writes its pid, deletes the file (when its own) and its temp file as it ends,
+        // and deletes dead workers' temp files as it starts
+        assert!(WORKER_SOURCE.contains("return clients.size() + \" \" + ProcessHandle.current().pid();"));
+        assert!(WORKER_SOURCE.contains("removeIfOwn(sock, bound);\n                dropClientsFile();"));
+        assert!(WORKER_SOURCE.contains("sweepClientTemps(clientsFile);\n            writeClients();"));
     }
 
     #[test]

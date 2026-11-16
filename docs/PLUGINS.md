@@ -30,13 +30,37 @@ A broken `plugin.json` shows as an error in the tab, with its path.
 A plugin that comes with a project (`<project>/.droid-lite/plugins/`) runs commands from a repo you
 may have just cloned, so nothing of it runs until you allow it. The Tests tab (and VS Code's Test
 Explorer and Droid Lite sidebar) shows it as **Needs your OK**, with its folder and every command
-it would run; **Allow** runs it from then on. When its `plugin.json` changes, it asks again.
+it would run; **Allow** runs it from then on.
+
+- **The OK is for one project.** Allowing a plugin in one project does not allow it in another,
+  even when both reach the same plugin folder.
+- **The OK is for the whole plugin folder.** A change to any file in it (`plugin.json`, a script,
+  a new or deleted file) asks again.
+- **Not for code outside the folder.** Allowing trusts this plugin's folder. Its commands may also
+  run project code outside it (for example a script in the repo, or `dir` pointing elsewhere);
+  changes to that code do not ask again.
+
+Some project plugins are refused (shown as an error in the tab, never runnable, never approvable):
+
+- its folder links outside the project's `.droid-lite/plugins` folder ("links outside the project");
+- a link (symlink) anywhere inside its folder ("contains links");
+- more than 2000 files or 8 MiB in its folder ("too big to check").
 
 Plugins you add yourself (`~/.config/droid-lite/plugins/`, **Add plugin…**) need no OK.
 
-The OKs are kept in `~/.config/droid-lite/approved-plugins.json`, shared by the app and the VS Code
-extension: a JSON object from the plugin folder's real path to the SHA-256 of its `plugin.json`.
-Delete an entry to be asked again.
+The OKs are kept in `approved-plugins.json` in the config folder (`$DROID_LITE_CONFIG_DIR`, else
+`~/.config/droid-lite`), shared by the app and the VS Code extension:
+
+```json
+{"version": 2, "approved": {"<project real path>": {"<plugin folder real path>": "<folder hash>"}}}
+```
+
+Real paths are the paths on disk with links resolved. The folder hash is SHA-256 (lowercase hex)
+over every regular file in the plugin folder, sorted by path relative to it (`/` between folders,
+compared as UTF-8 bytes); for each file: its path, one zero byte, its length as 8 bytes big-endian,
+then its bytes. A file of any other shape (the older flat map too) holds no OKs, so you are asked
+again, and the first **Allow** replaces it. A file that is not a JSON object is never overwritten:
+fix or delete it. Delete an entry to be asked again.
 
 ## plugin.json
 
@@ -56,7 +80,7 @@ Delete an entry to be asked again.
 | Key | Needed | What it is |
 |---|---|---|
 | `name` | yes | The name in the tab |
-| `dir` | no | Where the commands run. Relative to the plugin folder; `~/` is your home. Default: the plugin folder |
+| `dir` | no | Where the commands run. Relative to the plugin folder's real path (links resolved, then `..` taken by its text); `~/` is your home. Default: the plugin folder |
 | `list` | no | Prints the cases (below). Runs when the project opens and on ⟳ |
 | `run` | no | Runs one case or group. `{id}` is its id |
 | `watch` | no | Runs while the Tests tab shows; prints the live state, one JSON line per change |

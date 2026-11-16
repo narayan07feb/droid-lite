@@ -437,14 +437,6 @@ fn device_thread(
     (tx, t)
 }
 
-/// Every source file under `dir` (a folder created, moved or renamed), leaving out what
-/// `Project::open` leaves out.
-fn source_files(dir: &Path) -> Vec<PathBuf> {
-    crate::project::walk(dir)
-        .filter(|p| crate::project::is_code(p))
-        .collect()
-}
-
 /// The `"id"` of a request line that is not valid JSON (a lone surrogate in a text), found by a
 /// scan of its top level, so the error answer still reaches the request that waits for it.
 fn lenient_id(line: &str) -> Value {
@@ -542,9 +534,22 @@ impl Server {
                 {
                     return Ok(Value::Null);
                 }
-                // a folder created, moved or renamed: every source file in it
+                // a folder created, moved, renamed or replaced: what is in it now, and nothing of
+                // what was (a replaced folder keeps no deleted file)
                 if path.is_dir() {
-                    for f in source_files(path) {
+                    self.forget(path);
+                    let root = self.project.as_ref().map(|p| p.root.clone());
+                    for f in crate::project::walk(path) {
+                        if !crate::project::is_code(&f) {
+                            if root
+                                .as_deref()
+                                .is_some_and(|r| crate::project::accepts_in(r, &f))
+                            {
+                                self.edited.insert(f.clone());
+                                self.files_changed |= self.files.insert(f);
+                            }
+                            continue;
+                        }
                         let Ok(src) = std::fs::read_to_string(&f) else {
                             continue;
                         };
@@ -1144,6 +1149,41 @@ mod tests {
 
     fn call(s: &mut Server, method: &str, params: Value) -> Value {
         s.reply(&json!({ "id": 1, "method": method, "params": params }).to_string())
+    }
+
+    #[test]
+    fn update_of_a_replaced_folder_forgets_the_files_it_no_longer_has() {
+        let root = std::fs::canonicalize(project("replaced")).unwrap();
+        let feature = root.join("app/src/main/java/demo/feature");
+        std::fs::create_dir_all(feature.join("res")).unwrap();
+        std::fs::write(feature.join("Old.kt"), "package demo\nclass Old : Api\n").unwrap();
+        std::fs::write(feature.join("res/old.xml"), "<resources/>\n").unwrap();
+        let mut s = Server::default();
+        init(&mut s, &root);
+        // the folder replaced (a branch switch): Old.kt and old.xml gone, New.kt and new.xml there
+        std::fs::remove_dir_all(&feature).unwrap();
+        std::fs::create_dir_all(feature.join("res")).unwrap();
+        std::fs::write(feature.join("New.kt"), "package demo\nclass New : Api\n").unwrap();
+        std::fs::write(feature.join("res/new.xml"), "<resources/>\n").unwrap();
+        let r = call(&mut s, "update", json!({ "path": feature }));
+        assert!(r["error"].is_null(), "{r}");
+        let imp = call(&mut s, "implementations", json!({ "name": "Api" }));
+        let mut names: Vec<&str> = imp["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["name"].as_str().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["New", "RealApi"], "{imp}");
+        assert!(!s.files.contains(&feature.join("Old.kt")));
+        assert!(!s.files.contains(&feature.join("res/old.xml")));
+        assert!(s.files.contains(&feature.join("New.kt")));
+        assert!(
+            s.files.contains(&feature.join("res/new.xml")),
+            "a resource file too"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

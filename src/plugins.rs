@@ -3,7 +3,8 @@
 //! Nothing here knows any one tool: the plugin's own commands print JSON, Droid Lite shows it.
 
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::io::{Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 /// A command (argv) with a name, for an action or a view.
@@ -27,11 +28,20 @@ pub struct Manifest {
     pub views: Vec<Named>,
     /// (name, url)
     pub links: Vec<(String, String)>,
-    /// SHA-256 (hex) of the plugin.json bytes this manifest was read from.
-    pub hash: String,
+    /// A project plugin's approval key, as it was read; `None` for the user's own plugins.
+    pub trust: Option<Trust>,
     /// Its commands may run: a plugin of the user's own folder, or a project plugin the user
-    /// allowed with exactly this plugin.json ([`approve`]). [`Manifest::command`] refuses otherwise.
+    /// allowed with exactly these files ([`approve`]). [`Manifest::command`] refuses otherwise.
     pub allowed: bool,
+}
+
+/// What a project plugin is allowed under: the real path of the project, the real path of the
+/// plugin's folder and the [`tree_hash`] of that folder.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Trust {
+    pub project: String,
+    pub folder: String,
+    pub hash: String,
 }
 
 /// One test case or group from the `list` command. A group without an id cannot run itself.
@@ -119,9 +129,13 @@ impl Manifest {
         if name.is_empty() {
             return Err("\"name\" is missing".into());
         }
+        // as the VS Code extension's path.resolve(real folder, dir)
+        let real = folder
+            .canonicalize()
+            .unwrap_or_else(|_| folder.to_path_buf());
         let dir = match v.get("dir").and_then(Value::as_str) {
-            Some(d) => folder.join(expand_home(d)),
-            None => folder.to_path_buf(),
+            Some(d) => normalize(&real.join(expand_home(d))),
+            None => real,
         };
         let links = v
             .get("links")
@@ -141,7 +155,7 @@ impl Manifest {
             actions: named(&v, "actions"),
             views: named(&v, "views"),
             links,
-            hash: sha256_hex(json.as_bytes()),
+            trust: None,
             allowed: false,
         })
     }
@@ -167,7 +181,9 @@ impl Manifest {
     pub fn approval_text(&self) -> String {
         let cmds: Vec<String> = self.commands().iter().map(|a| format!("{a:?}")).collect();
         format!(
-            "Needs your OK: runs {} from {}",
+            "Needs your OK: runs {} from {}\nAllowing trusts this plugin's folder. Commands may also \
+             run project code outside it (for example a script in the repo); changes to that code do \
+             not ask again.",
             cmds.join(", "),
             self.folder.display()
         )
@@ -201,6 +217,21 @@ impl Manifest {
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
         Ok(cmd)
     }
+}
+
+/// `p` with `.` and `..` taken out by its text, as Node's path.resolve does (`/..` is `/`).
+fn normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn expand_home(p: &str) -> PathBuf {
@@ -268,72 +299,191 @@ pub fn remove(plugins: &Path, m: &Manifest) -> Result<(), String> {
 }
 
 /// The approvals file: `approved-plugins.json` in Droid Lite's config folder, shared with the VS Code
-/// extension. A JSON object: the real path of a project plugin's folder -> the SHA-256 (hex) of the
-/// plugin.json the user allowed.
+/// extension: `{"version":2,"approved":{"<project real path>":{"<plugin folder real path>":"<tree
+/// hash>"}}}`. Any other shape (an older flat map too) holds no approvals.
 pub fn approvals_file(config: &Path) -> PathBuf {
     config.join("approved-plugins.json")
 }
 
-fn approvals(store: &Path) -> Result<serde_json::Map<String, Value>, String> {
+/// The approvals file as JSON; `None` when there is none. An error when it is not a JSON object.
+fn read_store(store: &Path) -> Result<Option<Value>, String> {
     match std::fs::read_to_string(store) {
         Ok(t) => match serde_json::from_str(&t) {
-            Ok(Value::Object(m)) => Ok(m),
+            Ok(v @ Value::Object(_)) => Ok(Some(v)),
             _ => Err(format!(
                 "{} is not a JSON object; fix or delete it",
                 store.display()
             )),
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("{}: {e}", store.display())),
     }
 }
 
-/// The key a plugin is allowed under: the real path of its folder.
-fn approval_key(m: &Manifest) -> Option<String> {
-    m.folder
-        .canonicalize()
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned())
+fn is_v2(v: &Value) -> bool {
+    v["version"] == 2 && v["approved"].is_object()
 }
 
-/// Whether the user allowed this project plugin's folder with exactly this plugin.json.
+/// Whether the user allowed this project plugin, for this project, with exactly these files.
 pub fn is_approved(store: &Path, m: &Manifest) -> bool {
-    let (Some(key), Ok(all)) = (approval_key(m), approvals(store)) else {
+    let (Some(t), Ok(Some(v))) = (&m.trust, read_store(store)) else {
         return false;
     };
-    all.get(&key).and_then(Value::as_str) == Some(m.hash.as_str())
+    is_v2(&v) && v["approved"][&t.project][&t.folder].as_str() == Some(t.hash.as_str())
 }
 
-/// Allows a project plugin as it was read (its plugin.json's hash): written to `store` through a
-/// temp file and a rename, every other entry kept.
+/// Allows a project plugin as it was read ([`Manifest::trust`]), every other entry kept. Under a
+/// lock on `<store>.lock`, so two windows (or the VS Code extension) allowing at once keep both;
+/// written through a 0600 temp file and a rename. A file that is not a JSON object is never
+/// overwritten; one of another shape (the older flat map) is replaced.
 pub fn approve(store: &Path, m: &Manifest) -> Result<(), String> {
-    let key = approval_key(m).ok_or_else(|| format!("{} is gone", m.folder.display()))?;
-    let mut all = approvals(store)?;
-    all.insert(key, Value::String(m.hash.clone()));
+    let t = m
+        .trust
+        .as_ref()
+        .ok_or_else(|| format!("{} is not a project plugin", m.name))?;
     let dir = store.parent().ok_or("no folder for the approvals file")?;
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let tmp = dir.join(format!(".approved-plugins.json.{}.tmp", std::process::id()));
-    let text = serde_json::to_string_pretty(&Value::Object(all)).map_err(|e| e.to_string())?;
-    std::fs::write(&tmp, text + "\n")
+    let name = store
+        .file_name()
+        .ok_or("no name for the approvals file")?
+        .to_string_lossy();
+    let err = |e: std::io::Error| format!("{}: {e}", store.display());
+    std::fs::create_dir_all(dir).map_err(err)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(format!("{name}.lock")))
+        .map_err(err)?;
+    lock.lock().map_err(err)?;
+    let mut v = match read_store(store)? {
+        Some(v) if is_v2(&v) => v,
+        _ => serde_json::json!({"version": 2, "approved": {}}),
+    };
+    let project = &mut v["approved"][&t.project];
+    if !project.is_object() {
+        *project = serde_json::json!({});
+    }
+    project[&t.folder] = Value::String(t.hash.clone());
+    let text = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())? + "\n";
+    let salt = std::hash::BuildHasher::hash_one(
+        &std::collections::hash_map::RandomState::new(),
+        std::time::SystemTime::now(),
+    );
+    let tmp = dir.join(format!("{name}.{}.{salt:016x}.tmp", std::process::id()));
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(&tmp)
+        .and_then(|mut f| f.write_all(text.as_bytes()))
         .and_then(|_| std::fs::rename(&tmp, store))
         .map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
-            format!("{}: {e}", store.display())
+            err(e)
         })
 }
 
-/// Every `<dir>/<plugin>/plugin.json` under `user` and `project`, sorted by folder name; a broken
-/// one is an error that names its file. A user plugin may run; a project plugin (it comes with
-/// the project's files, so with anyone's commit) only once `store` has it ([`is_approved`]).
+/// A plugin folder's files are hashed only up to these: more is "too big to check".
+const TREE_MAX_FILES: usize = 2000;
+const TREE_MAX_BYTES: u64 = 8 << 20;
+
+/// Every regular file under `root` (path relative to it, with `/`), sorted by path as UTF-8
+/// bytes. An error for a link anywhere inside, a name that is not UTF-8, or more than
+/// [`TREE_MAX_FILES`] files or [`TREE_MAX_BYTES`] bytes.
+fn tree(root: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let (mut files, mut total) = (Vec::new(), 0u64);
+    let mut dirs = vec![(root.to_path_buf(), String::new())];
+    while let Some((dir, rel)) = dirs.pop() {
+        for e in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+            let e = e.map_err(|e| e.to_string())?;
+            let name = e
+                .file_name()
+                .into_string()
+                .map_err(|n| format!("{n:?} is not a UTF-8 name"))?;
+            let rel = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            let kind = e.file_type().map_err(|e| e.to_string())?;
+            if kind.is_symlink() {
+                return Err(format!("contains links ({rel})"));
+            } else if kind.is_dir() {
+                dirs.push((e.path(), rel));
+            } else if kind.is_file() {
+                let mut bytes = Vec::new();
+                std::fs::File::open(e.path())
+                    .and_then(|f| f.take(TREE_MAX_BYTES - total + 1).read_to_end(&mut bytes))
+                    .map_err(|e| format!("{rel}: {e}"))?;
+                total += bytes.len() as u64;
+                files.push((rel, bytes));
+                if files.len() > TREE_MAX_FILES || total > TREE_MAX_BYTES {
+                    return Err(format!(
+                        "too big to check (over {TREE_MAX_FILES} files or {} MiB)",
+                        TREE_MAX_BYTES >> 20
+                    ));
+                }
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// SHA-256 (lowercase hex) over the [`tree`] of a plugin folder: for each file its path, one 0
+/// byte, its length as 8 bytes big-endian, then its bytes. The VS Code extension hashes the same.
+fn tree_hash(files: &[(String, Vec<u8>)]) -> String {
+    let mut all = Vec::new();
+    for (path, bytes) in files {
+        all.extend_from_slice(path.as_bytes());
+        all.push(0);
+        all.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        all.extend_from_slice(bytes);
+    }
+    sha256_hex(&all)
+}
+
+/// A project plugin in `folder` (under `<project>/.droid-lite/plugins`), read from the same bytes
+/// it is hashed from. Refused when its real folder is not inside the project's real plugins
+/// folder, or when [`tree`] refuses it.
+fn project_plugin(folder: &Path, project: &Path, plugins: &Path) -> Result<Manifest, String> {
+    let real = folder.canonicalize().map_err(|e| e.to_string())?;
+    if real == plugins || !real.starts_with(plugins) {
+        return Err(format!("links outside the project ({})", real.display()));
+    }
+    let files = tree(&real)?;
+    let json = files
+        .iter()
+        .find(|(p, _)| p == "plugin.json")
+        .ok_or("no plugin.json")?;
+    let json = std::str::from_utf8(&json.1).map_err(|e| e.to_string())?;
+    let mut m = Manifest::parse(json, folder)?;
+    m.trust = Some(Trust {
+        project: project.to_string_lossy().into_owned(),
+        folder: real.to_string_lossy().into_owned(),
+        hash: tree_hash(&files),
+    });
+    Ok(m)
+}
+
+/// Every `<dir>/<plugin>/plugin.json` under `user` and `<project>/.droid-lite/plugins`, sorted by
+/// folder name; a broken or refused one is an error that names its file. A user plugin may run;
+/// a project plugin (it comes with the project's files, so with anyone's commit) only once
+/// `store` has it for this project with these files ([`is_approved`]).
 pub fn discover_all(
     user: &[PathBuf],
-    project: &[PathBuf],
+    project: Option<&Path>,
     store: Option<&Path>,
 ) -> Vec<Result<Manifest, String>> {
+    let project_dir = project.map(|p| p.join(".droid-lite/plugins"));
+    // (real project, real plugins folder): with neither, no project plugin is found
+    let real = project
+        .and_then(|p| p.canonicalize().ok())
+        .zip(project_dir.as_ref().and_then(|d| d.canonicalize().ok()));
     let mut found: Vec<(PathBuf, bool)> = user
         .iter()
         .map(|d| (d, false))
-        .chain(project.iter().map(|d| (d, true)))
+        .chain(real.as_ref().and(project_dir.as_ref()).map(|d| (d, true)))
         .filter_map(|(d, p)| std::fs::read_dir(d).ok().map(|rd| (rd, p)))
         .flat_map(|(rd, p)| rd.flatten().map(move |e| (e.path(), p)))
         .filter(|(f, _)| f.join("plugin.json").is_file())
@@ -343,14 +493,19 @@ pub fn discover_all(
         .into_iter()
         .map(|(f, in_project)| {
             let file = f.join("plugin.json");
-            std::fs::read_to_string(&file)
-                .map_err(|e| e.to_string())
-                .and_then(|j| Manifest::parse(&j, &f))
-                .map(|mut m| {
-                    m.allowed = !in_project || store.is_some_and(|s| is_approved(s, &m));
-                    m
-                })
-                .map_err(|e| format!("{}: {e}", file.display()))
+            match &real {
+                Some((root, plugins)) if in_project => {
+                    project_plugin(&f, root, plugins).map(|mut m| {
+                        m.allowed = store.is_some_and(|s| is_approved(s, &m));
+                        m
+                    })
+                }
+                _ => std::fs::read_to_string(&file)
+                    .map_err(|e| e.to_string())
+                    .and_then(|j| Manifest::parse(&j, &f))
+                    .map(|m| Manifest { allowed: true, ..m }),
+            }
+            .map_err(|e| format!("{}: {e}", file.display()))
         })
         .collect()
 }
@@ -358,7 +513,7 @@ pub fn discover_all(
 /// [`discover_all`] of the user's own plugin folders: every plugin there may run.
 #[cfg(test)]
 fn discover(dirs: &[PathBuf]) -> Vec<Result<Manifest, String>> {
-    discover_all(dirs, &[], None)
+    discover_all(dirs, None, None)
 }
 
 /// SHA-256 of `data` as lowercase hex (FIPS 180-4).
@@ -678,74 +833,122 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_project_plugin_runs_only_once_allowed_and_again_after_its_plugin_json_changes() {
-        let d = std::env::temp_dir().join(format!("droid-lite-approve-{}", std::process::id()));
+    /// A fresh temp folder for one test.
+    fn temp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("droid-lite-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
-        let (user, project) = (d.join("config/plugins"), d.join("proj/.droid-lite/plugins"));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The plugins of `project` (no user plugins), each unwrapped.
+    fn project_plugins(project: &Path, store: Option<&Path>) -> Vec<Manifest> {
+        discover_all(&[], Some(project), store)
+            .into_iter()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn a_project_plugin_runs_only_once_allowed_and_again_after_any_file_of_it_changes() {
+        let d = temp("approve");
+        let (user, project) = (d.join("config/plugins"), d.join("proj"));
+        let shared = project.join(".droid-lite/plugins/shared");
         std::fs::create_dir_all(user.join("mine")).unwrap();
-        std::fs::create_dir_all(project.join("shared")).unwrap();
+        std::fs::create_dir_all(shared.join("bin")).unwrap();
         std::fs::write(
             user.join("mine/plugin.json"),
             r#"{"name":"Mine","list":["./list.sh"]}"#,
         )
         .unwrap();
-        let shared = r#"{"name":"Shared","list":["sh","-c","touch pwned"],"actions":[{"name":"Go","run":["./go.sh"]}]}"#;
-        std::fs::write(project.join("shared/plugin.json"), shared).unwrap();
+        let json = r#"{"name":"Shared","list":["sh","-c","touch pwned"],"actions":[{"name":"Go","run":["./bin/go.sh"]}]}"#;
+        std::fs::write(shared.join("plugin.json"), json).unwrap();
+        std::fs::write(shared.join("bin/go.sh"), "echo go\n").unwrap();
         let store = approvals_file(&d.join("config"));
-        // another tool's entry, kept by every write
-        std::fs::write(&store, r#"{"/elsewhere/plugin":"00"}"#).unwrap();
         let found = |s: Option<&Path>| -> Vec<Manifest> {
-            discover_all(
-                std::slice::from_ref(&user),
-                std::slice::from_ref(&project),
-                s,
-            )
-            .into_iter()
-            .map(Result::unwrap)
-            .collect()
+            discover_all(std::slice::from_ref(&user), Some(&project), s)
+                .into_iter()
+                .map(Result::unwrap)
+                .collect()
         };
         let [mine, sh] = &found(Some(&store))[..] else {
             panic!()
         };
         assert!(mine.allowed, "the user's own plugin needs no OK");
+        assert!(mine.trust.is_none());
         assert!(!sh.allowed, "a project plugin waits for the user's OK");
         assert!(
             sh.command(sh.list.as_ref().unwrap(), None, "").is_err(),
             "and runs nothing meanwhile"
         );
-        let real = project.join("shared").canonicalize().unwrap();
         assert_eq!(
             sh.approval_text(),
             format!(
-                r#"Needs your OK: runs ["sh", "-c", "touch pwned"], ["./go.sh"] from {}"#,
-                project.join("shared").display()
+                "Needs your OK: runs [\"sh\", \"-c\", \"touch pwned\"], [\"./bin/go.sh\"] from {}\n\
+                 Allowing trusts this plugin's folder. Commands may also run project code outside \
+                 it (for example a script in the repo); changes to that code do not ask again.",
+                shared.display()
             )
         );
+        // another project's entry, kept by every write
+        std::fs::write(
+            &store,
+            r#"{"version":2,"approved":{"/other":{"/other/.droid-lite/plugins/p":"00"}}}"#,
+        )
+        .unwrap();
         approve(&store, sh).unwrap();
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
-        assert_eq!(v["/elsewhere/plugin"], "00", "other entries stay");
         assert_eq!(
-            v[real.to_str().unwrap()],
-            sha256_hex(shared.as_bytes()),
-            "real path -> sha-256 of the plugin.json bytes"
+            v["approved"]["/other"]["/other/.droid-lite/plugins/p"],
+            "00"
+        );
+        let (root, real) = (
+            project.canonicalize().unwrap(),
+            shared.canonicalize().unwrap(),
         );
         assert_eq!(
-            std::fs::read_dir(d.join("config")).unwrap().count(),
-            2,
-            "no temp file left: {:?}",
-            std::fs::read_dir(d.join("config"))
-                .unwrap()
-                .collect::<Vec<_>>()
+            v["approved"][root.to_str().unwrap()][real.to_str().unwrap()],
+            tree_hash(&tree(&shared).unwrap()),
+            "project real path -> folder real path -> tree hash"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(&store).unwrap().permissions()
+            ) & 0o777,
+            0o600
+        );
+        let mut left: Vec<_> = std::fs::read_dir(d.join("config"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "approved-plugins.json",
+                "approved-plugins.json.lock",
+                "plugins"
+            ],
+            "no temp file left"
         );
         let sh = found(Some(&store)).remove(1);
         assert!(sh.allowed);
         assert!(sh.command(sh.list.as_ref().unwrap(), None, "").is_ok());
         assert!(!found(None)[1].allowed, "no approvals file: not allowed");
-        // a changed plugin.json needs the OK again
+        // a changed script in the folder needs the OK again, and so does a new file
+        std::fs::write(shared.join("bin/go.sh"), "rm -rf ~\n").unwrap();
+        assert!(!found(Some(&store))[1].allowed);
+        approve(&store, &found(Some(&store))[1]).unwrap();
+        assert!(found(Some(&store))[1].allowed);
+        std::fs::write(shared.join("bin/extra.sh"), "").unwrap();
+        assert!(!found(Some(&store))[1].allowed);
+        // and a changed plugin.json
+        std::fs::remove_file(shared.join("bin/extra.sh")).unwrap();
+        assert!(found(Some(&store))[1].allowed);
         std::fs::write(
-            project.join("shared/plugin.json"),
-            shared.replace("touch pwned", "rm -rf ~"),
+            shared.join("plugin.json"),
+            json.replace("touch pwned", "rm -rf ~"),
         )
         .unwrap();
         assert!(!found(Some(&store))[1].allowed);
@@ -753,6 +956,189 @@ mod tests {
         std::fs::write(&store, "[").unwrap();
         assert!(approve(&store, &found(Some(&store))[1]).is_err());
         assert_eq!(std::fs::read_to_string(&store).unwrap(), "[");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_project_plugin_that_links_outside_the_project_or_holds_links_is_refused() {
+        let d = temp("refuse");
+        let project = d.join("proj");
+        let plugins = project.join(".droid-lite/plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        std::fs::create_dir_all(d.join("outside")).unwrap();
+        std::fs::write(d.join("outside/plugin.json"), r#"{"name":"Out"}"#).unwrap();
+        std::os::unix::fs::symlink(d.join("outside"), plugins.join("out")).unwrap();
+        // inside the plugins folder: a link there is fine
+        std::fs::create_dir_all(plugins.join("real")).unwrap();
+        std::fs::write(plugins.join("real/plugin.json"), r#"{"name":"Real"}"#).unwrap();
+        std::os::unix::fs::symlink(plugins.join("real"), plugins.join("same")).unwrap();
+        // a link inside the plugin's folder
+        std::fs::create_dir_all(plugins.join("inner")).unwrap();
+        std::fs::write(plugins.join("inner/plugin.json"), r#"{"name":"Inner"}"#).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", plugins.join("inner/run")).unwrap();
+        let store = approvals_file(&d.join("config"));
+        let found = discover_all(&[], Some(&project), Some(&store));
+        let [inner, out, real, same] = &found[..] else {
+            panic!("{found:?}")
+        };
+        assert!(
+            inner.as_ref().unwrap_err().contains("contains links"),
+            "{inner:?}"
+        );
+        assert!(
+            out.as_ref()
+                .unwrap_err()
+                .contains("links outside the project"),
+            "{out:?}"
+        );
+        let (real, same) = (real.as_ref().unwrap(), same.as_ref().unwrap());
+        assert_eq!(real.trust, same.trust, "one folder, one key");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_plugin_folder_too_big_to_check_is_refused() {
+        let d = temp("big");
+        let p = d.join("proj/.droid-lite/plugins/big");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("plugin.json"), r#"{"name":"Big"}"#).unwrap();
+        std::fs::write(p.join("blob"), vec![0u8; TREE_MAX_BYTES as usize]).unwrap();
+        let err = discover_all(&[], Some(&d.join("proj")), None).remove(0);
+        assert!(err.unwrap_err().contains("too big to check"));
+        std::fs::remove_file(p.join("blob")).unwrap();
+        for i in 0..TREE_MAX_FILES {
+            std::fs::write(p.join(format!("f{i}")), "").unwrap();
+        }
+        let err = discover_all(&[], Some(&d.join("proj")), None).remove(0);
+        assert!(err.unwrap_err().contains("too big to check"));
+        std::fs::remove_file(p.join("f0")).unwrap();
+        assert!(
+            discover_all(&[], Some(&d.join("proj")), None)[0].is_ok(),
+            "at the cap: fine"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ok_for_one_project_is_not_an_ok_for_another_with_the_same_plugin_folder() {
+        let d = temp("per-project");
+        let a = d.join("a");
+        std::fs::create_dir_all(a.join(".droid-lite/plugins/p")).unwrap();
+        std::fs::write(
+            a.join(".droid-lite/plugins/p/plugin.json"),
+            r#"{"name":"P"}"#,
+        )
+        .unwrap();
+        // project b's .droid-lite is project a's: the same real plugin folder
+        std::fs::create_dir_all(d.join("b")).unwrap();
+        std::os::unix::fs::symlink(a.join(".droid-lite"), d.join("b/.droid-lite")).unwrap();
+        let store = approvals_file(&d.join("config"));
+        let pa = project_plugins(&a, Some(&store)).remove(0);
+        approve(&store, &pa).unwrap();
+        assert!(project_plugins(&a, Some(&store))[0].allowed);
+        let pb = project_plugins(&d.join("b"), Some(&store)).remove(0);
+        assert_eq!(
+            pb.trust.as_ref().unwrap().folder,
+            pa.trust.as_ref().unwrap().folder
+        );
+        assert!(!pb.allowed, "allowed for a, not for b");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_old_flat_approvals_file_asks_again_and_the_first_ok_replaces_it() {
+        let d = temp("v1");
+        let p = d.join("proj/.droid-lite/plugins/p");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("plugin.json"), r#"{"name":"P"}"#).unwrap();
+        let store = approvals_file(&d.join("config"));
+        std::fs::create_dir_all(d.join("config")).unwrap();
+        let m = project_plugins(&d.join("proj"), None).remove(0);
+        let t = m.trust.clone().unwrap();
+        // what the first version kept: folder real path -> hash
+        let v1 = serde_json::json!({ &t.folder: &t.hash, "/x": "00" });
+        std::fs::write(&store, v1.to_string()).unwrap();
+        assert!(!project_plugins(&d.join("proj"), Some(&store))[0].allowed);
+        approve(&store, &m).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"version": 2, "approved": {&t.project: {&t.folder: &t.hash}}}),
+            "v1 entries dropped"
+        );
+        assert!(project_plugins(&d.join("proj"), Some(&store))[0].allowed);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn two_oks_at_once_keep_both_entries() {
+        let d = temp("concurrent");
+        let store = approvals_file(&d.join("config"));
+        for round in 0..20 {
+            let threads: Vec<_> = (0..4)
+                .map(|i| {
+                    let m = Manifest {
+                        name: "P".into(),
+                        trust: Some(Trust {
+                            project: "/proj".into(),
+                            folder: format!("/proj/.droid-lite/plugins/p{round}-{i}"),
+                            hash: "ab".into(),
+                        }),
+                        ..Default::default()
+                    };
+                    let store = store.clone();
+                    std::thread::spawn(move || approve(&store, &m).unwrap())
+                })
+                .collect();
+            threads.into_iter().for_each(|t| t.join().unwrap());
+        }
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
+        assert_eq!(v["approved"]["/proj"].as_object().unwrap().len(), 80);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The vector the VS Code extension's test uses too.
+    #[test]
+    fn tree_hash_of_a_fixed_folder() {
+        let d = temp("vector");
+        std::fs::create_dir_all(d.join("a")).unwrap();
+        std::fs::write(d.join("a.txt"), "x").unwrap();
+        std::fs::write(d.join("a/b"), "").unwrap();
+        std::fs::write(d.join("plugin.json"), r#"{"name":"T"}"#).unwrap();
+        let files = tree(&d).unwrap();
+        let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["a.txt", "a/b", "plugin.json"],
+            "sorted as bytes: '.' < '/'"
+        );
+        assert_eq!(
+            tree_hash(&files),
+            "785f791d17fa1ef53828f417bb59ba3da0d7e7e426a16e1839df07d75c88577f"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn dir_is_resolved_from_the_real_folder_by_text() {
+        let d = temp("dir");
+        std::fs::create_dir_all(d.join("tool/plugin")).unwrap();
+        std::fs::create_dir_all(d.join("elsewhere/deep")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(d.join("elsewhere/deep"), d.join("tool/plugin/sub")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(d.join("tool/plugin"), d.join("link")).unwrap();
+        let real = d.join("tool/plugin").canonicalize().unwrap();
+        let m =
+            Manifest::parse(r#"{"name":"T","dir":"sub/../x/./y/.."}"#, &d.join("link")).unwrap();
+        assert_eq!(m.dir, real.join("x"), "path.resolve(real folder, dir)");
+        assert_eq!(m.folder, d.join("link"), "{{plugin}} stays as found");
+        let m = Manifest::parse(r#"{"name":"T","dir":"/abs/../q"}"#, &d.join("link")).unwrap();
+        assert_eq!(m.dir, Path::new("/q"));
+        let m = Manifest::parse(r#"{"name":"T"}"#, &d.join("link")).unwrap();
+        assert_eq!(m.dir, real);
         let _ = std::fs::remove_dir_all(&d);
     }
 

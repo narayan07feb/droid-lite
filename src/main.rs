@@ -227,3 +227,58 @@ fn bench(dir: &std::path::Path) {
         src.len()
     });
 }
+
+#[cfg(all(test, unix))]
+mod script_tests {
+    use std::path::Path;
+
+    /// `scripts/package-vsix.sh` with a fake `uname` (`os`, `cpu`) and a fake `cargo` that only
+    /// notes it ran: (stderr, whether cargo ran).
+    fn package_vsix(os: &str, cpu: &str, target: Option<&str>) -> (String, bool) {
+        let bin = std::env::temp_dir().join(format!(
+            "droid-lite-vsix-{os}-{cpu}-{}-{}",
+            target.unwrap_or("none"),
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&bin);
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = |name: &str, body: String| {
+            let p = bin.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            let exe = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+            std::fs::set_permissions(&p, exe).unwrap();
+        };
+        script(
+            "uname",
+            format!("case \"$1\" in -s) echo {os} ;; -m) echo {cpu} ;; esac"),
+        );
+        let ran = bin.join("cargo-ran");
+        script("cargo", format!("touch {:?}; exit 3", ran));
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let out = std::process::Command::new("/bin/sh")
+            .arg(repo.join("scripts/package-vsix.sh"))
+            .args(target)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "the fake cargo always fails");
+        let result = (String::from_utf8_lossy(&out.stderr).into_owned(), ran.exists());
+        let _ = std::fs::remove_dir_all(&bin);
+        result
+    }
+
+    #[test]
+    fn package_vsix_builds_only_for_the_machine_it_runs_on() {
+        assert!(package_vsix("Darwin", "arm64", None).1, "no target: this Mac's");
+        assert!(package_vsix("Darwin", "arm64", Some("darwin-arm64")).1);
+        assert!(package_vsix("Darwin", "x86_64", Some("darwin-x64")).1);
+        assert!(package_vsix("Linux", "x86_64", Some("linux-x64")).1);
+        let (err, ran) = package_vsix("Darwin", "arm64", Some("darwin-x64"));
+        assert!(!ran, "an Intel package of an Apple silicon engine is refused before the build");
+        assert!(err.contains("darwin-x64 is not this machine (darwin-arm64)"), "{err}");
+        let (err, ran) = package_vsix("Darwin", "x86_64", Some("linux-x64"));
+        assert!(!ran && err.contains("not this machine"), "{err}");
+        let (err, ran) = package_vsix("SunOS", "sparc", Some("darwin-arm64"));
+        assert!(!ran && err.contains("no VS Code target for SunOS sparc"), "{err}");
+    }
+}

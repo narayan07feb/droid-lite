@@ -239,14 +239,9 @@ impl App {
     /// asks for the OK first. Running cases of the old set stop (Drop).
     pub(super) fn load_plugins(&mut self, ctx: &egui::Context) {
         let mut t = Tests::default();
-        let project: Vec<PathBuf> = self
-            .project
-            .as_ref()
-            .map(|p| p.root.join(".droid-lite/plugins"))
-            .into_iter()
-            .collect();
+        let project = self.project.as_ref().map(|p| p.root.as_path());
         let user: Vec<PathBuf> = self.plugins_home().into_iter().collect();
-        for m in plugins::discover_all(&user, &project, self.approvals().as_deref()) {
+        for m in plugins::discover_all(&user, project, self.approvals().as_deref()) {
             match m {
                 Ok(m) => t.plugins.push(Plugin::new(m)),
                 Err(e) => t.errors.push(e),
@@ -590,7 +585,7 @@ impl App {
         // a project plugin the user has not allowed: what it would run, and nothing else
         if !self.tests.plugins[active].m.allowed {
             ui.label(RichText::new(self.tests.plugins[active].m.approval_text()).strong());
-            ui.label("It comes with the project's files. Allow it only if you trust what it runs; a change to its plugin.json asks again.");
+            ui.label("It comes with the project's files. Allow it only if you trust what it runs; a change to any file in its folder asks again.");
             if ui.button("Allow").clicked() {
                 click = Some(Click::Allow);
             }

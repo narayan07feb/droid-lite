@@ -17,8 +17,9 @@
 // gets a status line every 10 s, so its client never takes this worker for hung.
 // The socket: a worker that finds another answering on its path ends; it removes only the socket file
 // it bound itself (a later worker may have bound a new one on the same path).
-// <socket>.clients holds the number of connected clients (Droid Lite windows), so an engine that
-// starts another worker never stops this one while a window uses it.
+// <socket>.clients holds the number of connected clients (Droid Lite windows) and this worker's pid,
+// so an engine that starts another worker never stops this one while a window uses it. The worker
+// deletes it (when still its own) and its temp file as it ends; a start deletes dead workers' temp files.
 // The work dir is shared by every worker of the preview folder: each worker's files carry its pid and
 // a random token, and pictures older than an hour are deleted when a worker starts.
 import app.cash.paparazzi.DeviceConfig;
@@ -123,10 +124,14 @@ public class PreviewWorker {
             server.bind(UnixDomainSocketAddress.of(sock));
             Object bound = fileKey(sock);
             clientsFile = Path.of(sock + ".clients");
+            sweepClientTemps(clientsFile);
             writeClients();
-            // on idle exit and on SIGTERM: only the socket file this worker bound, never a newer
-            // worker's on the same path
-            Runtime.getRuntime().addShutdownHook(new Thread(() -> removeIfOwn(sock, bound)));
+            // on idle exit and on SIGTERM: only the socket and clients files of this worker, never
+            // a newer worker's on the same path
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                removeIfOwn(sock, bound);
+                dropClientsFile();
+            }));
             watchdog.start();
             System.err.println("preview worker ready on " + sock);
             while (true) {
@@ -151,16 +156,51 @@ public class PreviewWorker {
         } catch (IOException ignored) {}
     }
 
+    /** "<clients> <pid>": the number of connected clients and whose count it is. */
+    static String clientsText() {
+        return clients.size() + " " + ProcessHandle.current().pid();
+    }
+
     /** The number of connected clients into <socket>.clients, through a temp file and a rename. */
     static synchronized void writeClients() {
         if (clientsFile == null) return;
         Path tmp = Path.of(clientsFile + "." + TAG + ".tmp");
         try {
-            Files.writeString(tmp, Integer.toString(clients.size()));
+            Files.writeString(tmp, clientsText());
             Files.move(tmp, clientsFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         } catch (IOException e) {
             try { Files.deleteIfExists(tmp); } catch (IOException ignored) {}
         }
+    }
+
+    /** As the worker ends: its temp file, and <socket>.clients when it is still this worker's (a
+     *  newer worker on the same socket keeps its own). No write after this. */
+    static synchronized void dropClientsFile() {
+        Path f = clientsFile;
+        if (f == null) return;
+        clientsFile = null;
+        try { Files.deleteIfExists(Path.of(f + "." + TAG + ".tmp")); } catch (IOException ignored) {}
+        try {
+            String[] t = Files.readString(f).trim().split(" ");
+            if (t.length == 2 && t[1].equals(Long.toString(ProcessHandle.current().pid()))) Files.deleteIfExists(f);
+        } catch (IOException ignored) {}
+    }
+
+    /** Deletes the `<socket>.clients.<pid>-<token>.tmp` files of workers that are gone (killed
+     *  between the write and the rename). */
+    static void sweepClientTemps(Path clientsFile) {
+        String prefix = clientsFile.getFileName() + ".";
+        try (var files = Files.list(clientsFile.toAbsolutePath().getParent())) {
+            files.forEach(f -> {
+                String n = f.getFileName().toString();
+                if (!n.startsWith(prefix) || !n.endsWith(".tmp")) return;
+                String tag = n.substring(prefix.length(), n.length() - 4);
+                try {
+                    long pid = Long.parseLong(tag.substring(0, tag.indexOf('-')));
+                    if (ProcessHandle.of(pid).isEmpty()) Files.deleteIfExists(f);
+                } catch (RuntimeException | IOException ignored) {}
+            });
+        } catch (IOException ignored) {}
     }
 
     /** Whether a worker answers on `sock`. */

@@ -2962,7 +2962,9 @@ fn e2e_a_project_plugin_runs_nothing_until_allowed_and_asks_again_after_a_change
         .click();
     steps(&mut h, 3);
     h.get_by_label(&format!(
-        r#"Needs your OK: runs ["sh", "{{plugin}}/list.sh"] from {}"#,
+        "Needs your OK: runs [\"sh\", \"{{plugin}}/list.sh\"] from {}\nAllowing trusts this \
+         plugin's folder. Commands may also run project code outside it (for example a script in \
+         the repo); changes to that code do not ask again.",
         dir.display()
     ));
     for _ in 0..20 {
@@ -2978,9 +2980,10 @@ fn e2e_a_project_plugin_runs_nothing_until_allowed_and_asks_again_after_a_change
         &std::fs::read_to_string(f.config.join("approved-plugins.json")).unwrap(),
     )
     .unwrap();
-    let real = dir.canonicalize().unwrap();
-    assert_eq!(store.as_object().unwrap().len(), 1);
-    assert!(store[real.to_str().unwrap()].as_str().is_some_and(|h| h.len() == 64), "{store}");
+    let (root, real) = (f.root.canonicalize().unwrap(), dir.canonicalize().unwrap());
+    assert_eq!(store["version"], 2, "{store}");
+    let entry = &store["approved"][root.to_str().unwrap()][real.to_str().unwrap()];
+    assert!(entry.as_str().is_some_and(|h| h.len() == 64), "{store}");
     // allowed once: the next load lists it at once
     let ctx = h.ctx.clone();
     std::fs::remove_file(f.path("listed")).unwrap();
