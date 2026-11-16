@@ -197,6 +197,7 @@ impl App {
             "active": self.active,
             "tree_view": self.tree_view.name(),
             "variant": self.variant,
+            "structure": self.show_structure,
         });
         let text = v.to_string();
         let h = hash(&text);
@@ -227,6 +228,7 @@ impl App {
         {
             self.variant = var.to_string();
         }
+        self.show_structure = v["structure"].as_bool().unwrap_or(false);
         let view = match v["tree_view"].as_str() {
             Some("Project") => super::tree::View::Project,
             _ => super::tree::View::Android,

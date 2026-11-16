@@ -322,6 +322,11 @@ fn e2e_compose_panel_tree_stability_lints_preview_render() {
     open(&mut h, &f.path("app/src/main/java/com/demo/ui/UserCard.kt"));
     place_cursor(&mut h, "Column(", 0);
     steps(&mut h, 3);
+    // only the previews by default: the UI tree is behind "Structure", which is remembered
+    assert!(h.query_by_label("Column").is_none(), "the UI tree is hidden by default");
+    h.get_by_label(&format!("{}  Structure", ic::TREE_STRUCTURE)).click();
+    steps(&mut h, 3);
+    assert!(h.state().show_structure, "the toggle turns the structure on");
     for label in ["Column", "Text"] {
         h.get_by_label(label);
     }

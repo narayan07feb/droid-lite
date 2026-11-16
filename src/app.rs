@@ -419,6 +419,8 @@ pub struct App {
     libs_rx: Option<Receiver<crate::libs::Libraries>>,
     compose_view: Option<ComposeView>,
     previews: Previews,
+    /// The Compose panel's structure sections (composables, UI tree, …) are shown; per project.
+    show_structure: bool,
     ctx: Option<egui::Context>,
     keymap: Keymap,
     show_shortcuts: bool,
@@ -532,6 +534,7 @@ impl App {
             libs_rx: None,
             compose_view: None,
             previews: Previews::default(),
+            show_structure: false,
             ctx: Some(cc.egui_ctx.clone()),
             keymap: load_setting("keymap").map_or(Keymap::Eclipse, |s| Keymap::from_name(&s)),
             show_shortcuts: false,
@@ -3320,9 +3323,19 @@ impl App {
         let mut render = false;
         let mut zoom: Option<usize> = None;
         let mut render_req: Option<crate::preview::Request> = None;
+        // only the previews by default; the composables list, UI tree, preview names and Compose
+        // checks sit behind "Structure" (remembered per project)
+        let mut structure = self.show_structure;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.toggle_value(&mut structure, RichText::new(format!("{}  Structure", ic::TREE_STRUCTURE)).small())
+                            .on_hover_text("Show the composables, the UI tree, the preview names and the Compose checks");
+                    });
+                });
+                if structure {
                 egui::CollapsingHeader::new(
                     RichText::new(format!("{}  Composables ({})", ic::CUBE, composables.len()))
                         .strong(),
@@ -3351,6 +3364,7 @@ impl App {
                             }
                         });
                 });
+                }
                 let Some(d) = composables.iter().find(|d| d.name == current) else {
                     return;
                 };
@@ -3371,17 +3385,18 @@ impl App {
                 let Some(view) = &self.compose_view else {
                     return;
                 };
-                ui.separator();
-                theme::section(ui, ic::TREE_STRUCTURE, &format!("UI tree · {}", d.name));
-                if view.tree.is_empty() {
-                    ui.label(RichText::new("No UI calls found.").weak());
+                if structure {
+                    ui.separator();
+                    theme::section(ui, ic::TREE_STRUCTURE, &format!("UI tree · {}", d.name));
+                    if view.tree.is_empty() {
+                        ui.label(RichText::new("No UI calls found.").weak());
+                    }
+                    for n in &view.tree {
+                        node_ui(ui, n, &mut jump);
+                    }
+                    ui.separator();
+                    theme::section(ui, ic::IMAGE, "Previews");
                 }
-                for n in &view.tree {
-                    node_ui(ui, n, &mut jump);
-                }
-
-                ui.separator();
-                theme::section(ui, ic::IMAGE, "Previews");
                 let previews: Vec<String> = tab
                     .syms
                     .decls
@@ -3393,7 +3408,7 @@ impl App {
                     ui.label(RichText::new("No @Preview functions in this file.").weak());
                 }
                 let font = egui::TextStyle::Body.resolve(ui.style());
-                for p in &previews {
+                for p in previews.iter().filter(|_| structure) {
                     let room = ui.available_width() - 8.0;
                     if ui.link(theme::elide(ui, p, &font, room)).on_hover_text(p).clicked() {
                         jump = tab
@@ -3457,6 +3472,9 @@ impl App {
                     }
                 }
 
+                if !structure {
+                    return;
+                }
                 ui.separator();
                 theme::section(ui, ic::CHECK_CIRCLE, "Compose checks");
                 for l in tab.lints.iter() {
@@ -3480,6 +3498,10 @@ impl App {
                 }
             });
         let path = tab.path.clone();
+        if structure != self.show_structure {
+            self.show_structure = structure;
+            self.save_session(true);
+        }
         if let Some(n) = pick {
             self.selected_composable = Some(n);
         }
