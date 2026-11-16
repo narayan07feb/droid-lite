@@ -280,7 +280,7 @@ fn ask(w: &mut UnixStream, rd: &mut BufReader<UnixStream>, id: u64, r: &Request)
             continue; // an older answer
         }
         if v["ok"].as_bool() != Some(true) {
-            let error = v["error"].as_str().unwrap_or("The preview failed.").to_string();
+            let error = short_error(v["error"].as_str().unwrap_or("The preview failed."), &r.file);
             return Ok(Event::Failed { file: r.file.clone(), error });
         }
         let cards = v["images"]
@@ -304,8 +304,29 @@ fn ask(w: &mut UnixStream, rd: &mut BufReader<UnixStream>, id: u64, r: &Request)
     }
 }
 
+/// The compiler's text for a card: the file's own path shortened to its name, at most 12 lines.
+fn short_error(text: &str, file: &Path) -> String {
+    let full = file.to_string_lossy();
+    let name = file.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+    let lines: Vec<String> = text.lines().map(|l| l.replace(full.as_ref(), &name)).collect();
+    let mut out = lines.iter().take(12).cloned().collect::<Vec<_>>().join("\n");
+    if lines.len() > 12 {
+        out.push_str(&format!("\n… {} more lines", lines.len() - 12));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compiler_errors_name_the_file_not_its_whole_path() {
+        let f = Path::new("/Users/n/code/app/src/main/kotlin/a/Card.kt");
+        let text = format!("{}:3:34: error: unresolved reference 'MaterialTheme'.\nimport x\n", f.display());
+        assert_eq!(short_error(&text, f), "Card.kt:3:34: error: unresolved reference 'MaterialTheme'.\nimport x");
+        let long: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        assert!(short_error(&long, f).ends_with("… 8 more lines"));
+    }
+
     use super::*;
 
     #[test]
