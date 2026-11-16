@@ -78,39 +78,97 @@ async function goTo(uri, line, targets) {
   }
 }
 
-function stabilityTitle(f) {
+// Droid Lite's colours: a badge after the `fun` line and after each parameter (or a line under its
+// name when it shares a line), the reasons on hover
+const GREEN = '#5FB865';
+const RED = '#E05050';
+const ORANGE = '#E0A030';
+const GREY = '#8C8C8C';
+const look = { stable: ['stable', GREEN], unstable: ['unstable', RED], runtime: ['runtime', ORANGE], unknown: ['unknown', GREY] };
+
+function summary(f) {
   const n = (v) => f.params.filter((p) => p.verdict === v).length;
   const unstable = n('unstable');
   const unknown = n('unknown') + n('runtime');
-  if (unstable) return `⚠ ${unstable} unstable: ${f.params.filter((p) => p.verdict === 'unstable').map((p) => p.name).join(', ')}`;
-  if (unknown) return `? ${unknown} unknown`;
-  return f.skippable ? '✓ skippable' : '✓ stable parameters';
+  if (unstable) return [`⚠ ${unstable} unstable`, ORANGE];
+  if (unknown) return [`? ${unknown} unknown`, GREY];
+  return [f.skippable ? '✓ skippable' : '✓ stable parameters', GREEN];
 }
 
-function showStability(f) {
-  const items = f.params.map((p) => ({ label: `${p.name}: ${p.verdict}`, detail: p.reason || undefined }));
-  const from = f.source === 'guess' ? 'Droid Lite guess (no compiler report)' : `report ${path.basename(f.source)}`;
-  vscode.window.showQuickPick(items, { title: `${f.function}: parameter stability (${from})` });
+function hover(f) {
+  const yn = (b) => (b === true ? 'yes' : b === false ? 'no' : '?');
+  const md = new vscode.MarkdownString(
+    `**${f.function}** skippable: ${yn(f.skippable)} · restartable: ${yn(f.restartable)}\n\n| Parameter | Stability | Why |\n|---|---|---|\n`
+    + f.params.map((p) => `| \`${p.name}\` | ${p.verdict} | ${(p.reason || '').replace(/\|/g, '\\|')} |`).join('\n')
+    + `\n\n${f.source === 'guess'
+      ? '_Local guess: run the stabilityDump task or build with Compose compiler reports for exact results._'
+      : `_From ${path.basename(f.source)}_`}`);
+  return md;
+}
+
+const badgeTypes = new Map(); // colour → decoration type (badge after the line)
+const lineTypes = new Map(); // colour → decoration type (line under a name)
+function badgeType(color) {
+  if (!badgeTypes.has(color)) {
+    badgeTypes.set(color, vscode.window.createTextEditorDecorationType({
+      after: {
+        color,
+        backgroundColor: `${color}24`,
+        margin: '0 0 0 1.5em',
+        textDecoration: 'none; border-radius: 6px; padding: 0 6px; font-size: 90%',
+      },
+    }));
+  }
+  return badgeTypes.get(color);
+}
+function lineType(color) {
+  if (!lineTypes.has(color)) {
+    lineTypes.set(color, vscode.window.createTextEditorDecorationType({
+      textDecoration: `underline 1.5px ${color}`,
+    }));
+  }
+  return lineTypes.get(color);
+}
+
+async function paintStability(ctx, editor) {
+  if (!editor || !/\.kts?$/.test(editor.document.uri.fsPath)) return;
+  const doc = editor.document;
+  const version = doc.version;
+  const funs = await project(ctx, 'stability', { path: doc.uri.fsPath, text: doc.getText() }).catch(() => []);
+  if (doc.version !== version) return; // a newer paint follows
+  const badges = new Map();
+  const lines = new Map();
+  const add = (map, color, opt) => (map.get(color) || map.set(color, []).get(color)).push(opt);
+  const end = (line) => doc.lineAt(Math.min(line, doc.lineCount - 1)).range.end;
+  for (const f of funs) {
+    const [text, color] = summary(f);
+    const tip = hover(f);
+    add(badges, color, { range: new vscode.Range(end(f.line), end(f.line)), hoverMessage: tip, renderOptions: { after: { contentText: text } } });
+    for (const p of f.params) {
+      if (p.line === undefined) continue;
+      const [word, pc] = look[p.verdict] || look.unknown;
+      const shared = p.line === f.line || f.params.filter((q) => q.line === p.line).length > 1;
+      if (shared) {
+        add(lines, pc, { range: new vscode.Range(p.line, p.col, p.line, p.end), hoverMessage: tip });
+      } else {
+        add(badges, pc, { range: new vscode.Range(end(p.line), end(p.line)), hoverMessage: tip, renderOptions: { after: { contentText: word } } });
+      }
+    }
+  }
+  for (const [color, t] of badgeTypes) if (!badges.has(color)) editor.setDecorations(t, []);
+  for (const [color, t] of lineTypes) if (!lines.has(color)) editor.setDecorations(t, []);
+  for (const [color, opts] of badges) editor.setDecorations(badgeType(color), opts);
+  for (const [color, opts] of lines) editor.setDecorations(lineType(color), opts);
 }
 
 function lenses(ctx) {
   return {
     onDidChangeCodeLenses: changed.event,
     async provideCodeLenses(doc) {
-      const params = { path: doc.uri.fsPath, text: doc.getText() };
-      const [links, stab] = await Promise.all([
-        project(ctx, 'lenses', params).catch(() => []),
-        /\.kts?$/.test(doc.uri.fsPath) ? project(ctx, 'stability', params).catch(() => []) : [],
-      ]);
-      const at = (line) => new vscode.Range(line, 0, line, 0);
-      return [
-        ...links.map((l) => new vscode.CodeLens(at(l.line), {
-          title: l.title, command: 'droidLite.goTo', arguments: [doc.uri, l.line, l.targets],
-        })),
-        ...stab.map((f) => new vscode.CodeLens(at(f.line), {
-          title: stabilityTitle(f), command: 'droidLite.stability', arguments: [f],
-        })),
-      ];
+      const links = await project(ctx, 'lenses', { path: doc.uri.fsPath, text: doc.getText() }).catch(() => []);
+      return links.map((l) => new vscode.CodeLens(new vscode.Range(l.line, 0, l.line, 0), {
+        title: l.title, command: 'droidLite.goTo', arguments: [doc.uri, l.line, l.targets],
+      }));
     },
   };
 }
@@ -172,11 +230,14 @@ function activate(ctx) {
         .then(() => changed.fire(), () => {});
     }, 400));
   };
+  paintStability(ctx, vscode.window.activeTextEditor);
   const watcher = vscode.workspace.createFileSystemWatcher('**/*.{kt,kts,java}');
 
   ctx.subscriptions.push(
     vscode.window.registerTreeDataProvider('droidLite.tools', { getTreeItem: (i) => i, getChildren: () => tools }),
     vscode.languages.registerCodeLensProvider(sel, lenses(ctx)),
+    vscode.window.onDidChangeActiveTextEditor((e) => paintStability(ctx, e)),
+    changed.event(() => paintStability(ctx, vscode.window.activeTextEditor)),
     vscode.workspace.onDidChangeTextDocument((e) => {
       if (/\.(kt|kts|java)$/.test(e.document.uri.fsPath)) update(e.document.uri.fsPath, e.document.getText());
     }),
@@ -187,7 +248,6 @@ function activate(ctx) {
     rec,
     out,
     vscode.commands.registerCommand('droidLite.goTo', guard(goTo)),
-    vscode.commands.registerCommand('droidLite.stability', showStability),
     vscode.commands.registerCommand('droidLite.reindex', guard(async () => {
       // a running recording ends with the engine
       engine?.proc.stdin.end();
@@ -231,7 +291,7 @@ function activate(ctx) {
       logcat = proc;
     })),
     vscode.commands.registerCommand('droidLite.logcatStop', () => logcat?.kill()),
-    { dispose: () => { logcat?.kill(); engine?.proc.stdin.end(); } },
+    { dispose: () => { logcat?.kill(); engine?.proc.stdin.end(); for (const t of [...badgeTypes.values(), ...lineTypes.values()]) t.dispose(); } },
   );
 }
 

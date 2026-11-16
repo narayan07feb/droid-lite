@@ -313,17 +313,30 @@ impl Server {
                             .cloned()
                             .unwrap_or_else(|| compose::guess(d, &self.index));
                         let (line, col) = position(&text, d.offset);
+                        // where each parameter's name is, for a badge on its line
+                        let at: HashMap<String, std::ops::Range<usize>> =
+                            compose::param_names(&text, d.offset).into_iter().collect();
                         json!({
                             "function": d.name,
                             "line": line,
                             "col": col,
                             "skippable": st.skippable,
+                            "restartable": st.restartable,
                             "source": st.source,
-                            "params": st.params.iter().map(|p| json!({
-                                "name": p.name,
-                                "verdict": verdict(p.verdict),
-                                "reason": p.reason,
-                            })).collect::<Vec<_>>(),
+                            "params": st.params.iter().map(|p| {
+                                let mut v = json!({
+                                    "name": p.name,
+                                    "verdict": verdict(p.verdict),
+                                    "reason": p.reason,
+                                });
+                                if let Some(r) = at.get(&p.name) {
+                                    let (l, c) = position(&text, r.start);
+                                    v["line"] = json!(l);
+                                    v["col"] = json!(c);
+                                    v["end"] = json!(c + text[r.clone()].chars().count());
+                                }
+                                v
+                            }).collect::<Vec<_>>(),
                         })
                     })
                     .collect();
@@ -513,6 +526,16 @@ mod tests {
             "{st}"
         );
         assert_eq!(f["params"][0]["verdict"], "unstable", "MutableList: {st}");
+        // `fun Card(names: …` on line 3: `names` starts at column 9
+        assert_eq!(
+            (
+                &f["params"][0]["line"],
+                &f["params"][0]["col"],
+                &f["params"][0]["end"]
+            ),
+            (&json!(3), &json!(9), &json!(14)),
+            "{st}"
+        );
         assert_eq!(f["params"][1]["verdict"], "stable", "{st}");
         assert!(
             s.reply("not json")["error"]

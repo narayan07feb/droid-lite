@@ -2,7 +2,7 @@
   "name": "droid-lite",
   "displayName": "Droid Lite",
   "description": "Android tools for VS Code and Cursor: implementation links, Compose stability, device screenshot, screen recording and logcat.",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "forgebyte",
   "license": "MIT",
   "repository": {
