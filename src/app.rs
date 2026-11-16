@@ -13,6 +13,7 @@ mod gutter;
 mod libs_ui;
 mod logcat_ui;
 mod perf;
+mod prs_ui;
 mod refactor_ui;
 mod run_ui;
 mod tests_ui;
@@ -401,6 +402,8 @@ pub struct App {
     /// Disk changes being read and scanned on worker threads.
     disk_rx: Vec<Receiver<Vec<disk::DiskChange>>>,
     git: git_ui::GitState,
+    /// The sidebar's Pull requests view.
+    prs: prs_ui::PrsState,
     /// Current git branch of the project, shown in the toolbar.
     branch: Option<String>,
     /// Bumped when a build or a report reload may have changed previews and stability.
@@ -522,6 +525,7 @@ impl App {
             watcher: None,
             disk_rx: Vec::new(),
             git: Default::default(),
+            prs: Default::default(),
             branch: None,
             outputs_gen: 0,
             decl_usages: None,
@@ -815,7 +819,8 @@ impl App {
 
     fn close_tab(&mut self, i: usize) {
         if i < self.tabs.len() {
-            if self.tabs[i].dirty() {
+            // a deleted file's tab closes like Android Studio's: ⌘S would bring the file back
+            if self.tabs[i].dirty() && !self.tabs[i].deleted {
                 self.status = format!(
                     "{} has unsaved changes: save (⌘S) or revert first",
                     self.tabs[i].path.display()
@@ -2172,6 +2177,23 @@ impl App {
     }
 
     fn project_panel(&mut self, ui: &mut Ui) {
+        // the sidebar shows the Project tree or the pull requests
+        ui.horizontal(|ui| {
+            let mut tabs = theme::Tabs::new(ui, "sidebar");
+            for (prs, label) in [
+                (false, format!("{}  Project", ic::TREE_STRUCTURE)),
+                (true, format!("{}  Pull requests", ic::GIT_PULL_REQUEST)),
+            ] {
+                if tabs.tab(ui, self.prs.shown == prs, label).clicked() {
+                    self.prs.shown = prs;
+                }
+            }
+            tabs.finish(ui);
+        });
+        if self.prs.shown {
+            self.prs_panel(ui);
+            return;
+        }
         ui.horizontal(|ui| {
             theme::section(ui, ic::TREE_STRUCTURE, "Project");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3957,6 +3979,15 @@ impl eframe::App for App {
                 self.show_right = false;
             }
         });
+        watch.stage("diff panel", || {
+            // docked beside the editor, like Android Studio's diff (it was a floating window)
+            if self.has_diff() && !hidden {
+                egui::Panel::right("diff")
+                    .resizable(true)
+                    .default_size(620.0)
+                    .show(ui, |ui| self.diff_panel(ui));
+            }
+        });
         let editor_frame = egui::Frame::central_panel(ui.style()).fill(theme::t().editor_bg);
         watch.stage("editor", || {
             egui::CentralPanel::default()
@@ -3971,7 +4002,6 @@ impl eframe::App for App {
             self.translations_window(&ctx);
             self.deep_link_window(&ctx);
             self.refactor_window(&ctx);
-            self.commit_window(&ctx);
             self.shortcuts_window(&ctx);
             self.settings_window(&ctx);
             self.capture_window(&ctx);

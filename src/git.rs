@@ -357,6 +357,104 @@ pub fn open_prs(root: &Path) -> Vec<OpenPr> {
         .unwrap_or_default()
 }
 
+/// Which pull requests the sidebar lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PrFilter {
+    /// Opened by you.
+    Mine,
+    /// Waiting for your review.
+    Review,
+}
+
+impl PrFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            PrFilter::Mine => "Your PRs",
+            PrFilter::Review => "Awaiting your review",
+        }
+    }
+}
+
+/// One pull request in the sidebar list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrItem {
+    pub number: u64,
+    pub title: String,
+    pub author: String,
+    pub draft: bool,
+    pub url: String,
+    /// APPROVED, CHANGES_REQUESTED, REVIEW_REQUIRED or empty.
+    pub review: String,
+}
+
+/// `gh pr list --json number,title,author,isDraft,url,reviewDecision` output.
+pub fn parse_pr_items(json: &[u8]) -> Vec<PrItem> {
+    serde_json::from_slice::<Vec<serde_json::Value>>(json)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|v| {
+            Some(PrItem {
+                number: v["number"].as_u64()?,
+                title: v["title"].as_str().unwrap_or("").to_string(),
+                author: v["author"]["login"].as_str().unwrap_or("").to_string(),
+                draft: v["isDraft"].as_bool().unwrap_or(false),
+                url: v["url"].as_str().unwrap_or("").to_string(),
+                review: v["reviewDecision"].as_str().unwrap_or("").to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Runs `gh` in `root` (off the UI thread: it uses the network); its stdout, or its first error line.
+fn gh(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let out = Command::new("gh")
+        .args(args)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("gh: {e}"))?;
+    if !out.status.success() {
+        let e = String::from_utf8_lossy(&out.stderr);
+        return Err(e.lines().next().unwrap_or("gh failed").to_string());
+    }
+    Ok(out.stdout)
+}
+
+/// The open pull requests for `filter`, newest first.
+pub fn list_prs(root: &Path, filter: PrFilter) -> Result<Vec<PrItem>, String> {
+    let who = match filter {
+        PrFilter::Mine => ["--author", "@me"],
+        PrFilter::Review => ["--search", "review-requested:@me"],
+    };
+    let mut args = vec!["pr", "list", "--state", "open", "--limit", "100"];
+    args.extend(who);
+    args.extend(["--json", "number,title,author,isDraft,url,reviewDecision"]);
+    gh(root, &args).map(|o| parse_pr_items(&o))
+}
+
+/// A pull request's whole diff (`gh pr diff`), split into one diff per file.
+pub fn pr_diff(root: &Path, number: u64) -> Result<Vec<(String, String)>, String> {
+    let n = number.to_string();
+    gh(root, &["pr", "diff", &n, "--color", "never"])
+        .map(|o| split_diff(&String::from_utf8_lossy(&o)))
+}
+
+/// (path, its diff) per `diff --git a/… b/…` section; the path is the new name.
+pub fn split_diff(text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for l in text.split_inclusive('\n') {
+        if let Some(rest) = l.strip_prefix("diff --git ") {
+            let rest = rest.trim_end();
+            let b = rest.rsplit_once(" b/").map_or(rest, |(_, b)| b);
+            out.push((b.to_string(), String::new()));
+        }
+        if let Some((_, d)) = out.last_mut() {
+            d.push_str(l);
+        }
+    }
+    out
+}
+
 /// `#123` or `123` as a PR number.
 pub fn pr_number(choice: &str) -> Option<u64> {
     choice.trim().trim_start_matches('#').parse().ok()
@@ -646,6 +744,41 @@ pub fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidebar_pr_items_are_read() {
+        let prs = parse_pr_items(
+            br#"[{"number":7,"title":"Fix","author":{"login":"ana"},"isDraft":true,"url":"https://x/7","reviewDecision":"APPROVED"},{"title":"no number"},{"number":8}]"#,
+        );
+        assert_eq!(prs.len(), 2);
+        assert_eq!(
+            prs[0],
+            PrItem {
+                number: 7,
+                title: "Fix".into(),
+                author: "ana".into(),
+                draft: true,
+                url: "https://x/7".into(),
+                review: "APPROVED".into(),
+            }
+        );
+        assert_eq!(
+            (prs[1].number, prs[1].draft, prs[1].author.as_str()),
+            (8, false, "")
+        );
+        assert_eq!(PrFilter::Review.label(), "Awaiting your review");
+    }
+
+    #[test]
+    fn a_pr_diff_splits_per_file() {
+        let d = "diff --git a/A.kt b/A.kt\n--- a/A.kt\n+++ b/A.kt\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/old/B.kt b/new/B.kt\nsimilarity index 90%\n";
+        let files = split_diff(d);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].0, "A.kt");
+        assert!(files[0].1.starts_with("diff --git a/A.kt") && files[0].1.ends_with("+b\n"));
+        assert_eq!(files[1].0, "new/B.kt");
+        assert!(split_diff("").is_empty());
+    }
 
     #[test]
     fn open_pr_list_and_pr_numbers() {

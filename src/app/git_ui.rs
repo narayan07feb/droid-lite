@@ -39,8 +39,10 @@ pub(super) struct GitState {
     history_for: Option<PathBuf>,
     history: Vec<Commit>,
     history_rx: Option<Receiver<Vec<Commit>>>,
-    /// Open commit window: title and `git show` output.
+    /// Open diff panel: title and `git show` / `git diff` output.
     commit: Option<(String, Vec<String>)>,
+    /// The diff panel shows one column (unified) instead of old | new side by side.
+    unified: bool,
     commit_rx: Option<Receiver<(String, String)>>,
     /// Uncommitted files and the branch's changes (refreshed in the background).
     pub changes: Option<git::Changes>,
@@ -680,48 +682,212 @@ impl App {
         }
     }
 
-    pub(super) fn commit_window(&mut self, ctx: &egui::Context) {
+    pub(super) fn has_diff(&self) -> bool {
+        self.git.commit.is_some()
+    }
+
+    /// The diff of a commit or a file, docked beside the editor like Android Studio's diff:
+    /// side by side (old | new, with line numbers) or unified. Esc or × closes it.
+    pub(super) fn diff_panel(&mut self, ui: &mut Ui) {
         let Some((title, lines)) = &self.git.commit else {
             return;
         };
-        let mut open = !ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-        egui::Window::new(title.clone())
-            .open(&mut open)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_size([900.0, 620.0])
-            .resizable(true)
-            .show(ctx, |ui| {
-                let row_h = ui.fonts_mut(|f| {
-                    f.row_height(&FontId::monospace(crate::theme::font_size() - 1.0))
-                });
-                egui::ScrollArea::both()
-                    .auto_shrink([false, false])
-                    .show_rows(ui, row_h, lines.len(), |ui, range| {
-                        for l in &lines[range] {
-                            let color = if l.starts_with("+++") || l.starts_with("---") {
-                                crate::theme::t().code
-                            } else if l.starts_with('+') {
-                                Color32::from_rgb(0x6A, 0xB0, 0x6A)
-                            } else if l.starts_with('-') {
-                                ERROR
-                            } else if l.starts_with("@@") {
-                                INFO
-                            } else {
-                                crate::theme::t().code
-                            };
-                            ui.label(
-                                RichText::new(l)
-                                    .monospace()
-                                    .size(crate::theme::font_size() - 1.0)
-                                    .color(color),
-                            );
-                        }
-                    });
+        let mut open = !ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        right_row(ui, |ui| {
+            if ui
+                .add(egui::Button::new(crate::icons::X).frame(false))
+                .on_hover_text("Close the diff  Esc")
+                .clicked()
+            {
+                open = false;
+            }
+            let mut split = !self.git.unified;
+            ui.checkbox(&mut split, "Side by side");
+            self.git.unified = !split;
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                ui.add(egui::Label::new(RichText::new(title).strong()).truncate());
             });
+        });
+        ui.separator();
+        let size = crate::theme::font_size() - 1.0;
+        let font = FontId::monospace(size);
+        let row_h = ui.fonts_mut(|f| f.row_height(&font));
+        let code = crate::theme::t().code;
+        let added = Color32::from_rgb(0x6A, 0xB0, 0x6A);
+        if self.git.unified {
+            egui::ScrollArea::both()
+                .id_salt("diff-unified")
+                .auto_shrink([false, false])
+                .show_rows(ui, row_h, lines.len(), |ui, range| {
+                    for l in &lines[range] {
+                        let color = if l.starts_with("+++") || l.starts_with("---") {
+                            code
+                        } else if l.starts_with('+') {
+                            added
+                        } else if l.starts_with('-') {
+                            ERROR
+                        } else if l.starts_with("@@") {
+                            INFO
+                        } else {
+                            code
+                        };
+                        ui.label(RichText::new(l).monospace().size(size).color(color));
+                    }
+                });
+        } else {
+            let rows = side_rows(lines);
+            let num_w = ui.fonts_mut(|f| {
+                f.layout_no_wrap("00000".into(), font.clone(), code)
+                    .size()
+                    .x
+            });
+            egui::ScrollArea::vertical()
+                .id_salt("diff-split")
+                .auto_shrink([false, false])
+                .show_rows(ui, row_h, rows.len(), |ui, range| {
+                    for row in &rows[range] {
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), row_h),
+                            Sense::hover(),
+                        );
+                        let p = ui.painter_at(rect);
+                        let text = |p: &egui::Painter, x: f32, s: &str, c: Color32| {
+                            p.text(
+                                Pos2::new(x, rect.top()),
+                                Align2::LEFT_TOP,
+                                s,
+                                font.clone(),
+                                c,
+                            );
+                        };
+                        match row {
+                            SideRow::Head(h) => {
+                                let c = if h.starts_with("@@") { INFO } else { DIM };
+                                text(&p, rect.left() + 4.0, h, c);
+                            }
+                            SideRow::Pair { old, new, changed } => {
+                                let half = rect.width() / 2.0;
+                                for (i, side, tint, fg) in
+                                    [(0.0, old, ERROR, code), (1.0, new, added, code)]
+                                {
+                                    let r = egui::Rect::from_min_size(
+                                        Pos2::new(rect.left() + i * half, rect.top()),
+                                        egui::vec2(half - 2.0, row_h),
+                                    );
+                                    let p = ui.painter_at(r);
+                                    match side {
+                                        Some((n, s)) => {
+                                            if *changed {
+                                                p.rect_filled(r, 0.0, tint.gamma_multiply(0.18));
+                                            }
+                                            let nx = r.left() + num_w;
+                                            p.text(
+                                                Pos2::new(nx, r.top()),
+                                                Align2::RIGHT_TOP,
+                                                n.to_string(),
+                                                font.clone(),
+                                                DIM,
+                                            );
+                                            text(&p, nx + 8.0, s, fg);
+                                        }
+                                        // the other side has lines here: hatch-like dim fill
+                                        None => {
+                                            p.rect_filled(r, 0.0, DIM.gamma_multiply(0.12));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+        }
         if !open {
             self.git.commit = None;
         }
     }
+}
+
+/// One row of the side-by-side diff: old line (number, text), new line, and what happened.
+#[derive(Debug, PartialEq)]
+pub(super) enum SideRow {
+    /// A header line (`diff --git`, `@@ …`, commit message) across both sides.
+    Head(String),
+    /// Old and new side; `changed` is false for an unchanged context line.
+    Pair {
+        old: Option<(usize, String)>,
+        new: Option<(usize, String)>,
+        changed: bool,
+    },
+}
+
+/// Pairs a unified diff's removed and added lines up, like Android Studio's two-pane diff.
+pub(super) fn side_rows(lines: &[String]) -> Vec<SideRow> {
+    let mut rows = Vec::new();
+    let (mut o, mut n) = (0usize, 0usize);
+    let mut dels: Vec<(usize, String)> = Vec::new();
+    let mut adds: Vec<(usize, String)> = Vec::new();
+    let flush = |rows: &mut Vec<SideRow>, dels: &mut Vec<_>, adds: &mut Vec<_>| {
+        let (mut d, mut a) = (dels.drain(..), adds.drain(..));
+        loop {
+            let (old, new) = (d.next(), a.next());
+            if old.is_none() && new.is_none() {
+                break;
+            }
+            rows.push(SideRow::Pair {
+                old,
+                new,
+                changed: true,
+            });
+        }
+    };
+    let mut in_hunk = false;
+    for l in lines {
+        if let Some(h) = l.strip_prefix("@@ -") {
+            flush(&mut rows, &mut dels, &mut adds);
+            // @@ -12,3 +14,4 @@
+            let num = |s: &str| {
+                s.split(',')
+                    .next()
+                    .and_then(|x| x.parse().ok())
+                    .unwrap_or(1)
+            };
+            let mut parts = h.split(' ');
+            o = num(parts.next().unwrap_or("1"));
+            n = num(parts.next().unwrap_or("+1").trim_start_matches('+'));
+            in_hunk = true;
+            rows.push(SideRow::Head(l.clone()));
+            continue;
+        }
+        if l.starts_with("diff --git") {
+            in_hunk = false;
+        }
+        match (in_hunk, l.chars().next()) {
+            (true, Some('-')) => {
+                dels.push((o, l[1..].to_string()));
+                o += 1;
+            }
+            (true, Some('+')) => {
+                adds.push((n, l[1..].to_string()));
+                n += 1;
+            }
+            (true, Some(' ')) | (true, None) => {
+                flush(&mut rows, &mut dels, &mut adds);
+                let t = l.get(1..).unwrap_or("").to_string();
+                rows.push(SideRow::Pair {
+                    old: Some((o, t.clone())),
+                    new: Some((n, t)),
+                    changed: false,
+                });
+                (o, n) = (o + 1, n + 1);
+            }
+            _ => {
+                flush(&mut rows, &mut dels, &mut adds);
+                rows.push(SideRow::Head(l.clone()));
+            }
+        }
+    }
+    flush(&mut rows, &mut dels, &mut adds);
+    rows
 }
 
 /// A form label `w` wide with its text at the right end.
@@ -1005,4 +1171,49 @@ pub(super) fn paint_changes(
         });
     }
     revert
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SideRow, side_rows};
+
+    fn pair(old: Option<(usize, &str)>, new: Option<(usize, &str)>, changed: bool) -> SideRow {
+        let s = |x: Option<(usize, &str)>| x.map(|(n, t)| (n, t.to_string()));
+        SideRow::Pair {
+            old: s(old),
+            new: s(new),
+            changed,
+        }
+    }
+
+    #[test]
+    fn removed_and_added_lines_pair_up_side_by_side() {
+        let lines: Vec<String> = [
+            "diff --git a/A.kt b/A.kt",
+            "--- a/A.kt",
+            "+++ b/A.kt",
+            "@@ -10,4 +10,4 @@ class A",
+            " keep",
+            "-old one",
+            "-old two",
+            "+new one",
+            " end",
+            "+tail",
+        ]
+        .map(String::from)
+        .to_vec();
+        let rows = side_rows(&lines);
+        assert_eq!(rows[0], SideRow::Head("diff --git a/A.kt b/A.kt".into()));
+        assert_eq!(rows[3], SideRow::Head("@@ -10,4 +10,4 @@ class A".into()));
+        assert_eq!(
+            rows[4..],
+            [
+                pair(Some((10, "keep")), Some((10, "keep")), false),
+                pair(Some((11, "old one")), Some((11, "new one")), true),
+                pair(Some((12, "old two")), None, true),
+                pair(Some((13, "end")), Some((12, "end")), false),
+                pair(None, Some((13, "tail")), true),
+            ]
+        );
+    }
 }

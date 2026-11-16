@@ -3850,3 +3850,83 @@ fn e2e_tab_close_button_closes_the_tab() {
     key(&mut h, Modifiers::COMMAND, Key::W);
     assert!(h.state().tabs.is_empty(), "⌘W closed the last tab");
 }
+
+#[test]
+fn e2e_tab_of_a_deleted_file_closes() {
+    let f = Fixture::new("tabgone");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    open(&mut h, &user);
+    open(&mut h, &card);
+    // UserCard.kt has an edit that was never saved, User.kt has none
+    place_cursor(&mut h, "fun ", 0);
+    type_text(&mut h, "// edit\n");
+    std::fs::remove_file(&user).unwrap();
+    std::fs::remove_file(&card).unwrap();
+    wait(&mut h, "both tabs marked deleted", |a| {
+        a.tabs.iter().filter(|t| t.deleted).count() == 2
+    });
+    // the × of a deleted file's tab closes it, edited or not
+    for _ in 0..2 {
+        let xs: Vec<_> = h.query_all_by_label(ic::X).collect();
+        xs[0].click();
+        steps(&mut h, 3);
+    }
+    assert!(h.state().tabs.is_empty(), "{:?}", h.state().status);
+}
+
+#[test]
+fn e2e_sidebar_pull_requests_open_a_file_diff_beside_the_editor() {
+    let f = Fixture::new("prsidebar");
+    let mut h = f.harness();
+    // gh needs GitHub: the lists and the PR's files come in as gh would send them
+    let item = |n, t: &str| crate::git::PrItem {
+        number: n,
+        title: t.into(),
+        author: "ana".into(),
+        draft: false,
+        url: String::new(),
+        review: "APPROVED".into(),
+    };
+    {
+        let s = h.state_mut();
+        s.prs
+            .lists
+            .insert(crate::git::PrFilter::Mine, Ok(vec![item(7, "Fix login")]));
+        s.prs
+            .lists
+            .insert(crate::git::PrFilter::Review, Ok(vec![item(9, "Add cards")]));
+    }
+    h.get_by_label(&format!("{}  Pull requests", ic::GIT_PULL_REQUEST))
+        .click();
+    steps(&mut h, 3);
+    assert!(h.query_by_label("#7 Fix login").is_some(), "your PRs first");
+    h.get_by_label("Awaiting your review").click();
+    steps(&mut h, 3);
+    assert!(h.query_by_label("#7 Fix login").is_none());
+    assert!(
+        h.query_by_label("#9 Add cards").is_some(),
+        "the review filter"
+    );
+    // an opened PR lists its files; a file's diff opens in the side panel, side by side
+    let diff = "diff --git a/A.kt b/A.kt\n@@ -1 +1 @@\n-val a = 1\n+val a = 2\n";
+    h.state_mut().prs.open = Some((9, Some(Ok(vec![("app/A.kt".into(), diff.into())]))));
+    steps(&mut h, 3);
+    h.get_by_label("A.kt").click();
+    wait(&mut h, "diff panel", |a| {
+        a.commit_lines()
+            .is_some_and(|l| l.iter().any(|l| l == "+val a = 2"))
+    });
+    assert!(
+        h.query_by_label("Side by side").is_some(),
+        "docked panel, not a window"
+    );
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert!(h.state().commit_lines().is_none(), "Esc closes the diff");
+    // back to the Project tree
+    h.get_by_label(&format!("{}  Project", ic::TREE_STRUCTURE))
+        .click();
+    steps(&mut h, 2);
+    assert!(!h.state().prs.shown);
+}
