@@ -315,6 +315,31 @@ fn flat(
 }
 
 /// A flat toolbar button whose hover fill fades in and out.
+/// Width of `text` on one line in `font`.
+pub fn text_width(ui: &egui::Ui, text: &str, font: &egui::FontId) -> f32 {
+    ui.fonts_mut(|f| f.layout_no_wrap(text.to_string(), font.clone(), egui::Color32::WHITE).size().x)
+}
+
+/// `text` cut to fit `max` points on one line, ending in "…" when cut (never broken mid-word onto a
+/// second line). Callers show the full text on hover.
+pub fn elide(ui: &egui::Ui, text: &str, font: &egui::FontId, max: f32) -> String {
+    if text_width(ui, text, font) <= max {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let (mut lo, mut hi) = (0, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let s: String = chars[..mid].iter().chain(std::iter::once(&'…')).collect();
+        if text_width(ui, &s, font) <= max {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    chars[..lo].iter().chain(std::iter::once(&'…')).collect()
+}
+
 pub fn button(
     ui: &mut egui::Ui,
     enabled: bool,
