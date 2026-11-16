@@ -248,7 +248,9 @@ fn start_worker(base: &Path, sock: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// `DROID_LITE_JAVA`, else `$JAVA_HOME/bin/java`, else macOS's java_home for 17, else `java`.
+/// The JVM for the worker: `DROID_LITE_JAVA`, else `$JAVA_HOME/bin/java`, else a JDK 17 (what layoutlib
+/// is built for: macOS's java_home, then Homebrew's openjdk@17), else a newer one, else `java`. An app
+/// opened from Finder has no JAVA_HOME, so the lookup must not depend on the shell.
 fn java() -> PathBuf {
     if let Some(j) = std::env::var_os("DROID_LITE_JAVA") {
         return j.into();
@@ -256,12 +258,22 @@ fn java() -> PathBuf {
     if let Some(h) = std::env::var_os("JAVA_HOME") {
         return Path::new(&h).join("bin/java");
     }
-    Command::new("/usr/libexec/java_home")
-        .args(["-v", "17+"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| Path::new(String::from_utf8_lossy(&o.stdout).trim()).join("bin/java"))
+    let java_home = |v: &str| {
+        Command::new("/usr/libexec/java_home")
+            .args(["-v", v])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| Path::new(String::from_utf8_lossy(&o.stdout).trim()).join("bin/java"))
+    };
+    java_home("17")
+        .or_else(|| {
+            ["/opt/homebrew/opt/openjdk@17/bin/java", "/usr/local/opt/openjdk@17/bin/java"]
+                .iter()
+                .map(PathBuf::from)
+                .find(|p| p.exists())
+        })
+        .or_else(|| java_home("17+"))
         .unwrap_or_else(|| "java".into())
 }
 
