@@ -29,6 +29,56 @@ You can also press **Open project…**, or drop a folder on the window. The last
 To get a normal Mac app with the icon, run `scripts/bundle-mac.sh`, then copy `target/release/Droid Lite.app` to `/Applications`.
 
 
+## VS Code and Cursor plugin
+
+The same engine also runs as an extension for VS Code, Cursor and other VS Code based editors
+(`vscode/`). It talks to `droid-lite serve`, a headless mode of this app (JSON lines over stdin and
+stdout), so a feature fixed in one shows up in both. The extension is about 8 MB: the engine is
+inside it, nothing else to install.
+
+What it adds:
+
+- **Compose preview** beside the editor: the preview icon at the top right of a `.kt` file, the
+  Droid Lite sidebar or the status bar menu. Same renderer as the app, no Gradle run, drawn again on
+  save. Unchanged files show their pictures at once from the preview cache.
+- **Code links** above Kotlin and Java declarations: implementations, overrides, supertypes,
+  expect/actual. Click one to jump or to see the list.
+- **Compose stability** like the app: a coloured badge after each `fun` line and parameter line
+  (stable, unstable, runtime, unknown), the reasons on hover.
+- **Device tools**: screenshot, screen recording and logcat. The status bar button shows the
+  connected phone and opens every tool; the Droid Lite icon in the left bar lists them in groups.
+- **Pull requests**: it brings GitHub Pull Requests with it ("Created by me", "Waiting for my
+  review", side by side diffs).
+
+### Install the plugin
+
+1. Build the `.vsix` (Mac with Apple Silicon):
+
+   ```sh
+   scripts/package-vsix.sh
+   ```
+
+   It builds the engine, runs the extension test and writes
+   `vscode/droid-lite-darwin-arm64-<version>.vsix`.
+2. Install it in one of these ways:
+   - VS Code or Cursor: Extensions panel → `...` → **Install from VSIX...** → pick the file.
+   - Terminal: `code --install-extension vscode/droid-lite-darwin-arm64-<version>.vsix`
+     (Cursor: `cursor --install-extension …`).
+3. Open the Android project folder (the one with `settings.gradle(.kts)`) and click **Trust** when
+   VS Code asks. In Restricted Mode VS Code keeps the extension off, because it runs the engine and
+   `adb`.
+4. For a newer version, install the new `.vsix` the same way, then ⌘⇧P → **Reload Window**.
+
+Good to know:
+
+- VS Code has no Kotlin language without a Kotlin extension; the plugin works on `.kt` files anyway
+  (it goes by file name). Add a Kotlin extension only for syntax colours.
+- Turn off VS Code's own Gradle import for Android projects: it starts a Gradle daemon (several
+  GB) on every folder open. In user settings: `"java.import.gradle.enabled": false` and
+  `"gradle.autoDetect": "off"`.
+- Settings: `droidLite.enginePath` (use another `droid-lite` binary), `droidLite.logcatHistory`
+  (lines shown from before logcat starts, 500).
+
 ## Features
 
 | Area | What you get |
@@ -56,7 +106,7 @@ To get a normal Mac app with the icon, run `scripts/bundle-mac.sh`, then copy `t
 | Autocomplete | Project symbols and keywords as you type (⌃Space to force). Adds the `import` for you. Type-aware items come from kotlin-lsp when it is installed |
 | Library symbols | The project's dependencies (and theirs, from the `.pom` files) are read from the Gradle cache for Go to class, Go to symbol and autocomplete: full declarations from source jars, class names and Kotlin top-level functions from jars and aars. Each artifact is read once and kept in `~/Library/Caches/droid-lite/libs` (Gradle never changes a downloaded artifact), so the next start takes about 0.2 s instead of about 5 s on a large project. A changed file is read again. Delete that folder to start fresh |
 | Compose analyser | The UI call tree of each composable. Parameter stability from skydoves' compose-stability-analyzer (`stabilityDump`) or Compose compiler reports, with a local guess when there is neither. Compose checks: `modifier` rules, naming, `mutableStateOf` without `remember`, effects without keys, `collectAsState` vs `collectAsStateWithLifecycle`, ViewModel parameters |
-| Preview render | Only for a module that already applies a screenshot tool (Google's Compose Preview Screenshot Testing, Paparazzi or Roborazzi): the Compose panel runs that tool's task and shows the PNGs for the previews in the open file. Other modules get no image in the IDE, only "▶ Run preview on the device" (below). Rendering any module's previews in the IDE is in progress |
+| Preview render | The Compose panel draws every `@Preview` of the open file (Light and Dark, font scales, sizes, like Android Studio), when the file opens and on save. No Gradle run: a warm preview worker compiles the file and the project code it needs, and renders with layoutlib. The renderer (14 jars and layoutlib's data) is taken from the Gradle cache when it is there, else downloaded once in the background (about 175 MB, checksums checked, the card shows the progress); offline and missing, the card names what is missing. The project's own libraries come from the Gradle cache, so a project must have been built once. First picture about 25 s, then a few seconds. Preview cache: an unchanged file shows its pictures at once; at most 20 pictures, none older than 30 minutes |
 | Refactor | Rename (⇧F6) with a preview of every change; you can untick lines. kotlin-lsp does the rename when it runs, else a code-only text search (strings and comments are skipped). It also renames `Old.kt` when the class matches the file. Extract variable (⌥⌘V), optimize imports (⌃⌥O, keeps the order), and undo the last refactoring from the Refactor menu |
 | Files on disk | The project folder is watched. An open file without edits reloads by itself; with edits you choose Reload or Keep mine. New and deleted files update the tree and the index. New stability dumps and compiler reports load by themselves |
 | Git (GitLens-style) | Grey "author, time • summary" after the cursor's line; hover for the full commit, click for its diff. A blame column with author and age per block (Pull request tab → Blame column). The Pull request tab lists every commit that changed the open file (follows renames). Blame uses the editor text, so unsaved lines show "Not committed yet". Change bars next to the line numbers (green added, blue changed, red deleted): bright for changes not committed yet (click to revert one), dim for what this branch changed since its base, the parent branch or PR set in the Pull request tab (else develop / main), so committed PR work stays visible |
@@ -137,7 +187,7 @@ Use it with `DROID_LITE_OPEN=<file>`, `DROID_LITE_SEARCH=<query>` or `DROID_LITE
 
 ## Limits (v0.1)
 
-- Live preview while you type is not built. Preview images need a screenshot tool in the module (see Preview render) and come from a Gradle run, which takes from seconds to minutes.
+- Live preview while you type is not built: previews draw on open and on save. Code that only Gradle generates (data binding, view binding, BuildConfig, KSP) cannot compile in the preview; the card shows the error.
 - Without kotlin-lsp there is no member completion after `.`, and no live errors while you type: compile errors show only after a Build (Gradle).
 - No debugger, Layout Inspector or emulator manager yet.
 - Rename without kotlin-lsp matches by name, so two different symbols with the same name both show up in the preview. Untick the wrong ones.
