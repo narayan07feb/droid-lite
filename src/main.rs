@@ -21,6 +21,7 @@ mod logcat;
 mod lsp;
 mod plugins;
 mod preview;
+mod preview_spec;
 mod preview_src;
 mod project;
 mod refactor;

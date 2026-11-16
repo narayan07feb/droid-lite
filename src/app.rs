@@ -302,6 +302,8 @@ struct Previews {
     progress: Option<(u64, u64)>,
     /// The previews being drawn, so their loading cards show before the pictures come.
     pending: Vec<String>,
+    /// The card open full size.
+    zoom: Option<usize>,
     /// The file and the hash of its saved text last sent, so each open or save renders once.
     sent: Option<(PathBuf, u64)>,
 }
@@ -3316,6 +3318,7 @@ impl App {
         let mut jump: Option<usize> = None;
         let mut pick = None;
         let mut render = false;
+        let mut zoom: Option<usize> = None;
         let mut render_req: Option<crate::preview::Request> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -3430,14 +3433,21 @@ impl App {
                         ui.label(RichText::new(&self.previews.note).weak());
                     }
                     if mine {
-                        for (name, card) in &self.previews.cards {
+                        for (i, (name, card)) in self.previews.cards.iter().enumerate() {
                             ui.add_space(6.0);
                             ui.label(RichText::new(name).strong()).on_hover_text(name);
                             match card {
                                 Ok(tex) => {
+                                    // the whole picture, scaled to the panel's width; a click opens it full size
                                     let size = tex.size_vec2();
-                                    let w = ui.available_width().min(size.x / 2.0);
-                                    ui.image((tex.id(), egui::vec2(w, size.y * w / size.x)));
+                                    let w = ui.available_width() - 4.0;
+                                    let r = ui
+                                        .add(egui::Image::new((tex.id(), egui::vec2(w, size.y * w / size.x))).sense(egui::Sense::click()))
+                                        .on_hover_cursor(egui::CursorIcon::ZoomIn)
+                                        .on_hover_text("Open full size");
+                                    if r.clicked() {
+                                        zoom = Some(i);
+                                    }
                                 }
                                 Err(e) => {
                                     ui.label(RichText::new(e).monospace().color(ERROR));
@@ -3475,6 +3485,28 @@ impl App {
         }
         if let Some(o) = jump {
             self.open_file(&path, Some(o));
+        }
+        if zoom.is_some() {
+            self.previews.zoom = zoom;
+        }
+        if let Some(i) = self.previews.zoom
+            && let Some((name, Ok(tex))) = self.previews.cards.get(i)
+        {
+            // full size: the picture at its pixels (half on a Retina screen, as rendered at 2x)
+            let mut open = true;
+            let size = tex.size_vec2() / 2.0;
+            egui::Window::new(name.as_str())
+                .id(egui::Id::unique("preview_zoom"))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_size(size.min(egui::vec2(900.0, 900.0)))
+                .show(ui.ctx(), |ui| {
+                    egui::ScrollArea::both().show(ui, |ui| ui.image((tex.id(), size)));
+                });
+            if !open {
+                self.previews.zoom = None;
+            }
         }
         if render && let Some(r) = render_req {
             let ctx = ui.ctx().clone();
@@ -3885,7 +3917,13 @@ impl eframe::App for App {
                     });
                     ui.separator();
                     match self.right {
-                        Right::Compose => self.compose_panel(ui),
+                        // the whole panel scrolls: preview cards can be taller than the window
+                        Right::Compose => {
+                            egui::ScrollArea::vertical()
+                                .id_salt("compose_panel_scroll")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| self.compose_panel(ui));
+                        }
                         Right::PullRequest => {
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])

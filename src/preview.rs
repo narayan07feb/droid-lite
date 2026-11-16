@@ -93,6 +93,19 @@ struct Own {
     key: String,
 }
 
+/// The pictures the file's preview functions ask for (Light and Dark, font scales, sizes…), from
+/// their annotations and the project's annotation classes.
+fn specs_for(text: &str, functions: &[String], classes: &std::collections::HashMap<String, String>) -> Vec<crate::preview_spec::Spec> {
+    functions
+        .iter()
+        .flat_map(|f| {
+            let at = [format!("fun {f}("), format!("fun {f} (")].iter().find_map(|p| text.find(p.as_str()));
+            let ann = at.map(|i| crate::preview_spec::annotations_before(text, i)).unwrap_or_default();
+            crate::preview_spec::specs(f, &ann, classes)
+        })
+        .collect()
+}
+
 /// Follows the open file's imports through the project (main sources only), writes the R classes of
 /// the modules it uses, and hashes it all, so the worker compiles this code once per change.
 fn own_code(pk: &crate::preview_src::Packages, open: &Path) -> Result<Own, String> {
@@ -280,6 +293,12 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
         };
         // never Kotlin's own compiler-side jars on the worker's classpath: the worker's compiler would
         // load them as plugins (a scripting plugin of another version crashed it); it brings its stdlib
+        let specs = {
+            let text = std::fs::read_to_string(&r.file).unwrap_or_default();
+            let empty = std::collections::HashMap::new();
+            let classes = packages.as_ref().map_or(&empty, |(_, p)| &p.annotation_classes);
+            specs_for(&text, &r.previews, classes)
+        };
         let rt = ProjectRuntime {
             jars: cp.iter().filter(|j| !j.contains("/org.jetbrains.kotlin/")).cloned().collect(),
             assets: if cp.is_empty() { Vec::new() } else { assets.clone() },
@@ -311,7 +330,7 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
             send(Event::Status(format!("Sending {} preview(s) to the worker", r.previews.len()), None));
             id += 1;
             let (w, rd) = conn.as_mut().unwrap();
-            match ask(w, rd, id, &r, &cp, own.as_ref(), &send) {
+            match ask(w, rd, id, &r, &specs, &cp, own.as_ref(), &send) {
                 Ok(e) => {
                     send(e);
                     last_error.clear();
@@ -702,9 +721,19 @@ fn fnv(s: &str) -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn ask(w: &mut UnixStream, rd: &mut BufReader<UnixStream>, id: u64, r: &Request, cp: &[String], own: Option<&Own>, send: &dyn Fn(Event)) -> Result<Event, String> {
+fn ask(
+    w: &mut UnixStream,
+    rd: &mut BufReader<UnixStream>,
+    id: u64,
+    r: &Request,
+    specs: &[crate::preview_spec::Spec],
+    cp: &[String],
+    own: Option<&Own>,
+    send: &dyn Fn(Event),
+) -> Result<Event, String> {
     let line = serde_json::json!({
-        "id": id, "file": r.file, "class": r.class, "previews": r.previews, "cp": cp,
+        "id": id, "file": r.file, "class": r.class, "cp": cp,
+        "previews": specs.iter().map(crate::preview_spec::Spec::json).collect::<Vec<_>>(),
         "sources": own.map_or(&[][..], |o| &o.sources[..]),
         "rjava": own.map_or(&[][..], |o| &o.rjava[..]),
         "key": own.map_or("", |o| o.key.as_str()),
@@ -735,6 +764,9 @@ fn ask(w: &mut UnixStream, rd: &mut BufReader<UnixStream>, id: u64, r: &Request,
             .flatten()
             .map(|img| {
                 let name = img["name"].as_str().unwrap_or("").to_string();
+                if let Some(e) = img["error"].as_str() {
+                    return (name, Err(short_error(e, &r.file)));
+                }
                 let png = img["png"].as_str().unwrap_or("");
                 let pic = image::open(png)
                     .map(|i| {
@@ -742,7 +774,9 @@ fn ask(w: &mut UnixStream, rd: &mut BufReader<UnixStream>, id: u64, r: &Request,
                         egui::ColorImage::from_rgba_unmultiplied([i.width() as usize, i.height() as usize], i.as_raw())
                     })
                     .map_err(|e| format!("Could not read the picture: {e}"));
-                let _ = std::fs::remove_file(png); // the texture holds it now
+                if std::env::var_os("DROID_LITE_KEEP_PREVIEW_PNGS").is_none() {
+                    let _ = std::fs::remove_file(png); // the texture holds it now
+                }
                 (name, pic)
             })
             .collect();

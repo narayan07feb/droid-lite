@@ -12,6 +12,9 @@ pub struct Packages {
     names: HashMap<PathBuf, BTreeSet<String>>,
     /// Module namespace (from `namespace = "…"`) -> the module's res folder.
     res_by_namespace: HashMap<String, PathBuf>,
+    /// The project's annotation classes (a multipreview like `@ThemePreviews`): name -> the annotations
+    /// written above it.
+    pub annotation_classes: HashMap<String, String>,
 }
 
 /// A Kotlin or Java file outside test code and build output: no folder on its path is a test source
@@ -96,11 +99,15 @@ impl Packages {
         let mut by_package: HashMap<String, Vec<PathBuf>> = HashMap::new();
         let mut names = HashMap::new();
         let mut res_by_namespace = HashMap::new();
+        let mut annotation_classes = HashMap::new();
         for f in files {
             if is_main_source(f) {
                 if let Ok(text) = std::fs::read_to_string(f) {
                     by_package.entry(package_of(&text)).or_default().push(f.clone());
                     names.insert(f.clone(), declared(&text));
+                    if text.contains("annotation class ") {
+                        annotation_classes.extend(crate::preview_spec::annotation_classes(&text));
+                    }
                 }
             } else if f.file_name().is_some_and(|n| n == "build.gradle.kts" || n == "build.gradle")
                 && let Some(dir) = f.parent()
@@ -118,7 +125,7 @@ impl Packages {
                 }
             }
         }
-        Packages { by_package, names, res_by_namespace }
+        Packages { by_package, names, res_by_namespace, annotation_classes }
     }
 
     /// The package an import points into: the longest prefix that is a project package.

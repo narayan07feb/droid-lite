@@ -26,10 +26,11 @@ while True:
             reply = {"id": r["id"], "ok": False, "error": r["file"] + ":3:5: error: unresolved reference 'Oops'."}
         else:
             images = []
-            for p in r["previews"]:
-                png = os.path.join(work, f"{r['id']}-{p}.png")
+            for i, p in enumerate(r["previews"]):
+                name = p["title"] if isinstance(p, dict) else p
+                png = os.path.join(work, f"{r['id']}-{i}.png")
                 shutil.copy(os.environ["FAKE_PREVIEW_PNG"], png)
-                images.append({"name": p, "png": png, "ms": 1})
+                images.append({"name": name, "png": png, "ms": 1})
             reply = {"id": r["id"], "ok": True, "images": images, "compile_ms": 1}
         f.write(json.dumps(reply) + "\n")
         f.flush()
