@@ -259,7 +259,7 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   const props = pkg.contributes.configuration.properties;
   check('enginePath is a machine setting', props['droidLite.enginePath'].scope === 'machine');
   check('logcatMaxLines setting', props['droidLite.logcatMaxLines'].default === 20000);
-  check('version 0.5.2', pkg.version === '0.5.2');
+  check('version 0.5.3', pkg.version === '0.5.3');
   check('Allow… on a test item that needs an OK', pkg.contributes.menus['testing/item/context']
     .some((m) => m.command === 'droidLite.allowTestPlugin' && /testId =~ \/\^needs-ok:\//.test(m.when)));
 

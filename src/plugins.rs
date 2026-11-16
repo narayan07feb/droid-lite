@@ -18,8 +18,10 @@ pub struct Named {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Manifest {
     pub name: String,
-    /// The plugin's folder (`{plugin}`).
+    /// The plugin's folder, as found.
     pub folder: PathBuf,
+    /// Its real path (links resolved): `{plugin}`, as in the VS Code extension.
+    pub real: PathBuf,
     /// Where its commands run: `dir` in the manifest, else the plugin's folder.
     pub dir: PathBuf,
     pub list: Option<Vec<String>>,
@@ -34,6 +36,9 @@ pub struct Manifest {
     /// Its commands may run: a plugin of the user's own folder, or a project plugin the user
     /// allowed with exactly these files ([`approve`]). [`Manifest::command`] refuses otherwise.
     pub allowed: bool,
+    /// Why a project plugin can no longer run at all: its folder, checked again, links outside the
+    /// project, holds a link or is too big. It can never run or be allowed (no OK to give).
+    pub broken: Option<String>,
 }
 
 /// What a project plugin is allowed under: the real path of the project, the real path of the
@@ -136,7 +141,7 @@ impl Manifest {
             .unwrap_or_else(|_| folder.to_path_buf());
         let dir = match v.get("dir").and_then(Value::as_str) {
             Some(d) => normalize(&real.join(expand_home(d))),
-            None => real,
+            None => real.clone(),
         };
         let links = v
             .get("links")
@@ -149,6 +154,7 @@ impl Manifest {
         Ok(Manifest {
             name,
             folder: folder.to_path_buf(),
+            real,
             dir,
             list: v.get("list").and_then(argv),
             run: v.get("run").and_then(argv),
@@ -158,6 +164,7 @@ impl Manifest {
             links,
             trust: None,
             allowed: false,
+            broken: None,
         })
     }
 
@@ -178,22 +185,29 @@ impl Manifest {
         out
     }
 
-    /// What the Tests tab shows for a project plugin that is not allowed yet.
+    /// What the Tests tab shows for a project plugin that is not allowed yet: its commands, and
+    /// where they run when that is not its own folder (`dir`), as the VS Code extension's OK does.
     pub fn approval_text(&self) -> String {
         let cmds: Vec<String> = self.commands().iter().map(|a| format!("{a:?}")).collect();
+        let dir = if self.dir == self.real {
+            String::new()
+        } else {
+            format!("\nRuns in: {}", self.dir.display())
+        };
         format!(
-            "Needs your OK: runs {} from {}\nAllowing trusts this plugin's folder. Commands may also \
-             run project code outside it (for example a script in the repo); changes to that code do \
-             not ask again.",
+            "Needs your OK: runs {} from {}{dir}\nAllowing trusts this plugin's folder. Commands may \
+             also run project code outside it (for example a script in the repo); changes to that \
+             code do not ask again.",
             cmds.join(", "),
             self.folder.display()
         )
     }
 
-    /// The command for `argv`, with `{plugin}`, `{project}` and `{id}` filled in, run in `dir`.
-    /// Its stdin is empty: a plugin must never wait for typed input. An error for a project plugin
-    /// the user has not allowed ([`Manifest::allowed`]): nothing of it runs. A project plugin's
-    /// folder is checked again first (`unchanged`).
+    /// The command for `argv`, with `{plugin}` (the real folder), `{project}` and `{id}` filled
+    /// in, run in `dir`. Its stdin is empty: a plugin must never wait for typed input. An error for
+    /// a project plugin the user has not allowed ([`Manifest::allowed`]): nothing of it runs. A
+    /// project plugin's folder is checked again first ([`Manifest::recheck`]), and Python writes
+    /// no `__pycache__` into it (that would change the folder and ask for the OK again).
     pub fn command(
         &mut self,
         argv: &[String],
@@ -201,12 +215,15 @@ impl Manifest {
         id: &str,
     ) -> Result<Command, String> {
         if !self.allowed {
-            return Err(format!("{} needs your OK first (Tests tab)", self.name));
+            return Err(match &self.broken {
+                Some(why) => why.clone(),
+                None => format!("{} needs your OK first (Tests tab)", self.name),
+            });
         }
-        self.unchanged()?;
+        self.recheck()?;
         let project = project.map(|p| p.display().to_string()).unwrap_or_default();
         let fill = |s: &str| {
-            s.replace("{plugin}", &self.folder.display().to_string())
+            s.replace("{plugin}", &self.real.display().to_string())
                 .replace("{project}", &project)
                 .replace("{id}", id)
         };
@@ -215,6 +232,9 @@ impl Manifest {
             .current_dir(&self.dir)
             .env("DROID_LITE_PROJECT", &project)
             .stdin(std::process::Stdio::null());
+        if self.trust.is_some() {
+            cmd.env("PYTHONDONTWRITEBYTECODE", "1");
+        }
         // its own process group, so Stop reaches the tools it starts too
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
@@ -224,8 +244,9 @@ impl Manifest {
     /// A project plugin's folder as it is on disk now must be the one the user allowed: read
     /// again (the same checks as when it was found) and hashed. When it is not, it is no longer
     /// allowed and is replaced by what its folder holds now (so the OK shows the new commands),
-    /// and the error says to allow it again. The user's own plugins pass.
-    fn unchanged(&mut self) -> Result<(), String> {
+    /// and the error says to allow it again; when the folder can no longer be checked at all
+    /// (links outside, too big), it is [`Manifest::broken`]. The user's own plugins pass.
+    pub fn recheck(&mut self) -> Result<(), String> {
         let Some(t) = &self.trust else {
             return Ok(());
         };
@@ -238,13 +259,22 @@ impl Manifest {
         if now.as_ref().is_ok_and(|m| m.trust.as_ref() == Some(t)) {
             return Ok(());
         }
-        let why = format!("{} changed since you allowed it; allow it again", self.name);
         self.allowed = false;
         match now {
             Ok(m) => *self = m,
-            Err(e) => return Err(format!("{why} ({e})")),
+            Err(e) => {
+                let why = format!(
+                    "{} changed since you allowed it and cannot run now ({e})",
+                    self.name
+                );
+                self.broken = Some(why.clone());
+                return Err(why);
+            }
         }
-        Err(why)
+        Err(format!(
+            "{} changed since you allowed it; allow it again",
+            self.name
+        ))
     }
 }
 
@@ -349,8 +379,10 @@ fn read_store(store: &Path) -> Result<Option<Value>, String> {
     }
 }
 
+/// Version 2 as a JSON number (`2.0` too, as the VS Code extension reads it), with an object of
+/// approvals.
 fn is_v2(v: &Value) -> bool {
-    v["version"] == 2 && v["approved"].is_object()
+    v["version"].as_f64() == Some(2.0) && v["approved"].is_object()
 }
 
 /// Whether the user allowed this project plugin, for this project, with exactly these files.
@@ -366,38 +398,68 @@ pub fn is_approved(store: &Path, m: &Manifest) -> bool {
 const LOCK_WAIT: Duration = Duration::from_secs(5);
 const LOCK_STALE: Duration = Duration::from_secs(30);
 
-/// `<store>.lock`, held until dropped (then removed).
-struct Lock(PathBuf);
+/// A number for names and lock tokens that no other call (of this or another process) uses.
+fn unique() -> u64 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::hash::BuildHasher::hash_one(
+        &std::collections::hash_map::RandomState::new(),
+        (
+            std::time::SystemTime::now(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ),
+    )
+}
+
+/// `<store>.lock`, holding this holder's token (its pid and a random number) until dropped.
+struct Lock {
+    path: PathBuf,
+    token: String,
+}
 
 impl Drop for Lock {
+    /// Removes the lock only while it still holds this token: one taken away as stale meanwhile
+    /// (and made again by another process) is not ours.
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        if std::fs::read_to_string(&self.path).is_ok_and(|t| t == self.token) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
 /// Takes the lock file `path` the way the VS Code extension does: created only when it does not
-/// exist yet, else tried again with a growing pause for up to [`LOCK_WAIT`]. A lock older than
-/// [`LOCK_STALE`] is removed first.
-fn lock(path: PathBuf) -> Result<Lock, String> {
-    let end = Instant::now() + LOCK_WAIT;
+/// exist yet, with this holder's token in it, else tried again with a growing pause for up to
+/// `patience`. Every try that fails waits and checks the time, whatever is in the way: a lock file
+/// older than [`LOCK_STALE`] is taken away ([`remove_stale`]); anything else (a fresh lock, a
+/// folder, a link, a stale lock that could not be taken away) is held.
+fn lock(path: PathBuf, patience: Duration) -> Result<Lock, String> {
+    let end = Instant::now() + patience;
     let mut wait = Duration::from_millis(10);
+    let token = format!("{} {:016x}", std::process::id(), unique());
     loop {
         let mut o = std::fs::OpenOptions::new();
         o.write(true).create_new(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
         match o.open(&path) {
-            Ok(_) => return Ok(Lock(path)),
+            Ok(mut f) => {
+                return match f.write_all(token.as_bytes()) {
+                    Ok(()) => Ok(Lock { path, token }),
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&path);
+                        Err(format!("{}: {e}", path.display()))
+                    }
+                };
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(format!("{}: {e}", path.display())),
         }
-        match std::fs::metadata(&path).and_then(|m| m.modified()) {
-            Ok(t) if t.elapsed().is_ok_and(|age| age > LOCK_STALE) => {
-                let _ = std::fs::remove_file(&path);
-                continue;
-            }
-            Err(_) => continue, // gone meanwhile: try again at once
-            Ok(_) => {}
+        if let Ok(md) = std::fs::symlink_metadata(&path)
+            && md.is_file()
+            && md
+                .modified()
+                .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > LOCK_STALE))
+        {
+            remove_stale(&path, &md);
         }
         if Instant::now() > end {
             return Err(format!(
@@ -410,12 +472,45 @@ fn lock(path: PathBuf) -> Result<Lock, String> {
     }
 }
 
+/// Takes away the stale lock file `path` that `seen` described: renamed to a name of its own
+/// first, then deleted only when what was renamed is still that file. Another process may have
+/// taken the stale one away and made a fresh lock meanwhile: that one is put back (unless a newer
+/// lock already took its place), so two processes taking away one stale lock never delete a fresh
+/// one.
+fn remove_stale(path: &Path, seen: &std::fs::Metadata) {
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(".stale.{}.{:016x}", std::process::id(), unique()));
+    let aside = PathBuf::from(aside);
+    if std::fs::rename(path, &aside).is_err() {
+        return;
+    }
+    if !std::fs::symlink_metadata(&aside).is_ok_and(|now| same_file(&now, seen)) {
+        let _ = std::fs::hard_link(&aside, path);
+    }
+    let _ = std::fs::remove_file(&aside);
+}
+
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    // a new file may get a freed inode number again: its time tells it apart
+    #[cfg(unix)]
+    let same = {
+        use std::os::unix::fs::MetadataExt;
+        a.dev() == b.dev() && a.ino() == b.ino()
+    };
+    #[cfg(not(unix))]
+    let same = a.len() == b.len();
+    same && a.modified().ok() == b.modified().ok()
+}
+
 /// Allows a project plugin as it was read ([`Manifest::trust`]), every other entry kept. Under
 /// the lock file `<store>.lock` ([`lock`]), shared with the VS Code extension, so two windows (or
 /// the extension) allowing at once keep both; written through a 0600 temp file and a rename. A
 /// file that is not a JSON object is never overwritten; one of another shape (the older flat map)
 /// is replaced.
 pub fn approve(store: &Path, m: &Manifest) -> Result<(), String> {
+    if let Some(why) = &m.broken {
+        return Err(why.clone());
+    }
     let t = m
         .trust
         .as_ref()
@@ -427,7 +522,7 @@ pub fn approve(store: &Path, m: &Manifest) -> Result<(), String> {
         .to_string_lossy();
     let err = |e: std::io::Error| format!("{}: {e}", store.display());
     std::fs::create_dir_all(dir).map_err(err)?;
-    let _lock = lock(dir.join(format!("{name}.lock")))?;
+    let _lock = lock(dir.join(format!("{name}.lock")), LOCK_WAIT)?;
     let mut v = match read_store(store)? {
         Some(v) if is_v2(&v) => v,
         _ => serde_json::json!({"version": 2, "approved": {}}),
@@ -438,11 +533,11 @@ pub fn approve(store: &Path, m: &Manifest) -> Result<(), String> {
     }
     project[&t.folder] = Value::String(t.hash.clone());
     let text = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())? + "\n";
-    let salt = std::hash::BuildHasher::hash_one(
-        &std::collections::hash_map::RandomState::new(),
-        std::time::SystemTime::now(),
-    );
-    let tmp = dir.join(format!("{name}.{}.{salt:016x}.tmp", std::process::id()));
+    let tmp = dir.join(format!(
+        "{name}.{}.{:016x}.tmp",
+        std::process::id(),
+        unique()
+    ));
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);
     #[cfg(unix)]
@@ -460,19 +555,20 @@ pub fn approve(store: &Path, m: &Manifest) -> Result<(), String> {
 const TREE_MAX_FILES: usize = 2000;
 const TREE_MAX_BYTES: u64 = 8 << 20;
 
-/// Every regular file under `root` (path relative to it, with `/`), sorted by path as UTF-8
-/// bytes. An error for a link anywhere inside, a name that is not UTF-8, or more than
-/// [`TREE_MAX_FILES`] files or [`TREE_MAX_BYTES`] bytes.
-fn tree(root: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
+/// One file of a plugin folder: its path relative to the folder (with `/`), its permission bits
+/// (`mode & 0o777`) and its bytes.
+type TreeFile = (String, u16, Vec<u8>);
+
+/// Every regular file under `root`, sorted by path as UTF-8 bytes. An error for a link anywhere
+/// inside (a file swapped for a link after the walk too: it is opened without following links), a
+/// name that is not UTF-8, or more than [`TREE_MAX_FILES`] files or [`TREE_MAX_BYTES`] bytes.
+fn tree(root: &Path) -> Result<Vec<TreeFile>, String> {
     let (mut files, mut total) = (Vec::new(), 0u64);
     let mut dirs = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, rel)) = dirs.pop() {
         for e in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
             let e = e.map_err(|e| e.to_string())?;
-            let name = e
-                .file_name()
-                .into_string()
-                .map_err(|n| format!("{n:?} is not a UTF-8 name"))?;
+            let name = utf8_name(e.file_name())?;
             let rel = if rel.is_empty() {
                 name
             } else {
@@ -484,12 +580,23 @@ fn tree(root: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
             } else if kind.is_dir() {
                 dirs.push((e.path(), rel));
             } else if kind.is_file() {
+                let f = open_no_link(&e.path()).map_err(|err| {
+                    if is_link_error(&err) {
+                        format!("contains links ({rel})")
+                    } else {
+                        format!("{rel}: {err}")
+                    }
+                })?;
                 let mut bytes = Vec::new();
-                std::fs::File::open(e.path())
-                    .and_then(|f| f.take(TREE_MAX_BYTES - total + 1).read_to_end(&mut bytes))
+                let mode = file_mode(&f)
+                    .and_then(|m| {
+                        f.take(TREE_MAX_BYTES - total + 1)
+                            .read_to_end(&mut bytes)
+                            .map(|_| m)
+                    })
                     .map_err(|e| format!("{rel}: {e}"))?;
                 total += bytes.len() as u64;
-                files.push((rel, bytes));
+                files.push((rel, mode, bytes));
                 if files.len() > TREE_MAX_FILES || total > TREE_MAX_BYTES {
                     return Err(format!(
                         "too big to check (over {TREE_MAX_FILES} files or {} MiB)",
@@ -503,14 +610,52 @@ fn tree(root: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     Ok(files)
 }
 
+/// A file name as the folder hash takes it: refused when it is not UTF-8 (the VS Code extension
+/// says the same).
+fn utf8_name(n: std::ffi::OsString) -> Result<String, String> {
+    n.into_string()
+        .map_err(|n| format!("{} is not a UTF-8 name", n.to_string_lossy()))
+}
+
+/// Opens `p` for reading; a link in its place is an error ([`is_link_error`]), never followed.
+fn open_no_link(p: &Path) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(target_os = "macos")]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut o, libc::O_NOFOLLOW);
+    o.open(p)
+}
+
+fn is_link_error(e: &std::io::Error) -> bool {
+    #[cfg(target_os = "macos")]
+    return e.raw_os_error() == Some(libc::ELOOP);
+    #[cfg(not(target_os = "macos"))]
+    return {
+        let _ = e;
+        false
+    };
+}
+
+/// The permission bits of an open file (`mode & 0o777`); 0 where there are none.
+fn file_mode(f: &std::fs::File) -> std::io::Result<u16> {
+    #[cfg(unix)]
+    return Ok(
+        (std::os::unix::fs::PermissionsExt::mode(&f.metadata()?.permissions()) & 0o777) as u16,
+    );
+    #[cfg(not(unix))]
+    return f.metadata().map(|_| 0);
+}
+
 /// SHA-256 (lowercase hex) over the [`tree`] of a plugin folder: for each file its path, one 0
-/// byte, its length as 8 bytes big-endian, then its bytes. The VS Code extension hashes the same.
-fn tree_hash(files: &[(String, Vec<u8>)]) -> String {
+/// byte, its length as 8 bytes big-endian, its permission bits as 2 bytes big-endian, then its
+/// bytes. The VS Code extension hashes the same.
+fn tree_hash(files: &[TreeFile]) -> String {
     let mut all = Vec::new();
-    for (path, bytes) in files {
+    for (path, mode, bytes) in files {
         all.extend_from_slice(path.as_bytes());
         all.push(0);
         all.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        all.extend_from_slice(&mode.to_be_bytes());
         all.extend_from_slice(bytes);
     }
     sha256_hex(&all)
@@ -529,9 +674,9 @@ fn project_plugin(folder: &Path, project: &Path, plugins: &Path) -> Result<Manif
     let files = tree(&real)?;
     let json = files
         .iter()
-        .find(|(p, _)| p == "plugin.json")
+        .find(|(p, _, _)| p == "plugin.json")
         .ok_or("no plugin.json")?;
-    let json = std::str::from_utf8(&json.1).map_err(|e| e.to_string())?;
+    let json = std::str::from_utf8(&json.2).map_err(|e| e.to_string())?;
     let mut m = Manifest::parse(json, folder)?;
     m.trust = Some(Trust {
         project: project.to_string_lossy().into_owned(),
@@ -1205,10 +1350,16 @@ mod tests {
         std::fs::write(dir.join("big"), vec![0u8; TREE_MAX_BYTES as usize]).unwrap();
         let e = m.command(&argvs[0], None, "").unwrap_err();
         assert!(
-            e.starts_with("P changed since you allowed it; allow it again (too big"),
+            e.starts_with("P changed since you allowed it and cannot run now (too big"),
             "{e}"
         );
         assert!(!m.allowed);
+        // it is an error now, never an OK to give: not with the hash it was allowed under either
+        assert_eq!(m.broken.as_deref(), Some(e.as_str()));
+        assert_eq!(m.command(&argvs[0], None, "").unwrap_err(), e);
+        let before = std::fs::read_to_string(&store).unwrap();
+        assert_eq!(approve(&store, &m).unwrap_err(), e);
+        assert_eq!(std::fs::read_to_string(&store).unwrap(), before);
         // the user's own plugins are not checked
         let mut own = Manifest::parse(json, &d.join("nowhere")).unwrap();
         own.allowed = true;
@@ -1330,16 +1481,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The vector the VS Code extension's test uses too.
+    /// Writes `text` to `p` with permission bits `mode`.
+    #[cfg(unix)]
+    fn write_mode(p: &Path, text: &str, mode: u32) {
+        std::fs::write(p, text).unwrap();
+        std::fs::set_permissions(p, std::os::unix::fs::PermissionsExt::from_mode(mode)).unwrap();
+    }
+
+    /// The vectors the VS Code extension's test uses too (recomputed with Python's hashlib).
+    #[cfg(unix)]
     #[test]
     fn tree_hash_of_a_fixed_folder() {
         let d = temp("vector");
         std::fs::create_dir_all(d.join("a")).unwrap();
-        std::fs::write(d.join("a.txt"), "x").unwrap();
-        std::fs::write(d.join("a/b"), "").unwrap();
-        std::fs::write(d.join("plugin.json"), r#"{"name":"T"}"#).unwrap();
+        write_mode(&d.join("a.txt"), "x", 0o644);
+        write_mode(&d.join("a/b"), "", 0o644);
+        write_mode(&d.join("plugin.json"), r#"{"name":"T"}"#, 0o644);
         let files = tree(&d).unwrap();
-        let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+        let paths: Vec<&str> = files.iter().map(|(p, _, _)| p.as_str()).collect();
         assert_eq!(
             paths,
             ["a.txt", "a/b", "plugin.json"],
@@ -1347,23 +1506,252 @@ mod tests {
         );
         assert_eq!(
             tree_hash(&files),
-            "785f791d17fa1ef53828f417bb59ba3da0d7e7e426a16e1839df07d75c88577f"
+            "b7b77b6b2174d5ec3f45452cb493a4a27fdce843557c41dcdecb1d7f98aff0bd"
         );
         let _ = std::fs::remove_dir_all(&d);
         // and the extension's own vector
         let d = temp("vector-js");
         std::fs::create_dir_all(d.join("sub")).unwrap();
-        std::fs::write(
-            d.join("plugin.json"),
+        write_mode(
+            &d.join("plugin.json"),
             r#"{"name":"V","list":["sh","list.sh"]}"#,
-        )
-        .unwrap();
-        std::fs::write(d.join("list.sh"), "echo []\n").unwrap();
-        std::fs::write(d.join("sub/a.txt"), "a").unwrap();
+            0o644,
+        );
+        write_mode(&d.join("list.sh"), "echo []\n", 0o755);
+        write_mode(&d.join("sub/a.txt"), "a", 0o600);
         assert_eq!(
             tree_hash(&tree(&d).unwrap()),
-            "85cf4b35bd11fc3ed3e9c64b0ad55846b230a2bd35e7fbf70122b98e1b8f3a5a"
+            "c8b8b3b7639db77b69849a4bdbd4858552d939e8f6a9e38e18d74f8ee18b1d1a"
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `chmod +x` on an allowed script changes what runs: the OK is asked again.
+    #[cfg(unix)]
+    #[test]
+    fn a_changed_file_mode_asks_for_the_ok_again() {
+        let d = temp("mode");
+        let dir = d.join("proj/.droid-lite/plugins/p");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("plugin.json"),
+            r#"{"name":"P","list":["./go.sh"]}"#,
+        )
+        .unwrap();
+        write_mode(&dir.join("go.sh"), "echo []\n", 0o644);
+        let store = approvals_file(&d.join("config"));
+        let found = || project_plugins(&d.join("proj"), Some(&store)).remove(0);
+        approve(&store, &found()).unwrap();
+        let mut loaded = found();
+        assert!(loaded.allowed);
+        write_mode(&dir.join("go.sh"), "echo []\n", 0o755);
+        assert!(!found().allowed, "the same bytes, another mode");
+        let list = loaded.list.clone().unwrap();
+        assert_eq!(
+            loaded.command(&list, None, "").unwrap_err(),
+            "P changed since you allowed it; allow it again"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_is_not_utf8_is_refused_with_the_extensions_words() {
+        use std::os::unix::ffi::OsStringExt;
+        let n = std::ffi::OsString::from_vec(b"a\xffb\xe2\x82".to_vec());
+        assert_eq!(
+            utf8_name(n).unwrap_err(),
+            "a\u{fffd}b\u{fffd} is not a UTF-8 name"
+        );
+        assert_eq!(utf8_name("plugin.json".into()).unwrap(), "plugin.json");
+    }
+
+    /// A file swapped for a link after the folder was listed is never followed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_link_in_place_of_a_file_is_never_opened() {
+        let d = temp("nofollow");
+        std::fs::write(d.join("target"), "secret").unwrap();
+        std::os::unix::fs::symlink(d.join("target"), d.join("link")).unwrap();
+        let e = open_no_link(&d.join("link")).unwrap_err();
+        assert!(is_link_error(&e), "{e}");
+        assert!(open_no_link(&d.join("target")).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `{plugin}` is the folder's real path, as in the VS Code extension; a project plugin's
+    /// commands get PYTHONDONTWRITEBYTECODE (no `__pycache__` in the folder), the user's do not need it.
+    #[cfg(unix)]
+    #[test]
+    fn plugin_is_the_real_folder_and_project_commands_write_no_bytecode() {
+        let d = temp("real-plugin");
+        let dir = d.join("proj/.droid-lite/plugins/real");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(&dir, d.join("proj/.droid-lite/plugins/via")).unwrap();
+        std::fs::write(
+            dir.join("plugin.json"),
+            r#"{"name":"P","list":["{plugin}/l.py","{plugin}"]}"#,
+        )
+        .unwrap();
+        let store = approvals_file(&d.join("config"));
+        let via = |s| {
+            project_plugins(&d.join("proj"), s)
+                .into_iter()
+                .find(|m| m.folder.ends_with("via"))
+                .unwrap()
+        };
+        approve(&store, &via(Some(&store))).unwrap();
+        let mut m = via(Some(&store));
+        let real = dir.canonicalize().unwrap();
+        assert_eq!(m.real, real);
+        let cmd = m.command(&m.list.clone().unwrap(), None, "").unwrap();
+        assert_eq!(cmd.get_program(), real.join("l.py"));
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), [real.as_os_str()]);
+        let env = |c: &Command| {
+            c.get_envs()
+                .find(|(k, _)| *k == "PYTHONDONTWRITEBYTECODE")
+                .and_then(|(_, v)| v.map(|v| v.to_owned()))
+        };
+        assert_eq!(env(&cmd), Some("1".into()));
+        let mut own = Manifest::parse(r#"{"name":"O","list":["x"]}"#, &dir).unwrap();
+        own.allowed = true;
+        assert_eq!(env(&own.command(&["x".into()], None, "").unwrap()), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_ok_says_where_the_commands_run_when_it_is_not_the_plugin_folder() {
+        let d = temp("runs-in");
+        std::fs::create_dir_all(d.join("p")).unwrap();
+        let m = Manifest::parse(r#"{"name":"P","list":["x"],"dir":".."}"#, &d.join("p")).unwrap();
+        let parent = d.canonicalize().unwrap();
+        assert!(
+            m.approval_text().contains(&format!(
+                "from {}\nRuns in: {}\nAllowing",
+                d.join("p").display(),
+                parent.display()
+            )),
+            "{}",
+            m.approval_text()
+        );
+        let own = Manifest::parse(r#"{"name":"P","list":["x"],"dir":"."}"#, &d.join("p")).unwrap();
+        assert!(!own.approval_text().contains("Runs in"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_store_whose_version_is_2_0_counts_as_version_2() {
+        for (text, v2) in [
+            (r#"{"version":2.0,"approved":{}}"#, true),
+            (r#"{"version":2,"approved":{}}"#, true),
+            (r#"{"version":"2","approved":{}}"#, false),
+            (r#"{"version":2.5,"approved":{}}"#, false),
+            (r#"{"version":2,"approved":[]}"#, false),
+        ] {
+            assert_eq!(is_v2(&serde_json::from_str(text).unwrap()), v2, "{text}");
+        }
+    }
+
+    /// Runs `lock` on a thread: an endless loop shows as a timeout, not a hung test.
+    fn lock_soon(path: &Path, patience: Duration) -> Result<String, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = path.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(lock(path, patience).map(|l| l.token.clone()));
+        });
+        rx.recv_timeout(patience + Duration::from_secs(3))
+            .unwrap_or_else(|_| panic!("still trying after {patience:?}: it spins"))
+    }
+
+    /// Whatever is in the way of the lock (an old folder, a dangling link, an old lock file that
+    /// cannot be taken away) waits and gives up in time, never spins, and is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_in_the_way_that_cannot_be_taken_is_held_and_never_spins() {
+        let d = temp("lock-odd");
+        let dir = d.join("dir.lock");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::File::open(&dir)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+        let link = d.join("link.lock");
+        std::os::unix::fs::symlink(d.join("nowhere"), &link).unwrap();
+        // a stale lock file in a folder that does not let it be renamed or removed
+        let ro = d.join("ro");
+        std::fs::create_dir_all(&ro).unwrap();
+        let stuck = ro.join("s.lock");
+        std::fs::write(&stuck, "1 old").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stuck)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+        let mode = |m| std::os::unix::fs::PermissionsExt::from_mode(m);
+        std::fs::set_permissions(&ro, mode(0o555)).unwrap();
+        for p in [&dir, &link, &stuck] {
+            let t0 = Instant::now();
+            let e = lock_soon(p, Duration::from_millis(300)).unwrap_err();
+            assert!(
+                e.ends_with("is held by another Droid Lite; try again"),
+                "{e}"
+            );
+            assert!(t0.elapsed() >= Duration::from_millis(300));
+            assert!(std::fs::symlink_metadata(p).is_ok(), "left alone: {p:?}");
+        }
+        std::fs::set_permissions(&ro, mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_holder_removes_only_its_own_lock() {
+        let d = temp("lock-token");
+        let path = d.join("s.lock");
+        let held = lock(path.clone(), Duration::ZERO).unwrap();
+        let token = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(token, held.token);
+        assert!(token.starts_with(&format!("{} ", std::process::id())));
+        drop(held);
+        assert!(!path.exists(), "its own lock: removed");
+        // taken away as stale and made again by another process meanwhile: not its to remove
+        let held = lock(path.clone(), Duration::ZERO).unwrap();
+        assert_ne!(held.token, token, "a token per lock");
+        std::fs::write(&path, "4242 another").unwrap();
+        drop(held);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "4242 another");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Two processes see one stale lock; the first takes it away and locks; the second, late,
+    /// must not delete that fresh lock.
+    #[test]
+    fn two_takers_of_one_stale_lock_never_delete_the_fresh_one() {
+        let d = temp("lock-stale-race");
+        let path = d.join("s.lock");
+        std::fs::write(&path, "1 old").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+        let seen = std::fs::symlink_metadata(&path).unwrap();
+        remove_stale(&path, &seen);
+        assert!(!path.exists(), "the first takes it away");
+        let fresh = lock(path.clone(), Duration::ZERO).unwrap();
+        remove_stale(&path, &seen);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            fresh.token,
+            "the fresh lock survives"
+        );
+        let names: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["s.lock"], "nothing left aside");
+        drop(fresh);
         let _ = std::fs::remove_dir_all(&d);
     }
 

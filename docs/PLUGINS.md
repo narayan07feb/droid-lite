@@ -35,16 +35,21 @@ it would run; **Allow** runs it from then on.
 - **The OK is for one project.** Allowing a plugin in one project does not allow it in another,
   even when both reach the same plugin folder.
 - **The OK is for the whole plugin folder.** A change to any file in it (`plugin.json`, a script,
-  a new or deleted file) asks again.
-- **The OK is checked before every command.** Droid Lite reads the folder again right before each
-  command the plugin runs (`list`, `run`, `watch`, a view, an action). When it changed since you
-  allowed it, nothing runs: you see "changed since you allowed it; allow it again" and the plugin
-  shows **Needs your OK** again.
+  a new or deleted file, a changed permission such as `chmod +x`) asks again. Every file counts,
+  hidden ones too (`.DS_Store` included): nothing in the folder is left out.
+- **The OK is checked before every command, and while one runs.** Droid Lite reads the folder again
+  right before each command the plugin runs (`list`, `run`, `watch`, a view, an action), and every
+  few seconds while one of them still runs. When it changed since you allowed it, nothing new runs
+  and what still runs (a `watch`, a run, an action) stops: you see "changed since you allowed it;
+  allow it again" and the plugin shows **Needs your OK** again. When the folder can no longer be
+  checked at all (below), the plugin shows the error instead, with no OK to give.
 - **Not for code outside the folder.** Allowing trusts this plugin's folder. Its commands may also
   run project code outside it (for example a script in the repo, or `dir` pointing elsewhere);
   changes to that code do not ask again.
 
 Some project plugins are refused (shown as an error in the tab, never runnable, never approvable):
+
+- a name in its folder that is not UTF-8 ("is not a UTF-8 name");
 
 - its folder links outside the project's `.droid-lite/plugins` folder, or the project's
   `.droid-lite` or `.droid-lite/plugins` folder links outside the project ("links outside the
@@ -57,7 +62,9 @@ Plugins you add yourself (`~/.config/droid-lite/plugins/`, **Add plugin…**) ne
 **For authors of project plugins:** every file in the plugin folder is part of the OK. Keep the
 plugin's own state, cache and log files outside its folder (for example under the project's build
 folder, or `~/Library/Caches/<your tool>`). A plugin that writes into its own folder changes it, so
-it is refused at its next command and asked about again on every load.
+it is stopped, refused at its next command and asked about again on every load. Every command of a
+project plugin runs with `PYTHONDONTWRITEBYTECODE=1`, so Python writes no `__pycache__` into it; a
+tool that writes other files there (or Finder's `.DS_Store`) still changes the folder.
 
 The OKs are kept in `approved-plugins.json` in the config folder (`$DROID_LITE_CONFIG_DIR` when it
 is set and not empty, else `~/.config/droid-lite`), shared by the app and the VS Code extension:
@@ -69,13 +76,18 @@ is set and not empty, else `~/.config/droid-lite`), shared by the app and the VS
 Real paths are the paths on disk with links resolved. The folder hash is SHA-256 (lowercase hex)
 over every regular file in the plugin folder, sorted by path relative to it (`/` between folders,
 compared as UTF-8 bytes); for each file: its path, one zero byte, its length as 8 bytes big-endian,
-then its bytes. A file of any other shape (the older flat map too) holds no OKs, so you are asked
-again, and the first **Allow** replaces it. A file that is not a JSON object is never overwritten:
+its permission bits (`mode & 0o777`) as 2 bytes big-endian, then its bytes. (OKs saved before the
+permission bits were part of the hash ask again once.) `"version"` is the number 2 (`2.0` counts
+too, the text `"2"` does not). A file of any other shape (the older flat map too) holds no OKs, so
+you are asked again, and the first **Allow** replaces it. A file that is not a JSON object is never overwritten:
 fix or delete it. Delete an entry to be asked again.
 
 A write takes the lock file `approved-plugins.json.lock` next to it: created only when it does not
-exist, tried again for about 5 s, and removed after the write. A lock file older than 30 s was left
-by a process that stopped, and is removed.
+exist, with the holder's token in it (its process id and a random number), tried again with a short
+pause for about 5 s, and removed after the write only while it still holds that token. A lock file
+older than 30 s was left by a process that stopped: it is renamed to a name of its own, then
+deleted only when it is still that same file (so two processes never delete each other's fresh
+lock). Anything else in its place (a folder, a link) counts as held and is left alone.
 
 ## plugin.json
 
@@ -104,7 +116,8 @@ by a process that stopped, and is removed.
 | `links` | no | Links that open in the browser |
 
 Each command is an argv array, not a shell line, so spaces in an id are safe. In every argument:
-`{plugin}` is the plugin folder, `{project}` the open project, `{id}` the case id. The command also
+`{plugin}` is the plugin folder's real path (links resolved), `{project}` the open project, `{id}`
+the case id. The command also
 gets `DROID_LITE_PROJECT` in its environment. Its stdin is empty: never wait for typed input.
 
 **Stop** sends `SIGTERM` to the command's process group, so the tools it started get it too. If
@@ -156,7 +169,8 @@ One JSON object per line, each time the state changes:
 ```
 
 The newest line replaces the panel. Droid Lite starts `watch` when the Tests tab shows and stops
-it when the tab hides, so it costs nothing in the background.
+it when the tab hides, so it costs nothing in the background. A `watch` that ends is started again
+after a pause (1 s, then doubled each time it ends soon, up to 30 s).
 
 ## views: lists
 

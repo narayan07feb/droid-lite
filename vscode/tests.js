@@ -26,16 +26,35 @@ const TRUST = "Allowing trusts this plugin's folder. Commands may also run proje
 const MAX_TREE_FILES = 2000;
 const MAX_TREE_BYTES = 8 << 20;
 
+const utf8 = new TextDecoder('utf-8', { fatal: true });
+// a file name as the tree hash takes it: refused when it is not UTF-8 (the app says the same)
+function utf8Name(n) {
+  try { utf8.decode(n); } catch { throw new Error(`${n.toString('utf8')} is not a UTF-8 name`); }
+  return n;
+}
+
+// at most `max` bytes of the open file `fd` (a file that grew since the walk is never read whole)
+function readUpTo(fd, max) {
+  const chunks = [];
+  const buf = Buffer.alloc(Math.min(max, 64 << 10));
+  let n = 0;
+  for (let r; n < max && (r = fs.readSync(fd, buf, 0, Math.min(buf.length, max - n), null)) > 0; n += r) {
+    chunks.push(Buffer.from(buf.subarray(0, r)));
+  }
+  return Buffer.concat(chunks, n);
+}
+
 // the tree hash of a plugin folder (shared with the app, byte for byte): SHA-256 over every regular
 // file under it, sorted by relative path ('/' separators) compared as UTF-8 bytes; per file its
-// path, one 0 byte, its length (8 bytes, big-endian) and its bytes. Lowercase hex. A link anywhere
-// inside, or more than 2000 files or 8 MiB, throws. Also gives the plugin.json bytes it hashed, so
-// what the user sees is what the OK covers.
+// path, one 0 byte, its length (8 bytes, big-endian), its permission bits (mode & 0o777, 2 bytes,
+// big-endian) and its bytes. Lowercase hex. A link anywhere inside, a name that is not UTF-8, or
+// more than 2000 files or 8 MiB, throws. Also gives the plugin.json bytes it hashed, so what the
+// user sees is what the OK covers.
 function treeHash(folder) {
   const files = []; // [relative path, absolute path], as bytes
   let total = 0;
   const walk = (abs, rel) => {
-    for (const n of fs.readdirSync(abs, { encoding: 'buffer' })) {
+    for (const n of fs.readdirSync(abs, { encoding: 'buffer' }).map(utf8Name)) {
       const a = Buffer.concat([abs, Buffer.from(path.sep), n]);
       const r = rel ? Buffer.concat([rel, Buffer.from('/'), n]) : n;
       const st = fs.lstatSync(a);
@@ -57,11 +76,16 @@ function treeHash(folder) {
       throw e.code === 'ELOOP' ? new Error('contains links') : e;
     }
     let bytes;
-    try { bytes = fs.readFileSync(fd); } finally { fs.closeSync(fd); }
+    let mode;
+    try {
+      mode = fs.fstatSync(fd).mode & 0o777;
+      bytes = readUpTo(fd, MAX_TREE_BYTES - total + 1);
+    } finally { fs.closeSync(fd); }
     if ((total += bytes.length) > MAX_TREE_BYTES) throw new Error('too big to check'); // grew since the walk
-    const len = Buffer.alloc(8);
-    len.writeBigUInt64BE(BigInt(bytes.length));
-    h.update(r).update(Buffer.of(0)).update(len).update(bytes);
+    const head = Buffer.alloc(10);
+    head.writeBigUInt64BE(BigInt(bytes.length));
+    head.writeUInt16BE(mode, 8);
+    h.update(r).update(Buffer.of(0)).update(head).update(bytes);
     if (r.toString() === 'plugin.json') manifest = bytes;
   }
   return { hash: h.digest('hex'), manifest };
@@ -81,26 +105,58 @@ function readStore(strict = false) {
     if (strict) throw new Error(`${storeFile()} is not a JSON object`);
     return empty;
   }
+  // the number 2 (2.0 too, as the app reads it; never the text "2")
   return store.version === 2 && isObject(store.approved) ? store : empty;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-// runs `f` holding <store>.lock (created with 'wx'; the app takes the same lock), waiting up to
-// about 5 s; a lock older than 30 s is from a process that died and is removed
+// takes away the stale lock file `lock` that `seen` (an lstat with bigint) described: renamed to a
+// name of its own first, then deleted only when what was renamed is still that file. Another
+// process may have taken the stale one away and made a fresh lock meanwhile: that one is put back
+// (unless a newer lock already took its place), so two processes taking away one stale lock never
+// delete a fresh one. A new file may get a freed inode number again: its time tells it apart.
+function removeStale(lock, seen) {
+  const aside = `${lock}.stale.${process.pid}.${crypto.randomBytes(8).toString('hex')}`;
+  try { fs.renameSync(lock, aside); } catch { return; }
+  let now;
+  try { now = fs.lstatSync(aside, { bigint: true }); } catch { /* gone */ }
+  if (!(now && now.dev === seen.dev && now.ino === seen.ino && now.mtimeNs === seen.mtimeNs)) {
+    try { fs.linkSync(aside, lock); } catch { /* a newer lock took its place */ }
+  }
+  try { fs.unlinkSync(aside); } catch { /* gone */ }
+}
+
+// runs `f` holding <store>.lock (created with 'wx', holding this holder's token: its pid and a
+// random number; the app takes the same lock), waiting up to limits.lock ms. Every try that fails
+// waits and checks the time, whatever is in the way: a lock file older than 30 s is from a process
+// that died and is taken away (removeStale); anything else (a fresh lock, a folder, a link, a stale
+// lock that could not be taken away) is held. The lock is removed after only while it holds this
+// token.
 async function locked(f) {
   const lock = `${storeFile()}.lock`;
+  const token = `${process.pid} ${crypto.randomBytes(8).toString('hex')}`;
   fs.mkdirSync(path.dirname(lock), { recursive: true });
-  for (let wait = 10, end = Date.now() + 5000; ; wait = Math.min(wait * 2, 250)) {
-    try { fs.closeSync(fs.openSync(lock, 'wx', 0o600)); break; } catch (e) {
+  for (let wait = 10, end = Date.now() + limits.lock; ; wait = Math.min(wait * 2, 250)) {
+    let fd;
+    try { fd = fs.openSync(lock, 'wx', 0o600); } catch (e) {
       if (e.code !== 'EEXIST') throw e;
     }
-    try {
-      if (Date.now() - fs.statSync(lock).mtimeMs > 30000) { fs.unlinkSync(lock); continue; }
-    } catch { continue; } // gone meanwhile: try again at once
+    if (fd !== undefined) {
+      try { fs.writeSync(fd, token); } catch (e) {
+        try { fs.unlinkSync(lock); } catch { /* gone */ }
+        throw e;
+      } finally { fs.closeSync(fd); }
+      break;
+    }
+    let st;
+    try { st = fs.lstatSync(lock, { bigint: true }); } catch { /* gone meanwhile */ }
+    if (st?.isFile() && Date.now() - Number(st.mtimeMs) > 30000) removeStale(lock, st);
     if (Date.now() > end) throw new Error(`${lock} is held by another Droid Lite; try again`);
     await sleep(wait);
   }
-  try { return f(); } finally { try { fs.unlinkSync(lock); } catch { /* removed as stale */ } }
+  try { return f(); } finally {
+    try { if (fs.readFileSync(lock, 'utf8') === token) fs.unlinkSync(lock); } catch { /* gone */ }
+  }
 }
 
 // allows the plugin folder `folder` of project `project` (both real paths) with this tree hash,
@@ -134,17 +190,24 @@ function inspect(project, folder) {
 }
 
 // why a loaded project plugin may not run now: its folder (read again, the same checks) is not the
-// one allowed at load, as in the app; undefined when it is, and for the user's own plugins
+// one allowed at load, as in the app: { why }, or { why, broken: true } when it can no longer be
+// checked at all (links outside, too big) and so never run or be allowed; undefined when it is
+// unchanged, and for the user's own plugins
 function changed(plugin) {
   if (!plugin.hash) return undefined;
-  let why = '';
-  try { if (inspect(plugin.project, plugin.folder).hash === plugin.hash) return undefined; } catch (e) { why = ` (${e.message})`; }
-  return `${plugin.name} changed since you allowed it; allow it again${why}`;
+  try {
+    if (inspect(plugin.project, plugin.folder).hash === plugin.hash) return undefined;
+  } catch (e) {
+    return { why: `${plugin.name} changed since you allowed it and cannot run now (${e.message})`, broken: true };
+  }
+  return { why: `${plugin.name} changed since you allowed it; allow it again` };
 }
 const MAX_LOG = 20000; // lines kept per run in the test output
 const MAX_LOG_CHARS = 8 << 20; // and characters (about 8 MB) in all
 const MAX_LINE = 64 << 10; // longest line kept (chars); the rest of a longer one is dropped
-const limits = { json: 120000, grace: 500, kill: 5000 }; // ms: list/view time, output after exit, TERM -> KILL
+// ms: list/view time, output after exit, TERM -> KILL, the store's lock wait, the check of a project
+// plugin's folder while a command of it runs
+const limits = { json: 120000, grace: 500, kill: 5000, lock: 5000, recheck: 3000 };
 const procs = new Set(); // every plugin process group still running (runs, actions, watch, list, views)
 
 // plugin.json of `dir`, or of its droid-lite-plugin/ folder
@@ -243,19 +306,20 @@ function argv(cmd, plugin, project, id = '') {
 // `onEnd(code, error)` runs once: after the exit plus a short grace for the last output (a tool
 // it left running may hold the pipes), or when it could not start. A project plugin whose folder
 // changed since it was allowed (`changed`) starts nothing: it fails like a missing command and
-// `plugin.revoke` marks it Needs your OK.
+// `plugin.revoke` stops what of it still runs and marks it Needs your OK (or an error). A project
+// plugin's Python writes no __pycache__ into its folder (that would ask for the OK again).
 function spawn(cmd, plugin, project, onEnd = () => {}) {
   const [bin, ...args] = Array.isArray(cmd) ? cmd.map(String) : [];
   let proc;
   try {
-    const why = changed(plugin);
-    if (why) {
-      plugin.revoke?.(why);
-      throw new Error(why);
+    const change = changed(plugin);
+    if (change) {
+      plugin.revoke?.(change);
+      throw new Error(change.why);
     }
     proc = cp.spawn(bin, args, {
       cwd: plugin.cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, DROID_LITE_PROJECT: project || '' },
+      env: { ...process.env, DROID_LITE_PROJECT: project || '', ...(plugin.hash && { PYTHONDONTWRITEBYTECODE: '1' }) },
     });
   } catch (err) { // no command at all (or refused): fails like a missing one
     proc = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough() });
@@ -265,6 +329,7 @@ function spawn(cmd, plugin, project, onEnd = () => {}) {
   }
   let ended = false;
   const end = (code, err) => { if (!ended) { ended = true; onEnd(code, err); } };
+  proc.plugin = plugin;
   procs.add(proc);
   proc.on('close', () => procs.delete(proc));
   proc.on('error', (err) => end(undefined, err));
@@ -378,17 +443,38 @@ function setup(ctx, projectOf) {
     root.error = `${p.why ? `${p.why}. ` : ''}Needs your OK: this project plugin runs nothing until you allow it (right-click > Allow…, or Allow… under Test plugins in the Droid Lite sidebar). ${TRUST} ${p.folder}`;
     return root;
   };
-  // a loaded project plugin whose folder changed since the OK (found by spawn): Needs your OK again
-  const revoke = (p, why) => {
-    if (p.needsOk || !plugins.includes(p)) return;
-    Object.assign(p, { needsOk: true, file: path.join(p.folder, 'plugin.json'), why });
+  // a loaded project plugin whose folder changed since the OK (found by spawn or the periodic
+  // check): what of it still runs stops, and it needs the OK again, or is an error (no OK to give)
+  // when its folder can no longer be checked
+  const revoke = (p, { why, broken }) => {
+    if (p.needsOk || p.error || !plugins.includes(p)) return;
+    procs.forEach((x) => { if (x.plugin === p) stop(x); });
+    const file = path.join(p.folder, 'plugin.json');
     delete p.spec;
     live.delete(p.folder);
     pluginRows.delete(p.folder);
     ctrl.items.delete(`plugin:${p.folder}`);
-    ctrl.items.add(needsOkItem(p));
+    if (broken) {
+      p.error = `${file}: ${why}`;
+      const root = ctrl.createTestItem(`plugin:${p.folder}`, p.name);
+      root.error = p.error;
+      ctrl.items.add(root);
+    } else {
+      Object.assign(p, { needsOk: true, file, why });
+      ctrl.items.add(needsOkItem(p));
+    }
     sidebar.fire();
   };
+  // a project plugin's folder may change while a command of it runs (a watch runs for hours): it
+  // is checked again every limits.recheck ms while one does
+  const recheck = setInterval(() => {
+    for (const p of plugins) {
+      if (!p.hash || !p.spec || ![...procs].some((x) => x.plugin === p)) continue;
+      const change = changed(p);
+      if (change) revoke(p, change);
+    }
+  }, limits.recheck);
+  recheck.unref?.();
 
   // loads may overlap (a refresh while a slow list runs): only the newest one writes its results
   let loads = 0;
@@ -621,7 +707,7 @@ function setup(ctx, projectOf) {
     ctrl, view, out,
     view.onDidChangeVisibility((e) => { watching = e.visible; if (watching) startWatch(); else stopWatch(); }),
     // every process group a plugin started ends with the extension
-    { dispose: () => { watching = false; procs.forEach((p) => stop(p, true)); } },
+    { dispose: () => { watching = false; clearInterval(recheck); procs.forEach((p) => stop(p, true)); } },
     vscode.commands.registerCommand('droidLite.testAction', (given, act) => {
       // only a loaded plugin that may run (a project plugin not allowed has no spec), its own action
       const p = plugins.find((x) => x.spec && x.folder === given?.folder);
@@ -722,4 +808,4 @@ function setup(ctx, projectOf) {
   return { load, readPlugins, loaded };
 }
 
-module.exports = { setup, readPlugins, argv, json, findPluginJson, location, limits, procs, treeHash, approve };
+module.exports = { setup, readPlugins, argv, json, findPluginJson, location, limits, procs, treeHash, approve, removeStale, readUpTo, utf8Name };

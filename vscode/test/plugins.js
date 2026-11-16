@@ -157,6 +157,10 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   const found = tests.readPlugins(project);
   assert.deepStrictEqual(found.map((p) => p.name || 'ERR'), ['ERR', 'ERR', 'Example tests', 'Missing', 'Quick', 'Tools']);
   assert.ok(found[1].error.includes('broken/plugin.json'), found[1].error);
+  // {plugin} is the folder's real path, as in the app (the temp folder is a link on macOS: /var -> /private/var)
+  const exampleDir = path.join(project, '.droid-lite', 'plugins', 'example');
+  check('{plugin} is the real folder', found[2].folder === real(exampleDir)
+    && tests.argv(['{plugin}/x'], found[2], project)[0] === `${real(exampleDir)}/x`);
 
   // a plugin.json with a command that is not a list of strings, a bad name, entry or link is an
   // error with its path (a string `run` used to throw inside the run and hang the Test Explorer)
@@ -679,20 +683,60 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   check('a link inside a plugin folder is refused', /contains links$/.test(tOf(tLink)?.error));
   check('more than 2000 files or 8 MiB is refused', /too big to check$/.test(tOf(tMany)?.error) && /too big to check$/.test(tOf(tBig)?.error)
     && tOf(tFit)?.needsOk);
-  // the tree hash: a fixed vector, the same in the app
+  // the tree hash: fixed vectors (recomputed with Python's hashlib), the same in the app; the
+  // permission bits are part of it
+  const writeMode = (f, text, mode) => { fs.writeFileSync(f, text); fs.chmodSync(f, mode); };
   const vec = path.join(tmp, 'vector');
   fs.mkdirSync(path.join(vec, 'sub'), { recursive: true });
-  fs.writeFileSync(path.join(vec, 'plugin.json'), '{"name":"V","list":["sh","list.sh"]}');
-  fs.writeFileSync(path.join(vec, 'list.sh'), 'echo []\n');
-  fs.writeFileSync(path.join(vec, 'sub', 'a.txt'), 'a');
+  writeMode(path.join(vec, 'plugin.json'), '{"name":"V","list":["sh","list.sh"]}', 0o644);
+  writeMode(path.join(vec, 'list.sh'), 'echo []\n', 0o755);
+  writeMode(path.join(vec, 'sub', 'a.txt'), 'a', 0o600);
   // (and the app's own: '.' sorts before '/')
   const vec2 = path.join(tmp, 'vector2');
   fs.mkdirSync(path.join(vec2, 'a'), { recursive: true });
-  fs.writeFileSync(path.join(vec2, 'a.txt'), 'x');
-  fs.writeFileSync(path.join(vec2, 'a', 'b'), '');
-  fs.writeFileSync(path.join(vec2, 'plugin.json'), '{"name":"T"}');
-  check('the tree hash matches the shared vectors', tests.treeHash(real(vec)).hash === '85cf4b35bd11fc3ed3e9c64b0ad55846b230a2bd35e7fbf70122b98e1b8f3a5a'
-    && tests.treeHash(real(vec2)).hash === '785f791d17fa1ef53828f417bb59ba3da0d7e7e426a16e1839df07d75c88577f');
+  writeMode(path.join(vec2, 'a.txt'), 'x', 0o644);
+  writeMode(path.join(vec2, 'a', 'b'), '', 0o644);
+  writeMode(path.join(vec2, 'plugin.json'), '{"name":"T"}', 0o644);
+  check('the tree hash matches the shared vectors', tests.treeHash(real(vec)).hash === 'c8b8b3b7639db77b69849a4bdbd4858552d939e8f6a9e38e18d74f8ee18b1d1a'
+    && tests.treeHash(real(vec2)).hash === 'b7b77b6b2174d5ec3f45452cb493a4a27fdce843557c41dcdecb1d7f98aff0bd');
+  // chmod +x on an allowed script asks again
+  const projectX = path.join(tmp, 'projectX');
+  const xDir = path.join(projectX, '.droid-lite', 'plugins', 'x');
+  fs.mkdirSync(xDir, { recursive: true });
+  fs.writeFileSync(path.join(xDir, 'plugin.json'), JSON.stringify({ name: 'X', list: ['./go.sh'] }));
+  writeMode(path.join(xDir, 'go.sh'), 'echo []\n', 0o644);
+  approve(xDir);
+  const xOf = () => tests.readPlugins(projectX).find((x) => x.folder === real(xDir));
+  const xAllowed = !!xOf().spec;
+  fs.chmodSync(path.join(xDir, 'go.sh'), 0o755);
+  check('a changed file mode asks for the OK again', xAllowed && xOf().needsOk);
+  // a store whose version is 2.0 is version 2 (as in the app); the text "2" is not
+  const storeText = fs.readFileSync(store, 'utf8');
+  approve(xDir);
+  const v2 = readStore();
+  fs.writeFileSync(store, JSON.stringify(v2).replace('"version":2', '"version":2.0'));
+  const as20 = !!xOf().spec && fs.readFileSync(store, 'utf8').includes('"version":2.0');
+  fs.writeFileSync(store, JSON.stringify({ ...v2, version: '2' }));
+  check('a store with version 2.0 counts, "2" does not', as20 && xOf().needsOk);
+  fs.writeFileSync(store, storeText);
+  // a name that is not UTF-8 is refused with the app's words (APFS cannot even make one)
+  let notUtf8;
+  try { tests.utf8Name(Buffer.from([0x61, 0xff, 0x62, 0xe2, 0x82])); } catch (e) { notUtf8 = e.message; }
+  check('a name that is not UTF-8 is refused', notUtf8 === 'a\ufffdb\ufffd is not a UTF-8 name'
+    && tests.utf8Name(Buffer.from('plugin.json')).toString() === 'plugin.json');
+  // a file that grew since the walk is read only up to the limit (+1 byte), then refused
+  const grown = path.join(tmp, 'grown');
+  fs.mkdirSync(grown);
+  fs.writeFileSync(path.join(grown, 'plugin.json'), '{"name":"G"}');
+  fs.closeSync(fs.openSync(path.join(grown, 'blob'), 'w'));
+  fs.truncateSync(path.join(grown, 'blob'), 32 << 20); // sparse: no disk
+  const [realLstat, realReadSync] = [fs.lstatSync, fs.readSync];
+  let readBytes = 0;
+  fs.lstatSync = (...a) => { const st = realLstat(...a); if (String(a[0]).endsWith('/blob')) st.size = 1; return st; };
+  fs.readSync = (...a) => { const n = realReadSync(...a); readBytes += n; return n; };
+  let grew;
+  try { tests.treeHash(real(grown)); } catch (e) { grew = e.message; } finally { [fs.lstatSync, fs.readSync] = [realLstat, realReadSync]; }
+  check('a file that grew is read up to the limit only, then refused', grew === 'too big to check' && readBytes === (8 << 20) + 1);
   // keys are real paths with the on-disk case (a project opened as /x/caseproj is /x/CaseProj)
   const caseDir = path.join(tmp, 'CaseProj');
   fs.mkdirSync(path.join(caseDir, '.droid-lite', 'plugins', 'Cased'), { recursive: true });
@@ -717,6 +761,63 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   fs.unlinkSync(lock);
   await pending;
   check('and keeps what the lock holder wrote', readStore().approved[P]['/x/a'] === 'ha' && readStore().approved[P]['/x/b'] === 'hb' && !fs.existsSync(lock));
+  // the lock holds the holder's token; the holder removes only its own lock (one taken away as stale
+  // and made again by another process meanwhile is not its)
+  const realRename = fs.renameSync;
+  let heldToken;
+  fs.renameSync = (a, b) => { realRename(a, b); if (b === store) { heldToken = fs.readFileSync(lock, 'utf8'); fs.writeFileSync(lock, '4242 another'); } };
+  try { await tests.approve(P, '/x/t', 'ht'); } finally { fs.renameSync = realRename; }
+  check('the holder removes only its own lock', new RegExp(`^${process.pid} [0-9a-f]{16}$`).test(heldToken)
+    && fs.readFileSync(lock, 'utf8') === '4242 another' && readStore().approved[P]['/x/t'] === 'ht');
+  fs.unlinkSync(lock);
+  // two processes see one stale lock; the first takes it away and locks; the second, late, must
+  // not delete that fresh lock
+  fs.writeFileSync(lock, '1 old');
+  fs.utimesSync(lock, new Date(Date.now() - 60000), new Date(Date.now() - 60000));
+  const seen = fs.lstatSync(lock, { bigint: true });
+  tests.removeStale(lock, seen);
+  const firstTook = !fs.existsSync(lock);
+  fs.writeFileSync(lock, '7 fresh', { flag: 'wx' });
+  tests.removeStale(lock, seen);
+  check('two takers of one stale lock never delete the fresh one', firstTook && fs.readFileSync(lock, 'utf8') === '7 fresh'
+    && fs.readdirSync(path.dirname(lock)).every((n) => !n.includes('.stale.')));
+  fs.unlinkSync(lock);
+  // whatever is in the way of the lock (an old folder that cannot be removed, a dangling link)
+  // waits and gives up in time, never spins (a child process: a spin would freeze this one), and
+  // is left alone
+  const lockChild = path.join(tmp, 'lock-child.js');
+  fs.writeFileSync(lockChild, `const Module = require('module');
+const load = Module._load;
+Module._load = function (r, ...a) { return r === 'vscode' ? {} : load.call(this, r, ...a); };
+const t = require(process.argv[2]);
+t.limits.lock = 300;
+t.approve('/l', '/l/.droid-lite/plugins/p', 'h').then(() => console.log('allowed'), (e) => console.log(e.message));
+`);
+  const odd = (n, make) => {
+    const cfgL = path.join(tmp, `lock-${n}`);
+    fs.mkdirSync(cfgL);
+    const l = path.join(cfgL, 'approved-plugins.json.lock');
+    make(l);
+    const t0 = Date.now();
+    const r = require('child_process').spawnSync(process.execPath, [lockChild, path.join(__dirname, '..', 'tests.js')],
+      { env: { ...process.env, DROID_LITE_CONFIG_DIR: cfgL }, timeout: 8000, encoding: 'utf8' });
+    return { out: (r.stdout || '').trim(), ms: Date.now() - t0, left: (() => { try { fs.lstatSync(l); return true; } catch { return false; } })() };
+  };
+  for (const [n, make] of [
+    ['dir', (l) => { fs.mkdirSync(l); fs.utimesSync(l, new Date(Date.now() - 60000), new Date(Date.now() - 60000)); }],
+    ['link', (l) => fs.symlinkSync(path.join(tmp, 'nowhere'), l)],
+    // a stale lock file in a folder that does not let it be renamed or removed
+    ['stuck', (l) => {
+      fs.writeFileSync(l, '1 old');
+      fs.utimesSync(l, new Date(Date.now() - 60000), new Date(Date.now() - 60000));
+      fs.chmodSync(path.dirname(l), 0o555);
+    }],
+  ]) {
+    const r = odd(n, make);
+    fs.chmodSync(path.join(tmp, `lock-${n}`), 0o755);
+    check(`a lock in the way (${n}) is held, gives up in time, is left alone`,
+      /is held by another Droid Lite; try again$/.test(r.out) && r.ms < 6000 && r.left || assert.fail(JSON.stringify(r)));
+  }
   // a lock left by a process that died (older than 30 s) is removed
   fs.writeFileSync(lock, '');
   fs.utimesSync(lock, new Date(Date.now() - 60000), new Date(Date.now() - 60000));
@@ -768,6 +869,50 @@ const t = require(process.argv[2]);
   await until('no tracked process', () => tests.procs.size === 0, 8000).catch(() => {});
   check('no plugin process left after the OK checks', tests.procs.size === 0);
 
+  // a project plugin's folder is checked again while a command of it runs: a running watch stops
+  // when a file of the folder changes, and the plugin asks for the OK again; when its folder can no
+  // longer be checked (too big), it is an error with no OK to give. Its commands get
+  // PYTHONDONTWRITEBYTECODE (Python writes no __pycache__ into the folder)
+  const projectW = path.join(tmp, 'projectW');
+  const wDir = path.join(projectW, '.droid-lite', 'plugins', 'w');
+  const wPid = path.join(tmp, 'w-pid');
+  fs.mkdirSync(wDir, { recursive: true });
+  fs.writeFileSync(path.join(wDir, 'plugin.json'), JSON.stringify({ name: 'W',
+    list: ['sh', '-c', 'echo "[{\\"id\\":\\"c\\",\\"label\\":\\"py=$PYTHONDONTWRITEBYTECODE\\"}]"'],
+    watch: ['sh', '-c', 'echo $$ > "$0"; while :; do echo "{}"; sleep 0.2; done', wPid] }));
+  approve(wDir);
+  tests.limits.recheck = 300;
+  const ctxW = { subscriptions: [] };
+  const apiW = tests.setup(ctxW, () => projectW);
+  await apiW.loaded;
+  const wId = real(wDir);
+  check('a project plugin\'s commands get PYTHONDONTWRITEBYTECODE=1', ctrl.items.get(`plugin:${wId}`)?.children.get(`${wId}\u0000c`)?.label === 'py=1');
+  visibility({ visible: true });
+  await until('the W watch', () => pidsIn(wPid).length === 1);
+  const wWatch = pidsIn(wPid)[0];
+  fs.writeFileSync(path.join(wDir, 'notes.txt'), 'new');
+  await until('the check', () => ctrl.items.get(`needs-ok:${wId}`), 3000).catch(() => {});
+  await until('the W watch to end', () => !alive(wWatch), 3000).catch(() => {});
+  check('a running watch stops when its folder changes, and the plugin asks again', !alive(wWatch)
+    && ctrl.items.get(`needs-ok:${wId}`)?.error.startsWith('W changed since you allowed it; allow it again'));
+  fake.answer = 'Allow';
+  fs.rmSync(wPid, { force: true });
+  await commands['droidLite.allowTestPlugin']({ folder: wId }); // its load starts the watch again
+  await until('the W watch again', () => pidsIn(wPid).length === 1);
+  const wWatch2 = pidsIn(wPid)[0];
+  fs.writeFileSync(path.join(wDir, 'blob'), Buffer.alloc((8 << 20) + 1));
+  await until('the check', () => ctrl.items.get(`plugin:${wId}`)?.error, 3000).catch(() => {});
+  await until('the W watch to end', () => !alive(wWatch2), 3000).catch(() => {});
+  fake.asked = undefined;
+  await commands['droidLite.allowTestPlugin']({ folder: wId });
+  check('a folder that can no longer be checked is an error, with no OK to give', !alive(wWatch2)
+    && /w\/plugin\.json: W changed since you allowed it and cannot run now \(too big to check\)$/.test(ctrl.items.get(`plugin:${wId}`)?.error)
+    && !ctrl.items.get(`needs-ok:${wId}`) && !fake.asked
+    && (await tree.getChildren()).some((r) => r.iconPath?.id === 'warning' && /cannot run now/.test(r.label)));
+  ctxW.subscriptions.forEach((d) => d.dispose?.());
+  await until('no tracked process', () => tests.procs.size === 0, 8000).catch(() => {});
+  check('no plugin process left after the watch checks', tests.procs.size === 0);
+
   fs.rmSync(tmp, { recursive: true, force: true });
   console.log(`ok: test plugins, ${checks} checks`);
 })().catch((e) => {
@@ -775,6 +920,7 @@ const t = require(process.argv[2]);
   // a failed check leaves no plugin process behind
   tests.procs.forEach((p) => { try { process.kill(-p.pid, 'SIGKILL'); } catch { /* ended */ } });
   pidsIn(path.join(quickState, 'qwatch')).forEach((pid) => { try { process.kill(pid, 'SIGKILL'); } catch { /* ended */ } });
+  pidsIn(path.join(tmp, 'w-pid')).forEach((pid) => { try { process.kill(pid, 'SIGKILL'); } catch { /* ended */ } });
   for (const f of ['pids', 'left', 'watch']) {
     pidsIn(path.join(toolsState, f)).forEach((pid) => { try { process.kill(pid, 'SIGKILL'); } catch { /* ended */ } });
   }

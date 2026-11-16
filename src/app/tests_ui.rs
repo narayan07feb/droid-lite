@@ -5,16 +5,25 @@
 use super::{App, Bottom, config_dir};
 use crate::gradle::{Line, Run};
 use crate::icons as ic;
-use crate::plugins::{self, Case, Entry, Live, Manifest, Status};
+use crate::plugins::{self, Case, Entry, Live, Manifest, Status, Trust};
 use egui::{Align, Color32, Layout, RichText, Ui};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
+use std::time::{Duration, Instant};
 
 /// Log lines kept per plugin.
 const KEEP_LOG: usize = 5000;
+/// How often a project plugin's folder is checked again while one of its commands runs.
+const RECHECK: Duration = Duration::from_secs(3);
+/// The longest pause before a `watch` that ended is started again (it doubles from 1 s).
+const WATCH_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 type Fetch = Receiver<Result<String, String>>;
+/// A saved OK: the trust it covers, and whether it was saved.
+type Allowing = Receiver<(Option<Trust>, Result<(), String>)>;
+/// A folder check: the trust it checked, the plugin as read again, and whether it is unchanged.
+type Check = Receiver<(Option<Trust>, Manifest, Result<(), String>)>;
 
 /// A runnable case that names a file, for the gutter.
 pub(super) struct Mark {
@@ -50,7 +59,16 @@ pub(super) struct Plugin {
     pub(super) results: Vec<Entry>,
     pub(super) log: Vec<String>,
     pub(super) watch: Option<Run>,
+    /// When the running `watch` started; the pause before starting an ended one again, and when.
+    watch_started: Option<Instant>,
+    watch_backoff: Duration,
+    watch_next: Option<Instant>,
     pub(super) live: Option<Live>,
+    /// The OK being saved on a thread (the lock may make it wait): for the trust it covers.
+    allowing: Option<Allowing>,
+    /// A check of the folder on a thread while a command runs ([`RECHECK`]); when the last started.
+    check: Option<Check>,
+    checked: Option<Instant>,
     /// None: the cases; Some(i): view i.
     view: Option<usize>,
     pub(super) rows: Vec<Entry>,
@@ -268,17 +286,25 @@ impl App {
         }
     }
 
-    /// A command of plugin `i` was refused because its folder changed since the OK: it shows
-    /// Needs your OK again, with why.
+    /// A command of plugin `i` was refused because its folder changed since the OK: what of it
+    /// still runs (its watch, a run or an action) stops, and it shows Needs your OK again (or its
+    /// error, when it can no longer run at all), with why.
     fn refused(&mut self, i: usize, why: String) {
         if let Some(p) = self.tests.plugins.get_mut(i) {
+            if let Some(mut w) = p.watch.take() {
+                stop(&mut w);
+            }
+            p.live = None;
+            if let Some((_, _, run)) = p.run.as_mut() {
+                stop(run);
+            }
             p.error = Some(why.clone());
         }
         self.status = why;
     }
 
-    /// The user's OK for project plugin `i` as it was read: kept in the approvals file, then its
-    /// cases are listed.
+    /// The user's OK for project plugin `i` as it was read: kept in the approvals file on a thread
+    /// (the lock may make it wait for seconds), then its cases are listed ([`App::poll_oks`]).
     pub(super) fn allow_plugin(&mut self, i: usize, ctx: &egui::Context) {
         let Some(store) = self.approvals() else {
             self.status = "No config folder for the approvals file".into();
@@ -287,14 +313,74 @@ impl App {
         let Some(p) = self.tests.plugins.get_mut(i) else {
             return;
         };
-        match plugins::approve(&store, &p.m) {
-            Ok(()) => {
-                p.m.allowed = true;
-                p.error = None;
-                self.status = format!("Allowed the plugin {}", p.m.name);
-                self.list_cases(i, ctx);
+        if p.allowing.is_some() {
+            return;
+        }
+        let (tx, rx) = channel();
+        let (m, ctx) = (p.m.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send((m.trust.clone(), plugins::approve(&store, &m)));
+            ctx.request_repaint();
+        });
+        p.allowing = Some(rx);
+        self.status = format!("Allowing the plugin {}…", p.m.name);
+    }
+
+    /// Saved OKs and finished folder checks; starts the next check of each project plugin that
+    /// runs a command (its folder may change while a watch runs for hours).
+    fn poll_oks(&mut self, ctx: &egui::Context) {
+        let (mut listed, mut refused) = (Vec::new(), Vec::new());
+        for (i, p) in self.tests.plugins.iter_mut().enumerate() {
+            if let Some(rx) = &p.allowing
+                && let Ok((trust, r)) = rx.try_recv()
+            {
+                p.allowing = None;
+                match r {
+                    // the plugin was read again meanwhile: that is not what was allowed
+                    Ok(()) if trust == p.m.trust => {
+                        p.m.allowed = true;
+                        p.error = None;
+                        self.status = format!("Allowed the plugin {}", p.m.name);
+                        listed.push(i);
+                    }
+                    Ok(()) => {}
+                    Err(e) => self.status = e,
+                }
             }
-            Err(e) => self.status = e,
+            if let Some(rx) = &p.check
+                && let Ok((trust, m, r)) = rx.try_recv()
+            {
+                p.check = None;
+                if let Err(e) = r
+                    && p.m.allowed
+                    && trust == p.m.trust
+                {
+                    p.m = m;
+                    refused.push((i, e));
+                }
+            }
+            let busy = p.watch.is_some() || p.run.is_some();
+            if p.m.trust.is_some() && p.m.allowed && busy && p.check.is_none() {
+                if p.checked.is_none_or(|t| t.elapsed() >= RECHECK) {
+                    p.checked = Some(Instant::now());
+                    let (tx, rx) = channel();
+                    let (mut m, ctx) = (p.m.clone(), ctx.clone());
+                    std::thread::spawn(move || {
+                        let trust = m.trust.clone();
+                        let r = m.recheck();
+                        let _ = tx.send((trust, m, r));
+                        ctx.request_repaint();
+                    });
+                    p.check = Some(rx);
+                }
+                ctx.request_repaint_after(RECHECK);
+            }
+        }
+        for (i, e) in refused {
+            self.refused(i, e);
+        }
+        for i in listed {
+            self.list_cases(i, ctx);
         }
     }
 
@@ -401,7 +487,21 @@ impl App {
                                 p.live = Some(live);
                             }
                         }
-                        Line::Done(_) => p.watch = None,
+                        Line::Done(_) => {
+                            p.watch = None;
+                            // one that ends at once is not started again every frame
+                            let lived = p
+                                .watch_started
+                                .take()
+                                .map_or(Duration::ZERO, |t| t.elapsed());
+                            p.watch_backoff = if lived >= WATCH_BACKOFF_MAX {
+                                Duration::ZERO
+                            } else {
+                                (p.watch_backoff * 2)
+                                    .clamp(Duration::from_secs(1), WATCH_BACKOFF_MAX)
+                            };
+                            p.watch_next = Some(Instant::now() + p.watch_backoff);
+                        }
                     }
                 }
             }
@@ -464,14 +564,23 @@ impl App {
         }
     }
 
-    /// The live state runs only while the Tests tab shows.
+    /// The live state runs only while the Tests tab shows; one that ended starts again after a
+    /// pause that grows while it keeps ending soon. Also takes saved OKs and folder checks
+    /// ([`App::poll_oks`]).
     pub(super) fn keep_watch(&mut self, ctx: &egui::Context) {
+        self.poll_oks(ctx);
         let root = self.project.as_ref().map(|p| p.root.clone());
         let shown = self.bottom == Bottom::Tests;
         let mut refused = None;
         for (i, p) in self.tests.plugins.iter_mut().enumerate() {
             let want = shown && i == self.tests.active;
+            let wait = p.watch_next.map_or(Duration::ZERO, |t| {
+                t.saturating_duration_since(Instant::now())
+            });
             match (&p.watch, &p.m.watch) {
+                (None, Some(_)) if want && p.m.allowed && !wait.is_zero() => {
+                    ctx.request_repaint_after(wait);
+                }
                 // not allowed (or refused once): nothing to start, no check each frame
                 (None, Some(w)) if want && p.m.allowed => {
                     let w = w.clone();
@@ -482,12 +591,14 @@ impl App {
                             None
                         }
                     };
+                    p.watch_started = Some(Instant::now());
                 }
                 (Some(_), _) if !want => {
                     if let Some(mut w) = p.watch.take() {
                         stop(&mut w);
                     }
                     p.live = None;
+                    p.watch_started = None;
                 }
                 _ => {}
             }
@@ -615,14 +726,21 @@ impl App {
             });
         });
         ui.separator();
-        // a project plugin the user has not allowed: what it would run, and nothing else
-        if !self.tests.plugins[active].m.allowed {
-            if let Some(e) = &self.tests.plugins[active].error {
+        // a project plugin the user has not allowed: what it would run, and nothing else; one that
+        // can no longer run at all shows only why (no OK to give)
+        let p = &self.tests.plugins[active];
+        if let (false, Some(why)) = (p.m.allowed, &p.m.broken) {
+            ui.colored_label(crate::highlight::ERROR, why);
+        } else if !p.m.allowed {
+            if let Some(e) = &p.error {
                 ui.colored_label(crate::highlight::ERROR, e);
             }
-            ui.label(RichText::new(self.tests.plugins[active].m.approval_text()).strong());
+            ui.label(RichText::new(p.m.approval_text()).strong());
             ui.label("It comes with the project's files. Allow it only if you trust what it runs; a change to any file in its folder asks again.");
-            if ui.button("Allow").clicked() {
+            if ui
+                .add_enabled(p.allowing.is_none(), egui::Button::new("Allow"))
+                .clicked()
+            {
                 click = Some(Click::Allow);
             }
         } else {

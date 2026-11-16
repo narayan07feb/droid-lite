@@ -3054,6 +3054,101 @@ fn e2e_a_project_plugin_changed_after_the_ok_runs_nothing_and_asks_again() {
 }
 
 #[test]
+fn e2e_a_running_watch_stops_when_its_folder_changes_and_one_that_cannot_be_checked_is_an_error() {
+    let f = Fixture::new("plugin-watch-recheck");
+    let dir = f.path(".droid-lite/plugins/live");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("plugin.json"), r#"{"name":"Live","watch":["sh","{plugin}/watch.sh"]}"#).unwrap();
+    std::fs::write(
+        dir.join("watch.sh"),
+        "echo $$ > \"$DROID_LITE_PROJECT/watch.pid\"\nwhile :; do echo '{\"title\":\"tick\"}'; sleep 0.2; done\n",
+    )
+    .unwrap();
+    let alive = |pid: &str| {
+        let kill = std::process::Command::new("kill").args(["-0", pid]).stderr(std::process::Stdio::null()).status();
+        kill.is_ok_and(|s| s.success())
+    };
+    let mut h = f.harness();
+    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    steps(&mut h, 3);
+    h.get_by_label("Allow").click();
+    wait(&mut h, "the watch", |a| a.tests.plugins[0].live.is_some());
+    let pid = std::fs::read_to_string(f.path("watch.pid")).unwrap().trim().to_owned();
+    assert!(alive(&pid));
+    // a new file in the folder while the watch runs, and no new command: a check finds it
+    std::fs::write(dir.join("notes.txt"), "new").unwrap();
+    wait(&mut h, "the check", |a| !a.tests.plugins[0].m.allowed);
+    assert!(h.state().tests.plugins[0].watch.is_none() && h.state().tests.plugins[0].live.is_none());
+    assert_eq!(h.state().status, "Live changed since you allowed it; allow it again");
+    for _ in 0..100 {
+        if !alive(&pid) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!alive(&pid), "the watch process ended");
+    // allowed again, it watches again; then the folder grows too big to check: an error, no Allow
+    steps(&mut h, 3);
+    h.get_by_label("Allow").click();
+    wait(&mut h, "the watch again", |a| a.tests.plugins[0].live.is_some());
+    std::fs::write(dir.join("blob"), vec![0u8; 8 << 20]).unwrap();
+    wait(&mut h, "the check", |a| a.tests.plugins[0].m.broken.is_some());
+    assert!(h.state().tests.plugins[0].watch.is_none());
+    steps(&mut h, 3);
+    // in the tab and the status bar
+    let why = "Live changed since you allowed it and cannot run now (too big";
+    assert_eq!(h.get_all_by_label_contains(why).count(), 2);
+    assert!(h.query_by_label("Allow").is_none(), "no OK to give");
+}
+
+#[test]
+fn e2e_a_watch_that_ends_at_once_starts_again_after_a_growing_pause() {
+    let f = Fixture::new("plugin-watch-backoff");
+    let dir = f.path(".droid-lite/plugins/quick");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.json"),
+        r#"{"name":"Quick","watch":["sh","-c","echo x >> \"$DROID_LITE_PROJECT/starts\""]}"#,
+    )
+    .unwrap();
+    let mut h = f.harness();
+    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    steps(&mut h, 3);
+    h.get_by_label("Allow").click();
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < Duration::from_millis(1500) {
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let starts = std::fs::read_to_string(f.path("starts")).unwrap_or_default().lines().count();
+    assert!((1..=2).contains(&starts), "{starts} starts in 1.5 s");
+}
+
+#[test]
+fn e2e_allow_waits_for_the_lock_off_the_ui_thread() {
+    let f = Fixture::new("plugin-allow-lock");
+    let dir = f.path(".droid-lite/plugins/shared");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("plugin.json"), r#"{"name":"Shared","list":["sh","-c","echo '[{\"id\":\"a\"}]'"]}"#)
+        .unwrap();
+    let mut h = f.harness();
+    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    steps(&mut h, 3);
+    // the VS Code extension holds the lock
+    std::fs::create_dir_all(&f.config).unwrap();
+    let lock = f.config.join("approved-plugins.json.lock");
+    std::fs::write(&lock, "4242 the extension").unwrap();
+    let t0 = std::time::Instant::now();
+    h.get_by_label("Allow").click();
+    steps(&mut h, 5);
+    assert!(t0.elapsed() < Duration::from_secs(2), "a frame waited for the lock");
+    assert!(!h.state().tests.plugins[0].m.allowed);
+    std::fs::remove_file(&lock).unwrap();
+    wait(&mut h, "allowed and listed", |a| a.tests.plugins[0].cases.len() == 1);
+    assert!(h.state().tests.plugins[0].m.allowed);
+}
+
+#[test]
 fn e2e_plugin_tests_tab_runs_cases_from_list_gutter_views_and_actions() {
     let f = Fixture::new("plugins");
     std::fs::create_dir_all(f.path("flows")).unwrap();

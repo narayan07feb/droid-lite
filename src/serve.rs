@@ -535,8 +535,15 @@ impl Server {
                     return Ok(Value::Null);
                 }
                 // a folder created, moved, renamed or replaced: what is in it now, and nothing of
-                // what was (a replaced folder keeps no deleted file)
+                // what was (a replaced folder keeps no deleted file); the editor's unsaved text of
+                // a file still there stays what the index reads
                 if path.is_dir() {
+                    let mut typed: HashMap<PathBuf, String> = self
+                        .texts
+                        .iter()
+                        .filter(|(p, _)| p.starts_with(path))
+                        .map(|(p, t)| (p.clone(), t.clone()))
+                        .collect();
                     self.forget(path);
                     let root = self.project.as_ref().map(|p| p.root.clone());
                     for f in crate::project::walk(path) {
@@ -550,11 +557,17 @@ impl Server {
                             }
                             continue;
                         }
-                        let Ok(src) = std::fs::read_to_string(&f) else {
-                            continue;
+                        let src = match typed.remove(&f) {
+                            Some(text) => {
+                                self.texts.insert(f.clone(), text.clone());
+                                text
+                            }
+                            None => match std::fs::read_to_string(&f) {
+                                Ok(src) => src,
+                                Err(_) => continue,
+                            },
                         };
                         self.index.update(&f, &src);
-                        self.texts.remove(&f);
                         self.edited.insert(f.clone());
                         self.files_changed |= self.files.insert(f);
                     }
@@ -1760,6 +1773,47 @@ mod tests {
             },
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_folder_update_keeps_the_editors_unsaved_text_of_files_still_there() {
+        let root = std::fs::canonicalize(project("folder-texts")).unwrap();
+        let mut s = Server::default();
+        init(&mut s, &root);
+        let names = |s: &mut Server| {
+            let r = call(s, "implementations", json!({ "name": "Api" }));
+            let mut v: Vec<String> = r["result"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["name"].as_str().unwrap().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        let dir = root.join("app/src/main/java/demo/feature");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (kept, gone) = (dir.join("Kept.kt"), dir.join("Gone.kt"));
+        for f in [&kept, &gone] {
+            std::fs::write(f, "package demo\nclass OnDisk : Api\n").unwrap();
+            let text = "package demo\nclass Typed : Api\n";
+            call(&mut s, "update", json!({ "path": f, "text": text }));
+        }
+        // a branch switch: Gone.kt is deleted, then the editor reports the folder
+        std::fs::remove_file(&gone).unwrap();
+        let r = call(&mut s, "update", json!({ "path": dir }));
+        assert!(r["error"].is_null(), "{r}");
+        assert_eq!(
+            names(&mut s),
+            ["RealApi", "Typed"],
+            "Kept.kt as typed, Gone.kt gone"
+        );
+        assert_eq!(
+            s.texts.keys().collect::<Vec<_>>(),
+            [&kept],
+            "the deleted file's text goes"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
