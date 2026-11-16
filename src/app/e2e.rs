@@ -3826,3 +3826,22 @@ fn e2e_real_preview_shot() {
     steps(&mut h, 4);
     h.render().expect("render needs the wgpu feature").save(&out).unwrap();
 }
+
+#[test]
+fn e2e_tab_close_button_closes_the_tab() {
+    let f = Fixture::new("tabclose");
+    let mut h = f.harness();
+    open(&mut h, &f.path("app/src/main/java/com/demo/data/User.kt"));
+    open(&mut h, &f.path("app/src/main/java/com/demo/ui/UserCard.kt"));
+    assert_eq!(h.state().tabs.len(), 2);
+    // the × of the active tab (UserCard.kt): the tab closes, the other stays
+    let xs: Vec<_> = h.query_all_by_label(ic::X).collect();
+    assert_eq!(xs.len(), 2, "one × per tab");
+    xs[1].click();
+    steps(&mut h, 3);
+    assert_eq!(h.state().tabs.len(), 1, "the × closed its tab");
+    assert!(h.state().tabs[0].path.ends_with("User.kt"));
+    // ⌘W closes the active one too
+    key(&mut h, Modifiers::COMMAND, Key::W);
+    assert!(h.state().tabs.is_empty(), "⌘W closed the last tab");
+}

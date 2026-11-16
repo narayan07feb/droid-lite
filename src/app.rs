@@ -4461,6 +4461,7 @@ fn tab_widget(ui: &mut Ui, t: &Tab, active: bool) -> (bool, bool) {
         Color32::TRANSPARENT
     };
     let mut close = false;
+    let mut close_rect = egui::Rect::NOTHING;
     let inner = egui::Frame::new()
         .fill(fill)
         .corner_radius(egui::CornerRadius {
@@ -4487,7 +4488,7 @@ fn tab_widget(ui: &mut Ui, t: &Tab, active: bool) -> (bool, bool) {
                     })
                     .color(color),
                 );
-                close = ui
+                let x = ui
                     .add(
                         egui::Button::new(
                             RichText::new(ic::X)
@@ -4496,8 +4497,9 @@ fn tab_widget(ui: &mut Ui, t: &Tab, active: bool) -> (bool, bool) {
                         )
                         .frame(false),
                     )
-                    .on_hover_text("Close  ⌘W")
-                    .clicked();
+                    .on_hover_text("Close  ⌘W");
+                close = x.clicked();
+                close_rect = x.rect;
             });
         });
     let r = inner
@@ -4512,6 +4514,10 @@ fn tab_widget(ui: &mut Ui, t: &Tab, active: bool) -> (bool, bool) {
             egui::Stroke::new(2.0, crate::theme::t().accent),
         );
     }
+    // the tab's own click area is added after the × and sits on top of it, so a click on the × arrives
+    // as a tab click: where the pointer was decides
+    let on_x = r.clicked() && r.interact_pointer_pos().is_some_and(|p| close_rect.expand(2.0).contains(p));
+    let close = close || on_x;
     (r.clicked() && !close, close || r.middle_clicked())
 }
 
