@@ -2,7 +2,14 @@
 # Builds the VS Code / Cursor extension with the engine inside: vscode/droid-lite-<target>-<version>.vsix
 set -eu
 cd "$(dirname "$0")/.."
-target=${1:-darwin-arm64}
+# the engine is built for this Mac's CPU, so the label follows it unless a target is passed
+case "$(uname -m)" in
+  arm64) host=darwin-arm64 ;;
+  x86_64) host=darwin-x64 ;;
+  *) host= ;;
+esac
+target=${1:-$host}
+[ -n "$target" ] || { echo "package-vsix.sh: no VS Code target for $(uname -m); pass one" >&2; exit 1; }
 cargo build --release
 mkdir -p vscode/bin
 cp target/release/droid-lite vscode/bin/droid-lite

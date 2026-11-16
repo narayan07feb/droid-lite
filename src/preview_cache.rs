@@ -12,7 +12,54 @@ use std::path::{Path, PathBuf};
 pub const MAX_IMAGES: usize = 20;
 pub const TTL_SECS: u64 = 30 * 60;
 
-pub type Cards = Vec<(String, Result<ColorImage, String>)>;
+pub type Cards = Vec<(String, Result<Picture, String>)>;
+
+/// One drawn picture: the worker's PNG bytes as they came, saved and cached as they are (never
+/// decoded and encoded again), and the pixels, decoded once, for a window that shows them.
+#[derive(Clone)]
+pub struct Picture {
+    pub png: Vec<u8>,
+    pub image: Option<ColorImage>,
+}
+
+impl Picture {
+    /// A picture from PNG bytes; with `decode`, its pixels too (the editor engine needs none).
+    pub fn from_png(png: Vec<u8>, decode: bool) -> Result<Picture, String> {
+        if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Err("not a PNG picture".into());
+        }
+        let image = if decode {
+            let i = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+                .map_err(|e| e.to_string())?
+                .to_rgba8();
+            let size = [i.width() as usize, i.height() as usize];
+            Some(ColorImage::from_rgba_unmultiplied(size, i.as_raw()))
+        } else {
+            None
+        };
+        Ok(Picture { png, image })
+    }
+
+    /// A picture of `img` (tests): encoded once, its pixels kept.
+    #[cfg(test)]
+    pub fn of(img: ColorImage) -> Picture {
+        let [w, h] = img.size;
+        let raw: Vec<u8> = img
+            .pixels
+            .iter()
+            .flat_map(|c| c.to_srgba_unmultiplied())
+            .collect();
+        let mut png = Vec::new();
+        image::RgbaImage::from_raw(w as u32, h as u32, raw)
+            .unwrap()
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        Picture {
+            png,
+            image: Some(img),
+        }
+    }
+}
 
 /// FNV-1a over the parts, in order.
 pub fn key(parts: &[&str]) -> String {
@@ -37,8 +84,9 @@ fn meta(root: &Path, key: &str) -> Option<serde_json::Value> {
     serde_json::from_str(&text).ok()
 }
 
-/// The pictures stored under `key`, when younger than the TTL and all still readable.
-pub fn lookup(root: &Path, key: &str, now: u64) -> Option<Cards> {
+/// The pictures stored under `key`, when younger than the TTL and all still readable; with
+/// `decode`, their pixels too.
+pub fn lookup(root: &Path, key: &str, now: u64, decode: bool) -> Option<Cards> {
     let m = meta(root, key)?;
     let at = m["at"].as_u64()?;
     if now.saturating_sub(at) >= TTL_SECS {
@@ -54,12 +102,8 @@ pub fn lookup(root: &Path, key: &str, now: u64) -> Option<Cards> {
             if let Some(e) = c["error"].as_str() {
                 return Some((name, Err(e.to_string())));
             }
-            let img = image::open(dir.join(format!("{i}.png"))).ok()?.to_rgba8();
-            let size = [img.width() as usize, img.height() as usize];
-            Some((
-                name,
-                Ok(ColorImage::from_rgba_unmultiplied(size, img.as_raw())),
-            ))
+            let png = std::fs::read(dir.join(format!("{i}.png"))).ok()?;
+            Some((name, Ok(Picture::from_png(png, decode).ok()?)))
         })
         .collect()
 }
@@ -81,16 +125,8 @@ pub fn store(root: &Path, key: &str, file: &Path, cards: &Cards, now: u64) {
         return;
     }
     let mut list = Vec::new();
-    for (i, (name, img)) in images.into_iter().enumerate() {
-        let [w, h] = img.size;
-        let raw: Vec<u8> = img
-            .pixels
-            .iter()
-            .flat_map(|c| c.to_srgba_unmultiplied())
-            .collect();
-        let saved = image::RgbaImage::from_raw(w as u32, h as u32, raw)
-            .is_some_and(|p| p.save(dir.join(format!("{i}.png"))).is_ok());
-        if !saved {
+    for (i, (name, pic)) in images.into_iter().enumerate() {
+        if std::fs::write(dir.join(format!("{i}.png")), &pic.png).is_err() {
             let _ = std::fs::remove_dir_all(&dir); // never a half entry
             return;
         }
@@ -167,7 +203,7 @@ mod tests {
 
     fn cards() -> Cards {
         let img = ColorImage::new([2, 3], vec![egui::Color32::from_rgb(10, 20, 30); 6]);
-        vec![("Card - Light".into(), Ok(img))]
+        vec![("Card - Light".into(), Ok(Picture::of(img)))]
     }
 
     fn entries(root: &Path) -> usize {
@@ -179,14 +215,20 @@ mod tests {
         let root = tmp("ttl");
         let k = key(&["text", "own"]);
         store(&root, &k, Path::new("/p/Card.kt"), &cards(), 1000);
-        let got = lookup(&root, &k, 1000 + TTL_SECS - 1).expect("hit before the TTL");
+        let got = lookup(&root, &k, 1000 + TTL_SECS - 1, true).expect("hit before the TTL");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0, "Card - Light");
-        let img = got[0].1.as_ref().unwrap();
+        let pic = got[0].1.as_ref().unwrap();
+        let img = pic.image.as_ref().unwrap();
         assert_eq!(img.size, [2, 3]);
         assert_eq!(img.pixels[0], egui::Color32::from_rgb(10, 20, 30));
+        // the bytes as they came, never encoded again; no pixels for a caller that needs none
+        assert_eq!(pic.png, cards()[0].1.as_ref().unwrap().png);
+        assert_eq!(std::fs::read(root.join(&k).join("0.png")).unwrap(), pic.png);
+        let plain = lookup(&root, &k, 1000, false).unwrap();
+        assert!(plain[0].1.as_ref().unwrap().image.is_none());
         assert!(
-            lookup(&root, &k, 1000 + TTL_SECS).is_none(),
+            lookup(&root, &k, 1000 + TTL_SECS, true).is_none(),
             "expired at 30 minutes"
         );
         let _ = std::fs::remove_dir_all(root);
@@ -202,10 +244,10 @@ mod tests {
         store(&root, &old, file, &cards(), 1000);
         store(&root, &new, file, &cards(), 1010);
         assert!(
-            lookup(&root, &old, 1010).is_none(),
+            lookup(&root, &old, 1010, true).is_none(),
             "the file's older entry is gone"
         );
-        assert!(lookup(&root, &new, 1010).is_some());
+        assert!(lookup(&root, &new, 1010, true).is_some());
         assert_eq!(entries(&root), 1);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -220,18 +262,18 @@ mod tests {
         }
         assert_eq!(entries(&root), MAX_IMAGES);
         assert!(
-            lookup(&root, &key(&["1"]), 1030).is_none(),
+            lookup(&root, &key(&["1"]), 1030, true).is_none(),
             "the oldest went"
         );
-        assert!(lookup(&root, &key(&["2"]), 1030).is_some());
+        assert!(lookup(&root, &key(&["2"]), 1030, true).is_some());
         // the newest stays even when it alone has more than 20 pictures
         let img = ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
         let big: Cards = (0..21)
-            .map(|i| (format!("P{i}"), Ok(img.clone())))
+            .map(|i| (format!("P{i}"), Ok(Picture::of(img.clone()))))
             .collect();
         store(&root, &key(&["big"]), Path::new("/p/Big.kt"), &big, 1100);
         assert_eq!(entries(&root), 1);
-        assert!(lookup(&root, &key(&["big"]), 1101).is_some());
+        assert!(lookup(&root, &key(&["big"]), 1101, true).is_some());
         // a store after the TTL also clears the expired ones
         store(
             &root,
@@ -251,7 +293,10 @@ mod tests {
         let mut c = cards();
         c.push(("Card - Dark".into(), Err("boom".into())));
         store(&root, &k, Path::new("/p/E.kt"), &c, 1000);
-        assert!(lookup(&root, &k, 1001).is_none(), "drawn again next time");
+        assert!(
+            lookup(&root, &k, 1001, true).is_none(),
+            "drawn again next time"
+        );
         assert_eq!(entries(&root), 0);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -259,8 +304,11 @@ mod tests {
     #[test]
     fn the_entry_just_stored_stays_when_another_has_the_same_time() {
         let img = ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
-        let many =
-            |n: usize| -> Cards { (0..n).map(|i| (format!("P{i}"), Ok(img.clone()))).collect() };
+        let many = |n: usize| -> Cards {
+            (0..n)
+                .map(|i| (format!("P{i}"), Ok(Picture::of(img.clone()))))
+                .collect()
+        };
         // several names, so the folder order puts the new entry both before and after the other
         for i in 0..8 {
             let root = tmp(&format!("tie{i}"));
@@ -274,7 +322,7 @@ mod tests {
             let new = key(&["new", &i.to_string()]);
             store(&root, &new, Path::new("/p/B.kt"), &many(10), 1000);
             assert!(
-                lookup(&root, &new, 1001).is_some(),
+                lookup(&root, &new, 1001, true).is_some(),
                 "round {i}: the entry just stored was evicted"
             );
             assert_eq!(entries(&root), 1, "round {i}");
@@ -314,7 +362,7 @@ mod tests {
         let k = key(&["x"]);
         store(&root, &k, Path::new("/p/X.kt"), &cards(), 1000);
         std::fs::remove_file(root.join(&k).join("0.png")).unwrap();
-        assert!(lookup(&root, &k, 1001).is_none());
+        assert!(lookup(&root, &k, 1001, true).is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 }

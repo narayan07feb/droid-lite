@@ -287,6 +287,7 @@ fn resolve(
         .sum();
     let mut done = 0u64;
     let mut failed = Vec::new();
+    let mut offline: Option<String> = None;
     for (p, slot) in pieces.iter().zip(found.iter_mut()) {
         if slot.is_some() {
             continue;
@@ -302,9 +303,17 @@ fn resolve(
             let text = format!("Waiting for another window's download of {}", p.label());
             status(text, None)
         };
-        match download(p, own, fetch, &report, &waiting) {
+        // after one download failed on the network the rest are not tried (each could take a
+        // minute and more to fail too): a file already here or a whole .part is still used
+        let net: &dyn Fetch = if offline.is_some() { &NotTried } else { fetch };
+        match download(p, own, net, &report, &waiting) {
             Ok(f) => *slot = Some(f),
-            Err(e) => failed.push(format!("  {} {}: {e}", p.label(), p.version)),
+            Err(e) => {
+                if !e.starts_with(CHECKSUM_MISMATCH) && offline.is_none() {
+                    offline = Some(p.label());
+                }
+                failed.push(format!("  {} {}: {e}", p.label(), p.version));
+            }
         }
         done += p.size;
     }
@@ -318,10 +327,22 @@ fn resolve(
     Ok(found.into_iter().flatten().collect())
 }
 
+/// The start of a download's error when the file came but was wrong (not a network failure).
+const CHECKSUM_MISMATCH: &str = "the download did not match its checksum";
+
+/// Stands in for the network once a download failed on it: every fetch fails at once.
+struct NotTried;
+
+impl Fetch for NotTried {
+    fn fetch(&self, _: &str, _: &Path, _: &dyn Fn(u64)) -> Result<(), String> {
+        Err("not tried: an earlier download failed".into())
+    }
+}
+
 /// An exclusive lock on `path` (made if missing), held until the file is dropped: two engines never
 /// write one download or one unpacked folder at once. While another engine holds it, `waiting` is
 /// called at once and then every 2 s, so this engine's status says why it waits.
-fn lock(path: &Path, waiting: &dyn Fn()) -> Result<std::fs::File, String> {
+pub(crate) fn lock(path: &Path, waiting: &dyn Fn()) -> Result<std::fs::File, String> {
     let f = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -371,7 +392,7 @@ fn download(
     if size_of(&part) != p.size || sha != p.sha1 {
         let _ = std::fs::remove_file(&part); // a bad file: the next try starts over
         return Err(format!(
-            "the download did not match its checksum (sha1 {sha}, expected {})",
+            "{CHECKSUM_MISMATCH} (sha1 {sha}, expected {})",
             p.sha1
         ));
     }
@@ -850,6 +871,36 @@ mod tests {
             "{e}"
         );
         assert!(!e.contains("here"), "{e}");
+    }
+
+    #[test]
+    fn after_the_first_network_failure_the_rest_are_not_tried_and_all_are_named() {
+        struct Slow(std::cell::Cell<u32>);
+        impl Fetch for Slow {
+            fn fetch(&self, _: &str, _: &Path, _: &dyn Fn(u64)) -> Result<(), String> {
+                self.0.set(self.0.get() + 1);
+                Err("Operation timed out".into())
+            }
+        }
+        let own = temp("slownet");
+        // a whole .part of the last piece still counts: no network needed for it
+        let part = own.join("demo.lib/c/1.0/c-1.0.jar.part");
+        std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+        std::fs::write(&part, "hello").unwrap();
+        let net = Slow(std::cell::Cell::new(0));
+        let pieces = [
+            piece("a", HELLO_SHA1, 5),
+            piece("b", HELLO_SHA1, 5),
+            piece("c", HELLO_SHA1, 5),
+        ];
+        let e = resolve(&pieces, None, &own, &net, &quiet).unwrap_err();
+        assert_eq!(net.0.get(), 1, "one try on the network: {e}");
+        assert!(
+            e.contains("  a (1 MB) 1.0: Operation timed out\n  b (1 MB) 1.0: not tried"),
+            "{e}"
+        );
+        assert!(!e.contains("  c "), "{e}");
+        assert!(own.join("demo.lib/c/1.0/c-1.0.jar").is_file());
     }
 
     #[test]

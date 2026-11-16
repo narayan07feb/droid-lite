@@ -3603,7 +3603,9 @@ impl App {
                     p.cards = cards
                         .into_iter()
                         .map(|(name, pic)| {
-                            let tex = pic.map(|img| ctx.load_texture(format!("preview:{name}"), img, Default::default()));
+                            let tex = pic
+                                .and_then(|p| p.image.ok_or_else(|| "no pixels".to_string()))
+                                .map(|img| ctx.load_texture(format!("preview:{name}"), img, Default::default()));
                             (name, tex)
                         })
                         .collect();

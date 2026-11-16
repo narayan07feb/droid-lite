@@ -217,8 +217,8 @@ impl Recording {
     }
 
     /// Stops the recording, copies the video into `dir` and deletes it from the device, only once
-    /// the whole file arrived; when the copy fails the video stays on the device and the error names
-    /// it. Blocks for seconds, minutes for a long recording over Wi-Fi: call it off the UI thread.
+    /// the whole file arrived; when the copy fails, or the device does not say the video's size (so
+    /// the copy cannot be checked), the video stays on the device and the error names it. Blocks for seconds, minutes for a long recording over Wi-Fi: call it off the UI thread.
     /// At most about 16 minutes: 2 + 20 (stop) + 10 (finish) + 20 (size) + [`MAX_PULL`] + 20 (delete)
     /// seconds, plus up to 1 s per adb call for its output.
     pub fn finish(mut self, dir: &Path) -> Result<PathBuf, String> {
@@ -235,28 +235,39 @@ impl Recording {
         let _ = self.child.wait();
         self.done = true;
         let local = dir.join(file_name("Recording", &self.serial, &stamp(), "mp4"));
-        let local_s = local.to_string_lossy().into_owned();
+        // copied into `<name>.mp4.part` and renamed only once all of it is here: an engine stopped
+        // mid-copy leaves a .part, never an .mp4 that looks whole
+        let part = local.with_extension("mp4.part");
+        let part_s = part.to_string_lossy().into_owned();
         let size = self.remote_size();
-        let pulled = self.adb_within(&["pull", &self.remote, &local_s], pull_limit(size));
-        let got = std::fs::metadata(&local)
+        let pulled = self.adb_within(&["pull", &self.remote, &part_s], pull_limit(size));
+        let got = std::fs::metadata(&part)
             .ok()
             .filter(|m| m.is_file())
             .map(|m| m.len());
         let copied = pulled.as_ref().is_ok_and(|o| o.status.success()) && got.is_some();
-        if copied && size.is_none_or(|s| got == Some(s)) {
-            // delete only the file this recording wrote, and only once all of it is here (a size
-            // the device would not say: keep it there)
-            if size.is_some() {
-                let _ = self.adb(&["shell", "rm", "-f", &self.remote]);
+        // delete only the file this recording wrote, and only once all of it is here
+        if copied && size.is_some() && got == size {
+            if let Err(e) = std::fs::rename(&part, &local) {
+                let _ = std::fs::remove_file(&part);
+                return Err(format!(
+                    "{e}. The video is still on the device: {}",
+                    self.remote
+                ));
             }
+            let _ = self.adb(&["shell", "rm", "-f", &self.remote]);
             return Ok(local);
         }
-        let _ = std::fs::remove_file(&local); // a part of a video
+        let _ = std::fs::remove_file(&part); // a part of a video, or one that cannot be checked
         let why = match pulled {
             Err(e) => e,
             Ok(out) => {
                 let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
                 match (size, got) {
+                    (None, Some(_)) if copied => {
+                        "the device did not say the video's size, so the copy could not be checked"
+                            .into()
+                    }
                     (None, _) if err.is_empty() => "the device kept no video".into(),
                     (Some(s), Some(g)) if err.is_empty() && g != s => {
                         format!("only {g} of {s} bytes arrived")
@@ -266,9 +277,10 @@ impl Recording {
                 }
             }
         };
-        Err(match size {
-            Some(_) => format!("{why}. The video is still on the device: {}", self.remote),
-            None => why,
+        Err(if size.is_some() || copied {
+            format!("{why}. The video is still on the device: {}", self.remote)
+        } else {
+            why
         })
     }
 }
@@ -325,7 +337,7 @@ mod tests {
         let script = format!(
             "#!/bin/sh\necho \"$@\" >> {d}/adb.log\ncase \"$*\" in\n\
              *screenrecord*) echo 4242; sleep 0.2;;\n\
-             *stat*) echo 1000;;\n\
+             *stat*) cat {d}/stat 2>/dev/null || echo 1000;;\n\
              *pull*) case $(cat {d}/pull) in\n\
                ok) head -c 1000 /dev/zero > \"$5\";;\n\
                short) head -c 600 /dev/zero > \"$5\";;\n\
@@ -359,12 +371,47 @@ mod tests {
             assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0, "no part video");
         }
         std::fs::write(dir.join("pull"), "ok").unwrap();
+        // a copy whose size the device would not say: kept there, and the error names it
+        std::fs::write(dir.join("stat"), "").unwrap();
+        let _ = std::fs::remove_file(dir.join("adb.log"));
+        let e = Recording::start(&adb, "emu")
+            .unwrap()
+            .finish(&out)
+            .unwrap_err();
+        assert!(
+            e.contains(
+                "could not be checked. The video is still on the device: /sdcard/droid-lite-"
+            ),
+            "{e}"
+        );
+        assert!(!log().contains("rm -f"), "{}", log());
+        assert_eq!(
+            std::fs::read_dir(&out).unwrap().count(),
+            0,
+            "no unchecked video"
+        );
+        std::fs::remove_file(dir.join("stat")).unwrap();
         let _ = std::fs::remove_file(dir.join("adb.log"));
         let video = Recording::start(&adb, "emu").unwrap().finish(&out).unwrap();
         assert_eq!(std::fs::metadata(&video).unwrap().len(), 1000);
         let calls = log();
         let (pull, rm) = (calls.find(" pull ").unwrap(), calls.find("rm -f").unwrap());
         assert!(pull < rm, "deleted after the copy: {calls}");
+        // copied into a .part first, renamed after the check
+        let to = calls[pull..]
+            .lines()
+            .next()
+            .unwrap()
+            .split(' ')
+            .next_back()
+            .unwrap();
+        assert!(to.ends_with(".mp4.part"), "{calls}");
+        assert_eq!(video.extension().unwrap(), "mp4");
+        assert_eq!(
+            std::fs::read_dir(&out).unwrap().count(),
+            1,
+            "only the video"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

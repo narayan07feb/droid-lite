@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 /// Main-source Kotlin and Java files by package.
+#[derive(Default)]
 pub struct Packages {
     by_package: HashMap<String, Vec<PathBuf>>,
     /// The names each file declares (classes, functions, properties, type aliases).
@@ -15,6 +16,12 @@ pub struct Packages {
     /// The project's annotation classes (a multipreview like `@ThemePreviews`): name -> the annotations
     /// written above it.
     pub annotation_classes: HashMap<String, String>,
+    /// Each source file's package and annotation classes, and each build file's namespace: a file
+    /// added or removed changes only its own entries.
+    sources: HashMap<PathBuf, (String, Vec<(String, String)>)>,
+    builds: HashMap<PathBuf, String>,
+    /// Files read so far, for tests.
+    pub reads: usize,
 }
 
 /// A Kotlin or Java file outside test code and build output: no folder on its path is a test source
@@ -97,38 +104,75 @@ fn imports_of(text: &str) -> Vec<String> {
 impl Packages {
     /// Reads the package line of every main source file once (about 0.1 s for 11k files).
     pub fn read(files: &[PathBuf]) -> Packages {
-        let mut by_package: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        let mut names = HashMap::new();
-        let mut res_by_namespace = HashMap::new();
-        let mut annotation_classes = HashMap::new();
+        let mut pk = Packages::default();
         for f in files {
-            if is_main_source(f) {
-                if let Ok(text) = std::fs::read_to_string(f) {
-                    by_package.entry(package_of(&text)).or_default().push(f.clone());
-                    names.insert(f.clone(), declared(&text));
-                    if text.contains("annotation class ") {
-                        annotation_classes.extend(crate::preview_spec::annotation_classes(&text));
-                    }
-                }
-            } else if f.file_name().is_some_and(|n| n == "build.gradle.kts" || n == "build.gradle")
-                && let Some(dir) = f.parent()
+            pk.add(f);
+        }
+        pk
+    }
+
+    /// Follows a file list that changed: reads only the files added and drops the files removed
+    /// (an editor's file list after a new screen or a moved folder), not all 11k files again.
+    pub fn update(&mut self, added: &[&PathBuf], removed: &[&PathBuf]) {
+        for f in removed {
+            self.remove(f);
+        }
+        for f in added {
+            self.add(f);
+        }
+    }
+
+    fn add(&mut self, f: &Path) {
+        if is_main_source(f) {
+            if self.sources.contains_key(f) {
+                return;
+            }
+            self.reads += 1;
+            if let Ok(text) = std::fs::read_to_string(f) {
+                let pkg = package_of(&text);
+                self.by_package.entry(pkg.clone()).or_default().push(f.to_path_buf());
+                self.names.insert(f.to_path_buf(), declared(&text));
+                let ann = if text.contains("annotation class ") { crate::preview_spec::annotation_classes(&text) } else { Vec::new() };
+                self.annotation_classes.extend(ann.iter().cloned());
+                self.sources.insert(f.to_path_buf(), (pkg, ann));
+            }
+        } else if f.file_name().is_some_and(|n| n == "build.gradle.kts" || n == "build.gradle")
+            && let Some(dir) = f.parent()
+        {
+            self.reads += 1;
+            // the namespace from the build file, else the manifest's package (older modules)
+            let ns = std::fs::read_to_string(f).ok().and_then(|t| namespace_of(&t)).or_else(|| {
+                ["src/main/AndroidManifest.xml", "AndroidManifest.xml"].iter().find_map(|m| {
+                    let x = std::fs::read_to_string(dir.join(m)).ok()?;
+                    x.split("package=\"").nth(1)?.split('"').next().map(String::from)
+                })
+            });
+            let res = res_dirs(dir);
+            if let Some(ns) = ns
+                && !res.is_empty()
             {
-                // the namespace from the build file, else the manifest's package (older modules)
-                let ns = std::fs::read_to_string(f).ok().and_then(|t| namespace_of(&t)).or_else(|| {
-                    ["src/main/AndroidManifest.xml", "AndroidManifest.xml"].iter().find_map(|m| {
-                        let x = std::fs::read_to_string(dir.join(m)).ok()?;
-                        x.split("package=\"").nth(1)?.split('"').next().map(String::from)
-                    })
-                });
-                let res = res_dirs(dir);
-                if let Some(ns) = ns
-                    && !res.is_empty()
-                {
-                    res_by_namespace.insert(ns, res);
-                }
+                self.res_by_namespace.insert(ns.clone(), res);
+                self.builds.insert(f.to_path_buf(), ns);
             }
         }
-        Packages { by_package, names, res_by_namespace, annotation_classes }
+    }
+
+    fn remove(&mut self, f: &Path) {
+        if let Some((pkg, ann)) = self.sources.remove(f) {
+            if let Some(v) = self.by_package.get_mut(&pkg) {
+                v.retain(|g| g != f);
+                if v.is_empty() {
+                    self.by_package.remove(&pkg);
+                }
+            }
+            self.names.remove(f);
+            if !ann.is_empty() {
+                // another file may declare the same name: made again from the files left
+                self.annotation_classes = self.sources.values().flat_map(|(_, a)| a.iter().cloned()).collect();
+            }
+        } else if let Some(ns) = self.builds.remove(f) {
+            self.res_by_namespace.remove(&ns);
+        }
     }
 
     /// The package an import points into: the longest prefix that is a project package.

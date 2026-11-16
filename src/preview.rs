@@ -136,7 +136,7 @@ pub enum Event {
     /// cannot run ("Skipped: …").
     Status(PathBuf, String, Option<(u64, u64)>),
     /// One picture or one error text per preview, in request order.
-    Done { file: PathBuf, seq: u64, cards: Vec<(String, Result<egui::ColorImage, String>)> },
+    Done { file: PathBuf, seq: u64, cards: crate::preview_cache::Cards },
     /// The whole request failed (compile error, missing class): the text for the cards.
     Failed { file: PathBuf, seq: u64, error: String },
     /// The request was not drawn: a newer one replaced it, or there is no room now (the reason).
@@ -148,21 +148,22 @@ pub struct Client {
     rx: Receiver<Event>,
 }
 
-/// Starts the client's thread: requests go in, events come out (a caller may block on them).
-pub fn spawn(ctx: &egui::Context) -> (Sender<Request>, Receiver<Event>) {
+/// Starts the client's thread: requests go in, events come out (a caller may block on them). With
+/// `decode`, each picture comes with its pixels (a window shows them); without, only its PNG bytes.
+pub fn spawn(ctx: &egui::Context, decode: bool) -> (Sender<Request>, Receiver<Event>) {
     let (tx, jobs) = channel::<Request>();
     let (events, rx) = channel();
     let ctx = ctx.clone();
     std::thread::Builder::new()
         .name("preview-client".into())
-        .spawn(move || run(jobs, events, ctx))
+        .spawn(move || run(jobs, events, ctx, decode))
         .expect("preview thread");
     (tx, rx)
 }
 
 impl Client {
     pub fn new(ctx: &egui::Context) -> Client {
-        let (tx, rx) = spawn(ctx);
+        let (tx, rx) = spawn(ctx, true);
         Client { tx, rx }
     }
 
@@ -302,7 +303,16 @@ impl Reads {
             self.files = None;
         }
         if self.files.as_ref().is_none_or(|f| !std::sync::Arc::ptr_eq(f, &p.files) && **f != *p.files) {
-            self.packages = Some((p.root.clone(), crate::preview_src::Packages::read(&p.files)));
+            match (&mut self.packages, &self.files) {
+                // the same project: only the files added are read, the files removed dropped
+                (Some((root, pk)), Some(old)) if *root == p.root => {
+                    let (was, now): (std::collections::HashSet<&PathBuf>, std::collections::HashSet<&PathBuf>) = (old.iter().collect(), p.files.iter().collect());
+                    let added: Vec<&PathBuf> = p.files.iter().filter(|f| !was.contains(f)).collect();
+                    let removed: Vec<&PathBuf> = old.iter().filter(|f| !now.contains(f)).collect();
+                    pk.update(&added, &removed);
+                }
+                _ => self.packages = Some((p.root.clone(), crate::preview_src::Packages::read(&p.files))),
+            }
             self.files = Some(p.files.clone());
         }
     }
@@ -318,12 +328,12 @@ fn library_trouble(error: &str, unresolved_imports: &[String], packages: Option<
         || unresolved_imports.iter().any(|i| packages.is_none_or(|p| p.package_for(i).is_none()))
 }
 
-fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
+fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context, decode: bool) {
     let send = |e: Event| {
         let _ = events.send(e);
         ctx.request_repaint();
     };
-    let mut state = State::default();
+    let mut state = State { decode, ..Default::default() };
     serve_jobs(&jobs, &send, &room, &mut |r| state.draw(r, &send));
 }
 
@@ -352,6 +362,8 @@ struct State {
     module_res: Vec<String>,
     exploded: Vec<String>,
     walks: Walks,
+    /// Pictures come with their pixels (a window), not only their PNG bytes (the editor engine).
+    decode: bool,
 }
 
 /// The resource and assets folders' listings, each kept while the folder's own time is unchanged
@@ -439,7 +451,7 @@ impl State {
         let (file, specs_text) = (r.file.to_string_lossy(), format!("{specs:?}"));
         let draw = [file.as_ref(), &text, own.as_ref().map_or("", |o| o.key.as_str()), &specs_text, &version];
         let cache_key = cache_key(&draw, &rt, WORKER_SOURCE, &crate::preview_base::fingerprint(), &mut self.walks);
-        if !stand_in && let Some(cards) = crate::preview_cache::lookup(&cache_dir, &cache_key, crate::preview_cache::now_secs()) {
+        if !stand_in && let Some(cards) = crate::preview_cache::lookup(&cache_dir, &cache_key, crate::preview_cache::now_secs(), self.decode) {
             return send(Event::Done { file: r.file.clone(), seq: r.seq, cards });
         }
         let worker_id = format!("{version}-{:08x}", rt.key());
@@ -447,7 +459,10 @@ impl State {
             self.conn = None; // another project's Kotlin or libraries: its own worker
             self.conn_version = worker_id;
         }
-        let sock = socket(&kt, &rt);
+        let sock = match socket_in(&dir(), &kt, &rt) {
+            Ok(s) => s,
+            Err(e) => return send(fail(e)),
+        };
         // the worker may have ended (idle exit, a crash) or never started: start it and connect by
         // itself, up to 3 tries with a short back-off, then the error goes on the card
         let mut last_error = String::new();
@@ -474,7 +489,7 @@ impl State {
             send(Event::Status(r.file.clone(), format!("Sending {} preview(s) to the worker", r.previews.len()), None));
             self.id += 1;
             let (w, rd) = self.conn.as_mut().unwrap();
-            match ask(w, rd, self.id, r, &specs, &cp, own.as_ref(), send) {
+            match ask(w, rd, self.id, r, &specs, &cp, own.as_ref(), self.decode, send) {
                 Ok((e, unresolved)) => {
                     match &e {
                         Event::Done { file, cards, .. } if !stand_in => store_if_current(&cache_dir, &cache_key, file, &text, cards),
@@ -519,11 +534,44 @@ fn store_if_current(cache_dir: &Path, key: &str, file: &Path, text: &str, cards:
     }
 }
 
-/// One socket per worker source, Kotlin version and libraries: after an update, or for a project on
-/// another Kotlin, a new worker starts; an old one exits when idle.
-fn socket(kt: &Kotlin, rt: &ProjectRuntime) -> PathBuf {
+/// The longest Unix socket path macOS takes (`sun_path` holds 104 bytes with the closing NUL).
+const MAX_SOCKET_PATH: usize = 103;
+
+/// One socket in `d` per worker source, Kotlin version and libraries: after an update, or for a
+/// project on another Kotlin, a new worker starts; an old one exits when idle. In a long preview
+/// folder the same parts give a short hashed name; one too long even for that is an error.
+fn socket_in(d: &Path, kt: &Kotlin, rt: &ProjectRuntime) -> Result<PathBuf, String> {
     let plugins = format!("{:?}{:?}{:?}", kt.compose_plugin, kt.parcelize_plugin, kt.serialization_plugin);
-    dir().join(format!("w-{:08x}-{}-{:08x}.sock", (fnv(WORKER_SOURCE) ^ fnv(&plugins)) as u32, kt.version, rt.key()))
+    let name = format!("w-{:08x}-{}-{:08x}.sock", (fnv(WORKER_SOURCE) ^ fnv(&plugins)) as u32, kt.version, rt.key());
+    let full = d.join(&name);
+    if full.as_os_str().len() <= MAX_SOCKET_PATH {
+        return Ok(full);
+    }
+    let short = d.join(format!("w-{:016x}.sock", fnv(&name)));
+    if short.as_os_str().len() <= MAX_SOCKET_PATH {
+        return Ok(short);
+    }
+    Err(format!(
+        "The preview folder's path is too long for the preview worker's socket ({} bytes; macOS takes at most {MAX_SOCKET_PATH}): {}. \
+         Set DROID_LITE_PREVIEW_DIR to a shorter folder.",
+        short.as_os_str().len(),
+        d.display()
+    ))
+}
+
+/// The lock an engine holds from a failed connect until the worker it started listens (and while
+/// it stops a hung one): two engines never both start a worker on one socket, and a socket is
+/// removed only by the engine that stopped every worker on it.
+fn start_lock(sock: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.start.lock", sock.display()))
+}
+
+/// How long `ps` or `java_home` may take (a hung one never holds up a preview).
+const PS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The text `prog args` prints, or "" when it fails or runs past `limit`.
+fn output_text(prog: &Path, args: &[&str], limit: Duration) -> String {
+    crate::capture::output_within(Command::new(prog).args(args), limit).map_or_else(|_| String::new(), |o| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
 /// How long a stopped worker gets to end after SIGTERM before SIGKILL.
@@ -534,6 +582,9 @@ const STOP_GRACE: Duration = Duration::from_secs(3);
 /// connecting to the hung one. Found by its command line (the socket is its argument), like
 /// [`stop_other_workers`]; worker.pid names only the newest worker.
 fn stop_worker(sock: &Path, grace: Duration) {
+    // under the start lock: no engine starts a worker on this socket meanwhile, so the socket
+    // removed below is a stopped worker's, never a fresh one's
+    let _start = crate::preview_base::lock(&start_lock(sock), &|| {}).ok();
     let mut pids = worker_pids(sock);
     for p in &pids {
         unsafe { libc::kill(*p, libc::SIGTERM) };
@@ -551,16 +602,22 @@ fn stop_worker(sock: &Path, grace: Duration) {
 
 /// The processes whose command line names `sock` (never this one).
 fn worker_pids(sock: &Path) -> Vec<i32> {
-    let Ok(out) = Command::new("ps").args(["-axww", "-o", "pid=,command="]).output() else { return Vec::new() };
+    let out = output_text(Path::new("ps"), &["-axww", "-o", "pid=,command="], PS_TIMEOUT);
     let (sock, me) = (sock.to_string_lossy().into_owned(), std::process::id());
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
+    out.lines()
         .filter_map(|l| {
             let (pid, cmd) = l.trim_start().split_once(' ')?;
             let pid = pid.parse::<i32>().ok()?;
             (pid as u32 != me && format!(" {cmd} ").contains(&format!(" {sock} "))).then_some(pid)
         })
         .collect()
+}
+
+/// A connection to the worker on `sock`, when one answers there.
+fn connect(sock: &Path) -> Option<(UnixStream, BufReader<UnixStream>)> {
+    let s = UnixStream::connect(sock).ok()?;
+    let rd = BufReader::new(s.try_clone().ok()?);
+    Some((s, rd))
 }
 
 fn connect_or_start(
@@ -571,9 +628,8 @@ fn connect_or_start(
     rt: &ProjectRuntime,
     base: &mut Option<crate::preview_base::Base>,
 ) -> Result<(UnixStream, BufReader<UnixStream>), String> {
-    if let Ok(s) = UnixStream::connect(sock) {
-        let rd = BufReader::new(s.try_clone().map_err(|e| e.to_string())?);
-        return Ok((s, rd));
+    if let Some(c) = connect(sock) {
+        return Ok(c);
     }
     // the renderer's files, checked at every worker start: one that went away is found again or
     // downloaded; never a start with a partial set
@@ -581,16 +637,25 @@ fn connect_or_start(
         let status = |t: String, n| send(Event::Status(file.to_path_buf(), t, n));
         *base = Some(crate::preview_base::ensure(&base_dir(), &dir().join("m2"), &status)?);
     }
+    // one start per socket at a time, across engines (two windows opening a preview at once): the
+    // lock is held until the new worker listens, and an engine that waited for it connects to that one
+    let waiting = || send(Event::Status(file.to_path_buf(), "Waiting for another window to start the preview worker".into(), None));
+    if let Some(d) = sock.parent() {
+        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+    }
+    let _start = crate::preview_base::lock(&start_lock(sock), &waiting)?;
+    if let Some(c) = connect(sock) {
+        return Ok(c);
+    }
     send(Event::Status(file.to_path_buf(), "Starting the preview worker".into(), None));
     stop_other_workers(sock);
     let mut child = start_worker(sock, kt, rt, base.as_ref())?;
     let _ = std::fs::write(dir().join("worker.pid"), format!("{} {}", child.id(), sock.display()));
     let until = Instant::now() + START_TIMEOUT;
     while Instant::now() < until {
-        if let Ok(s) = UnixStream::connect(sock) {
+        if let Some(c) = connect(sock) {
             std::thread::spawn(move || child.wait()); // reap it when it ends (idle exit)
-            let rd = BufReader::new(s.try_clone().map_err(|e| e.to_string())?);
-            return Ok((s, rd));
+            return Ok(c);
         }
         // it ended before it listened: say why now (the end of its log), do not wait the full minute
         if let Ok(Some(status)) = child.try_wait() {
@@ -622,19 +687,20 @@ const MAX_WORKERS: usize = 2;
 /// Before a new worker starts, the other preview workers of this preview folder (an older build's,
 /// another project's or Kotlin version's) past [`MAX_WORKERS`] are asked to stop (SIGTERM), the
 /// oldest first: the youngest is the one most likely still in use, and an unused one exits by
-/// itself when idle. Found by their command line (worker source and socket), so older builds that
-/// wrote no pidfile are found too.
-fn stop_other_workers(keep: &Path) {
-    let Ok(out) = Command::new("ps").args(["-axo", "pid=,etime=,command="]).output() else { return };
+/// itself when idle. A worker on the new one's own socket counts too and always stops: it did not
+/// answer there (hung, or its socket file was replaced). Found by their command line (worker
+/// source and socket), so older builds that wrote no pidfile are found too.
+fn stop_other_workers(sock: &Path) {
+    let out = output_text(Path::new("ps"), &["-axo", "pid=,etime=,command="], PS_TIMEOUT);
     let src = base_dir().join("PreviewWorker.java");
-    let (src, keep, me) = (src.to_string_lossy().into_owned(), keep.to_string_lossy().into_owned(), std::process::id());
+    let (src, sock, me) = (src.to_string_lossy().into_owned(), format!(" {} ", sock.display()), std::process::id());
     let mut others = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
+    for line in out.lines() {
         let mut it = line.split_whitespace();
         let (Some(pid), Some(age)) = (it.next().and_then(|p| p.parse::<i32>().ok()), it.next().and_then(etime_secs)) else { continue };
         let cmd = it.collect::<Vec<_>>().join(" ");
-        if pid as u32 != me && cmd.contains(&src) && !cmd.contains(&keep) {
-            others.push((pid, age));
+        if pid as u32 != me && cmd.contains(&src) {
+            others.push((pid, age, format!(" {cmd} ").contains(&sock)));
         }
     }
     let mut stopped = workers_to_stop(others);
@@ -649,11 +715,13 @@ fn stop_other_workers(keep: &Path) {
     }
 }
 
-/// Of the other workers (pid, age in seconds), the ones to stop so that with the new one at most
-/// [`MAX_WORKERS`] run: all but the youngest.
-fn workers_to_stop(mut others: Vec<(i32, u64)>) -> Vec<i32> {
-    others.sort_by_key(|w| w.1);
-    others.into_iter().skip(MAX_WORKERS - 1).map(|w| w.0).collect()
+/// Of the other workers (pid, age in seconds, on the new one's socket), the ones to stop so that
+/// with the new one at most [`MAX_WORKERS`] run: every one on its socket, then all but the
+/// youngest of the rest.
+fn workers_to_stop(others: Vec<(i32, u64, bool)>) -> Vec<i32> {
+    let (same, mut rest): (Vec<_>, Vec<_>) = others.into_iter().partition(|w| w.2);
+    rest.sort_by_key(|w| w.1);
+    same.into_iter().chain(rest.into_iter().skip(MAX_WORKERS - 1)).map(|w| w.0).collect()
 }
 
 /// `ps` elapsed time (`[[dd-]hh:]mm:ss`) in seconds.
@@ -725,6 +793,7 @@ fn start_worker(
                 .arg(format!("-Ddroidlite.res.packages={}", rt.res_packages.join(":")))
                 .arg(format!("-Ddroidlite.res.modules={}", rt.module_res.join(":")))
                 .arg(format!("-Ddroidlite.aar.dirs={}", rt.exploded.join(":")))
+                .arg(format!("-Ddroidlite.idle.seconds={}", std::env::var("DROID_LITE_PREVIEW_IDLE_SECS").unwrap_or_else(|_| "600".into())))
                 .arg("-cp")
                 // the project's Kotlin compiler (and its stdlib) first, then the renderer, then the
                 // project's libraries (or an older pack's Compose), android.jar last (after layoutlib)
@@ -744,7 +813,7 @@ fn start_worker(
         .stdout(log.try_clone().map_err(|e| e.to_string())?)
         .stderr(log)
         .process_group(0);
-    let _ = std::fs::remove_file(sock);
+    // a stale socket file is the worker's to remove: it checks first that no worker answers there
     cmd.spawn().map_err(|e| format!("Could not start the preview worker: {e}"))
 }
 
@@ -759,9 +828,7 @@ fn java() -> PathBuf {
         return Path::new(&h).join("bin/java");
     }
     let java_home = |v: &str| {
-        Command::new("/usr/libexec/java_home")
-            .args(["-v", v])
-            .output()
+        crate::capture::output_within(Command::new("/usr/libexec/java_home").args(["-v", v]), PS_TIMEOUT)
             .ok()
             .filter(|o| o.status.success())
             .map(|o| Path::new(String::from_utf8_lossy(&o.stdout).trim()).join("bin/java"))
@@ -899,6 +966,9 @@ fn project_r(pk: &crate::preview_src::Packages, lib_r: &[String]) -> Result<(Pat
     Ok((out, packages, res))
 }
 
+/// How long javac may take for the libraries' R classes (thousands of small files: seconds).
+const JAVAC_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 120 });
+
 /// The libraries' R classes as one folder of classes, compiled with javac once per set of libraries
 /// (they must sit next to the libraries' own code, in the worker's base class loader).
 fn library_r_classes(rjava: &[String]) -> Result<Option<PathBuf>, String> {
@@ -911,22 +981,49 @@ fn library_r_classes(rjava: &[String]) -> Result<Option<PathBuf>, String> {
     if out.join(".ok").exists() {
         return Ok(Some(out));
     }
-    let _ = std::fs::remove_dir_all(&out);
-    std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
-    let args = out.join("sources.txt");
-    std::fs::write(&args, rjava.join("\n")).map_err(|e| e.to_string())?;
-    let javac = java().with_file_name("javac");
-    let o = Command::new(&javac)
-        .args(["-nowarn", "-proc:none", "--release", "17", "-d"])
-        .arg(&out)
-        .arg(format!("@{}", args.display()))
-        .output()
+    // compiled in a folder of this engine's own, then moved into place whole: another engine
+    // compiling the same classes at once never deletes or reads a half folder
+    let tmp = unique_tmp(&out);
+    let compiled = (|| {
+        std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+        let args = tmp.join("sources.txt");
+        std::fs::write(&args, rjava.join("\n")).map_err(|e| e.to_string())?;
+        let javac = java().with_file_name("javac");
+        let o = crate::capture::output_within(
+            Command::new(&javac).args(["-nowarn", "-proc:none", "--release", "17", "-d"]).arg(&tmp).arg(format!("@{}", args.display())),
+            JAVAC_TIMEOUT,
+        )
         .map_err(|e| format!("Could not run {}: {e}", javac.display()))?;
-    if !o.status.success() {
-        return Err(format!("The libraries' R classes did not compile:\n{}", String::from_utf8_lossy(&o.stderr)));
+        if !o.status.success() {
+            return Err(format!("The libraries' R classes did not compile:\n{}", String::from_utf8_lossy(&o.stderr)));
+        }
+        std::fs::write(tmp.join(".ok"), "").map_err(|e| e.to_string())
+    })();
+    if compiled.is_ok() && !out.join(".ok").exists() {
+        let _ = std::fs::remove_dir_all(&out); // a half folder an older build left
+        let _ = std::fs::rename(&tmp, &out);
     }
-    let _ = std::fs::write(out.join(".ok"), "");
-    Ok(Some(out))
+    let _ = std::fs::remove_dir_all(&tmp);
+    compiled?;
+    if out.join(".ok").exists() { Ok(Some(out)) } else { Err(format!("Could not keep the libraries' R classes in {}", out.display())) }
+}
+
+/// A path next to `p` that only this call uses (pid and a counter), for a file or folder written
+/// whole and then renamed to `p`.
+fn unique_tmp(p: &Path) -> PathBuf {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    PathBuf::from(format!("{}.{}-{}.part", p.display(), std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)))
+}
+
+/// Writes `out` from `r` through a file of this call's own and a rename, so two engines unpacking
+/// the same library at once never lose it (a shared `.part` renamed away under the other).
+fn write_whole(out: &Path, r: &mut dyn std::io::Read) -> std::io::Result<()> {
+    let tmp = unique_tmp(out);
+    let written = std::fs::File::create(&tmp).and_then(|mut w| std::io::copy(r, &mut w)).and_then(|_| std::fs::rename(&tmp, out));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 fn library_classpath(root: &Path, scripts: &[PathBuf], progress: &dyn Fn(usize, usize)) -> LibraryCode {
@@ -985,10 +1082,7 @@ fn library_classpath(root: &Path, scripts: &[PathBuf], progress: &dyn Fn(usize, 
                 }
                 let _ = assets;
                 let mut entry = zip.by_name("classes.jar").ok()?;
-                let tmp = out.with_extension("part");
-                let mut w = std::fs::File::create(&tmp).ok()?;
-                std::io::copy(&mut entry, &mut w).ok()?;
-                std::fs::rename(&tmp, &out).ok()?;
+                write_whole(&out, &mut entry).ok()?;
             }
             let a = aars.join(&key).join("assets");
             if a.is_dir() {
@@ -1014,16 +1108,20 @@ fn fnv(s: &str) -> u64 {
     s.bytes().fold(0xcbf29ce484222325, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
 }
 
-/// How long the worker may be silent before it counts as stopped.
+/// How long the worker may be silent before it counts as hung: it sends a line at least every 10 s
+/// while a request is drawn or waits (a heartbeat during a long compile).
 const REPLY_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 120 });
+/// The longest one request may take in all, heartbeats or not: past it the worker is stopped.
+const REQUEST_LIMIT: Duration = Duration::from_secs(if cfg!(test) { 4 } else { 10 * 60 });
 
 /// Why [`ask`] got no answer.
 #[derive(Debug, PartialEq)]
 enum NoAnswer {
     /// Another client's request took the worker's one waiting place: ask again, the worker is fine.
     Replaced,
-    /// The worker was silent past the reply timeout (it sends a line at least every 10 s, also while
-    /// our request waits behind another client's draw): it hung.
+    /// The worker was silent past the reply timeout (it sends a line at least every 10 s, while our
+    /// request is drawn or waits behind another client's draw), or the request took longer than
+    /// [`REQUEST_LIMIT`] in all: it hung.
     Silent(String),
     /// The connection ended or broke (the worker exited when idle, crashed, or sent garbage): connect
     /// again; another client may have started a fresh worker on the same socket, never stop that one.
@@ -1041,6 +1139,7 @@ fn ask(
     specs: &[crate::preview_spec::Spec],
     cp: &[String],
     own: Option<&Own>,
+    decode: bool,
     send: &dyn Fn(Event),
 ) -> Result<(Event, Vec<String>), NoAnswer> {
     let lost = |e: std::io::Error| NoAnswer::Lost(e.to_string());
@@ -1051,15 +1150,25 @@ fn ask(
         "rjava": own.map_or(&[][..], |o| &o.rjava[..]),
         "key": own.map_or("", |o| o.key.as_str()),
     });
-    // a worker that hangs is given up (a cold compile takes about 25 s between lines)
-    rd.get_ref().set_read_timeout(Some(REPLY_TIMEOUT)).map_err(lost)?;
     writeln!(w, "{line}").map_err(lost)?;
+    // a worker that hangs is given up: no line at all (heartbeats count) for REPLY_TIMEOUT, or no
+    // answer in REQUEST_LIMIT
+    let until = Instant::now() + REQUEST_LIMIT;
     loop {
+        let left = until.saturating_duration_since(Instant::now());
+        let over = || NoAnswer::Silent(format!("no answer in {} min", REQUEST_LIMIT.as_secs().div_ceil(60)));
+        if left.is_zero() {
+            return Err(over());
+        }
+        rd.get_ref().set_read_timeout(Some(REPLY_TIMEOUT.min(left))).map_err(lost)?;
         let mut reply = String::new();
         match rd.read_line(&mut reply) {
             Ok(0) => return Err(NoAnswer::Lost("the connection closed".into())),
             Ok(_) => {}
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                if Instant::now() >= until {
+                    return Err(over());
+                }
                 return Err(NoAnswer::Silent(format!("no answer in {} s", REPLY_TIMEOUT.as_secs())));
             }
             Err(e) => return Err(lost(e)),
@@ -1091,12 +1200,11 @@ fn ask(
                 if let Some(e) = img["error"].as_str() {
                     return (name, Err(short_error(e, &r.file)));
                 }
+                // the worker's PNG as it is: saved and cached without being encoded again
                 let png = img["png"].as_str().unwrap_or("");
-                let pic = image::open(png)
-                    .map(|i| {
-                        let i = i.to_rgba8();
-                        egui::ColorImage::from_rgba_unmultiplied([i.width() as usize, i.height() as usize], i.as_raw())
-                    })
+                let pic = std::fs::read(png)
+                    .map_err(|e| e.to_string())
+                    .and_then(|b| crate::preview_cache::Picture::from_png(b, decode))
                     .map_err(|e| format!("Could not read the picture: {e}"));
                 if std::env::var_os("DROID_LITE_KEEP_PREVIEW_PNGS").is_none() {
                     let _ = std::fs::remove_file(png); // the texture holds it now
@@ -1279,7 +1387,7 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         });
         let (done, got) = channel();
         std::thread::spawn(move || {
-            let _ = done.send(ask(&mut w, &mut rd, 7, &request(1), &[], &[], None, &|_| {}).err());
+            let _ = done.send(ask(&mut w, &mut rd, 7, &request(1), &[], &[], None, true, &|_| {}).err());
         });
         let err = got.recv_timeout(Duration::from_secs(10)).expect("an answer, not a hang");
         assert_eq!(err, Some(NoAnswer::Replaced));
@@ -1292,7 +1400,7 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         let mut rd = BufReader::new(w.try_clone().unwrap());
         let (done, got) = channel();
         std::thread::spawn(move || {
-            let _ = done.send(ask(&mut w, &mut rd, 1, &request(1), &[], &[], None, &|_| {}).is_err());
+            let _ = done.send(ask(&mut w, &mut rd, 1, &request(1), &[], &[], None, true, &|_| {}).is_err());
         });
         assert_eq!(got.recv_timeout(Duration::from_secs(10)), Ok(true), "no endless wait");
         drop(peer);
@@ -1311,7 +1419,7 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
                     (&peer).write_all(said.as_bytes()).unwrap();
                 }
             });
-            let err = ask(&mut w, &mut rd, 1, &request(1), &[], &[], None, &|_| {}).err();
+            let err = ask(&mut w, &mut rd, 1, &request(1), &[], &[], None, true, &|_| {}).err();
             assert!(matches!(err, Some(NoAnswer::Lost(_))), "{peer_says:?}: {err:?}");
             worker.join().unwrap();
         }
@@ -1319,12 +1427,12 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         let (mut w, peer) = UnixStream::pair().unwrap();
         let mut rd = BufReader::new(w.try_clone().unwrap());
         drop(peer);
-        let err = ask(&mut w, &mut rd, 1, &request(1), &[], &[], None, &|_| {}).err();
+        let err = ask(&mut w, &mut rd, 1, &request(1), &[], &[], None, true, &|_| {}).err();
         assert!(matches!(err, Some(NoAnswer::Lost(_))), "{err:?}");
         // a silent one, still connected
         let (mut w, peer) = UnixStream::pair().unwrap();
         let mut rd = BufReader::new(w.try_clone().unwrap());
-        let err = ask(&mut w, &mut rd, 1, &request(1), &[], &[], None, &|_| {}).err();
+        let err = ask(&mut w, &mut rd, 1, &request(1), &[], &[], None, true, &|_| {}).err();
         assert!(matches!(err, Some(NoAnswer::Silent(_))), "{err:?}");
         drop(peer);
     }
@@ -1346,12 +1454,12 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
             p
         });
         let (log, send) = record();
-        let r = ask(&mut w, &mut rd, 3, &request(1), &[], &[], None, &send);
+        let r = ask(&mut w, &mut rd, 3, &request(1), &[], &[], None, true, &send);
         assert!(matches!(r, Ok((Event::Failed { .. }, _))), "{:?}", r.err());
         assert_eq!(log.borrow()[0].2, "Waiting for another preview to finish");
         drop(worker.join());
         // the real worker sends those lines from its idle thread while a request waits
-        assert!(WORKER_SOURCE.contains("if (waiting != null) status(waiting, \"Waiting for another preview to finish\""));
+        assert!(WORKER_SOURCE.contains("if (waiting != null) send(waiting, \"Waiting for another preview to finish\""));
     }
 
     #[test]
@@ -1474,8 +1582,11 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
     #[test]
     fn at_most_two_workers_run_the_youngest_other_one_stays() {
         assert_eq!(workers_to_stop(vec![]), Vec::<i32>::new());
-        assert_eq!(workers_to_stop(vec![(10, 900)]), Vec::<i32>::new(), "another window's worker stays");
-        assert_eq!(workers_to_stop(vec![(10, 900), (11, 30), (12, 4000)]), vec![10, 12], "oldest go");
+        assert_eq!(workers_to_stop(vec![(10, 900, false)]), Vec::<i32>::new(), "another window's worker stays");
+        assert_eq!(workers_to_stop(vec![(10, 900, false), (11, 30, false), (12, 4000, false)]), vec![10, 12], "oldest go");
+        // a worker on the new one's socket did not answer there: it goes and counts in the cap
+        assert_eq!(workers_to_stop(vec![(10, 900, false), (11, 30, true)]), vec![11]);
+        assert_eq!(workers_to_stop(vec![(10, 900, true), (11, 30, true), (12, 60, false)]), vec![10, 11]);
         assert_eq!(etime_secs("05:07"), Some(307));
         assert_eq!(etime_secs("01:00:01"), Some(3601));
         assert_eq!(etime_secs("2-00:00:10"), Some(172_810));
@@ -1604,12 +1715,12 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         let d = tmp("race");
         let (f, cache) = (d.join("Card.kt"), d.join("cache"));
         std::fs::write(&f, "B").unwrap(); // saved while the worker drew text "A"
-        let cards: crate::preview_cache::Cards = vec![("P".into(), Ok(egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE])))];
+        let cards: crate::preview_cache::Cards = vec![("P".into(), Ok(crate::preview_cache::Picture::of(egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]))))];
         store_if_current(&cache, "k-a", &f, "A", &cards);
         let now = crate::preview_cache::now_secs();
-        assert!(crate::preview_cache::lookup(&cache, "k-a", now).is_none());
+        assert!(crate::preview_cache::lookup(&cache, "k-a", now, true).is_none());
         store_if_current(&cache, "k-b", &f, "B", &cards);
-        assert!(crate::preview_cache::lookup(&cache, "k-b", now).is_some(), "unchanged: kept");
+        assert!(crate::preview_cache::lookup(&cache, "k-b", now, true).is_some(), "unchanged: kept");
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -1646,6 +1757,163 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         reads.refresh(&p(vec![src.join("demo/Card.kt"), src.join("demo/extra/New.kt")]), &no_status);
         assert_eq!(pk(&reads).as_deref(), Some("demo.extra"), "the new folder's package");
         assert_eq!(reads.libs.as_ref().unwrap().1.jars, ["/lib.jar"]);
+        // only the file added is read, the one removed dropped: not every file again
+        std::fs::write(src.join("demo/Gone.kt"), "package demo.gone\nclass Gone\n").unwrap();
+        reads.refresh(&p(vec![src.join("demo/Card.kt"), src.join("demo/Gone.kt")]), &no_status);
+        let packages = &reads.packages.as_ref().unwrap().1;
+        assert_eq!(packages.reads, 3, "Card, New, then Gone");
+        assert_eq!(packages.package_for("demo.extra.New"), Some("demo"), "New.kt was removed");
+        assert_eq!(packages.package_for("demo.gone.Gone"), Some("demo.gone"));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_long_preview_folder_gets_a_short_socket_name_or_a_clear_error() {
+        let kt = Kotlin { version: "2.2.20".into(), ..Default::default() };
+        let rt = ProjectRuntime::default();
+        let short = socket_in(Path::new("/tmp/p"), &kt, &rt).unwrap();
+        assert!(short.to_string_lossy().contains("-2.2.20-"), "the readable name when it fits: {short:?}");
+        let long_dir = PathBuf::from(format!("/Users/someone/{}", "x".repeat(60)));
+        let s = socket_in(&long_dir, &kt, &rt).unwrap();
+        assert!(s.as_os_str().len() <= MAX_SOCKET_PATH && s.starts_with(&long_dir), "{s:?}");
+        assert_ne!(s, socket_in(&long_dir, &Kotlin { version: "2.3.0".into(), ..Default::default() }, &rt).unwrap(), "still one per Kotlin");
+        let e = socket_in(&PathBuf::from(format!("/Users/someone/{}", "x".repeat(90))), &kt, &rt).unwrap_err();
+        assert!(e.contains("too long") && e.contains("DROID_LITE_PREVIEW_DIR"), "{e}");
+    }
+
+    #[test]
+    fn a_ps_that_hangs_is_stopped_at_its_limit() {
+        let d = tmp("ps");
+        let ps = d.join("ps");
+        std::fs::write(&ps, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&ps, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let t = Instant::now();
+        assert_eq!(output_text(&ps, &["-ax"], Duration::from_millis(300)), "");
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        assert!(output_text(Path::new("ps"), &["-o", "pid=", "-p", &std::process::id().to_string()], PS_TIMEOUT).contains(&std::process::id().to_string()));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_javac_that_hangs_is_stopped_at_its_limit() {
+        let _lock = crate::app::test_lock();
+        let d = tmp("javac");
+        std::fs::write(d.join("javac"), "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(d.join("javac"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::write(d.join("R.java"), "package a; public final class R {}\n").unwrap();
+        let vars = ["DROID_LITE_PREVIEW_DIR", "DROID_LITE_JAVA"];
+        let old: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        // SAFETY: the test lock is held, so no other test reads the environment meanwhile.
+        unsafe {
+            std::env::set_var(vars[0], d.join("pv"));
+            std::env::set_var(vars[1], d.join("java"));
+        }
+        let t = Instant::now();
+        let r = library_r_classes(&[d.join("R.java").to_string_lossy().into_owned()]);
+        let took = t.elapsed();
+        for (k, v) in vars.iter().zip(old) {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        assert!(r.as_ref().is_err_and(|e| e.contains("no answer in 2 s")), "{:?}", r.err());
+        assert!(took < Duration::from_secs(10), "{took:?}");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_worker_that_only_sends_heartbeats_is_given_up_after_the_request_limit() {
+        let (mut w, peer) = UnixStream::pair().unwrap();
+        let mut rd = BufReader::new(w.try_clone().unwrap());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let st = stop.clone();
+        let worker = std::thread::spawn(move || {
+            let mut line = String::new();
+            BufReader::new(peer.try_clone().unwrap()).read_line(&mut line).unwrap();
+            let mut p = peer;
+            // a line every 300 ms (well inside the 1 s silence limit), never an answer
+            while !st.load(std::sync::atomic::Ordering::Relaxed) {
+                if writeln!(p, r#"{{"id":4,"status":"Compiling (still working, 10 s)","done":0,"total":0}}"#).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        });
+        let (done, got) = channel();
+        std::thread::spawn(move || {
+            let _ = done.send(ask(&mut w, &mut rd, 4, &request(1), &[], &[], None, true, &|_| {}).err());
+        });
+        let err = got.recv_timeout(Duration::from_secs(15)).expect("given up, not an endless wait");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(err, Some(NoAnswer::Silent("no answer in 1 min".into())));
+        worker.join().unwrap();
+        // the real worker sends a heartbeat for the request it draws, not only for waiting ones
+        assert!(WORKER_SOURCE.contains("(still working, "));
+    }
+
+    #[test]
+    fn two_engines_starting_at_once_start_one_worker_and_both_connect() {
+        let _lock = crate::app::test_lock();
+        let d = tmp("race");
+        // slow to listen, so both engines find no worker at first; counts its starts
+        let fake = "import os,socket,sys,time,signal\nsignal.alarm(30)\nopen(os.environ['STARTS'],'a').write('x')\ntime.sleep(0.7)\n\
+                    if os.path.exists(sys.argv[1]): os.remove(sys.argv[1])\n\
+                    s=socket.socket(socket.AF_UNIX)\ns.bind(sys.argv[1])\ns.listen(5)\nwhile True:\n\tc,_=s.accept()\n";
+        std::fs::write(d.join("w.py"), fake).unwrap();
+        let vars = ["DROID_LITE_PREVIEW_DIR", "DROID_LITE_PREVIEW_WORKER", "STARTS"];
+        let old: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        // SAFETY: the test lock is held, so no other test reads the environment meanwhile.
+        unsafe {
+            std::env::set_var(vars[0], d.join("pv"));
+            std::env::set_var(vars[1], format!("python3 {}", d.join("w.py").display()));
+            std::env::set_var(vars[2], d.join("starts"));
+        }
+        std::fs::create_dir_all(d.join("pv")).unwrap();
+        let sock = d.join("pv/w-race.sock");
+        let go = std::sync::Barrier::new(2);
+        let ok = std::thread::scope(|sc| {
+            let engines: Vec<_> = (0..2)
+                .map(|_| {
+                    sc.spawn(|| {
+                        go.wait();
+                        connect_or_start(&|_| {}, Path::new("/p/A.kt"), &sock, &Kotlin::default(), &ProjectRuntime::default(), &mut None).is_ok()
+                    })
+                })
+                .collect();
+            engines.into_iter().map(|e| e.join().unwrap()).collect::<Vec<_>>()
+        });
+        let starts = std::fs::read_to_string(d.join("starts")).unwrap_or_default();
+        stop_worker(&sock, Duration::from_secs(1));
+        for (k, v) in vars.iter().zip(old) {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        assert_eq!(ok, [true, true], "both engines connected");
+        assert_eq!(starts, "x", "one worker, not one per engine");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn two_engines_unpacking_one_library_at_once_both_keep_it() {
+        let d = tmp("unpack");
+        let out = d.join("lib.jar");
+        let data = vec![7u8; 1 << 20];
+        std::thread::scope(|sc| {
+            for _ in 0..2 {
+                sc.spawn(|| {
+                    for i in 0..100 {
+                        let _ = std::fs::remove_file(&out);
+                        let r = write_whole(&out, &mut std::io::Cursor::new(&data));
+                        assert!(r.is_ok(), "round {i}: {r:?}");
+                    }
+                });
+            }
+        });
+        assert_eq!(std::fs::read(&out).unwrap().len(), data.len());
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1, "no part left");
         let _ = std::fs::remove_dir_all(d);
     }
 }

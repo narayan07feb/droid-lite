@@ -5,14 +5,18 @@
 // Run: java -cp <base jars> PreviewWorker.java <socket path> <work dir>
 //   system properties: paparazzi.layoutlib.runtime.root, paparazzi.layoutlib.resources.root,
 //   droidlite.plugins (the Kotlin compiler plugin jars: Compose, parcelize; ":"-separated),
-//   droidlite.compile.cp (the classpath the open file compiles against), droidlite.idle.minutes (10).
+//   droidlite.compile.cp (the classpath the open file compiles against), droidlite.idle.seconds (600),
+//   droidlite.write.timeout.ms (10000: a client that takes no reply for that long is dropped).
 //
 // Protocol, one JSON object per line each way (a tiny reader below, no JSON library):
 //   -> {"id":7,"file":"/abs/Card.kt","sources":["/abs/Other.kt"],"class":"demo.CardKt","previews":["CardPreview"]}
 //   <- {"id":7,"ok":true,"images":[{"name":"CardPreview","png":"/work/7-CardPreview.png","ms":48}],"compile_ms":210}
 //   <- {"id":7,"ok":false,"error":"e: Card.kt:3:5 Unresolved reference 'Foo'."}
 // One render at a time; the newest request wins (an older one waiting is dropped and answered "skipped").
-// A request waiting for the renderer gets a status line every 10 s, so its client never times it out.
+// A request waiting for the renderer, and the one being drawn (a long compile says nothing for minutes),
+// gets a status line every 10 s, so its client never takes this worker for hung.
+// The socket: a worker that finds another answering on its path ends; it removes only the socket file
+// it bound itself (a later worker may have bound a new one on the same path).
 import app.cash.paparazzi.DeviceConfig;
 import app.cash.paparazzi.Environment;
 import app.cash.paparazzi.PaparazziSdk;
@@ -29,48 +33,86 @@ import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.imageio.ImageIO;
 
 public class PreviewWorker {
     record Request(long id, String file, List<String> sources, String cls, List<Map<String, Object>> previews, List<String> cp,
-        List<String> rjava, String key, SocketChannel out) {}
+        List<String> rjava, String key, Client out) {}
 
     static final AtomicReference<Request> next = new AtomicReference<>();
     static final Object wake = new Object();
     static volatile long lastWork = System.currentTimeMillis();
     static BufferedImage frame;
+    /** The request being drawn, since when, and its last real step (the heartbeat repeats it). */
+    static volatile Request current;
+    static volatile long currentSince;
+    static volatile String step = "Working";
+    static volatile int stepDone, stepTotal;
 
     public static void main(String[] a) throws Exception {
         Path sock = Path.of(a[0]);
         Path work = Path.of(a[1]);
         Files.createDirectories(work);
-        Files.deleteIfExists(sock);
+        // two engines that each started a worker for one socket: the later one leaves the socket alone
+        if (answers(sock)) {
+            System.err.println("another preview worker answers on " + sock + "; this one ends");
+            System.exit(0);
+        }
+        Files.deleteIfExists(sock); // a stopped worker's: nobody answers there
         hostBuildFingerprint();
-        long idle = Long.getLong("droidlite.idle.minutes", 10) * 60_000;
+        long idle = Long.getLong("droidlite.idle.seconds", 600) * 1000;
         Thread renderer = new Thread(() -> renderLoop(work), "render");
         renderer.setDaemon(true);
         renderer.start();
         Thread watchdog = new Thread(() -> {
             while (true) {
                 sleep(10_000);
-                // a request waiting behind another client's long draw hears from us every 10 s, so its
-                // client does not take this worker for hung (it gives up after 120 s of silence)
+                // a request waiting behind another client's long draw, and the one being drawn, hear
+                // from us every 10 s, so their clients do not take this worker for hung (they give up
+                // after 120 s of silence)
                 synchronized (wake) {
                     Request waiting = next.get();
-                    if (waiting != null) status(waiting, "Waiting for another preview to finish", 0, 0);
+                    if (waiting != null) send(waiting, "Waiting for another preview to finish", 0, 0);
                 }
-                if (next.get() == null && System.currentTimeMillis() - lastWork > idle) {
-                    try { Files.deleteIfExists(sock); } catch (IOException ignored) {}
-                    System.exit(0); // idle: give the memory back
+                Request drawing = current;
+                if (drawing != null) {
+                    long secs = (System.currentTimeMillis() - currentSince) / 1000;
+                    send(drawing, step + " (still working, " + secs + " s)", stepDone, stepTotal);
+                }
+                if (next.get() == null && current == null && System.currentTimeMillis() - lastWork > idle) {
+                    System.exit(0); // idle: give the memory back (the shutdown hook removes our socket)
                 }
             }
         }, "idle");
         watchdog.setDaemon(true);
-        watchdog.start();
+        Thread writes = new Thread(() -> {
+            while (true) {
+                sleep(1_000);
+                long now = System.currentTimeMillis();
+                for (Client c : clients) {
+                    long since = c.writingSince;
+                    if (since != 0 && now - since > WRITE_TIMEOUT) {
+                        System.err.println("a client took no reply for " + WRITE_TIMEOUT + " ms: dropped");
+                        c.close();
+                    }
+                }
+            }
+        }, "write-timeout");
+        writes.setDaemon(true);
+        writes.start();
         try (ServerSocketChannel server = ServerSocketChannel.open(StandardProtocolFamily.UNIX)) {
             server.bind(UnixDomainSocketAddress.of(sock));
+            Object bound = fileKey(sock);
+            // on idle exit and on SIGTERM: only the socket file this worker bound, never a newer
+            // worker's on the same path
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> removeIfOwn(sock, bound)));
+            watchdog.start();
             System.err.println("preview worker ready on " + sock);
             while (true) {
                 SocketChannel c = server.accept();
@@ -81,11 +123,85 @@ public class PreviewWorker {
         }
     }
 
+    /** Whether a worker answers on `sock`. */
+    static boolean answers(Path sock) {
+        try (SocketChannel c = SocketChannel.open(UnixDomainSocketAddress.of(sock))) {
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /** The file's identity (device and inode), or null. */
+    static Object fileKey(Path p) {
+        try {
+            return Files.readAttributes(p, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).fileKey();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /** Removes `sock` only when it is still the file `bound` names (this worker's). */
+    static boolean removeIfOwn(Path sock, Object bound) {
+        Object now = fileKey(sock);
+        if (bound == null || !bound.equals(now)) return false;
+        try { return Files.deleteIfExists(sock); } catch (IOException e) { return false; }
+    }
+
+    /** How long a write to one client may block before that client is dropped. */
+    static final long WRITE_TIMEOUT = Long.getLong("droidlite.write.timeout.ms", 10_000);
+    static final Set<Client> clients = ConcurrentHashMap.newKeySet();
+
+    /** One connection. Replies queue up and the client's own thread writes them, so a client that
+     *  stops reading holds up nobody: not the renderer, not other clients. One whose write is stuck
+     *  for WRITE_TIMEOUT is dropped (its channel closed). */
+    static final class Client {
+        final SocketChannel ch;
+        final LinkedBlockingQueue<String> queue = new LinkedBlockingQueue<>();
+        volatile long writingSince; // 0: not writing
+        volatile boolean closed;
+
+        Client(SocketChannel ch) {
+            this.ch = ch;
+            clients.add(this);
+            Thread w = new Thread(this::writeLoop, "write");
+            w.setDaemon(true);
+            w.start();
+        }
+
+        void send(String line) {
+            if (!closed) queue.add(line);
+        }
+
+        void writeLoop() {
+            try {
+                while (!closed) {
+                    String line = queue.poll(1, TimeUnit.SECONDS);
+                    if (line == null) continue;
+                    java.nio.ByteBuffer b = java.nio.ByteBuffer.wrap((line + "\n").getBytes(StandardCharsets.UTF_8));
+                    writingSince = System.currentTimeMillis();
+                    while (b.hasRemaining()) ch.write(b);
+                    writingSince = 0;
+                }
+            } catch (IOException | InterruptedException e) {
+                if (!closed) System.err.println("reply: " + e); // Droid Lite went away: nothing to answer
+            }
+            close();
+        }
+
+        void close() {
+            closed = true;
+            clients.remove(this);
+            queue.clear();
+            try { ch.close(); } catch (IOException ignored) {}
+        }
+    }
+
     static void serve(SocketChannel c) {
-        // replies go straight to the channel: Channels' stream wrappers share one lock, so a reply would wait
-        // for the blocked read of the next request
+        // replies go through the client's own writer thread: Channels' stream wrappers share one lock,
+        // so a reply would wait for the blocked read of the next request
+        Client out = new Client(c);
         try (c; BufferedReader in = new BufferedReader(new InputStreamReader(Channels.newInputStream(c), StandardCharsets.UTF_8))) {
-            SocketChannel out = c;
             String line;
             while ((line = in.readLine()) != null) {
                 Map<String, Object> m = Json.parse(line);
@@ -97,7 +213,9 @@ public class PreviewWorker {
                 synchronized (wake) { wake.notifyAll(); }
             }
         } catch (Exception e) {
-            System.err.println("connection: " + e);
+            if (!out.closed) System.err.println("connection: " + e);
+        } finally {
+            out.close();
         }
     }
 
@@ -111,6 +229,10 @@ public class PreviewWorker {
                 }
             }
             lastWork = System.currentTimeMillis();
+            step = "Working";
+            stepDone = stepTotal = 0;
+            currentSince = System.currentTimeMillis();
+            current = r;
             try {
                 if (sdk == null) {
                     status(r, "Starting the renderer", 0, 0);
@@ -132,6 +254,8 @@ public class PreviewWorker {
                 reply(r.out, handle(r, work, sdk));
             } catch (Throwable e) {
                 reply(r.out, "{\"id\":" + r.id + ",\"ok\":false,\"error\":" + Json.str(trace(e)) + "}");
+            } finally {
+                current = null;
             }
             lastWork = System.currentTimeMillis();
         }
@@ -401,17 +525,22 @@ public class PreviewWorker {
         return s.toString();
     }
 
-    static synchronized void reply(SocketChannel out, String json) {
-        try {
-            java.nio.ByteBuffer b = java.nio.ByteBuffer.wrap((json + "\n").getBytes(StandardCharsets.UTF_8));
-            while (b.hasRemaining()) out.write(b);
-        } catch (IOException e) {
-            System.err.println("reply: " + e); // Droid Lite went away: nothing to answer
-        }
+    /** Never blocks: the client's own thread writes it. */
+    static void reply(Client out, String json) {
+        out.send(json);
     }
 
     /** The real step, sent while a request runs: Droid Lite shows it under the loading card. */
     static void status(Request r, String text, int done, int total) {
+        if (r == current) {
+            step = text;
+            stepDone = done;
+            stepTotal = total;
+        }
+        send(r, text, done, total);
+    }
+
+    static void send(Request r, String text, int done, int total) {
         reply(r.out, "{\"id\":" + r.id + ",\"status\":" + Json.str(text) + ",\"done\":" + done + ",\"total\":" + total + "}");
     }
 

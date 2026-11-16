@@ -37,6 +37,36 @@ const EXTENSIONS: &[&str] = &[
     "stability",
 ];
 
+/// Folder names the file list leaves out: build output, tool folders, and every hidden name (one
+/// starting with '.', e.g. `.gradle`, `.idea`, `.git`, `.cxx`, `.kotlin`). `open`, `accepts` and
+/// `droid-lite serve` share it; the VS Code extension mirrors it.
+pub const SKIPPED_NAMES: [&str; 2] = ["build", "node_modules"];
+
+/// Whether a file or folder name is left out of the file list (see [`SKIPPED_NAMES`]).
+pub fn skipped_name(name: &str) -> bool {
+    name.starts_with('.') || SKIPPED_NAMES.contains(&name)
+}
+
+/// Whether a path relative to the project root is left out: any part of it is a skipped name.
+pub fn skipped(rel: &Path) -> bool {
+    rel.components().any(|c| match c {
+        std::path::Component::Normal(n) => skipped_name(&n.to_string_lossy()),
+        _ => false,
+    })
+}
+
+/// Every file under `dir` (the project root, or a folder created, moved or renamed in it) that is
+/// not left out by [`skipped_name`] or `.gitignore`. `dir` itself is not checked.
+pub fn walk(dir: &Path) -> impl Iterator<Item = PathBuf> {
+    ignore::WalkBuilder::new(dir)
+        .hidden(true)
+        .filter_entry(|e| e.depth() == 0 || !e.file_name().to_str().is_some_and(skipped_name))
+        .build()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+        .map(|e| e.into_path())
+}
+
 pub fn is_code(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),
@@ -81,18 +111,7 @@ impl Project {
                 },
             );
         }
-        let mut files: Vec<PathBuf> = ignore::WalkBuilder::new(&root)
-            .hidden(true)
-            .filter_entry(|e| {
-                !matches!(
-                    e.file_name().to_str(),
-                    Some("build" | ".gradle" | ".idea" | "node_modules" | ".cxx")
-                )
-            })
-            .build()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
-            .map(|e| e.into_path())
+        let mut files: Vec<PathBuf> = walk(&root)
             .filter(|p| {
                 p.extension()
                     .and_then(|e| e.to_str())
@@ -124,10 +143,7 @@ impl Project {
     /// Whether a file that appeared later belongs in the file list (same rules as `open`).
     pub fn accepts(&self, path: &Path) -> bool {
         path.strip_prefix(&self.root).is_ok_and(|rel| {
-            !crate::watch::ignored(rel)
-                && !rel
-                    .components()
-                    .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+            !skipped(rel)
                 && path
                     .extension()
                     .and_then(|e| e.to_str())

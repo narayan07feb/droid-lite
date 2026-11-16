@@ -5,8 +5,8 @@
 //! `{"id":1,"result":{...}}` or `{"id":1,"error":"..."}`.
 //! Positions are 0-based lines and columns in UTF-16 code units (as VS Code counts them).
 //!
-//! Methods: `ping`, `initialize {root}`, `update {path, text}`, `remove {path}` (a deleted file or
-//! folder), `lenses {path, text?}`, `implementations {name, member?}`, `stability {path, text?}`;
+//! Methods: `ping`, `initialize {root}`, `update {path, text}`, `remove {path}` or
+//! `remove {paths: [...]}` (deleted files or folders), `lenses {path, text?}`, `implementations {name, member?}`, `stability {path, text?}`;
 //! device tools without a project: `adb`, `devices`, `screenshot {serial}`,
 //! `record_start {serial}`, `record_stop`. Device tools run on their own thread and answer when
 //! done, so a device that hangs (each adb call is stopped after 20 s) holds up nothing else.
@@ -103,11 +103,7 @@ fn answer(id: Value, r: Result<Value, String>) -> Value {
 
 /// Saves the pictures as PNGs in `dir` (new names each time, so an editor never shows a cached
 /// one) and deletes this file's older ones and anyone's older than the preview cache keeps.
-fn save_cards(
-    dir: &Path,
-    file: &Path,
-    cards: Vec<(String, Result<egui::ColorImage, String>)>,
-) -> Vec<Value> {
+fn save_cards(dir: &Path, file: &Path, cards: crate::preview_cache::Cards) -> Vec<Value> {
     let _ = std::fs::create_dir_all(dir);
     let key = format!("{:016x}", {
         use std::hash::{Hash, Hasher};
@@ -134,18 +130,10 @@ fn save_cards(
         .into_iter()
         .enumerate()
         .map(|(i, (name, pic))| {
-            let png = pic.and_then(|img| {
-                let [w, h] = img.size;
-                let raw: Vec<u8> = img
-                    .pixels
-                    .iter()
-                    .flat_map(|c| c.to_srgba_unmultiplied())
-                    .collect();
+            // the worker's PNG bytes as they are, never decoded and encoded again
+            let png = pic.and_then(|p| {
                 let path = dir.join(format!("{key}-{stamp}-{i}.png"));
-                image::RgbaImage::from_raw(w as u32, h as u32, raw)
-                    .ok_or("bad picture size")?
-                    .save(&path)
-                    .map_err(|e| e.to_string())?;
+                std::fs::write(&path, &p.png).map_err(|e| e.to_string())?;
                 Ok(path)
             });
             match png {
@@ -202,6 +190,19 @@ fn relay(events: Receiver<crate::preview::Event>, waiting: Waiting, out: Out, di
         if let Some(v) = guarded(|| Ok(on_event(event, &waiting, &dir))).unwrap_or(None) {
             out.emit(v);
         }
+    }
+    // the preview thread ended (a bug): no answer comes for any request still waiting, whatever
+    // its file
+    let left: Vec<Value> = waiting
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain()
+        .map(|(_, (_, id))| id)
+        .collect();
+    for id in left {
+        out.emit(
+            json!({ "id": id, "error": "the preview thread stopped; open the preview again" }),
+        );
     }
 }
 
@@ -403,21 +404,10 @@ fn device_thread(out: Out) -> (Sender<DeviceCall>, std::thread::JoinHandle<()>) 
     (tx, t)
 }
 
-/// Every source file under `dir` (a folder created, moved or renamed), leaving out generated and
-/// tool folders like `Project::open` does.
+/// Every source file under `dir` (a folder created, moved or renamed), leaving out what
+/// `Project::open` leaves out.
 fn source_files(dir: &Path) -> Vec<PathBuf> {
-    ignore::WalkBuilder::new(dir)
-        .hidden(true)
-        .filter_entry(|e| {
-            !matches!(
-                e.file_name().to_str(),
-                Some("build" | ".gradle" | ".idea" | ".git" | "node_modules" | ".cxx")
-            )
-        })
-        .build()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
-        .map(|e| e.into_path())
+    crate::project::walk(dir)
         .filter(|p| crate::project::is_code(p))
         .collect()
 }
@@ -453,16 +443,11 @@ fn lenient_id(line: &str) -> Value {
     Value::Null
 }
 
-/// Generated or tool folders the index leaves out (Project::open skips them too): Hilt_* and
-/// *_Factory classes there would count as implementations.
+/// Generated, tool and hidden folders the index leaves out, as `Project::open` does (Hilt_* and
+/// *_Factory classes under build/ would count as implementations), the path itself included.
 fn ignored(root: Option<&Path>, path: &Path) -> bool {
     let rel = root.and_then(|r| path.strip_prefix(r).ok()).unwrap_or(path);
-    rel.components().any(|c| {
-        matches!(
-            c.as_os_str().to_str(),
-            Some("build" | ".gradle" | ".idea" | ".git")
-        )
-    })
+    crate::project::skipped(rel)
 }
 
 fn verdict(v: Verdict) -> &'static str {
@@ -555,16 +540,29 @@ impl Server {
                 Ok(Value::Null)
             }
             // a deleted file, or everything under a deleted folder (in the project: never all of
-            // it by an empty path)
+            // it by an empty path); `paths` removes many in one request
             "remove" => {
-                let raw = s("path")?;
-                let path = &canon(raw);
-                let root = self.project.as_ref().map(|p| p.root.as_path());
-                if raw.trim().is_empty() || !in_project(root, path) {
-                    return Err(format!("{raw:?} is not in the project"));
+                let raws: Vec<&str> = match params["paths"].as_array() {
+                    Some(a) => a
+                        .iter()
+                        .map(|p| p.as_str().ok_or("\"paths\" holds a non-text"))
+                        .collect::<Result<_, _>>()?,
+                    None => vec![s("path")?],
+                };
+                let root = self.project.as_ref().map(|p| p.root.clone());
+                let mut outside = Vec::new();
+                for raw in raws {
+                    let path = &canon(raw);
+                    if raw.trim().is_empty() || !in_project(root.as_deref(), path) {
+                        outside.push(format!("{raw:?}"));
+                    } else if !ignored(root.as_deref(), path) {
+                        self.forget(path);
+                    }
                 }
-                self.forget(path);
-                Ok(Value::Null)
+                match outside.len() {
+                    0 => Ok(Value::Null),
+                    _ => Err(format!("{} is not in the project", outside.join(", "))),
+                }
             }
             // Droid Lite's gutter links for one file: expect/actual, supertypes, implementations,
             // overrides
@@ -712,14 +710,27 @@ impl Server {
     }
 
     /// Drops a deleted file, or everything under a deleted folder: its index entries, texts and
-    /// place in the file list.
+    /// place in the file list. A known file costs a few lookups; a folder one range of the sorted
+    /// lists, never a scan of every file (an editor may send thousands of removes at once).
     fn forget(&mut self, path: &Path) {
-        self.index.remove(path);
+        if self.files.remove(path) || self.index.files.contains_key(path) {
+            self.index.remove(path);
+            self.texts.remove(path);
+            self.files_changed = true;
+            return;
+        }
         self.index.remove_under(path);
         self.texts.retain(|p, _| !p.starts_with(path));
-        let before = self.files.len();
-        self.files.retain(|p| !p.starts_with(path));
-        self.files_changed |= self.files.len() != before;
+        let under: Vec<PathBuf> = self
+            .files
+            .range::<Path, _>((std::ops::Bound::Included(path), std::ops::Bound::Unbounded))
+            .take_while(|p| p.starts_with(path))
+            .cloned()
+            .collect();
+        self.files_changed |= !under.is_empty();
+        for p in under {
+            self.files.remove(&p);
+        }
     }
 
     /// Starts drawing a file's previews. `Ok(Some)` answers now (no previews); `Ok(None)` means the
@@ -760,7 +771,7 @@ impl Server {
             sweep_png_dirs(&root);
             let dir = png_dir(&root);
             self.pngs = Some(dir.clone());
-            let (tx, events) = crate::preview::spawn(&egui::Context::default());
+            let (tx, events) = crate::preview::spawn(&egui::Context::default(), false);
             std::thread::spawn(move || relay(events, waiting, out, dir));
             self.previews = Some(tx);
         }
@@ -864,15 +875,36 @@ impl Server {
 /// Reads requests from stdin until it closes.
 pub fn run() {
     let mut server = Server::default();
-    for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+    serve_input(&mut server, std::io::stdin().lock(), &emit);
+    server.shutdown(Duration::from_secs(15));
+}
+
+/// Answers each request line of `input` until it ends. A line that is not UTF-8 is answered with
+/// an error (to its id when one can be read) and the next line goes on: it never ends the engine.
+fn serve_input(server: &mut Server, mut input: impl BufRead, out: &dyn Fn(&Value)) {
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match input.read_until(b'\n', &mut buf) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        }
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            let lossy = String::from_utf8_lossy(&buf);
+            out(
+                &json!({ "id": lenient_id(&lossy), "error": "bad request: the line is not UTF-8 text" }),
+            );
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(v) = server.request(&line) {
-            emit(&v);
+        if let Some(v) = server.request(line.trim_end_matches(['\n', '\r'])) {
+            out(&v);
         }
     }
-    server.shutdown(Duration::from_secs(15));
 }
 
 /// The project as a preview request carries it: its build scripts and its files.
@@ -1663,5 +1695,184 @@ mod tests {
         s.shutdown(Duration::from_secs(1));
         assert!(!mine.exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A project of `n` files under /p (not on disk) in the index and the file list.
+    fn big(n: usize) -> (Server, Vec<PathBuf>) {
+        let root = PathBuf::from("/p");
+        let mut s = Server {
+            open: true,
+            project: Some(project_ref(root.clone(), vec![])),
+            ..Default::default()
+        };
+        let files: Vec<PathBuf> = (0..n)
+            .map(|i| root.join(format!("m{}/src/main/java/a/F{i}.kt", i % 40)))
+            .collect();
+        for (i, f) in files.iter().enumerate() {
+            s.index
+                .update(f, &format!("package a\nclass X{i}\nfun y{i}() {{}}\n"));
+            s.files.insert(f.clone());
+        }
+        (s, files)
+    }
+
+    #[test]
+    fn removes_scan_nothing_of_the_whole_project() {
+        let (mut s, files) = big(12_000);
+        s.texts.insert(files[1].clone(), "x".into());
+        let t = Instant::now();
+        for f in &files[..3000] {
+            let r = call(&mut s, "remove", json!({ "path": f }));
+            assert!(r["error"].is_null(), "{r}");
+        }
+        let one_by_one = t.elapsed();
+        eprintln!("3000 removes on 12000 files: {one_by_one:?}");
+        assert!(!s.texts.contains_key(&files[1]));
+        assert_eq!((s.files.len(), s.index.files.len()), (9000, 9000));
+        assert!(one_by_one < Duration::from_millis(500), "{one_by_one:?}");
+        // many in one request; a folder; a path outside the project is named, the rest still go
+        let t = Instant::now();
+        let batch: Vec<&PathBuf> = files[3000..6000].iter().collect();
+        let r = call(&mut s, "remove", json!({ "paths": batch }));
+        assert!(r["error"].is_null(), "{r}");
+        eprintln!("3000 removes in one request: {:?}", t.elapsed());
+        assert_eq!((s.files.len(), s.index.files.len()), (6000, 6000));
+        let r = call(
+            &mut s,
+            "remove",
+            json!({ "paths": ["/elsewhere/A.kt", "/p/m7"] }),
+        );
+        assert_eq!(
+            r["error"], "\"/elsewhere/A.kt\" is not in the project",
+            "{r}"
+        );
+        assert_eq!(
+            (s.files.len(), s.index.files.len()),
+            (5850, 5850),
+            "folder m7 went"
+        );
+        assert!(s.files.iter().all(|f| !f.starts_with("/p/m7")));
+    }
+
+    #[test]
+    fn update_skips_what_project_open_skips_the_walked_folder_itself_included() {
+        let root = std::fs::canonicalize(project("skips")).unwrap();
+        let demo = root.join("app/src/main/java/demo");
+        let files = [
+            demo.join("node_modules/x/N.kt"),
+            demo.join("feat/node_modules/Bad.kt"),
+            demo.join("feat/.cache/Hidden.kt"),
+            demo.join("feat/Ok.kt"),
+            root.join("app/.cxx/C.kt"),
+            root.join(".hidden/H.kt"),
+        ];
+        for f in &files {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            let n = f.file_stem().unwrap().to_str().unwrap();
+            std::fs::write(f, format!("package demo\nclass {n} : Base\n")).unwrap();
+        }
+        let mut s = Server::default();
+        init(&mut s, &root);
+        let subclasses = |s: &mut Server| {
+            let r = call(s, "implementations", json!({ "name": "Base" }));
+            let mut v: Vec<String> = r["result"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["name"].as_str().unwrap().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(subclasses(&mut s), ["Ok"], "Project::open");
+        for f in &files {
+            call(&mut s, "remove", json!({ "path": f }));
+        }
+        assert_eq!(subclasses(&mut s), Vec::<String>::new());
+        for p in [
+            demo.join("node_modules"),
+            demo.join("feat"),
+            root.join("app/.cxx"),
+            root.join(".hidden/H.kt"),
+            root.join(".hidden"),
+        ] {
+            let r = call(&mut s, "update", json!({ "path": p }));
+            assert!(r["error"].is_null(), "{r}");
+        }
+        assert_eq!(subclasses(&mut s), ["Ok"], "update of a folder or file");
+        assert!(
+            !s.files
+                .iter()
+                .any(|f| f.to_string_lossy().contains("node_modules"))
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_line_that_is_not_utf8_is_answered_and_the_engine_goes_on() {
+        let input: &[u8] = b"{\"id\":1,\"method\":\"ping\"}\n{\"id\":2,\"method\":\"update\",\"params\":{\"text\":\"\xff\"}}\n\n{\"id\":3,\"method\":\"ping\"}";
+        let got = std::cell::RefCell::new(Vec::new());
+        serve_input(&mut Server::default(), input, &|v| {
+            got.borrow_mut().push(v.clone())
+        });
+        let got = got.into_inner();
+        let ids: Vec<&Value> = got.iter().map(|v| &v["id"]).collect();
+        assert_eq!(ids, [&json!(1), &json!(2), &json!(3)], "{got:?}");
+        assert!(
+            got[1]["error"].as_str().unwrap().contains("not UTF-8"),
+            "{got:?}"
+        );
+        assert_eq!(got[2]["result"]["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn when_the_preview_thread_ends_every_waiting_request_is_answered() {
+        let (tx, events) = channel::<crate::preview::Event>();
+        let (out, lines) = channel();
+        let waiting: Waiting = Default::default();
+        waiting
+            .lock()
+            .unwrap()
+            .insert(PathBuf::from("/p/A.kt"), (1, json!(10)));
+        waiting
+            .lock()
+            .unwrap()
+            .insert(PathBuf::from("/p/B.kt"), (2, json!(11)));
+        let w = waiting.clone();
+        let t = std::thread::spawn(move || {
+            relay(events, w, Out(Some(out)), PathBuf::from("/nonexistent"))
+        });
+        drop(tx);
+        t.join().unwrap();
+        let mut ids: Vec<i64> = lines
+            .try_iter()
+            .map(|v| {
+                assert!(
+                    v["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("preview thread stopped"),
+                    "{v}"
+                );
+                v["id"].as_i64().unwrap()
+            })
+            .collect();
+        ids.sort();
+        assert_eq!(ids, [10, 11]);
+        assert!(waiting.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn saved_pictures_are_the_workers_png_bytes_not_encoded_again() {
+        let dir = std::env::temp_dir().join(format!("dl-serve-bytes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let png = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icon-256.png"))
+            .unwrap();
+        let pic = crate::preview_cache::Picture::from_png(png.clone(), false).unwrap();
+        assert!(pic.image.is_none(), "the engine decodes nothing");
+        let saved = save_cards(&dir, Path::new("/p/Card.kt"), vec![("P".into(), Ok(pic))]);
+        let path = saved[0]["png"].as_str().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), png);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

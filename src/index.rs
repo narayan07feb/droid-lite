@@ -4,7 +4,7 @@ use crate::kotlin::{Atom, Decl, FileSyms, Kind, scan};
 use crate::project::is_code;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,8 +17,8 @@ pub struct Index {
     /// Files with a class that names each supertype, for "implemented by" lookups.
     subtypes: HashMap<String, Vec<Arc<Path>>>,
     /// One shared copy of each file's path for the maps above (a copy per name cost ~20 MB on a
-    /// 12k-file project).
-    shared: HashMap<PathBuf, Arc<Path>>,
+    /// 12k-file project), sorted, so the files under a folder are one range.
+    shared: BTreeMap<PathBuf, Arc<Path>>,
     /// Bumped on every change, so callers can cache results.
     pub generation: u64,
 }
@@ -112,12 +112,14 @@ impl Index {
         self.generation += 1;
     }
 
-    /// Drops every file under `dir` (a deleted folder).
+    /// Drops every file under `dir` (a deleted folder): one range of the sorted paths, not a scan
+    /// of every file.
     pub fn remove_under(&mut self, dir: &Path) {
         let gone: Vec<PathBuf> = self
-            .files
-            .keys()
-            .filter(|p| p.starts_with(dir))
+            .shared
+            .range::<Path, _>((std::ops::Bound::Included(dir), std::ops::Bound::Unbounded))
+            .map(|(p, _)| p)
+            .take_while(|p| p.starts_with(dir))
             .cloned()
             .collect();
         for p in gone {
