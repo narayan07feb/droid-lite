@@ -21,6 +21,7 @@ process.env.DROID_LITE_PREVIEW_DIR = dir;
 // silent.json; sends progress for previews (another file's first); ends with its stdin
 const log = path.join(dir, 'requests.log');
 const silent = path.join(dir, 'silent.json');
+const progressFile = path.join(dir, 'progress.json'); // previews: n progress lines, one each `every` ms
 const fakeEngine = path.join(dir, 'fake-engine');
 const fakeAdb = path.join(dir, 'fake-adb');
 fs.writeFileSync(fakeEngine, `#!/usr/bin/env node
@@ -30,7 +31,15 @@ require('readline').createInterface({ input: process.stdin }).on('line', (l) => 
   fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ pid: process.pid, method, params }) + '\\n');
   const answers = { devices: [{ serial: 'S1', label: 'Fake (S1)', online: true }], adb: ${JSON.stringify(fakeAdb)}, lenses: [], stability: [] };
   const quiet = fs.existsSync(${JSON.stringify(silent)}) ? JSON.parse(fs.readFileSync(${JSON.stringify(silent)}, 'utf8')) : [];
-  if (method === 'previews') {
+  const prog = method === 'previews' && fs.existsSync(${JSON.stringify(progressFile)})
+    && JSON.parse(fs.readFileSync(${JSON.stringify(progressFile)}, 'utf8'));
+  if (prog) {
+    let i = 0;
+    const t = setInterval(() => {
+      console.log(JSON.stringify({ event: 'preview_status', file: prog.other ? '/elsewhere/Other.kt' : fs.realpathSync(params.path), text: 'tick' }));
+      if (++i === prog.n) clearInterval(t);
+    }, prog.every);
+  } else if (method === 'previews') {
     console.log(JSON.stringify({ event: 'preview_status', file: '/elsewhere/Other.kt', text: 'other file' }));
     console.log(JSON.stringify({ event: 'preview_status', file: fs.realpathSync(params.path), text: 'this file' }));
   }
@@ -78,7 +87,11 @@ let clears = 0;
 class Pos { constructor(l, c) { this.line = l; this.character = c; } }
 const fake = {
   EventEmitter: class {
-    constructor() { this.ls = []; this.event = (l) => { this.ls.push(l); return {}; }; emitters.push(this); }
+    constructor() {
+      this.ls = [];
+      this.event = (l) => { this.ls.push(l); return { dispose: () => { this.ls = this.ls.filter((x) => x !== l); } }; };
+      emitters.push(this);
+    }
     fire(v) { this.ls.forEach((l) => l(v)); }
   },
   MarkdownString: class { constructor(v) { this.value = v; } },
@@ -95,6 +108,7 @@ const fake = {
   ProgressLocation: { Notification: 15 },
   ViewColumn: { Beside: -2 },
   workspace: {
+    textDocuments: [],
     get workspaceFolders() { folderReads++; return folders; },
     getConfiguration: () => ({ get: (k) => cfg[k] }),
     onDidChangeTextDocument: (l) => { docChanges.push(l); return { dispose() {} }; },
@@ -217,7 +231,7 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   const props = pkg.contributes.configuration.properties;
   check('enginePath is a machine setting', props['droidLite.enginePath'].scope === 'machine');
   check('logcatMaxLines setting', props['droidLite.logcatMaxLines'].default === 20000);
-  check('version 0.4.1', pkg.version === '0.4.1');
+  check('version 0.4.2', pkg.version === '0.4.2');
 
   // the rest runs on the fake engine
   cfg.enginePath = fakeEngine;
@@ -242,6 +256,11 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   all.ls.Delete({ fsPath: path.join(src, 'Gone.kt') });
   all.ls.Delete({ fsPath: path.join(dir, 'app/build') });
   all.ls.Delete({ fsPath: path.join(src, 'notes.txt') });
+  // another folder of a multi-root workspace (one whose name starts like the root too) is not sent
+  const outside = path.join(`${dir}-other`, 'A.kt');
+  files.ls.Change({ fsPath: outside });
+  files.ls.Create({ fsPath: '/elsewhere/B.kt' });
+  all.ls.Delete({ fsPath: path.join(dir, '..', 'gone') });
   let reads = 0;
   const editDoc = (scheme, text, file = api) => ({
     uri: { scheme, fsPath: file }, getText: () => { reads++; return text; }, version: 2,
@@ -256,6 +275,7 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   change('file', 'package demo\n// 2\n');
   // half an emoji (a lone surrogate) goes as U+FFFD: the engine reads UTF-8
   change('file', 'package demo\n// a\uD83Db\n', path.join(src, 'Emoji.kt'));
+  change('file', 'package other\n', outside);
   check('no text read per keystroke', reads === 0);
   await sleep(600);
   check('text read once when the update goes', reads === 2);
@@ -270,6 +290,7 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   check('every deleted path sends remove (folders with a dot too)', ['demo/old', 'demo/old.dir', 'Gone.kt', 'notes.txt']
     .every((f) => sent.some(([m, p]) => m === 'remove' && p.endsWith(f))));
   check('no update with empty text', !sent.some(([m, , t]) => m === 'update' && t === ''));
+  check('paths outside the project folder are not sent', sent.length && !sent.some(([, p]) => p.startsWith('..') || path.isAbsolute(p)));
   check('a lone surrogate goes as U+FFFD', sent.some(([m, p, t]) => m === 'update' && p.endsWith('Emoji.kt')
     && t === 'package demo\n// a\uFFFDb\n'));
   check('the watchers split: files create/change, all paths create/delete',
@@ -288,11 +309,29 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   check('closing a tab sends update without text',
     after.length === 1 && after[0].method === 'update' && after[0].params.text === undefined);
 
+  // a late watcher event (no text) for an open file with unsaved edits keeps those edits; closing
+  // it (edits dropped) still goes back to the disk
+  const dirtyText = 'package demo\n// dirty\n';
+  const dirtyApi = { ...editDoc('file', dirtyText), isDirty: true, isClosed: false };
+  fake.workspace.textDocuments = [dirtyApi];
+  const beforeLate = requests().length;
+  change('file', dirtyText);
+  files.ls.Change({ fsPath: api });
+  await sleep(600);
+  const late = requests().slice(beforeLate).filter((r) => r.params.path === api);
+  check('a late watcher event keeps the unsaved text', late.length === 1 && late[0].params.text === dirtyText);
+  const beforeClose = requests().length;
+  close('file');
+  await sleep(600);
+  const closed = requests().slice(beforeClose).filter((r) => r.params.path === api);
+  check('closing an unsaved tab still sends no text', closed.length === 1 && closed[0].params.text === undefined);
+  fake.workspace.textDocuments = [];
+
   // every engine call has a time limit: one never answered does not wait forever
   check('every engine method has a limit', ['initialize', 'ping', 'update', 'remove', 'lenses', 'stability',
     'implementations', 'previews', 'devices', 'adb', 'screenshot', 'record_start', 'record_stop']
     .every((m) => ext.limits[m] > 0) && ext.limits.initialize === 60000 && ext.limits.update === 15000
-    && ext.limits.lenses === 15000 && ext.limits.record_stop === 120000);
+    && ext.limits.lenses === 15000 && ext.limits.record_stop === 900000);
   fs.writeFileSync(silent, '["lenses"]');
   ext.limits.lenses = 100;
   const lensResult = await Promise.race([provider.provideCodeLenses(doc('Api.kt')), sleep(2000).then(() => 'stuck')]);
@@ -307,7 +346,7 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   check('device call times out', errors.some((m) => /did not answer screenshot/.test(m)));
 
   // a preview that is never answered: the panel shows the error instead of "Drawing…"
-  check('previews wait 180 s at most', ext.limits.previews === 180000);
+  check('previews wait 180 s without progress, 15 min in all', ext.limits.previews === 180000 && ext.caps.previews === 900000);
   ext.limits.previews = 100;
   // the active editor is still Card.kt
   commands['droidLite.preview']();
@@ -333,6 +372,28 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   check('the panel draws the active file when shown', starts().length === drawn + 1 && starts().at(-1) === 'Card.kt');
   await sleep(300); // the preview call times out
 
+  // each progress line for the drawn file starts the previews limit again, up to the cap; another
+  // file's progress does not
+  const previewError = async (prog) => {
+    fs.writeFileSync(progressFile, JSON.stringify(prog));
+    const n = panel.posted.length;
+    const t = Date.now();
+    commands['droidLite.preview']();
+    await until('the preview error', () => panel.posted.slice(n).some((m) => m.type === 'error'), 5000);
+    fs.rmSync(progressFile);
+    return [Date.now() - t, panel.posted.slice(n).find((m) => m.type === 'error').text];
+  };
+  ext.limits.previews = 300;
+  const [withProgress] = await previewError({ n: 8, every: 100 }); // last line at 0.8 s: ends at about 1.1 s
+  check('progress for the file starts the previews limit again', withProgress >= 900);
+  const [otherProgress] = await previewError({ n: 8, every: 100, other: true });
+  check("another file's progress does not", otherProgress < 750);
+  ext.caps.previews = 600;
+  const [capped, cappedText] = await previewError({ n: 20, every: 100 });
+  check('previews end at the cap', capped < 1300 && /in 0\.6 s/.test(cappedText));
+  ext.caps.previews = 900000;
+  await sleep(1500); // the last progress lines
+
   // logcat: older lines cleared past logcatMaxLines; stderr is read (else the fake adb never ends)
   cfg.logcatMaxLines = 10;
   await commands['droidLite.logcat']();
@@ -348,12 +409,23 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   check('recording shows in the status bar', status.command === 'droidLite.recordStop');
 
   // the engine stops: the next project call starts a new one and indexes again first
+  // (with unsaved edits: the new engine gets them again; another folder's and a clean file's not)
+  const dirtyRestart = 'package demo\n// after restart\n';
+  const otherDoc = { ...editDoc('file', 'x', outside), isDirty: true };
+  const cleanDoc = { ...editDoc('file', 'clean', path.join(src, 'RealApi.kt')), isDirty: false };
+  fake.workspace.textDocuments = [{ ...editDoc('file', dirtyRestart), isDirty: true }, otherDoc, cleanDoc,
+    { ...editDoc('git', 'git', api), isDirty: true }];
   process.kill(enginePid);
   await sleep(200);
   check('an engine stop ends the recording', status.command === 'droidLite.menu' && /device-mobile/.test(status.text));
   await provider.provideCodeLenses(doc('Api.kt'));
   const next = requests().filter((r) => r.pid !== enginePid).map((r) => r.method);
   check('a restarted engine indexes first', next[0] === 'initialize' && next.includes('lenses'));
+  await sleep(600);
+  const resent = requests().filter((r) => r.pid !== enginePid && r.method === 'update');
+  check('a restarted engine gets the unsaved edits again', resent.length === 1 && resent[0].params.path === api
+    && resent[0].params.text === dirtyRestart);
+  fake.workspace.textDocuments = [];
 
   // an engine that stops reading: the next write fails (EPIPE) and fails every waiting call
   const deaf = path.join(dir, 'deaf-engine');
@@ -404,6 +476,20 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   try { ext.activate(ctx2); } catch (e) { threw = e; }
   await sleep(100);
   check('activation with a missing engine does not throw', !threw);
+
+  // the device poll skips a round while the last devices call still waits
+  cfg.enginePath = fakeEngine;
+  fs.writeFileSync(silent, '["devices"]');
+  ext.every.devices = 50;
+  fake.window.state.focused = true;
+  const beforePoll = requests().length;
+  const ctx3 = { subscriptions: [], extensionPath: ctx.extensionPath };
+  ext.activate(ctx3);
+  await sleep(600);
+  const polls = requests().slice(beforePoll).filter((r) => r.method === 'devices').length;
+  check('no new devices poll while one waits', polls === 1);
+  fake.window.state.focused = false;
+  ctx2.subscriptions.push(...ctx3.subscriptions);
 
   for (const s of [...ctx.subscriptions, ...ctx2.subscriptions]) s.dispose?.();
   fs.rmSync(dir, { recursive: true, force: true });

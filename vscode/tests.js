@@ -23,6 +23,28 @@ function findPluginJson(dir) {
     .find((p) => fs.existsSync(p));
 }
 
+// why a plugin.json cannot be used, or undefined: every command is a list of strings (a plain
+// string would fail later, inside a run or a watcher), links open only http(s) pages
+function problem(spec) {
+  const argv = (v) => Array.isArray(v) && v.length > 0 && v.every((a) => typeof a === 'string');
+  if (!spec || typeof spec !== 'object' || Array.isArray(spec)) return 'not a JSON object';
+  if (typeof spec.name !== 'string' || !spec.name) return 'name must be a string';
+  if (spec.dir !== undefined && typeof spec.dir !== 'string') return 'dir must be a string';
+  for (const k of ['list', 'run', 'watch']) {
+    if (spec[k] !== undefined && !argv(spec[k])) return `${k} must be a list of strings`;
+  }
+  for (const k of ['views', 'actions', 'links']) {
+    if (spec[k] === undefined) continue;
+    if (!Array.isArray(spec[k]) || !spec[k].every((x) => x && typeof x === 'object' && typeof x.name === 'string')) {
+      return `${k} must be a list of objects with a name`;
+    }
+    for (const x of spec[k]) {
+      if (k === 'links' && !(typeof x.url === 'string' && /^https?:\/\//i.test(x.url))) return `links: ${x.name}: url must be an http or https link`;
+      if (k !== 'links' && !argv(x.run)) return `${k}: ${x.name}: run must be a list of strings`;
+    }
+  }
+}
+
 // every plugin: { name, folder, cwd, spec } or { error, folder }
 function readPlugins(project) {
   const roots = [userDir(), project && path.join(project, '.droid-lite', 'plugins')].filter(Boolean);
@@ -36,7 +58,8 @@ function readPlugins(project) {
       if (!fs.existsSync(file)) continue;
       try {
         const spec = JSON.parse(fs.readFileSync(file, 'utf8'));
-        if (!spec.name) throw new Error('no "name"');
+        const bad = problem(spec);
+        if (bad) throw new Error(bad);
         const real = fs.realpathSync(folder);
         const dir = spec.dir ? spec.dir.replace(/^~\//, `${os.homedir()}/`) : '.';
         out.push({ name: spec.name, folder: real, cwd: path.resolve(real, dir), spec });
@@ -84,11 +107,17 @@ function spawn(cmd, plugin, project, onEnd = () => {}) {
   return proc;
 }
 
-// SIGTERM to the whole group, SIGKILL after a while if any of it is still there
-function stop(proc) {
+// SIGTERM to the whole group, SIGKILL after limits.kill if any of it is still there. `final` (the
+// extension goes away): a group already sent SIGTERM gets SIGKILL now, and the SIGKILL timer of
+// the others keeps the host's event loop up until it fires (an unref'd one is lost when the host exits)
+function stop(proc, final = false) {
   if (!proc.pid) return;
-  try { process.kill(-proc.pid, 'SIGTERM'); } catch { return; /* already ended */ }
-  setTimeout(() => { try { process.kill(-proc.pid, 'SIGKILL'); } catch { /* ended */ } }, limits.kill).unref();
+  const signal = (s) => { try { process.kill(-proc.pid, s); return true; } catch { return false; /* ended */ } };
+  if (final && proc.stopping) { signal('SIGKILL'); return; }
+  if (!signal('SIGTERM')) return;
+  proc.stopping = true;
+  const t = setTimeout(() => signal('SIGKILL'), limits.kill);
+  if (!final) t.unref();
 }
 
 // lines of a stream; a line longer than MAX_LINE is cut there (memory stays bounded)
@@ -199,12 +228,15 @@ function setup(ctx, project) {
     const { plugin: p, caseId } = meta.get(item.id) || {};
     return new Promise((resolve) => {
       if (!p?.spec.run || !caseId) { run.skipped(item); return resolve(); }
+      try { start(resolve); } catch (e) { run.errored(item, new vscode.TestMessage(e.message)); resolve(); }
+    });
+    function start(resolve) {
       run.started(item);
       const byCase = new Map();
       const walk = (i) => { const c = meta.get(i.id)?.caseId; if (c) byCase.set(c, i); i.children.forEach(walk); };
       walk(item);
       const ended = new Set();
-      let logged = 0;
+      let logged = 0; // every line counts, status lines too: a flooding plugin cannot grow memory
       let cancel;
       const proc = spawn(argv(p.spec.run, p, project, caseId), p, project, (code, err) => {
         cancel.dispose(); // a later cancel never signals a pid that is free again
@@ -222,14 +254,17 @@ function setup(ctx, project) {
         let m;
         try { m = JSON.parse(line); } catch { m = { log: line }; }
         if (typeof m !== 'object' || m === null) m = { log: line };
+        const full = logged >= MAX_LOG;
+        if (logged++ === MAX_LOG) run.appendOutput(`[more than ${MAX_LOG} lines: the rest is not shown]\r\n`);
         if (m.log !== undefined || !m.status) {
-          if (logged++ < MAX_LOG) run.appendOutput(`${m.log ?? line}\r\n`);
+          if (!full) run.appendOutput(`${m.log ?? line}\r\n`);
           return;
         }
         const target = byCase.get(m.case) || (m.case ? undefined : item);
         const text = [m.label, m.message].filter(Boolean).join(': ');
-        if (text) run.appendOutput(`[${m.status}] ${text}${m.url ? ` ${m.url}` : ''}\r\n`, location(project, m.file, m.line), target);
+        if (text && !full) run.appendOutput(`[${m.status}] ${text}${m.url ? ` ${m.url}` : ''}\r\n`, location(project, m.file, m.line), target);
         if (!target || !m.case) return; // a step's result: output only
+        if (full && ended.has(target)) return; // past the limit a case ends once
         if (m.status === 'running') run.started(target);
         else if (m.status === 'passed') { run.passed(target); ended.add(target); }
         else if (m.status === 'skipped') { run.skipped(target); ended.add(target); }
@@ -242,7 +277,7 @@ function setup(ctx, project) {
       };
       lines(proc.stdout, onLine);
       lines(proc.stderr, onLine);
-    });
+    }
   }
 
   ctrl.createRunProfile('Run', vscode.TestRunProfileKind.Run, async (request, token) => {
@@ -252,11 +287,14 @@ function setup(ctx, project) {
       return;
     }
     const run = ctrl.createTestRun(request);
-    for (const item of request.include) {
-      if (token.isCancellationRequested) break;
-      await runOne(run, item, token);
+    try {
+      for (const item of request.include) {
+        if (token.isCancellationRequested) break;
+        await runOne(run, item, token);
+      }
+    } finally {
+      run.end(); // else the Test Explorer shows it running forever
     }
-    run.end();
   }, true);
   ctrl.refreshHandler = load;
 
@@ -265,14 +303,20 @@ function setup(ctx, project) {
   function startWatch() {
     stopWatch();
     for (const p of plugins.filter((x) => x.spec?.watch)) {
-      const proc = spawn(argv(p.spec.watch, p, project), p, project);
-      lines(proc.stdout, (l) => {
-        let state;
-        try { state = JSON.parse(l); } catch { return; /* not a state line */ }
-        if (state && typeof state === 'object') { live.set(p.name, state); fireRow(p.name); }
-      });
-      proc.stderr.resume();
-      watchers.push(proc);
+      try { // one plugin that cannot watch does not stop the others
+        const proc = spawn(argv(p.spec.watch, p, project), p, project);
+        lines(proc.stdout, (l) => {
+          let state;
+          try { state = JSON.parse(l); } catch { return; /* not a state line */ }
+          if (state && typeof state === 'object') { live.set(p.name, state); fireRow(p.name); }
+        });
+        proc.stderr.resume();
+        watchers.push(proc);
+        // an ended watcher is never signalled: its group id may belong to another process by then
+        proc.on('close', () => { watchers = watchers.filter((w) => w !== proc); });
+      } catch (e) {
+        live.set(p.name, { title: 'Live', status: `watch: ${e.message}` });
+      }
     }
   }
   function stopWatch() {
@@ -293,12 +337,13 @@ function setup(ctx, project) {
         return i;
       };
       if (!node) {
-        const rows = plugins.filter((p) => p.spec).map((p) => {
+        const rows = plugins.filter((p) => p.error).map((p) => item(p.error, 'warning'));
+        rows.push(...plugins.filter((p) => p.spec).map((p) => {
           const g = new vscode.TreeItem(p.name, vscode.TreeItemCollapsibleState.Expanded);
           g.plugin = p;
           pluginRows.set(p.name, g);
           return g;
-        });
+        }));
         rows.push(item('Add test plugin…', 'add', 'droidLite.addTestPlugin'));
         rows.push(item('Open Test Explorer', 'beaker', 'workbench.view.testing.focus'));
         return rows;
@@ -359,7 +404,7 @@ function setup(ctx, project) {
     ctrl, view, out,
     view.onDidChangeVisibility((e) => { watching = e.visible; if (watching) startWatch(); else stopWatch(); }),
     // every process group a plugin started ends with the extension
-    { dispose: () => { watching = false; procs.forEach(stop); } },
+    { dispose: () => { watching = false; procs.forEach((p) => stop(p, true)); } },
     vscode.commands.registerCommand('droidLite.testAction', (p, a) => {
       const key = `${p.name}\u0000${a.name}`;
       out.show(true);

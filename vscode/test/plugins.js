@@ -15,6 +15,13 @@ fs.mkdirSync(path.join(project, '.droid-lite', 'plugins'), { recursive: true });
 fs.cpSync(path.join(__dirname, '..', '..', 'docs', 'plugin-example'), path.join(project, '.droid-lite', 'plugins', 'example'), { recursive: true });
 fs.mkdirSync(path.join(project, '.droid-lite', 'plugins', 'broken'));
 fs.writeFileSync(path.join(project, '.droid-lite', 'plugins', 'broken', 'plugin.json'), '{ not json');
+// a plugin whose run is one string, not a list
+fs.mkdirSync(path.join(project, '.droid-lite', 'plugins', 'badrun'));
+fs.writeFileSync(path.join(project, '.droid-lite', 'plugins', 'badrun', 'plugin.json'), JSON.stringify({ name: 'Bad run', run: './t.sh' }));
+// a plugin whose watch ends at once (its pid goes to <plugin>/qwatch)
+const quickDir = path.join(project, '.droid-lite', 'plugins', 'quick');
+fs.mkdirSync(quickDir);
+fs.writeFileSync(path.join(quickDir, 'plugin.json'), JSON.stringify({ name: 'Quick', watch: ['sh', '-c', 'echo $$ >> "$0/qwatch"', '{plugin}'] }));
 // a plugin whose commands start child processes (their pids go to <plugin>/pids), watch every 0.2 s,
 // count view runs, print a huge line and garbage places
 const toolsDir = path.join(project, '.droid-lite', 'plugins', 'tools');
@@ -23,23 +30,25 @@ const sh = (...a) => ['sh', '{plugin}/tools.sh', ...a, '{plugin}'];
 fs.writeFileSync(path.join(toolsDir, 'plugin.json'), JSON.stringify({
   name: 'Tools', list: sh('list'), run: ['sh', '{plugin}/tools.sh', 'run', '{plugin}', '{id}'], watch: sh('watch'),
   views: [{ name: 'Count', run: sh('count') }, { name: 'Hang', run: sh('hang') }],
-  actions: [{ name: 'Slow', run: sh('slow') }],
+  actions: [{ name: 'Slow', run: sh('slow') }, { name: 'Stubborn', run: sh('stubborn') }],
 }));
 fs.writeFileSync(path.join(toolsDir, 'tools.sh'), `#!/bin/sh
 case "$1" in
   list) echo '[{"id":"group","label":"two children"},{"id":"term","label":"ignores TERM"},{"id":"left","label":"leaves a child"},
-    {"id":"long","label":"one huge line"},{"id":"garbage","label":"garbage place","file":5,"line":"x"}]' ;;
+    {"id":"long","label":"one huge line"},{"id":"garbage","label":"garbage place","file":5,"line":"x"},{"id":"flood","label":"floods"}]' ;;
   run) case "$3" in
     group) sleep 300 & echo $! >> "$2/pids"; sleep 300 & echo $! >> "$2/pids"; wait ;;
     term) trap '' TERM; echo $$ >> "$2/pids"; sleep 300 & echo $! >> "$2/pids"; wait ;;
     left) sleep 300 & echo $! >> "$2/left"; exit 0 ;;
     long) head -c 200000 /dev/zero | tr '\\0' x; echo; echo after ;;
     garbage) echo '{"case":"garbage","status":"failed","message":{"a":1},"file":["x"],"line":{}}'; exit 1 ;;
+    flood) seq 30000 | sed 's/.*/{"status":"passed","label":"step"}/'; seq 30000 | sed 's/.*/{"case":"flood","status":"failed","message":"m"}/'; exit 1 ;;
   esac ;;
   watch) echo $$ >> "$2/watch"; i=0; while :; do echo "{\\"title\\":\\"tick $i\\"}"; i=$((i+1)); sleep 0.2; done ;;
   count) echo x >> "$2/views"; echo '[{"label":"one","file":"a.kt","line":"zz"}]' ;;
   hang) sleep 300 & echo $! >> "$2/pids"; wait ;;
   slow) echo $$ >> "$2/pids"; sleep 300 & echo $! >> "$2/pids"; wait ;;
+  stubborn) trap '' TERM; echo $$ >> "$2/pids"; sleep 300 & echo $! >> "$2/pids"; wait ;;
 esac
 `);
 // a plugin whose commands do not exist
@@ -116,8 +125,47 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
 (async () => {
   // the plugin folders are read, a broken plugin.json is an error with its path
   const found = tests.readPlugins(project);
-  assert.deepStrictEqual(found.map((p) => p.name || 'ERR'), ['ERR', 'Example tests', 'Missing', 'Tools']);
-  assert.ok(found[0].error.includes('broken/plugin.json'), found[0].error);
+  assert.deepStrictEqual(found.map((p) => p.name || 'ERR'), ['ERR', 'ERR', 'Example tests', 'Missing', 'Quick', 'Tools']);
+  assert.ok(found[1].error.includes('broken/plugin.json'), found[1].error);
+
+  // a plugin.json with a command that is not a list of strings, a bad name, entry or link is an
+  // error with its path (a string `run` used to throw inside the run and hang the Test Explorer)
+  const badSpecs = {
+    'run-string': [{ name: 'A', run: './t.sh' }, 'run must be a list of strings'],
+    'list-number': [{ name: 'A', list: ['sh', 3] }, 'list must be a list of strings'],
+    'watch-empty': [{ name: 'A', watch: [] }, 'watch must be a list of strings'],
+    'name-number': [{ name: 5 }, 'name must be a string'],
+    'no-name': [{ run: ['x'] }, 'name must be a string'],
+    'null': [null, 'not a JSON object'],
+    'list': [[{ name: 'A' }], 'not a JSON object'],
+    'dir-number': [{ name: 'A', dir: 1 }, 'dir must be a string'],
+    'view-run': [{ name: 'A', views: [{ name: 'V', run: 'x' }] }, 'views: V: run must be a list of strings'],
+    'view-no-run': [{ name: 'A', views: [{ name: 'V' }] }, 'views: V: run must be a list of strings'],
+    'action-run': [{ name: 'A', actions: [{ name: 'B', run: ['x', null] }] }, 'actions: B: run must be a list of strings'],
+    'action-name': [{ name: 'A', actions: [{ run: ['x'] }] }, 'actions must be a list of objects with a name'],
+    'actions-object': [{ name: 'A', actions: { name: 'B', run: ['x'] } }, 'actions must be a list of objects with a name'],
+    'views-strings': [{ name: 'A', views: ['V'] }, 'views must be a list of objects with a name'],
+    'link-file': [{ name: 'A', links: [{ name: 'L', url: 'file:///etc/passwd' }] }, 'links: L: url must be an http or https link'],
+    'link-command': [{ name: 'A', links: [{ name: 'L', url: 'command:workbench.action.terminal.new' }] }, 'links: L: url must be an http or https link'],
+    'link-number': [{ name: 'A', links: [{ name: 'L', url: 7 }] }, 'links: L: url must be an http or https link'],
+    'link-name': [{ name: 'A', links: [{ url: 'https://x' }] }, 'links must be a list of objects with a name'],
+  };
+  const badProject = path.join(tmp, 'bad');
+  for (const [n, [spec]] of Object.entries(badSpecs)) {
+    fs.mkdirSync(path.join(badProject, '.droid-lite', 'plugins', n), { recursive: true });
+    fs.writeFileSync(path.join(badProject, '.droid-lite', 'plugins', n, 'plugin.json'), JSON.stringify(spec));
+  }
+  const good = path.join(badProject, '.droid-lite', 'plugins', 'zz-good');
+  fs.mkdirSync(good);
+  fs.writeFileSync(path.join(good, 'plugin.json'), JSON.stringify({ name: 'Good', dir: '..', list: ['a'], run: ['a', '{id}'], watch: ['w'],
+    views: [{ name: 'V', run: ['v'] }], actions: [{ name: 'B', run: ['b'] }], links: [{ name: 'L', url: 'HTTPS://example.com' }] }));
+  const read = tests.readPlugins(badProject);
+  const wrong = Object.entries(badSpecs).filter(([n, [, msg]]) => {
+    const p = read.find((x) => x.folder.endsWith(`/${n}`));
+    return !p?.error || !p.error.endsWith(`${n}/plugin.json: ${msg}`);
+  }).map(([n]) => `${n}: ${read.find((x) => x.folder.endsWith(`/${n}`))?.error}`);
+  check('every bad plugin.json is an error with its path', wrong.length === 0 || assert.fail(wrong.join('\n')));
+  check('a good plugin.json loads', read.find((x) => x.name === 'Good') && !read.find((x) => x.name === 'Good').error);
   assert.deepStrictEqual(tests.argv(['x', '{plugin}/a', '{id}', '{project}'], { folder: '/p' }, '/proj', 'case 1'), ['x', '/p/a', 'case 1', '/proj']);
   assert.ok(tests.findPluginJson(path.join(project, '.droid-lite', 'plugins', 'example')));
 
@@ -132,6 +180,10 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   assert.strictEqual(ok.uri.fsPath, path.join(project, 'flows/login.yaml'), 'file relative to the project');
   assert.strictEqual(ok.range.start.line, 1, '1-based line 2 -> 0-based 1');
   assert.ok(ctrl.items.get('plugin:broken').error, 'broken plugin shows its error');
+  check('a plugin with a string run shows its error in the Test Explorer',
+    /badrun\/plugin\.json: run must be a list of strings$/.test(ctrl.items.get('plugin:badrun').error));
+  check('and in the sidebar', (await tree.getChildren()).some((r) => r.iconPath?.id === 'warning'
+    && /badrun\/plugin\.json: run must be a list of strings$/.test(r.label)));
 
   // a cancellation token: cancel() runs its listeners; `ls` holds those not disposed
   const token = () => {
@@ -144,7 +196,7 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
     let run;
     const orig = ctrl.createTestRun;
     ctrl.createTestRun = (r) => (run = orig(r));
-    await profile({ include }, tok);
+    await profile({ include }, tok).catch((e) => run?.ev.push(['threw', e.message]));
     ctrl.createTestRun = orig;
     return run ? run.ev : [];
   };
@@ -220,6 +272,22 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   ev = await go([missing]);
   check('a missing command is reported once', JSON.stringify(quiet(ev).slice(1, -1).map((e) => e[0])) === '["errored"]');
   const rowsOf = async () => tree.getChildren();
+
+  // a run that cannot start (a command that is not a list) is an error and the run still ends
+  const toolsPlugin = (await rowsOf()).find((r) => r.label === 'Tools').plugin;
+  const toolsRun = toolsPlugin.spec.run;
+  toolsPlugin.spec.run = './t.sh';
+  ev = await Promise.race([go([toolCase('long')]), sleep(3000).then(() => 'stuck')]);
+  toolsPlugin.spec.run = toolsRun;
+  check('a run that throws still ends', ev !== 'stuck' && ev.at(-1)[0] === 'end');
+  check('and shows the error on its case', ev.some((e) => e[0] === 'errored' && e[1] === toolCase('long').id));
+
+  // a flooding plugin: status lines count toward the output limit, a case ends once past it
+  ev = await go([toolCase('flood')]);
+  const floodOut = ev.filter((e) => e[0] === 'out').length;
+  const floodFailed = ev.filter((e) => e[0] === 'failed').length;
+  check('status lines count toward the output limit', floodOut <= 20001 && ev.some((e) => e[0] === 'out' && /more than 20000 lines/.test(e[1])));
+  check('past the limit a case ends once', floodFailed === 1 && ev.at(-1)[0] === 'end');
   const missingPlugin = (await rowsOf()).find((r) => r.label === 'Missing').plugin;
   commands['droidLite.testAction'](missingPlugin, missingPlugin.spec.actions[0]);
   await until('the missing action', () => output.some((l) => /Gone could not start/.test(l)), 2000).catch(() => {});
@@ -248,6 +316,7 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   const hung = pidsIn(pids);
   await until('the hung view to end', () => !hung.some(alive), 2000).catch(() => {});
   check('a timed-out view ends its group', /no answer/.test(hang[0].label) && hung.length === 1 && !hung.some(alive));
+  tests.limits.json = 120000; // the list calls of the next load
   fs.rmSync(pids);
   // plugins added or removed: the watchers start again
   const firstWatch = pidsIn(path.join(toolsDir, 'watch'));
@@ -255,6 +324,29 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   await until('a new watcher', () => pidsIn(path.join(toolsDir, 'watch')).length === 2);
   await until('the old watcher to end', () => !firstWatch.some(alive), 2000).catch(() => {});
   check('load restarts the watchers', firstWatch.length === 1 && !firstWatch.some(alive));
+
+  // a plugin whose watch cannot start does not stop the others
+  const watchFile = path.join(toolsDir, 'watch');
+  const example = (await rowsOf()).find((r) => r.label === 'Example tests').plugin;
+  const exampleWatch = example.spec.watch;
+  example.spec.watch = 'not a list';
+  const watchCount = pidsIn(watchFile).length;
+  visibility({ visible: true });
+  await until('the Tools watcher', () => pidsIn(watchFile).length === watchCount + 1, 3000).catch(() => {});
+  example.spec.watch = exampleWatch;
+  check('one watch that cannot start does not stop the others', pidsIn(watchFile).length === watchCount + 1);
+
+  // a watcher that ended is never signalled again (its group id may be another process's by then)
+  const qwatch = path.join(quickDir, 'qwatch');
+  const quickGone = () => { const q = pidsIn(qwatch).at(-1); return q && ![...tests.procs].some((x) => x.pid === q); };
+  await until('the quick watcher to end', quickGone, 3000);
+  const quickPid = pidsIn(qwatch).at(-1);
+  const signalled = [];
+  const realKill = process.kill;
+  process.kill = (pid, sig) => { signalled.push(pid); return realKill.call(process, pid, sig); };
+  visibility({ visible: false });
+  process.kill = realKill;
+  check('an ended watcher is not signalled', signalled.length > 0 && !signalled.includes(-quickPid));
 
   // an action shows Stop while it runs, and Stop ends its group
   const toolsRow = (await rowsOf()).find((r) => r.label === 'Tools');
@@ -270,13 +362,35 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   check('an ended action shows Run again', (await tree.getChildren(toolsRow)).some((i) => i.label === 'Slow'));
   fs.rmSync(pids);
 
-  // dispose: every process a plugin started ends (watch and a running action)
+  // dispose: every process a plugin started ends (watch, a run, actions). A group already sent
+  // SIGTERM (a cancelled run) gets SIGKILL at once; the others SIGTERM and a SIGKILL timer that
+  // keeps the host up until it fires
+  tests.limits.kill = 2000;
+  visibility({ visible: true });
+  await until('a watcher', () => pidsIn(watchFile).length === watchCount + 2);
   commands['droidLite.testAction'](toolsRow.plugin, slow);
   await until('the action', () => pidsIn(pids).length === 2);
-  const leftOver = [...pidsIn(pids), ...pidsIn(path.join(toolsDir, 'watch'))];
+  tok = token();
+  running = go([toolCase('term')], tok);
+  await until('the TERM-proof run', () => pidsIn(pids).length === 4);
+  const cancelled = pidsIn(pids).slice(2);
+  tok.cancel();
+  commands['droidLite.testAction'](toolsRow.plugin, toolsRow.plugin.spec.actions[1]);
+  await until('the TERM-proof action', () => pidsIn(pids).length === 6);
+  const proof = pidsIn(pids).slice(4);
+  const leftOver = [...pidsIn(pids), pidsIn(watchFile).at(-1)];
+  const timers = [];
+  const realTimeout = global.setTimeout;
+  global.setTimeout = (...a) => { const t = realTimeout(...a); timers.push(t); return t; };
   ctx.subscriptions.forEach((d) => d.dispose?.());
-  await until('every plugin process to end', () => !leftOver.some(alive), 3000).catch(() => {});
-  check('dispose ends every plugin process', leftOver.length === 4 && !leftOver.some(alive));
+  global.setTimeout = realTimeout;
+  await sleep(400);
+  check('dispose: a group already sent SIGTERM gets SIGKILL at once', !cancelled.some(alive));
+  check('dispose: the others get SIGTERM first', proof.every(alive));
+  check('dispose: their SIGKILL timer keeps the host up', timers.length && timers.every((t) => t.hasRef()));
+  await Promise.race([running, sleep(3000)]);
+  await until('every plugin process to end', () => !leftOver.some(alive), 4000).catch(() => {});
+  check('dispose ends every plugin process', leftOver.length === 7 && !leftOver.some(alive));
   await until('no tracked process', () => tests.procs.size === 0, 2000).catch(() => {});
   check('no tracked process left', tests.procs.size === 0);
 
@@ -286,6 +400,7 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   console.error(e);
   // a failed check leaves no plugin process behind
   tests.procs.forEach((p) => { try { process.kill(-p.pid, 'SIGKILL'); } catch { /* ended */ } });
+  pidsIn(path.join(quickDir, 'qwatch')).forEach((pid) => { try { process.kill(pid, 'SIGKILL'); } catch { /* ended */ } });
   for (const f of ['pids', 'left', 'watch']) {
     pidsIn(path.join(toolsDir, f)).forEach((pid) => { try { process.kill(pid, 'SIGKILL'); } catch { /* ended */ } });
   }

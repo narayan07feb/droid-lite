@@ -11,6 +11,7 @@ let ready; // Promise of the initialize reply
 let recording; // serial while a screen recording runs
 let logcat; // running `adb logcat` process
 let onStopped = () => {}; // the current engine stopped (set in activate)
+let onIndexed = () => {}; // an initialize answered (set in activate)
 const changed = new vscode.EventEmitter();
 const events = new vscode.EventEmitter(); // engine lines without an id (preview progress)
 
@@ -49,8 +50,13 @@ function start(ctx) {
 // longest wait for an answer (ms), so no waiting call outlives a stuck engine; others wait 15 s
 const limits = {
   initialize: 60000, ping: 15000, update: 15000, remove: 15000, lenses: 15000, stability: 15000, implementations: 15000,
-  previews: 180000, devices: 60000, adb: 60000, screenshot: 60000, record_start: 60000, record_stop: 120000,
+  previews: 180000, devices: 60000, adb: 60000, screenshot: 60000, record_start: 60000, record_stop: 900000,
 };
+// a previews call starts its limit again on each progress line for its file (a first run downloads
+// and compiles), up to this cap (ms)
+const caps = { previews: 900000 };
+// how often the device in the status bar is looked up (ms)
+const every = { devices: 20000 };
 
 function call(ctx, method, params = {}) {
   if (!engine) {
@@ -61,11 +67,25 @@ function call(ctx, method, params = {}) {
   return new Promise((resolve, reject) => {
     const id = e.nextId++;
     const ms = limits[method] || 15000;
-    const timer = setTimeout(() => {
-      e.pending.delete(id);
-      reject(new Error(`Droid Lite engine did not answer ${method} in ${ms / 1000} s`));
-    }, ms);
-    const done = (f) => (v) => { clearTimeout(timer); f(v); };
+    const cap = caps[method];
+    const t0 = Date.now();
+    let timer;
+    const arm = () => {
+      clearTimeout(timer);
+      const left = cap ? cap - (Date.now() - t0) : ms;
+      timer = setTimeout(() => {
+        e.pending.delete(id);
+        progress?.dispose();
+        reject(new Error(`Droid Lite engine did not answer ${method} in ${(left < ms ? cap : ms) / 1000} s`));
+      }, Math.min(ms, left));
+    };
+    const real = cap && (() => { try { return fs.realpathSync(params.path); } catch { return params.path; } })();
+    // older engines name no file
+    const progress = cap && events.event((m) => {
+      if (m.event === 'preview_status' && [undefined, params.path, real].includes(m.file)) arm();
+    });
+    arm();
+    const done = (f) => (v) => { clearTimeout(timer); progress?.dispose(); f(v); };
     e.pending.set(id, { resolve: done(resolve), reject: done(reject) });
     e.proc.stdin.write(JSON.stringify({ id, method, params }) + '\n');
   });
@@ -94,7 +114,7 @@ function project(ctx, method, params) {
     const r = dir ? call(ctx, 'initialize', { root: dir }) : Promise.reject(new Error('Open a folder first'));
     ready = r;
     // a failed index is not kept: the next project call tries again
-    r.then(() => changed.fire(), () => { if (ready === r) ready = undefined; });
+    r.then(() => { changed.fire(); if (ready === r) onIndexed(); }, () => { if (ready === r) ready = undefined; });
   }
   return ready.then(() => call(ctx, method, params));
 }
@@ -244,11 +264,16 @@ function activate(ctx) {
     main.show();
     treeChanged.fire();
   };
-  const findDevice = () => call(ctx, 'devices').then((all) => {
-    const on = all.filter((d) => d.online);
-    device = on.length === 1 ? on[0].label.replace(/ \(.*\)$/, '') : on.length ? `${on.length} devices` : 'No device';
-    refresh();
-  }, () => {});
+  // one lookup at a time: a slow adb never piles up calls
+  let looking;
+  const findDevice = () => {
+    looking ??= call(ctx, 'devices').then((all) => {
+      const on = all.filter((d) => d.online);
+      device = on.length === 1 ? on[0].label.replace(/ \(.*\)$/, '') : on.length ? `${on.length} devices` : 'No device';
+      refresh();
+    }, () => {}).finally(() => { looking = undefined; });
+    return looking;
+  };
   const tool = (label, command, icon) => ({ label, command, icon });
   const tools = () => [
     ['Compose', [tool('Compose preview', 'droidLite.preview', 'open-preview')]],
@@ -278,7 +303,7 @@ function activate(ctx) {
       });
     },
   };
-  const timer = setInterval(() => { if (vscode.window.state.focused) findDevice(); }, 20000);
+  const timer = setInterval(() => { if (vscode.window.state.focused) findDevice(); }, every.devices);
   findDevice();
   refresh();
   onStopped = refresh; // a recording ends with its engine
@@ -288,17 +313,34 @@ function activate(ctx) {
   // `text` is a function read when the request goes, not on every keystroke.
   const timers = new Map();
   const source = (p) => /\.(kt|kts|java)$/.test(p);
-  const ignored = (p) => /(^|[\\/])(build|\.gradle|\.idea|\.git)([\\/]|$)/.test(path.relative(root() || '', p));
+  // only paths under the project folder (another folder of a multi-root workspace is not indexed)
+  const indexed = (p) => {
+    const r = root() && path.relative(root(), p);
+    return typeof r === 'string' && r !== '..' && !r.startsWith(`..${path.sep}`) && !path.isAbsolute(r)
+      && !/(^|[\\/])(build|\.gradle|\.idea|\.git)([\\/]|$)/.test(r);
+  };
   const send = (p, method, text) => {
-    if (!ready || ignored(p)) return;
+    if (!ready || !indexed(p)) return;
     clearTimeout(timers.get(p));
     timers.set(p, setTimeout(() => {
       timers.delete(p);
       project(ctx, method, { path: p, ...(text && { text: wellFormed(text()) }) }).then(() => changed.fire(), () => {});
     }, 400));
   };
+  // an open file with unsaved edits: its text, so a late watcher event never undoes them
+  const unsaved = (p) => vscode.workspace.textDocuments
+    .find((d) => d.isDirty && !d.isClosed && d.uri.scheme === 'file' && d.uri.fsPath === p);
   // no text: the engine reads the disk (a folder: every source file under it)
-  const update = (p, text) => send(p, 'update', text);
+  const update = (p, text) => {
+    const d = !text && unsaved(p);
+    send(p, 'update', d ? () => d.getText() : text);
+  };
+  // a new engine (restart, Index again) knows only the disk: send every unsaved edit again
+  onIndexed = () => {
+    for (const d of vscode.workspace.textDocuments) {
+      if (d.isDirty && d.uri.scheme === 'file' && source(d.uri.fsPath)) update(d.uri.fsPath);
+    }
+  };
   // any deleted path: a folder (its name may have a dot) takes every file under it out of the index
   const remove = (p) => send(p, 'remove');
   const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
@@ -329,7 +371,7 @@ function activate(ctx) {
     }),
     // a closed tab drops its unsaved text: the index goes back to the file on disk
     vscode.workspace.onDidCloseTextDocument((d) => {
-      if (d.uri.scheme === 'file' && source(d.uri.fsPath)) update(d.uri.fsPath);
+      if (d.uri.scheme === 'file' && source(d.uri.fsPath)) send(d.uri.fsPath, 'update');
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
       rootDir = null;
@@ -406,4 +448,4 @@ function activate(ctx) {
   );
 }
 
-module.exports = { activate, deactivate() {}, limits };
+module.exports = { activate, deactivate() {}, limits, caps, every };
