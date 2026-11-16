@@ -307,6 +307,8 @@ struct Previews {
     zoom: Option<usize>,
     /// The file and the hash of its saved text last sent, so each open or save renders once.
     sent: Option<(PathBuf, u64)>,
+    /// Files saved since the last request: the preview reads their packages and names again.
+    saved: Vec<PathBuf>,
 }
 
 /// What the worker needs to draw a tab's previews: its top-level `@Preview` functions (their class is
@@ -335,6 +337,7 @@ fn preview_request(tab: &Tab, project: Option<&crate::project::Project>) -> Opti
                 .cloned()
                 .collect(),
             files: std::sync::Arc::new(p.files.clone()),
+            changed: Vec::new(),
         }),
     })
 }
@@ -808,6 +811,9 @@ impl App {
             Ok(()) => {
                 self.git.changes_stale = true;
                 tab.saved = tab.text.clone();
+                if !self.previews.saved.contains(&tab.path) {
+                    self.previews.saved.push(tab.path.clone());
+                }
                 self.index.update(&tab.path, &tab.text);
                 if let Some(l) = self.lsp.as_mut() {
                     l.did_save(&tab.path);
@@ -3553,7 +3559,10 @@ impl App {
                 self.previews.zoom = None;
             }
         }
-        if render && let Some(r) = render_req {
+        if render && let Some(mut r) = render_req {
+            if let Some(p) = r.project.as_mut() {
+                p.changed = std::mem::take(&mut self.previews.saved);
+            }
             let ctx = ui.ctx().clone();
             self.previews.busy = true;
             self.previews.progress = None;
@@ -3569,10 +3578,13 @@ impl App {
         // by itself: a file with previews that was just opened or saved (no unsaved edits) is drawn
         if let Some(tab) = self.tabs.get(self.active)
             && tab.text == tab.saved
-            && let Some(r) = preview_request(tab, self.project.as_ref())
+            && let Some(mut r) = preview_request(tab, self.project.as_ref())
         {
             let key = (tab.path.clone(), hash(&tab.saved));
             if self.previews.sent.as_ref() != Some(&key) {
+                if let Some(p) = r.project.as_mut() {
+                    p.changed = std::mem::take(&mut self.previews.saved);
+                }
                 self.previews.sent = Some(key);
                 self.previews.busy = true;
                 self.previews.progress = None;

@@ -17,6 +17,10 @@
 // gets a status line every 10 s, so its client never takes this worker for hung.
 // The socket: a worker that finds another answering on its path ends; it removes only the socket file
 // it bound itself (a later worker may have bound a new one on the same path).
+// <socket>.clients holds the number of connected clients (Droid Lite windows), so an engine that
+// starts another worker never stops this one while a window uses it.
+// The work dir is shared by every worker of the preview folder: each worker's files carry its pid and
+// a random token, and pictures older than an hour are deleted when a worker starts.
 import app.cash.paparazzi.DeviceConfig;
 import app.cash.paparazzi.Environment;
 import app.cash.paparazzi.PaparazziSdk;
@@ -55,10 +59,19 @@ public class PreviewWorker {
     static volatile String step = "Working";
     static volatile int stepDone, stepTotal;
 
+    /** This worker's prefix for its files in the shared work dir: pid and a random token. */
+    static final String TAG = ProcessHandle.current().pid() + "-" + Long.toHexString(new java.security.SecureRandom().nextLong() >>> 1);
+    /** Requests this worker handled, for unique file names. */
+    static final java.util.concurrent.atomic.AtomicLong handled = new java.util.concurrent.atomic.AtomicLong();
+    static Path clientsFile;
+    /** The project code dirs this worker compiled. */
+    static final Set<Path> ownLibs = ConcurrentHashMap.newKeySet();
+
     public static void main(String[] a) throws Exception {
         Path sock = Path.of(a[0]);
         Path work = Path.of(a[1]);
         Files.createDirectories(work);
+        sweepPictures(work, 3_600_000L);
         // two engines that each started a worker for one socket: the later one leaves the socket alone
         if (answers(sock)) {
             System.err.println("another preview worker answers on " + sock + "; this one ends");
@@ -109,6 +122,8 @@ public class PreviewWorker {
         try (ServerSocketChannel server = ServerSocketChannel.open(StandardProtocolFamily.UNIX)) {
             server.bind(UnixDomainSocketAddress.of(sock));
             Object bound = fileKey(sock);
+            clientsFile = Path.of(sock + ".clients");
+            writeClients();
             // on idle exit and on SIGTERM: only the socket file this worker bound, never a newer
             // worker's on the same path
             Runtime.getRuntime().addShutdownHook(new Thread(() -> removeIfOwn(sock, bound)));
@@ -120,6 +135,31 @@ public class PreviewWorker {
                 t.setDaemon(true);
                 t.start();
             }
+        }
+    }
+
+    /** Deletes the PNGs in `work` older than `maxAgeMs`: a client copies its pictures as soon as they
+     *  come, and one that went away never will. */
+    static void sweepPictures(Path work, long maxAgeMs) {
+        long cut = System.currentTimeMillis() - maxAgeMs;
+        try (var files = Files.list(work)) {
+            files.filter(f -> f.getFileName().toString().endsWith(".png")).forEach(f -> {
+                try {
+                    if (Files.getLastModifiedTime(f).toMillis() < cut) Files.deleteIfExists(f);
+                } catch (IOException ignored) {}
+            });
+        } catch (IOException ignored) {}
+    }
+
+    /** The number of connected clients into <socket>.clients, through a temp file and a rename. */
+    static synchronized void writeClients() {
+        if (clientsFile == null) return;
+        Path tmp = Path.of(clientsFile + "." + TAG + ".tmp");
+        try {
+            Files.writeString(tmp, Integer.toString(clients.size()));
+            Files.move(tmp, clientsFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException e) {
+            try { Files.deleteIfExists(tmp); } catch (IOException ignored) {}
         }
     }
 
@@ -164,6 +204,7 @@ public class PreviewWorker {
         Client(SocketChannel ch) {
             this.ch = ch;
             clients.add(this);
+            writeClients();
             Thread w = new Thread(this::writeLoop, "write");
             w.setDaemon(true);
             w.start();
@@ -191,7 +232,7 @@ public class PreviewWorker {
 
         void close() {
             closed = true;
-            clients.remove(this);
+            if (clients.remove(this)) writeClients();
             queue.clear();
             try { ch.close(); } catch (IOException ignored) {}
         }
@@ -262,11 +303,15 @@ public class PreviewWorker {
     }
 
     /** The project's own code a preview needs (its R classes, then its source files), compiled once per
-     *  key into work/lib-KEY and reused until a file changes; older lib dirs are deleted. Null when none. */
+     *  key into work/lib-KEY and reused until a file changes. This worker's older lib dirs are deleted, and
+     *  any other unused for an hour (the work dir is shared: another worker may be using its own). Null when none. */
     static Path ownCode(Request r, Path work, String cp) throws Exception {
         if (r.key.isEmpty() || (r.sources.isEmpty() && r.rjava.isEmpty())) return null;
         Path lib = work.resolve("lib-" + r.key);
-        if (Files.exists(lib.resolve(".ok"))) return lib;
+        if (Files.exists(lib.resolve(".ok"))) {
+            try { Files.setLastModifiedTime(lib.resolve(".ok"), java.nio.file.attribute.FileTime.fromMillis(System.currentTimeMillis())); } catch (IOException ignored) {}
+            return lib;
+        }
         status(r, "Compiling the project code this preview needs (" + r.sources.size() + " files)", 0, 0);
         deleteTree(lib);
         Files.createDirectories(lib);
@@ -287,8 +332,14 @@ public class PreviewWorker {
         }
         if (!java.isEmpty()) javac(java, cp + ":" + lib, lib);
         Files.writeString(lib.resolve(".ok"), r.key);
-        try (var dirs = Files.list(work)) { // keep only the current project code
-            dirs.filter(d -> d.getFileName().toString().startsWith("lib-") && !d.equals(lib)).forEach(PreviewWorker::deleteTree);
+        ownLibs.add(lib);
+        long cut = System.currentTimeMillis() - 3_600_000L;
+        try (var dirs = Files.list(work)) {
+            dirs.filter(d -> d.getFileName().toString().startsWith("lib-") && !d.equals(lib)).forEach(d -> {
+                try {
+                    if (ownLibs.remove(d) || Files.getLastModifiedTime(d.resolve(".ok")).toMillis() < cut) deleteTree(d);
+                } catch (IOException ignored) {} // no .ok: another worker is compiling it
+            });
         }
         return lib;
     }
@@ -414,7 +465,10 @@ public class PreviewWorker {
     }
 
     static String handle(Request r, Path work, PaparazziSdk sdk) throws Exception {
-        Path out = work.resolve("classes-" + r.id);
+        // the request's id is its client's number: unique in the shared work dir only with this
+        // worker's tag and its own count
+        String name = TAG + "-" + handled.incrementAndGet();
+        Path out = work.resolve("classes-" + name);
         long t0 = System.nanoTime();
         // the project's own libraries first (the worker runs with them too), then the base pack
         String cp = (r.cp.isEmpty() ? "" : String.join(":", r.cp) + ":") + System.getProperty("droidlite.compile.cp");
@@ -486,7 +540,7 @@ public class PreviewWorker {
                     } finally {
                         sdk.teardown();
                     }
-                    Path png = work.resolve(r.id + "-" + drawn + ".png");
+                    Path png = work.resolve(name + "-" + drawn + ".png");
                     ImageIO.write(frame, "png", png.toFile());
                     images.append("{\"name\":").append(Json.str(title)).append(",\"png\":").append(Json.str(png.toString()))
                         .append(",\"ms\":").append((System.nanoTime() - t) / 1_000_000).append('}');

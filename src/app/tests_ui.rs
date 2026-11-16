@@ -40,9 +40,9 @@ pub(super) struct Tests {
 
 #[derive(Default)]
 pub(super) struct Plugin {
-    m: Manifest,
-    cases: Vec<Case>,
-    loading: Option<Fetch>,
+    pub(super) m: Manifest,
+    pub(super) cases: Vec<Case>,
+    pub(super) loading: Option<Fetch>,
     error: Option<String>,
     pub(super) status: HashMap<String, Status>,
     /// The running case or action: (its id, or "" for an action; title; process).
@@ -152,6 +152,7 @@ enum Click {
     Link(String),
     Add,
     Remove,
+    Allow,
 }
 
 impl Tests {
@@ -228,22 +229,24 @@ impl App {
         }
     }
 
-    fn plugin_dirs(&self) -> Vec<PathBuf> {
-        self.plugins_home()
-            .into_iter()
-            .chain(
-                self.project
-                    .as_ref()
-                    .map(|p| p.root.join(".droid-lite/plugins")),
-            )
-            .collect()
+    /// Where the user's OKs for project plugins are kept (shared with the VS Code extension).
+    fn approvals(&self) -> Option<PathBuf> {
+        config_dir().map(|d| plugins::approvals_file(&d))
     }
 
     /// Finds the plugins (config folder and the project's `.droid-lite/plugins`) and lists their
-    /// cases in the background. Running cases of the old set stop (Drop).
+    /// cases in the background. A project plugin the user has not allowed runs nothing: the tab
+    /// asks for the OK first. Running cases of the old set stop (Drop).
     pub(super) fn load_plugins(&mut self, ctx: &egui::Context) {
         let mut t = Tests::default();
-        for m in plugins::discover(&self.plugin_dirs()) {
+        let project: Vec<PathBuf> = self
+            .project
+            .as_ref()
+            .map(|p| p.root.join(".droid-lite/plugins"))
+            .into_iter()
+            .collect();
+        let user: Vec<PathBuf> = self.plugins_home().into_iter().collect();
+        for m in plugins::discover_all(&user, &project, self.approvals().as_deref()) {
             match m {
                 Ok(m) => t.plugins.push(Plugin::new(m)),
                 Err(e) => t.errors.push(e),
@@ -258,16 +261,40 @@ impl App {
     fn list_cases(&mut self, i: usize, ctx: &egui::Context) {
         let root = self.project.as_ref().map(|p| p.root.clone());
         let p = &mut self.tests.plugins[i];
-        if let Some(list) = &p.m.list {
-            p.loading = Some(fetch(p.m.command(list, root.as_deref(), ""), ctx));
+        if let Some(list) = &p.m.list
+            && let Ok(cmd) = p.m.command(list, root.as_deref(), "")
+        {
+            p.loading = Some(fetch(cmd, ctx));
+        }
+    }
+
+    /// The user's OK for project plugin `i` as it was read: kept in the approvals file, then its
+    /// cases are listed.
+    pub(super) fn allow_plugin(&mut self, i: usize, ctx: &egui::Context) {
+        let Some(store) = self.approvals() else {
+            self.status = "No config folder for the approvals file".into();
+            return;
+        };
+        let Some(p) = self.tests.plugins.get_mut(i) else {
+            return;
+        };
+        match plugins::approve(&store, &p.m) {
+            Ok(()) => {
+                p.m.allowed = true;
+                self.status = format!("Allowed the plugin {}", p.m.name);
+                self.list_cases(i, ctx);
+            }
+            Err(e) => self.status = e,
         }
     }
 
     fn load_view(&mut self, i: usize, v: usize, ctx: &egui::Context) {
         let root = self.project.as_ref().map(|p| p.root.clone());
         let p = &mut self.tests.plugins[i];
-        let cmd = p.m.command(&p.m.views[v].argv, root.as_deref(), "");
-        p.rows_rx = Some(fetch(cmd, ctx));
+        match p.m.command(&p.m.views[v].argv, root.as_deref(), "") {
+            Ok(cmd) => p.rows_rx = Some(fetch(cmd, ctx)),
+            Err(e) => p.rows_error = Some(e),
+        }
     }
 
     /// Runs case `id` of plugin `i`, or action `action` when given.
@@ -292,9 +319,16 @@ impl App {
                 None => return,
             },
         };
+        let cmd = match p.m.command(&argv, root.as_deref(), id) {
+            Ok(c) => c,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
         p.results.clear();
         p.log.clear();
-        match Run::spawn(p.m.command(&argv, root.as_deref(), id), ctx.clone()) {
+        match Run::spawn(cmd, ctx.clone()) {
             Ok(run) => {
                 if action.is_none() {
                     p.status.insert(id.to_owned(), Status::Running);
@@ -419,7 +453,10 @@ impl App {
             let want = shown && i == self.tests.active;
             match (&p.watch, &p.m.watch) {
                 (None, Some(w)) if want => {
-                    p.watch = Run::spawn(p.m.command(w, root.as_deref(), ""), ctx.clone()).ok();
+                    p.watch =
+                        p.m.command(w, root.as_deref(), "")
+                            .ok()
+                            .and_then(|c| Run::spawn(c, ctx.clone()).ok());
                 }
                 (Some(_), _) if !want => {
                     if let Some(mut w) = p.watch.take() {
@@ -538,7 +575,10 @@ impl App {
                 }
                 for (a, n) in p.m.actions.iter().enumerate().rev() {
                     if ui
-                        .add_enabled(p.run.is_none(), egui::Button::new(&n.name).small())
+                        .add_enabled(
+                            p.run.is_none() && p.m.allowed,
+                            egui::Button::new(&n.name).small(),
+                        )
                         .clicked()
                     {
                         click = Some(Click::Action(a));
@@ -547,23 +587,16 @@ impl App {
             });
         });
         ui.separator();
-        egui::Panel::left("tests-list")
-            .resizable(true)
-            .default_size(360.0)
-            .show(ui, |ui| {
-                // keep the dragged width: narrow rows must not shrink the panel
-                ui.set_min_width(ui.available_width());
-                let left = match self.tests.plugins[active].view {
-                    None => self.cases_list(ui, active),
-                    Some(_) => rows_list(ui, &self.tests.plugins[active]),
-                };
-                click = click.take().or(left);
-            });
-        let right = egui::Frame::new()
-            .inner_margin(egui::Margin::symmetric(8, 0))
-            .show(ui, |ui| output(ui, &self.tests.plugins[active]))
-            .inner;
-        click = click.or(right);
+        // a project plugin the user has not allowed: what it would run, and nothing else
+        if !self.tests.plugins[active].m.allowed {
+            ui.label(RichText::new(self.tests.plugins[active].m.approval_text()).strong());
+            ui.label("It comes with the project's files. Allow it only if you trust what it runs; a change to its plugin.json asks again.");
+            if ui.button("Allow").clicked() {
+                click = Some(Click::Allow);
+            }
+        } else {
+            click = self.tests_lists(ui, active, click);
+        }
         match click {
             Some(Click::Run(id)) => self.run_case(active, &id, None, &ctx),
             Some(Click::Action(a)) => self.run_case(active, "", Some(a), &ctx),
@@ -587,6 +620,7 @@ impl App {
             }
             Some(Click::Link(u)) => open_link(&u),
             Some(Click::Add) => self.pick_plugin(&ctx),
+            Some(Click::Allow) => self.allow_plugin(active, &ctx),
             Some(Click::Remove) => {
                 let m = self.tests.plugins[active].m.clone();
                 match self.plugins_home().map(|d| plugins::remove(&d, &m)) {
@@ -600,6 +634,33 @@ impl App {
             }
             None => {}
         }
+    }
+
+    /// The case list (or a view's rows) on the left and the run's output on the right.
+    fn tests_lists(
+        &mut self,
+        ui: &mut Ui,
+        active: usize,
+        mut click: Option<Click>,
+    ) -> Option<Click> {
+        egui::Panel::left("tests-list")
+            .resizable(true)
+            .default_size(360.0)
+            .show(ui, |ui| {
+                // keep the dragged width: narrow rows must not shrink the panel
+                ui.set_min_width(ui.available_width());
+                let left = match self.tests.plugins[active].view {
+                    None => self.cases_list(ui, active),
+                    Some(_) => rows_list(ui, &self.tests.plugins[active]),
+                };
+                click = click.take().or(left);
+            });
+        let right = egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(8, 0))
+            .show(ui, |ui| output(ui, &self.tests.plugins[active]))
+            .inner;
+        click = click.or(right);
+        click
     }
 
     /// The case tree, a filtered flat list, or the cases a gutter ▶ picked.

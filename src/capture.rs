@@ -4,11 +4,15 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 /// Android stops `screenrecord` after 3 minutes.
 pub const MAX_RECORDING: Duration = Duration::from_secs(180);
+
+/// The error of a call stopped because the engine is ending.
+const STOPPED: &str = "stopped: Droid Lite is closing";
 
 /// How long one adb call may take before it is stopped (a device that hangs, a stuck adb server);
 /// copying a finished recording may take longer (see [`pull_limit`]).
@@ -38,6 +42,15 @@ fn read_all(r: Option<impl std::io::Read + Send + 'static>) -> Receiver<Vec<u8>>
 
 /// `cmd.output()`, but the process is killed when it runs longer than `limit`.
 pub fn output_within(cmd: &mut Command, limit: Duration) -> Result<std::process::Output, String> {
+    output_until(cmd, limit, &AtomicBool::new(false))
+}
+
+/// [`output_within`], also killed as soon as `stop` is set (the engine is ending).
+fn output_until(
+    cmd: &mut Command,
+    limit: Duration,
+    stop: &AtomicBool,
+) -> Result<std::process::Output, String> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -57,6 +70,11 @@ pub fn output_within(cmd: &mut Command, limit: Duration) -> Result<std::process:
                 stdout: out.recv_timeout(left).unwrap_or_default(),
                 stderr: err.recv_timeout(left).unwrap_or_default(),
             });
+        }
+        if stop.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(STOPPED.into());
         }
         if Instant::now() >= until {
             let _ = child.kill();
@@ -220,8 +238,10 @@ impl Recording {
     /// the whole file arrived; when the copy fails, or the device does not say the video's size (so
     /// the copy cannot be checked), the video stays on the device and the error names it. Blocks for seconds, minutes for a long recording over Wi-Fi: call it off the UI thread.
     /// At most about 16 minutes: 2 + 20 (stop) + 10 (finish) + 20 (size) + [`MAX_PULL`] + 20 (delete)
-    /// seconds, plus up to 1 s per adb call for its output.
-    pub fn finish(mut self, dir: &Path) -> Result<PathBuf, String> {
+    /// seconds, plus up to 1 s per adb call for its output. When `stop` is set (the engine is
+    /// ending) the copy stops at once, its `.part` is deleted and the video stays on the device: no
+    /// adb pull outlives the engine.
+    pub fn finish(mut self, dir: &Path, stop: &AtomicBool) -> Result<PathBuf, String> {
         if matches!(self.child.try_wait(), Ok(None)) {
             if !self.interrupt(Duration::from_secs(2)) {
                 let _ = self.child.kill();
@@ -240,7 +260,19 @@ impl Recording {
         let part = local.with_extension("mp4.part");
         let part_s = part.to_string_lossy().into_owned();
         let size = self.remote_size();
-        let pulled = self.adb_within(&["pull", &self.remote, &part_s], pull_limit(size));
+        let pulled = output_until(
+            Command::new(&self.adb).args(["-s", &self.serial, "pull", &self.remote, &part_s]),
+            pull_limit(size),
+            stop,
+        )
+        .map_err(|e| format!("adb: {e}"));
+        if stop.load(Ordering::SeqCst) {
+            let _ = std::fs::remove_file(&part);
+            return Err(format!(
+                "{STOPPED}. The video is still on the device: {}",
+                self.remote
+            ));
+        }
         let got = std::fs::metadata(&part)
             .ok()
             .filter(|m| m.is_file())
@@ -361,7 +393,9 @@ mod tests {
         for mode in ["fail", "short"] {
             std::fs::write(dir.join("pull"), mode).unwrap();
             let _ = std::fs::remove_file(dir.join("adb.log"));
-            let r = Recording::start(&adb, "emu").unwrap().finish(&out);
+            let r = Recording::start(&adb, "emu")
+                .unwrap()
+                .finish(&out, &AtomicBool::new(false));
             let e = r.expect_err(mode);
             assert!(
                 e.contains("still on the device: /sdcard/droid-lite-"),
@@ -376,7 +410,7 @@ mod tests {
         let _ = std::fs::remove_file(dir.join("adb.log"));
         let e = Recording::start(&adb, "emu")
             .unwrap()
-            .finish(&out)
+            .finish(&out, &AtomicBool::new(false))
             .unwrap_err();
         assert!(
             e.contains(
@@ -392,7 +426,10 @@ mod tests {
         );
         std::fs::remove_file(dir.join("stat")).unwrap();
         let _ = std::fs::remove_file(dir.join("adb.log"));
-        let video = Recording::start(&adb, "emu").unwrap().finish(&out).unwrap();
+        let video = Recording::start(&adb, "emu")
+            .unwrap()
+            .finish(&out, &AtomicBool::new(false))
+            .unwrap();
         assert_eq!(std::fs::metadata(&video).unwrap().len(), 1000);
         let calls = log();
         let (pull, rm) = (calls.find(" pull ").unwrap(), calls.find("rm -f").unwrap());

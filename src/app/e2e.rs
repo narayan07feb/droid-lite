@@ -2946,6 +2946,58 @@ fn e2e_performance_tab_shows_frames_memory_and_open_time() {
 }
 
 #[test]
+fn e2e_a_project_plugin_runs_nothing_until_allowed_and_asks_again_after_a_change() {
+    let f = Fixture::new("plugin-ok");
+    let dir = f.path(".droid-lite/plugins/shared");
+    std::fs::create_dir_all(&dir).unwrap();
+    let manifest = r#"{"name":"Shared tests","list":["sh","{plugin}/list.sh"]}"#;
+    std::fs::write(dir.join("plugin.json"), manifest).unwrap();
+    std::fs::write(
+        dir.join("list.sh"),
+        "touch \"$DROID_LITE_PROJECT/listed\"\necho '[{\"id\":\"a\",\"label\":\"Case A\"}]'\n",
+    )
+    .unwrap();
+    let mut h = f.harness();
+    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE))
+        .click();
+    steps(&mut h, 3);
+    h.get_by_label(&format!(
+        r#"Needs your OK: runs ["sh", "{{plugin}}/list.sh"] from {}"#,
+        dir.display()
+    ));
+    for _ in 0..20 {
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!f.path("listed").exists(), "nothing ran before the OK");
+    assert!(h.state().tests.plugins[0].loading.is_none());
+    h.get_by_label("Allow").click();
+    wait(&mut h, "cases listed", |a| a.tests.plugins[0].cases.len() == 1);
+    assert!(f.path("listed").exists());
+    let store: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(f.config.join("approved-plugins.json")).unwrap(),
+    )
+    .unwrap();
+    let real = dir.canonicalize().unwrap();
+    assert_eq!(store.as_object().unwrap().len(), 1);
+    assert!(store[real.to_str().unwrap()].as_str().is_some_and(|h| h.len() == 64), "{store}");
+    // allowed once: the next load lists it at once
+    let ctx = h.ctx.clone();
+    std::fs::remove_file(f.path("listed")).unwrap();
+    h.state_mut().load_plugins(&ctx);
+    wait(&mut h, "listed again", |a| a.tests.plugins[0].cases.len() == 1);
+    assert!(f.path("listed").exists());
+    // a changed plugin.json asks again, and runs nothing meanwhile
+    std::fs::remove_file(f.path("listed")).unwrap();
+    std::fs::write(dir.join("plugin.json"), manifest.replace("list.sh", "list.sh\",\"x")).unwrap();
+    h.state_mut().load_plugins(&ctx);
+    steps(&mut h, 3);
+    assert!(!h.state().tests.plugins[0].m.allowed);
+    h.get_by_label_contains("Needs your OK: runs ");
+    assert!(!f.path("listed").exists());
+}
+
+#[test]
 fn e2e_plugin_tests_tab_runs_cases_from_list_gutter_views_and_actions() {
     let f = Fixture::new("plugins");
     std::fs::create_dir_all(f.path("flows")).unwrap();

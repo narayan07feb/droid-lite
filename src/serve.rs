@@ -56,7 +56,12 @@ pub struct Server {
     /// dropped; the previews' file list is made again from it when it changed.
     files: std::collections::BTreeSet<PathBuf>,
     files_changed: bool,
+    /// Files `update` sent since the last preview request (text or disk): the preview reads their
+    /// packages and declared names again.
+    edited: std::collections::BTreeSet<PathBuf>,
     devices: Option<(Sender<DeviceCall>, std::thread::JoinHandle<()>)>,
+    /// Set at shutdown: a recording's copy under way stops (no adb pull outlives the engine).
+    stopping: Arc<std::sync::atomic::AtomicBool>,
     out: Out,
 }
 
@@ -360,6 +365,7 @@ fn device_call(
     recording: &mut Option<Recording>,
     method: &str,
     params: &Value,
+    stop: &std::sync::atomic::AtomicBool,
 ) -> Result<Value, String> {
     let s = |k: &str| params[k].as_str().ok_or_else(|| format!("missing \"{k}\""));
     match method {
@@ -384,20 +390,47 @@ fn device_call(
         // waits while the device finishes and sends the video
         "record_stop" => {
             let r = recording.take().ok_or("no recording is running")?;
-            Ok(json!(r.finish(&capture::out_dir())?))
+            Ok(json!(r.finish(&capture::out_dir(), stop)?))
         }
         _ => Err(format!("unknown method {method}")),
     }
 }
 
-/// The device thread: runs device calls one after another and answers each when it is done. It
-/// ends when its sender is dropped; a recording still running then stops (see [`Server::shutdown`]).
-fn device_thread(out: Out) -> (Sender<DeviceCall>, std::thread::JoinHandle<()>) {
+/// The device thread: runs device calls one after another and answers each when it is done. A
+/// `devices` call with a newer one queued behind it (they pile up while `record_stop` copies a long
+/// video) does not run: the newest one's list answers it too. It ends when its sender is dropped;
+/// a recording still running then stops, and a copy under way stops when `stop` is set (see
+/// [`Server::shutdown`]).
+fn device_thread(
+    out: Out,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> (Sender<DeviceCall>, std::thread::JoinHandle<()>) {
     let (tx, rx) = channel::<DeviceCall>();
     let t = std::thread::spawn(move || {
         let mut recording = None;
-        for (id, method, params) in rx {
-            let r = guarded(|| device_call(&mut recording, &method, &params));
+        let mut queued = std::collections::VecDeque::new();
+        let mut stale = Vec::new();
+        loop {
+            if queued.is_empty() {
+                match rx.recv() {
+                    Ok(c) => queued.push_back(c),
+                    Err(_) => break,
+                }
+            }
+            queued.extend(rx.try_iter());
+            let Some((id, method, params)) = queued.pop_front() else {
+                break;
+            };
+            if method == "devices" && queued.iter().any(|(_, m, _)| m == "devices") {
+                stale.push(id);
+                continue;
+            }
+            let r = guarded(|| device_call(&mut recording, &method, &params, &stop));
+            if method == "devices" {
+                for id in stale.drain(..) {
+                    out.emit(answer(id, r.clone()));
+                }
+            }
             out.emit(answer(id, r));
         }
     });
@@ -489,6 +522,7 @@ impl Server {
                 self.project = Some(project_ref(p.root.clone(), p.files.clone()));
                 self.files = p.files.iter().cloned().collect();
                 self.files_changed = false;
+                self.edited.clear();
                 self.open = true;
                 Ok(json!({
                     "files": p.files.len(),
@@ -503,7 +537,9 @@ impl Server {
                 if !in_project(root, path) {
                     return Err(format!("{raw:?} is not in the project"));
                 }
-                if ignored(root, path) {
+                // what the walk of `initialize` leaves out: tool folders, `.gitignore`
+                if ignored(root, path) || root.is_some_and(|r| crate::project::git_ignored(r, path))
+                {
                     return Ok(Value::Null);
                 }
                 // a folder created, moved or renamed: every source file in it
@@ -514,7 +550,22 @@ impl Server {
                         };
                         self.index.update(&f, &src);
                         self.texts.remove(&f);
+                        self.edited.insert(f.clone());
                         self.files_changed |= self.files.insert(f);
+                    }
+                    return Ok(Value::Null);
+                }
+                // a file the file list does not take (an image, a log): nothing to do
+                if root.is_some_and(|r| !crate::project::accepts_in(r, path)) {
+                    return Ok(Value::Null);
+                }
+                // a build or resource file: only the file list (the index reads Kotlin and Java)
+                if !crate::project::is_code(path) {
+                    if path.is_file() {
+                        self.edited.insert(path.clone());
+                        self.files_changed |= self.files.insert(path.clone());
+                    } else {
+                        self.forget(path);
                     }
                     return Ok(Value::Null);
                 }
@@ -536,6 +587,7 @@ impl Server {
                 } else {
                     self.texts.remove(path);
                 }
+                self.edited.insert(path.clone());
                 self.files_changed |= self.files.insert(path.clone());
                 Ok(Value::Null)
             }
@@ -553,7 +605,11 @@ impl Server {
                 let mut outside = Vec::new();
                 for raw in raws {
                     let path = &canon(raw);
-                    if raw.trim().is_empty() || !in_project(root.as_deref(), path) {
+                    // never the project folder itself: that would wipe the whole index
+                    if raw.trim().is_empty()
+                        || !in_project(root.as_deref(), path)
+                        || root.as_deref() == Some(path.as_path())
+                    {
                         outside.push(format!("{raw:?}"));
                     } else if !ignored(root.as_deref(), path) {
                         self.forget(path);
@@ -806,20 +862,24 @@ impl Server {
     }
 
     /// The project for a preview request, its file list made again when files were added or
-    /// removed since the last one (else the same list, not a copy).
+    /// removed since the last one (else the same list, not a copy), with the files edited since.
     fn project_ref(&mut self) -> Option<crate::preview::ProjectRef> {
         if std::mem::take(&mut self.files_changed)
             && let Some(p) = &mut self.project
         {
             *p = project_ref(p.root.clone(), self.files.iter().cloned().collect());
         }
-        self.project.clone()
+        let mut p = self.project.clone()?;
+        p.changed = std::mem::take(&mut self.edited).into_iter().collect();
+        Some(p)
     }
 
     /// At the end of input: the device thread ends first (dropping a running recording stops
-    /// screenrecord and deletes its file on the device), waited for at most `limit`; then this
-    /// engine's pictures go.
+    /// screenrecord and deletes its file on the device; a video being copied stops copying and
+    /// stays on the device), waited for at most `limit`; then this engine's pictures go.
     pub fn shutdown(&mut self, limit: Duration) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some((tx, t)) = self.devices.take() {
             drop(tx);
             let until = Instant::now() + limit;
@@ -850,8 +910,8 @@ impl Server {
             &req["params"],
         );
         if is_device_call(method) {
-            let out = self.out.clone();
-            let (devices, _) = self.devices.get_or_insert_with(|| device_thread(out));
+            let (out, stop) = (self.out.clone(), self.stopping.clone());
+            let (devices, _) = self.devices.get_or_insert_with(|| device_thread(out, stop));
             let _ = devices.send((id.clone(), method.to_string(), params.clone()));
             return None;
         }
@@ -917,6 +977,7 @@ fn project_ref(root: PathBuf, files: Vec<PathBuf>) -> crate::preview::ProjectRef
             .cloned()
             .collect(),
         files: Arc::new(files),
+        changed: Vec::new(),
     }
 }
 
@@ -1352,6 +1413,119 @@ mod tests {
     }
 
     #[test]
+    fn files_updated_since_the_last_preview_go_with_the_next_one_once() {
+        let root = std::fs::canonicalize(project("edited")).unwrap();
+        let mut s = Server::default();
+        init(&mut s, &root);
+        let api = root.join("app/src/main/java/demo/Api.kt");
+        let card = root.join("app/src/main/java/demo/Card.kt");
+        assert!(s.project_ref().unwrap().changed.is_empty());
+        // unsaved text and a save on disk both count; the file list stays the same
+        let r = call(
+            &mut s,
+            "update",
+            json!({ "path": api, "text": "package demo\ndata class Item(val n: Int)\n" }),
+        );
+        assert!(r["error"].is_null(), "{r}");
+        let r = call(&mut s, "update", json!({ "path": card }));
+        assert!(r["error"].is_null(), "{r}");
+        let p = s.project_ref().unwrap();
+        assert_eq!(p.changed, [api, card]);
+        assert!(s.project_ref().unwrap().changed.is_empty(), "sent once");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_follows_gitignore_and_takes_only_code_into_the_index() {
+        let root = std::fs::canonicalize(project("gitignore")).unwrap();
+        std::fs::create_dir_all(root.join(".git/info")).unwrap();
+        std::fs::write(root.join(".gitignore"), "generated/\n*.gen.kt\n").unwrap();
+        std::fs::write(root.join(".git/info/exclude"), "excluded.kt\n").unwrap();
+        let demo = root.join("app/src/main/java/demo");
+        std::fs::write(demo.join(".gitignore"), "local/\n!Kept.gen.kt\n").unwrap();
+        let files = [
+            demo.join("generated/G.kt"),
+            demo.join("Model.gen.kt"),
+            demo.join("excluded.kt"),
+            demo.join("local/L.kt"),
+            demo.join("Kept.gen.kt"),
+            demo.join("Ok.kt"),
+        ];
+        for f in &files {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            let n = f
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .split('.')
+                .next()
+                .unwrap()
+                .to_string();
+            std::fs::write(f, format!("package demo\nclass {n} : Base\n")).unwrap();
+        }
+        let mut s = Server::default();
+        init(&mut s, &root);
+        let subclasses = |s: &mut Server| {
+            let r = call(s, "implementations", json!({ "name": "Base" }));
+            let mut v: Vec<String> = r["result"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["name"].as_str().unwrap().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(subclasses(&mut s), ["Kept", "Ok"], "Project::open");
+        for f in &files {
+            call(&mut s, "remove", json!({ "path": f }));
+        }
+        for f in files
+            .iter()
+            .chain([&demo.join("generated"), &demo.join("local")])
+        {
+            let r = call(&mut s, "update", json!({ "path": f }));
+            assert!(r["error"].is_null(), "{f:?}: {r}");
+            let r = call(
+                &mut s,
+                "update",
+                json!({ "path": f, "text": "package demo\nclass Typed : Base\n" }),
+            );
+            assert!(r["error"].is_null(), "{f:?}: {r}");
+        }
+        assert_eq!(
+            subclasses(&mut s),
+            ["Typed", "Typed"],
+            "only Kept.gen.kt and Ok.kt took the typed text"
+        );
+        assert_eq!(s.texts.len(), 2, "{:?}", s.texts.keys());
+        // not code: a build file joins the file list (the previews read its namespace), never the index
+        let (notes, gradle, png) = (
+            root.join("notes.md"),
+            root.join("app/build.gradle"),
+            root.join("app/shot.png"),
+        );
+        for (f, t) in [
+            (&notes, "class Notes : Base"),
+            (&gradle, "android { namespace 'demo' }"),
+            (&png, "x"),
+        ] {
+            std::fs::write(f, t).unwrap();
+            let r = call(
+                &mut s,
+                "update",
+                json!({ "path": f, "text": "class Fake : Base" }),
+            );
+            assert!(r["error"].is_null(), "{r}");
+        }
+        assert_eq!(subclasses(&mut s), ["Typed", "Typed"]);
+        assert!(s.files.contains(&gradle) && s.files.contains(&notes) && !s.files.contains(&png));
+        assert_eq!(s.texts.len(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_line_that_is_not_json_is_answered_with_its_id() {
         let mut s = Server::default();
         // a lone surrogate: not valid JSON
@@ -1399,6 +1573,152 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("DROID_LITE_ADB", v) },
             None => unsafe { std::env::remove_var("DROID_LITE_ADB") },
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A fake adb for the device thread's tests: every call goes to `adb.log`; `pull` writes part of
+    /// the video and hangs, `screencap` takes a second.
+    fn slow_adb(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let adb = dir.join("adb");
+        let d = dir.display();
+        let script = format!(
+            "#!/bin/sh\necho \"$@\" >> {d}/adb.log\ncase \"$*\" in\n\
+             *screenrecord*) echo 4242; sleep 0.2;;\n\
+             *stat*) echo 1000;;\n\
+             *pull*) head -c 500 /dev/zero > \"$5\"; echo $$ > {d}/pull.pid; exec sleep 30;;\n\
+             *screencap*) sleep 1; printf png;;\n\
+             *devices*) printf 'List of devices attached\\nemu device model:Pixel\\n';;\n\
+             esac\n"
+        );
+        std::fs::write(&adb, script).unwrap();
+        std::fs::set_permissions(&adb, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        adb
+    }
+
+    fn with_env<T>(vars: &[(&str, &Path)], f: impl FnOnce() -> T) -> T {
+        let old: Vec<_> = vars.iter().map(|(k, _)| std::env::var_os(k)).collect();
+        // SAFETY: the caller holds the test lock, so no other test reads the environment meanwhile.
+        for (k, v) in vars {
+            unsafe { std::env::set_var(k, v) };
+        }
+        let r = f();
+        for ((k, _), v) in vars.iter().zip(old) {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        r
+    }
+
+    #[test]
+    fn at_the_end_of_input_a_video_being_copied_stops_copying_and_stays_on_the_device() {
+        let _lock = crate::app::test_lock();
+        let dir = std::env::temp_dir().join(format!("dl-serve-pull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let adb = slow_adb(&dir);
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        with_env(
+            &[
+                ("DROID_LITE_ADB", &adb),
+                ("DROID_LITE_CAPTURE_DIR", &out_dir),
+            ],
+            || {
+                let mut s = Server::default();
+                let (tx, rx) = channel();
+                s.out = Out(Some(tx));
+                assert_eq!(
+                    s.request(r#"{"id":1,"method":"record_start","params":{"serial":"emu"}}"#),
+                    None
+                );
+                assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap()["id"], 1);
+                assert_eq!(s.request(r#"{"id":2,"method":"record_stop"}"#), None);
+                let until = Instant::now() + Duration::from_secs(10);
+                while !dir.join("pull.pid").exists() && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                let pull: i32 = std::fs::read_to_string(dir.join("pull.pid"))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                assert_eq!(
+                    std::fs::read_dir(&out_dir).unwrap().count(),
+                    1,
+                    "the .part being copied"
+                );
+                let t = Instant::now();
+                s.shutdown(Duration::from_secs(15));
+                assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+                let answer = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert_eq!(answer["id"], 2);
+                let e = answer["error"].as_str().unwrap();
+                assert!(e.contains("Droid Lite is closing. The video is still on the device: /sdcard/droid-lite-"), "{e}");
+                assert_eq!(
+                    std::fs::read_dir(&out_dir).unwrap().count(),
+                    0,
+                    "no .part left"
+                );
+                assert_ne!(
+                    unsafe { libc::kill(pull, 0) },
+                    0,
+                    "no adb pull outlives the engine"
+                );
+                assert!(
+                    !std::fs::read_to_string(dir.join("adb.log"))
+                        .unwrap()
+                        .contains("rm -f"),
+                    "the device keeps its copy"
+                );
+            },
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn only_the_newest_of_queued_devices_calls_runs_and_answers_them_all() {
+        let _lock = crate::app::test_lock();
+        let dir = std::env::temp_dir().join(format!("dl-serve-devices-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let adb = slow_adb(&dir);
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        with_env(
+            &[
+                ("DROID_LITE_ADB", &adb),
+                ("DROID_LITE_CAPTURE_DIR", &out_dir),
+            ],
+            || {
+                let mut s = Server::default();
+                let (tx, rx) = channel();
+                s.out = Out(Some(tx));
+                // a long call first, then three `devices` behind it
+                assert_eq!(
+                    s.request(r#"{"id":1,"method":"screenshot","params":{"serial":"emu"}}"#),
+                    None
+                );
+                for id in 2..=4 {
+                    assert_eq!(
+                        s.request(&format!(r#"{{"id":{id},"method":"devices"}}"#)),
+                        None
+                    );
+                }
+                let mut answers: Vec<Value> = (0..4)
+                    .map(|_| rx.recv_timeout(Duration::from_secs(10)).unwrap())
+                    .collect();
+                answers.sort_by_key(|a| a["id"].as_i64());
+                for a in &answers[1..] {
+                    assert_eq!(a["result"][0]["serial"], "emu", "{a}");
+                }
+                let log = std::fs::read_to_string(dir.join("adb.log")).unwrap();
+                assert_eq!(log.matches("devices").count(), 1, "{log}");
+                s.shutdown(Duration::from_secs(5));
+            },
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1517,10 +1837,14 @@ mod tests {
         let root = project("remove");
         let mut s = Server::default();
         init(&mut s, &root);
-        for p in ["", " ", "/", "/tmp/elsewhere"] {
+        let root_s = root.to_str().unwrap().to_string();
+        let slash = format!("{root_s}/");
+        for p in ["", " ", "/", "/tmp/elsewhere", &root_s, &slash] {
             let r = call(&mut s, "remove", json!({ "path": p }));
             assert!(r["error"].is_string(), "{p:?}: {r}");
         }
+        let r = call(&mut s, "remove", json!({ "paths": [root_s] }));
+        assert!(r["error"].is_string(), "{r}");
         let r = call(&mut s, "implementations", json!({ "name": "Api" }));
         assert_eq!(r["result"][0]["name"], "RealApi", "{r}");
         let _ = std::fs::remove_dir_all(root);

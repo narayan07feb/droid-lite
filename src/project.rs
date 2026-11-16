@@ -67,6 +67,68 @@ pub fn walk(dir: &Path) -> impl Iterator<Item = PathBuf> {
         .map(|e| e.into_path())
 }
 
+/// Whether a file under `root` that appeared later belongs in the file list by its name alone (the
+/// same rules as [`Project::open`]: no skipped folder on its way, a listed extension). See
+/// [`git_ignored`] for the `.gitignore` half of the walk's rules.
+pub fn accepts_in(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root).is_ok_and(|rel| {
+        !skipped(rel)
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| EXTENSIONS.contains(&e))
+    })
+}
+
+/// Whether [`walk`] from `root` leaves `path` (a file or folder under it) out by an ignore file:
+/// `.ignore`, and in a git repository `.gitignore` of each folder from `root` down (the deepest
+/// match wins), `.git/info/exclude` and the global gitignore. A part of its path left out leaves it
+/// out too, as the walk never enters that folder.
+pub fn git_ignored(root: &Path, path: &Path) -> bool {
+    use ignore::gitignore::{Gitignore, GitignoreBuilder};
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    let in_git = root.ancestors().any(|a| a.join(".git").exists());
+    let load = |base: &Path, file: &Path| -> Option<Gitignore> {
+        if !file.is_file() {
+            return None;
+        }
+        let mut b = GitignoreBuilder::new(base);
+        b.add(file);
+        b.build().ok()
+    };
+    // lowest first: the global gitignore, then the repository's exclude file
+    let mut last: Vec<Gitignore> = Vec::new();
+    if in_git {
+        last.push(Gitignore::global().0);
+        last.extend(load(root, &root.join(".git/info/exclude")));
+    }
+    let (mut ignores, mut gitignores): (Vec<Gitignore>, Vec<Gitignore>) = (Vec::new(), Vec::new());
+    let parts: Vec<_> = rel.components().collect();
+    let mut cur = root.to_path_buf();
+    for (i, c) in parts.iter().enumerate() {
+        ignores.extend(load(&cur, &cur.join(".ignore")));
+        if in_git {
+            gitignores.extend(load(&cur, &cur.join(".gitignore")));
+        }
+        cur.push(c);
+        let is_dir = i + 1 < parts.len() || cur.is_dir();
+        // as the walk ranks them: `.ignore` over `.gitignore` over exclude over global, the deepest first
+        let verdict = ignores
+            .iter()
+            .rev()
+            .chain(gitignores.iter().rev())
+            .chain(last.iter().rev())
+            .map(|g| g.matched(&cur, is_dir))
+            .find(|m| !m.is_none());
+        if verdict.is_some_and(|m| m.is_ignore()) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn is_code(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),
@@ -142,13 +204,7 @@ impl Project {
 
     /// Whether a file that appeared later belongs in the file list (same rules as `open`).
     pub fn accepts(&self, path: &Path) -> bool {
-        path.strip_prefix(&self.root).is_ok_and(|rel| {
-            !skipped(rel)
-                && path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| EXTENSIONS.contains(&e))
-        })
+        accepts_in(&self.root, path)
     }
 
     pub fn gradlew(&self) -> PathBuf {

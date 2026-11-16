@@ -57,7 +57,12 @@ impl App {
     pub(super) fn toggle_recording(&mut self, ctx: &egui::Context) {
         if let Some(rec) = self.capture.recording.take() {
             self.status = format!("Saving the recording of {}…", rec.serial());
-            self.save_in_background(ctx, move || rec.finish(&capture::out_dir()));
+            self.save_in_background(ctx, move || {
+                rec.finish(
+                    &capture::out_dir(),
+                    &std::sync::atomic::AtomicBool::new(false),
+                )
+            });
             return;
         }
         let Some((adb, serial)) = self.capture_target() else {

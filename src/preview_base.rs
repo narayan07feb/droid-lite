@@ -339,10 +339,24 @@ impl Fetch for NotTried {
     }
 }
 
+/// How long an engine waits for a lock another engine holds: one that was stopped (SIGSTOP) or
+/// hangs while holding it must not hold up every other engine for ever.
+const LOCK_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// An exclusive lock on `path` (made if missing), held until the file is dropped: two engines never
 /// write one download or one unpacked folder at once. While another engine holds it, `waiting` is
-/// called at once and then every 2 s, so this engine's status says why it waits.
+/// called at once and then every 2 s, so this engine's status says why it waits; after
+/// [`LOCK_LIMIT`] the answer is an error.
 pub(crate) fn lock(path: &Path, waiting: &dyn Fn()) -> Result<std::fs::File, String> {
+    lock_within(path, waiting, LOCK_LIMIT)
+}
+
+fn lock_within(
+    path: &Path,
+    waiting: &dyn Fn(),
+    limit: std::time::Duration,
+) -> Result<std::fs::File, String> {
+    let start = std::time::Instant::now();
     let f = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -354,6 +368,13 @@ pub(crate) fn lock(path: &Path, waiting: &dyn Fn()) -> Result<std::fs::File, Str
         match f.try_lock() {
             Ok(()) => return Ok(f),
             Err(std::fs::TryLockError::WouldBlock) => {
+                if start.elapsed() >= limit {
+                    return Err(format!(
+                        "Another Droid Lite window has held {} for {} s (stopped or stuck?). Close it, or open the preview again later.",
+                        path.display(),
+                        limit.as_secs()
+                    ));
+                }
                 if said.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(2)) {
                     waiting();
                     said = Some(std::time::Instant::now());
@@ -706,6 +727,25 @@ mod tests {
     }
 
     fn quiet(_: String, _: Option<(u64, u64)>) {}
+
+    #[test]
+    fn a_lock_held_too_long_is_an_error_not_an_endless_wait() {
+        let d = std::env::temp_dir().join(format!("dl-lock-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("x.lock");
+        let _held = lock(&path, &|| {}).unwrap(); // a stopped engine holding it
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(lock_within(&p, &|| {}, std::time::Duration::from_millis(300)).err());
+        });
+        let err = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("an answer, not a hang");
+        assert!(err.is_some_and(|e| e.contains("has held") && e.contains("x.lock")));
+        assert_eq!(LOCK_LIMIT, std::time::Duration::from_secs(120));
+        let _ = std::fs::remove_dir_all(d);
+    }
 
     #[test]
     fn sha1_matches_the_standard_vectors() {

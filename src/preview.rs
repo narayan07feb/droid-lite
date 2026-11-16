@@ -86,6 +86,9 @@ pub struct ProjectRef {
     pub root: PathBuf,
     pub scripts: Vec<PathBuf>,
     pub files: std::sync::Arc<Vec<PathBuf>>,
+    /// Files whose text changed since the last request (an edit, a save): their package, declared
+    /// names and annotation classes are read again, not only those of files added or removed.
+    pub changed: Vec<PathBuf>,
 }
 
 /// The project's own code a preview needs: the files (compiled once, cached by `key`) and the R sources.
@@ -190,7 +193,7 @@ pub fn dir() -> PathBuf {
     )
 }
 
-/// The worker's folder: its source (PreviewWorker.java) and layoutlib's unpacked runtime and resources
+/// The worker's folder: its source (PreviewWorker-<hash>.java) and layoutlib's unpacked runtime and resources
 /// (`layoutlib/`). The renderer's jars are found or downloaded at every worker start
 /// ([`crate::preview_base`]): Gradle's cache, else `m2/` next to it. Optional, from older packs:
 ///   compose/*.jar, compile/*.jar  Compose for a project that has none in the Gradle cache
@@ -244,17 +247,32 @@ fn room_from_status(status: &str) -> String {
 
 /// The next request to draw: the newest one waiting. Every older one, and one there is no room
 /// for now, is answered Skipped, so no caller waits for an answer that never comes.
-fn next_job(jobs: &Receiver<Request>, send: &dyn Fn(Event), room: &dyn Fn() -> String) -> Option<Request> {
+/// The files a request dropped here says were edited go on with the next one, so no edit is missed.
+fn next_job(jobs: &Receiver<Request>, send: &dyn Fn(Event), room: &dyn Fn() -> String, taken: &dyn Fn()) -> Option<Request> {
+    let mut edited: Vec<PathBuf> = Vec::new();
+    let keep = |edited: &mut Vec<PathBuf>, r: &mut Request| {
+        if let Some(p) = r.project.as_mut() {
+            edited.append(&mut p.changed);
+        }
+    };
     loop {
         let mut r = jobs.recv().ok()?;
+        taken();
         while let Ok(newer) = jobs.try_recv() {
+            taken();
+            keep(&mut edited, &mut r);
             send(Event::Skipped { file: r.file, seq: r.seq, reason: "replaced by a newer request".into() });
             r = newer;
         }
         let why = room();
         if why.is_empty() {
+            keep(&mut edited, &mut r);
+            if let Some(p) = r.project.as_mut() {
+                p.changed = std::mem::take(&mut edited);
+            }
             return Some(r);
         }
+        keep(&mut edited, &mut r);
         send(Event::Status(r.file.clone(), why.clone(), None));
         send(Event::Skipped { file: r.file, seq: r.seq, reason: why });
     }
@@ -302,17 +320,28 @@ impl Reads {
             self.libs = Some((p.root.clone(), library_classpath(&p.root, &p.scripts, &progress)));
             self.files = None;
         }
-        if self.files.as_ref().is_none_or(|f| !std::sync::Arc::ptr_eq(f, &p.files) && **f != *p.files) {
-            match (&mut self.packages, &self.files) {
-                // the same project: only the files added are read, the files removed dropped
-                (Some((root, pk)), Some(old)) if *root == p.root => {
+        let same_list = self.files.as_ref().is_some_and(|f| std::sync::Arc::ptr_eq(f, &p.files) || **f == *p.files);
+        match (&mut self.packages, &self.files) {
+            // the same project: only the files added are read, the files removed dropped, and the
+            // files edited since read again
+            (Some((root, pk)), Some(old)) if *root == p.root => {
+                let (mut added, mut removed): (Vec<&PathBuf>, Vec<&PathBuf>) = (Vec::new(), Vec::new());
+                if !same_list {
                     let (was, now): (std::collections::HashSet<&PathBuf>, std::collections::HashSet<&PathBuf>) = (old.iter().collect(), p.files.iter().collect());
-                    let added: Vec<&PathBuf> = p.files.iter().filter(|f| !was.contains(f)).collect();
-                    let removed: Vec<&PathBuf> = old.iter().filter(|f| !now.contains(f)).collect();
-                    pk.update(&added, &removed);
+                    added = p.files.iter().filter(|f| !was.contains(f)).collect();
+                    removed = old.iter().filter(|f| !now.contains(f)).collect();
                 }
-                _ => self.packages = Some((p.root.clone(), crate::preview_src::Packages::read(&p.files))),
+                let now: std::collections::HashSet<&PathBuf> = if p.changed.is_empty() { Default::default() } else { p.files.iter().collect() };
+                for f in p.changed.iter().filter(|f| now.contains(f)) {
+                    removed.push(f);
+                    added.push(f);
+                }
+                pk.update(&added, &removed);
             }
+            _ if same_list => {}
+            _ => self.packages = Some((p.root.clone(), crate::preview_src::Packages::read(&p.files))),
+        }
+        if !same_list {
             self.files = Some(p.files.clone());
         }
     }
@@ -329,18 +358,79 @@ fn library_trouble(error: &str, unresolved_imports: &[String], packages: Option<
 }
 
 fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context, decode: bool) {
-    let send = |e: Event| {
+    let sender = move |events: &Sender<Event>, ctx: &egui::Context, e: Event| {
         let _ = events.send(e);
         ctx.request_repaint();
     };
+    let queue = std::sync::Arc::new(std::sync::Mutex::new(Queue::default()));
+    let (to_draw, jobs_in) = channel();
+    {
+        let (queue, events, ctx) = (queue.clone(), events.clone(), ctx.clone());
+        std::thread::Builder::new()
+            .name("preview-queue".into())
+            .spawn(move || forward(jobs, to_draw, &queue, &|e| sender(&events, &ctx, e), WAIT_NOTE_EVERY))
+            .expect("preview queue thread");
+    }
+    let send = |e: Event| sender(&events, &ctx, e);
     let mut state = State { decode, ..Default::default() };
-    serve_jobs(&jobs, &send, &room, &mut |r| state.draw(r, &send));
+    let lock = || queue.lock().unwrap_or_else(|e| e.into_inner());
+    serve_jobs(&jobs_in, &send, &room, &|| drop(lock().waiting.pop_front()), &mut |r| {
+        lock().drawing = Some(r.file.clone());
+        let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.draw(r, &send)));
+        lock().drawing = None;
+        if let Err(p) = drawn {
+            std::panic::resume_unwind(p);
+        }
+    });
+}
+
+/// What the client's thread draws now and the files of the requests sent to it since (oldest first).
+#[derive(Default)]
+struct Queue {
+    drawing: Option<PathBuf>,
+    waiting: std::collections::VecDeque<PathBuf>,
+}
+
+/// How often a request waiting behind another file's draw hears why.
+const WAIT_NOTE_EVERY: Duration = Duration::from_secs(10);
+
+/// Passes each request on to the drawing loop, noting its file in `queue` first. A request for a
+/// file that waits behind another file's draw is told so ("Waiting for Card.kt to finish") at once
+/// and every `every`, so its window does not sit there silent for the minutes a draw may take.
+fn forward(jobs: Receiver<Request>, to: Sender<Request>, queue: &std::sync::Mutex<Queue>, send: &dyn Fn(Event), every: Duration) {
+    loop {
+        match jobs.recv_timeout(every) {
+            Ok(r) => {
+                queue.lock().unwrap_or_else(|e| e.into_inner()).waiting.push_back(r.file.clone());
+                if to.send(r).is_err() {
+                    return;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+        let notes: Vec<Event> = {
+            let q = queue.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(a) = &q.drawing else { continue };
+            let name = a.file_name().map_or_else(|| a.display().to_string(), |n| n.to_string_lossy().into_owned());
+            let mut seen = std::collections::HashSet::new();
+            q.waiting
+                .iter()
+                .filter(|b| *b != a && seen.insert(*b))
+                .map(|b| Event::Status(b.clone(), format!("Waiting for {name} to finish"), None))
+                .collect()
+        };
+        for n in notes {
+            send(n);
+        }
+    }
 }
 
 /// Draws each request the loop takes. A panic in one (a bug) answers that request Failed and the
-/// loop goes on, so no caller waits for an answer that never comes.
-fn serve_jobs(jobs: &Receiver<Request>, send: &dyn Fn(Event), room: &dyn Fn() -> String, draw: &mut dyn FnMut(&Request)) {
-    while let Some(r) = next_job(jobs, send, room) {
+/// loop goes on, so no caller waits for an answer that never comes. `taken` is called for each
+/// request taken from `jobs`, drawn or not.
+fn serve_jobs(jobs: &Receiver<Request>, send: &dyn Fn(Event), room: &dyn Fn() -> String, taken: &dyn Fn(), draw: &mut dyn FnMut(&Request)) {
+    while let Some(r) = next_job(jobs, send, room, taken) {
         if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| draw(&r))) {
             let why = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
             send(Event::Failed { file: r.file.clone(), seq: r.seq, error: format!("internal error: {why}") });
@@ -352,6 +442,9 @@ fn serve_jobs(jobs: &Receiver<Request>, send: &dyn Fn(Event), room: &dyn Fn() ->
 #[derive(Default)]
 struct State {
     conn: Option<(UnixStream, BufReader<UnixStream>)>,
+    /// The pid of the worker `conn` talks to (read from the socket at connect): a hung one is
+    /// stopped by it, never whatever worker is on the socket by then.
+    conn_pid: Option<i32>,
     conn_version: String,
     id: u64,
     reads: Reads,
@@ -475,7 +568,10 @@ impl State {
             }
             if self.conn.is_none() {
                 match connect_or_start(send, &r.file, &sock, &kt, &rt, &mut base) {
-                    Ok(c) => self.conn = Some(c),
+                    Ok(c) => {
+                        self.conn_pid = peer_pid(&c.0);
+                        self.conn = Some(c);
+                    }
                     Err(e) => {
                         self.forget |= e.contains("is not in the Gradle cache yet"); // the Compose compiler plugin
                         last_error = e;
@@ -506,9 +602,12 @@ impl State {
                 }
                 Err(NoAnswer::Silent(e)) => {
                     // a hung worker would take the next connection too: stop it, so the next try
-                    // starts a fresh one
+                    // starts a fresh one (only the one this connection reached: another window may
+                    // have replaced it already)
                     self.conn = None;
-                    stop_worker(&sock, STOP_GRACE);
+                    if let Some(pid) = self.conn_pid.take() {
+                        stop_worker(&sock, Some(pid), STOP_GRACE);
+                    }
                     last_error = format!("The preview worker stopped: {e}");
                 }
                 Err(NoAnswer::Lost(e)) => {
@@ -577,15 +676,16 @@ fn output_text(prog: &Path, args: &[&str], limit: Duration) -> String {
 /// How long a stopped worker gets to end after SIGTERM before SIGKILL.
 const STOP_GRACE: Duration = Duration::from_secs(3);
 
-/// Stops the worker serving `sock` (it hung, closed the connection or sent garbage): SIGTERM, then
-/// SIGKILL after `grace`, then its socket goes, so the next try starts a fresh worker instead of
-/// connecting to the hung one. Found by its command line (the socket is its argument), like
-/// [`stop_other_workers`]; worker.pid names only the newest worker.
-fn stop_worker(sock: &Path, grace: Duration) {
+/// Stops the worker `only` (every worker on `sock` when None) that hung: SIGTERM, then SIGKILL after
+/// `grace`, then the socket goes when no worker answers there any more, so the next try starts a
+/// fresh worker instead of connecting to the hung one. Found by its command line (the socket is its
+/// argument), like [`stop_other_workers`], so a pid reused by another program is never touched.
+fn stop_worker(sock: &Path, only: Option<i32>, grace: Duration) {
     // under the start lock: no engine starts a worker on this socket meanwhile, so the socket
     // removed below is a stopped worker's, never a fresh one's
     let _start = crate::preview_base::lock(&start_lock(sock), &|| {}).ok();
     let mut pids = worker_pids(sock);
+    pids.retain(|p| only.is_none_or(|o| o == *p));
     for p in &pids {
         unsafe { libc::kill(*p, libc::SIGTERM) };
     }
@@ -597,7 +697,24 @@ fn stop_worker(sock: &Path, grace: Duration) {
     for p in &pids {
         unsafe { libc::kill(*p, libc::SIGKILL) };
     }
-    let _ = std::fs::remove_file(sock);
+    let until = Instant::now() + Duration::from_secs(1);
+    while !pids.is_empty() && Instant::now() < until {
+        pids.retain(|p| unsafe { libc::kill(*p, 0) } == 0);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if connect(sock).is_none() {
+        let _ = std::fs::remove_file(sock);
+    }
+}
+
+/// The pid of the process at the other end of a Unix socket.
+fn peer_pid(s: &UnixStream) -> Option<i32> {
+    use std::os::fd::AsRawFd;
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `len` bytes into `pid`, a valid pid_t.
+    let r = unsafe { libc::getsockopt(s.as_raw_fd(), libc::SOL_LOCAL, libc::LOCAL_PEERPID, (&raw mut pid).cast(), &mut len) };
+    (r == 0 && pid > 0).then_some(pid)
 }
 
 /// The processes whose command line names `sock` (never this one).
@@ -648,7 +765,9 @@ fn connect_or_start(
         return Ok(c);
     }
     send(Event::Status(file.to_path_buf(), "Starting the preview worker".into(), None));
-    stop_other_workers(sock);
+    stop_other_workers(sock)?;
+    let log = worker_log(sock);
+    let log_start = std::fs::metadata(&log).map_or(0, |m| m.len());
     let mut child = start_worker(sock, kt, rt, base.as_ref())?;
     let _ = std::fs::write(dir().join("worker.pid"), format!("{} {}", child.id(), sock.display()));
     let until = Instant::now() + START_TIMEOUT;
@@ -659,7 +778,9 @@ fn connect_or_start(
         }
         // it ended before it listened: say why now (the end of its log), do not wait the full minute
         if let Ok(Some(status)) = child.try_wait() {
-            let log = std::fs::read_to_string(dir().join("worker.log")).unwrap_or_default();
+            // this start's lines only: the log is appended to by every start on this socket
+            let log = std::fs::read(&log).unwrap_or_default();
+            let log = String::from_utf8_lossy(log.get(log_start as usize..).unwrap_or_default());
             let tail: Vec<&str> = log.lines().rev().take(8).collect();
             return Err(format!(
                 "The preview worker stopped at start ({status}):\n{}",
@@ -673,37 +794,92 @@ fn connect_or_start(
     Err(format!(
         "The preview worker did not start in {} s. Its log: {}",
         START_TIMEOUT.as_secs(),
-        dir().join("worker.log").display()
+        log.display()
     ))
+}
+
+/// The log of the workers on `sock`, next to it: one per socket, so a worker starting for another
+/// project never truncates the log a running worker writes.
+fn worker_log(sock: &Path) -> PathBuf {
+    sock.with_extension("log")
+}
+
+/// Opens the log of the workers on `sock` for appending; one past [`MAX_LOG`] is moved to
+/// `<log>.old` first (a worker still writing it keeps writing there).
+fn open_log(sock: &Path) -> std::io::Result<std::fs::File> {
+    let log = worker_log(sock);
+    if std::fs::metadata(&log).is_ok_and(|m| m.len() > MAX_LOG) {
+        let _ = std::fs::rename(&log, log.with_extension("log.old"));
+    }
+    std::fs::OpenOptions::new().create(true).append(true).open(log)
+}
+
+const MAX_LOG: u64 = 5_000_000;
+
+/// The worker's source in `base`, named by its hash and written through a temp file and a rename:
+/// two Droid Lite builds starting workers at once never truncate each other's source.
+fn worker_source(base: &Path) -> Result<PathBuf, String> {
+    let src = base.join(format!("PreviewWorker-{:016x}.java", fnv(WORKER_SOURCE)));
+    if std::fs::read_to_string(&src).ok().as_deref() != Some(WORKER_SOURCE) {
+        std::fs::create_dir_all(base).map_err(|e| e.to_string())?;
+        write_whole(&src, &mut WORKER_SOURCE.as_bytes()).map_err(|e| format!("{}: {e}", src.display()))?;
+    }
+    Ok(src)
 }
 
 /// How long a starting worker may take to listen.
 const START_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 60 });
 
-/// Workers that may run at once (about 2 GB each): the one starting and one other, so two windows
-/// on different projects (the app and VS Code) do not stop each other's worker mid-draw.
+/// Workers kept at once when they are idle (about 2 GB each): the one starting and one other, so
+/// two windows on different projects (the app and VS Code) do not stop each other's worker.
 const MAX_WORKERS: usize = 2;
+/// Workers that may run at once when the others all have a window connected: past that a new one
+/// does not start (memory), and the window says to close another.
+const HARD_MAX_WORKERS: usize = 3;
+
+/// Another preview worker found by `ps`.
+#[derive(Clone, Copy, Debug)]
+struct Other {
+    pid: i32,
+    /// Seconds since it started.
+    age: u64,
+    /// It is on the new one's own socket (it did not answer there).
+    same_socket: bool,
+    /// Windows connected to it (its `<socket>.clients`); 0 when it does not say (an older build's).
+    clients: usize,
+}
 
 /// Before a new worker starts, the other preview workers of this preview folder (an older build's,
 /// another project's or Kotlin version's) past [`MAX_WORKERS`] are asked to stop (SIGTERM), the
-/// oldest first: the youngest is the one most likely still in use, and an unused one exits by
-/// itself when idle. A worker on the new one's own socket counts too and always stops: it did not
-/// answer there (hung, or its socket file was replaced). Found by their command line (worker
-/// source and socket), so older builds that wrote no pidfile are found too.
-fn stop_other_workers(sock: &Path) {
+/// oldest first, but never one with a window connected: it may be drawing, and its window would
+/// get an error and start it again (with 3 windows on 3 projects each start stopped another's
+/// worker in turn). The count comes from the file each worker keeps next to its socket, read
+/// without connecting (a probe would count as a client itself and wait on a hung worker). When the
+/// busy ones leave no room ([`HARD_MAX_WORKERS`]), the answer is an error. A worker on the new
+/// one's own socket always stops: it did not answer there (hung, or its socket file was replaced).
+/// Found by their command line (worker source and socket), so older builds are found too.
+fn stop_other_workers(sock: &Path) -> Result<(), String> {
     let out = output_text(Path::new("ps"), &["-axo", "pid=,etime=,command="], PS_TIMEOUT);
-    let src = base_dir().join("PreviewWorker.java");
-    let (src, sock, me) = (src.to_string_lossy().into_owned(), format!(" {} ", sock.display()), std::process::id());
+    let src = base_dir().join("PreviewWorker");
+    let (src, me) = (src.to_string_lossy().into_owned(), std::process::id());
     let mut others = Vec::new();
     for line in out.lines() {
         let mut it = line.split_whitespace();
         let (Some(pid), Some(age)) = (it.next().and_then(|p| p.parse::<i32>().ok()), it.next().and_then(etime_secs)) else { continue };
-        let cmd = it.collect::<Vec<_>>().join(" ");
-        if pid as u32 != me && cmd.contains(&src) {
-            others.push((pid, age, format!(" {cmd} ").contains(&sock)));
+        let args: Vec<&str> = it.collect();
+        // `… <base>/PreviewWorker[-<hash>].java <socket> <work>`
+        let Some(at) = args.iter().position(|a| a.starts_with(&src) && a.ends_with(".java")) else { continue };
+        if pid as u32 == me {
+            continue;
         }
+        let theirs = args.get(at + 1).map(Path::new);
+        let clients = theirs
+            .and_then(|s| std::fs::read_to_string(format!("{}.clients", s.display())).ok())
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0);
+        others.push(Other { pid, age, same_socket: theirs == Some(sock), clients });
     }
-    let mut stopped = workers_to_stop(others);
+    let mut stopped = workers_to_stop(others)?;
     for p in &stopped {
         unsafe { libc::kill(*p, libc::SIGTERM) };
     }
@@ -713,15 +889,31 @@ fn stop_other_workers(sock: &Path) {
         stopped.retain(|p| unsafe { libc::kill(*p, 0) } == 0);
         std::thread::sleep(Duration::from_millis(100));
     }
+    Ok(())
 }
 
-/// Of the other workers (pid, age in seconds, on the new one's socket), the ones to stop so that
-/// with the new one at most [`MAX_WORKERS`] run: every one on its socket, then all but the
-/// youngest of the rest.
-fn workers_to_stop(others: Vec<(i32, u64, bool)>) -> Vec<i32> {
-    let (same, mut rest): (Vec<_>, Vec<_>) = others.into_iter().partition(|w| w.2);
-    rest.sort_by_key(|w| w.1);
-    same.into_iter().chain(rest.into_iter().skip(MAX_WORKERS - 1)).map(|w| w.0).collect()
+/// Of the other workers, the ones to stop before a new one starts: every one on its socket; of the
+/// rest, every one with a window connected stays, and idle ones stay (youngest first) until
+/// [`MAX_WORKERS`] would run with the new one. An error when the ones that stay leave no room for
+/// the new one within [`HARD_MAX_WORKERS`].
+fn workers_to_stop(others: Vec<Other>) -> Result<Vec<i32>, String> {
+    let (same, mut rest): (Vec<_>, Vec<_>) = others.into_iter().partition(|w| w.same_socket);
+    rest.sort_by_key(|w| w.age);
+    let busy = rest.iter().filter(|w| w.clients > 0).count();
+    if busy + 1 > HARD_MAX_WORKERS {
+        return Err(format!(
+            "Too many preview workers: {busy} other windows are using theirs (about 2 GB each). Close a window, then open the preview again."
+        ));
+    }
+    let mut idle_kept = 0;
+    let stop = rest.into_iter().filter(|w| {
+        if w.clients > 0 {
+            return false;
+        }
+        idle_kept += 1;
+        busy + idle_kept > MAX_WORKERS - 1
+    });
+    Ok(same.into_iter().chain(stop).map(|w| w.pid).collect())
 }
 
 /// `ps` elapsed time (`[[dd-]hh:]mm:ss`) in seconds.
@@ -731,7 +923,7 @@ fn etime_secs(s: &str) -> Option<u64> {
     Some(days * 86_400 + secs)
 }
 
-/// Starts the worker detached (its own process group, output to worker.log), so it outlives nothing
+/// Starts the worker detached (its own process group, output to its socket's log), so it outlives nothing
 /// it should not and a restart of Droid Lite finds it still warm.
 fn start_worker(
     sock: &Path,
@@ -742,7 +934,7 @@ fn start_worker(
     let d = dir();
     let base = base_dir();
     std::fs::create_dir_all(d.join("work")).map_err(|e| e.to_string())?;
-    let log = std::fs::File::create(d.join("worker.log")).map_err(|e| e.to_string())?;
+    let log = open_log(sock).map_err(|e| e.to_string())?;
     let mut cmd = match std::env::var("DROID_LITE_PREVIEW_WORKER") {
         // tests: a stand-in worker taking the same two arguments
         Ok(c) => {
@@ -753,11 +945,7 @@ fn start_worker(
         }
         Err(_) => {
             let r = renderer.ok_or("The preview renderer's files were not checked.")?;
-            std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
-            let src = base.join("PreviewWorker.java");
-            if std::fs::read_to_string(&src).ok().as_deref() != Some(WORKER_SOURCE) {
-                std::fs::write(&src, WORKER_SOURCE).map_err(|e| e.to_string())?;
-            }
+            let src = worker_source(&base)?;
             let paths = |v: &[PathBuf]| v.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join(":");
             let compose = kt.compose_plugin.clone().unwrap_or_else(|| base.join("compose-plugin.jar"));
             if !compose.is_file() {
@@ -1033,9 +1221,6 @@ fn library_classpath(root: &Path, scripts: &[PathBuf], progress: &dyn Fn(usize, 
     let mut assets = Vec::new();
     let mut exploded = Vec::new();
     let mut r_packages = std::collections::HashSet::new();
-    // ids unique across all libraries (a library's own R.txt has placeholders); kept apart from the
-    // ids of the project's modules (0x7f000001 up) by starting high
-    let mut next_id = 0x7f80_0000u32;
     let archives: Vec<PathBuf> = crate::libs::class_archives(root, scripts).into_iter().filter(|f| !build_or_test_only(f)).collect();
     let total = archives.len();
     let cp = archives
@@ -1064,7 +1249,9 @@ fn library_classpath(root: &Path, scripts: &[PathBuf], progress: &dyn Fn(usize, 
                     && let Some(pkg) = manifest.split("package=\"").nth(1).and_then(|s| s.split('"').next())
                 {
                     let _ = std::fs::create_dir_all(r.parent().unwrap());
-                    let _ = std::fs::write(&r, crate::preview_src::r_txt_java(pkg, &rtxt, &mut next_id));
+                    if let Ok(java) = library_r_java(&aars, pkg, &rtxt) {
+                        let _ = std::fs::write(&r, java);
+                    }
                 }
                 // its assets (Compose resources and fonts load from there) and resources (strings,
                 // drawables the renderer resolves), once, next to its classes
@@ -1102,6 +1289,44 @@ fn library_classpath(root: &Path, scripts: &[PathBuf], progress: &dyn Fn(usize, 
         .map(|p| p.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     LibraryCode { jars: cp, rjava, assets, exploded }
+}
+
+/// The first id of the libraries' resources: kept apart from the ids of the project's modules
+/// (0x7f000001 up) by starting high.
+const LIBRARY_IDS: u32 = 0x7f80_0000;
+
+/// A library's R class from its R.txt, its resources given ids no other library's R class has:
+/// every R class stays in `aars` for later calls and other engines, so the next free id is kept
+/// there too (`r-next-id`, under a lock). Without that file (an older cache) it starts past the
+/// highest id the kept R classes use.
+fn library_r_java(aars: &Path, package: &str, r_txt: &str) -> Result<String, String> {
+    let _lock = crate::preview_base::lock(&aars.join("r-next-id.lock"), &|| {})?;
+    let file = aars.join("r-next-id");
+    let mut next = match std::fs::read_to_string(&file).ok().and_then(|t| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok()) {
+        Some(n) => n,
+        None => highest_library_id(aars).max(LIBRARY_IDS),
+    };
+    let java = crate::preview_src::r_txt_java(package, r_txt, &mut next);
+    write_whole(&file, &mut format!("{next:#010x}\n").as_bytes()).map_err(|e| e.to_string())?;
+    Ok(java)
+}
+
+/// The highest `0x7f8…` id in the library R classes kept in `aars/<key>/R.java`.
+fn highest_library_id(aars: &Path) -> u32 {
+    std::fs::read_dir(aars)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| std::fs::read_to_string(e.path().join("R.java")).ok())
+        .flat_map(|t| {
+            t.split("0x")
+                .skip(1)
+                .filter_map(|h| u32::from_str_radix(h.get(..h.len().min(8))?, 16).ok())
+                .filter(|&n| n >= LIBRARY_IDS)
+                .max()
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn fnv(s: &str) -> u64 {
@@ -1360,7 +1585,7 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         }
         let (log, send) = record();
         let go = || String::new();
-        assert_eq!(next_job(&jobs, &send, &go).map(|r| r.seq), Some(3), "the newest wins");
+        assert_eq!(next_job(&jobs, &send, &go, &|| {}).map(|r| r.seq), Some(3), "the newest wins");
         let replaced = |seq| ("skipped".to_string(), seq, "replaced by a newer request".to_string());
         assert_eq!(*log.borrow(), vec![replaced(1), replaced(2)]);
         // no room now: the request is answered with the reason, then the loop waits for the next
@@ -1368,9 +1593,40 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         tx.send(request(4)).unwrap();
         drop(tx);
         let busy = || "Skipped: mac-guard says memory is critical.".to_string();
-        assert!(next_job(&jobs, &send, &busy).is_none());
+        assert!(next_job(&jobs, &send, &busy, &|| {}).is_none());
         let why = busy();
         assert_eq!(*log.borrow(), vec![("status".to_string(), 0, why.clone()), ("skipped".to_string(), 4, why)]);
+    }
+
+    #[test]
+    fn a_request_queued_behind_another_files_draw_hears_why_at_once_and_again_later() {
+        let (tx, jobs) = channel();
+        let (to, drawn) = channel();
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(Queue::default()));
+        queue.lock().unwrap().drawing = Some(PathBuf::from("/p/Card.kt"));
+        let (notes, heard) = channel();
+        let q = queue.clone();
+        let t = std::thread::spawn(move || {
+            forward(jobs, to, &q, &|e| drop(notes.send(e)), Duration::from_millis(300));
+        });
+        tx.send(request(2)).unwrap();
+        let first = heard.recv_timeout(Duration::from_secs(5)).expect("at once");
+        assert!(matches!(&first, Event::Status(f, t, None) if f == Path::new("/p/F2.kt") && t == "Waiting for Card.kt to finish"));
+        let again = heard.recv_timeout(Duration::from_secs(5)).expect("repeated while it waits");
+        assert!(matches!(&again, Event::Status(f, _, _) if f == Path::new("/p/F2.kt")));
+        assert_eq!(drawn.recv_timeout(Duration::from_secs(5)).unwrap().seq, 2, "passed on to the drawing loop");
+        // taken by the loop: no more notes for it
+        queue.lock().unwrap().waiting.pop_front();
+        while heard.try_recv().is_ok() {}
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(heard.try_recv().is_err());
+        // a request for the file being drawn is not told to wait for itself
+        tx.send(Request { file: PathBuf::from("/p/Card.kt"), ..request(3) }).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(heard.try_recv().is_err());
+        drop(tx);
+        t.join().unwrap();
+        assert_eq!(WAIT_NOTE_EVERY, Duration::from_secs(10));
     }
 
     #[test]
@@ -1494,7 +1750,7 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         assert_eq!(std::fs::read_to_string(d.join("starts")).unwrap(), "x", "the same worker serves both");
         for e in std::fs::read_dir(d.join("pv")).unwrap().flatten() {
             if e.path().extension().is_some_and(|x| x == "sock") {
-                stop_worker(&e.path(), Duration::from_secs(1));
+                stop_worker(&e.path(), None, Duration::from_secs(1));
             }
         }
         for (k, v) in vars.iter().zip(old) {
@@ -1581,16 +1837,76 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
 
     #[test]
     fn at_most_two_workers_run_the_youngest_other_one_stays() {
+        let w = |pid, age, same_socket| Other { pid, age, same_socket, clients: 0 };
+        let workers_to_stop = |o: Vec<Other>| workers_to_stop(o).unwrap();
         assert_eq!(workers_to_stop(vec![]), Vec::<i32>::new());
-        assert_eq!(workers_to_stop(vec![(10, 900, false)]), Vec::<i32>::new(), "another window's worker stays");
-        assert_eq!(workers_to_stop(vec![(10, 900, false), (11, 30, false), (12, 4000, false)]), vec![10, 12], "oldest go");
+        assert_eq!(workers_to_stop(vec![w(10, 900, false)]), Vec::<i32>::new(), "another window's worker stays");
+        assert_eq!(workers_to_stop(vec![w(10, 900, false), w(11, 30, false), w(12, 4000, false)]), vec![10, 12], "oldest go");
         // a worker on the new one's socket did not answer there: it goes and counts in the cap
-        assert_eq!(workers_to_stop(vec![(10, 900, false), (11, 30, true)]), vec![11]);
-        assert_eq!(workers_to_stop(vec![(10, 900, true), (11, 30, true), (12, 60, false)]), vec![10, 11]);
+        assert_eq!(workers_to_stop(vec![w(10, 900, false), w(11, 30, true)]), vec![11]);
+        assert_eq!(workers_to_stop(vec![w(10, 900, true), w(11, 30, true), w(12, 60, false)]), vec![10, 11]);
         assert_eq!(etime_secs("05:07"), Some(307));
         assert_eq!(etime_secs("01:00:01"), Some(3601));
         assert_eq!(etime_secs("2-00:00:10"), Some(172_810));
         assert_eq!(etime_secs("x"), None);
+    }
+
+    #[test]
+    fn a_worker_with_a_window_connected_is_never_stopped_and_three_busy_ones_are_the_limit() {
+        let w = |pid, age, clients| Other { pid, age, same_socket: false, clients };
+        // three windows on three projects: the oldest one is drawing, so the idle young one goes
+        assert_eq!(workers_to_stop(vec![w(10, 900, 1), w(11, 30, 0)]).unwrap(), vec![11]);
+        // both others busy: none stops, and the new one is the third
+        assert_eq!(workers_to_stop(vec![w(10, 900, 1), w(11, 30, 2), w(12, 4000, 0)]).unwrap(), vec![12]);
+        // a fourth would be too many: an error, nothing stopped
+        let e = workers_to_stop(vec![w(10, 900, 1), w(11, 30, 1), w(12, 60, 1)]).unwrap_err();
+        assert!(e.contains("Too many preview workers") && e.contains("Close a window"), "{e}");
+        // the count each worker keeps next to its socket
+        assert!(WORKER_SOURCE.contains("clientsFile = Path.of(sock + \".clients\");"));
+    }
+
+    #[test]
+    fn each_socket_has_its_own_log_appended_to_and_each_build_its_own_worker_source() {
+        let d = tmp("logs");
+        let (a, b) = (d.join("w-a.sock"), d.join("w-b.sock"));
+        assert_ne!(worker_log(&a), worker_log(&b));
+        assert_eq!(worker_log(&a), d.join("w-a.log"));
+        for (sock, line) in [(&a, "first\n"), (&b, "other project\n"), (&a, "second\n")] {
+            open_log(sock).unwrap().write_all(line.as_bytes()).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(worker_log(&a)).unwrap(), "first\nsecond\n", "a start never truncates it");
+        // another build's source stays as it is; ours is named by its hash and written whole
+        let base = d.join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("PreviewWorker-0000000000000001.java"), "class Older {}").unwrap();
+        let src = worker_source(&base).unwrap();
+        assert_eq!(src, base.join(format!("PreviewWorker-{:016x}.java", fnv(WORKER_SOURCE))));
+        assert_eq!(std::fs::read_to_string(&src).unwrap(), WORKER_SOURCE);
+        assert_eq!(std::fs::read_to_string(base.join("PreviewWorker-0000000000000001.java")).unwrap(), "class Older {}");
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 2, "no temp file left");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn library_resource_ids_never_repeat_across_calls_engines_or_an_older_cache() {
+        let d = tmp("rids");
+        let ids = |java: &str| -> Vec<u32> {
+            java.lines().filter_map(|l| l.split("= 0x").nth(1)).map(|h| u32::from_str_radix(h.trim_end_matches(';'), 16).unwrap()).collect()
+        };
+        let rtxt = "int string title 0x0\nint drawable icon 0x0\nint styleable Neem_tint 0\n";
+        // two calls (a second engine, or a later read of the libraries): each starts from the file
+        let a = ids(&library_r_java(&d, "lib.a", rtxt).unwrap());
+        let b = ids(&library_r_java(&d, "lib.b", rtxt).unwrap());
+        assert_eq!(a, [LIBRARY_IDS + 2, LIBRARY_IDS + 1], "sorted by type: drawable, string");
+        assert!(a.iter().all(|x| !b.contains(x)), "{a:x?} {b:x?}");
+        // an older cache: R classes kept, no counter file
+        std::fs::create_dir_all(d.join("k1")).unwrap();
+        std::fs::write(d.join("k1/R.java"), library_r_java(&d, "lib.c", rtxt).unwrap()).unwrap();
+        std::fs::remove_file(d.join("r-next-id")).unwrap();
+        let c = ids(&std::fs::read_to_string(d.join("k1/R.java")).unwrap());
+        let e = ids(&library_r_java(&d, "lib.e", rtxt).unwrap());
+        assert!(e.iter().all(|x| x > c.iter().max().unwrap()), "{c:x?} {e:x?}");
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]
@@ -1641,7 +1957,7 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         assert!(!state.forget, "an error in the user's code is not a missing library");
         for e in std::fs::read_dir(d.join("pv")).unwrap().flatten() {
             if e.path().extension().is_some_and(|x| x == "sock") {
-                stop_worker(&e.path(), Duration::from_secs(1));
+                stop_worker(&e.path(), None, Duration::from_secs(1));
             }
         }
         for (k, v) in vars.iter().zip(old) {
@@ -1650,6 +1966,33 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
                 None => unsafe { std::env::remove_var(k) },
             }
         }
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_hung_worker_is_stopped_by_the_pid_it_was_reached_at_never_a_newer_one_on_its_socket() {
+        let d = tmp("stoppid");
+        let sock = d.join("w-test.sock");
+        // the pid at the other end of a connection: here this test's own listener
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let c = UnixStream::connect(&sock).unwrap();
+        assert_eq!(peer_pid(&c), Some(std::process::id() as i32));
+        drop((c, listener));
+        // the hung worker this engine reached, and a fresh one another window started on the socket
+        let start = || Command::new("perl").args(["-e", "sleep 60"]).arg(&sock).spawn().unwrap();
+        let (mut hung, mut fresh) = (start(), start());
+        let until = Instant::now() + Duration::from_secs(5);
+        while worker_pids(&sock).len() < 2 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let hung_pid = hung.id() as i32;
+        let reaper = std::thread::spawn(move || hung.wait());
+        stop_worker(&sock, Some(hung_pid), Duration::from_millis(300));
+        assert!(reaper.join().unwrap().is_ok(), "the hung one stopped");
+        assert!(fresh.try_wait().unwrap().is_none(), "the fresh one still runs");
+        assert_eq!(worker_pids(&sock), [fresh.id() as i32]);
+        let _ = fresh.kill();
+        let _ = fresh.wait();
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -1667,7 +2010,7 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         }
         assert_eq!(worker_pids(&sock), [pid], "found by its socket argument");
         let t = Instant::now();
-        stop_worker(&sock, Duration::from_millis(300));
+        stop_worker(&sock, None, Duration::from_millis(300));
         assert!(reaper.join().unwrap().is_ok());
         assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
         assert!(!sock.exists(), "the next try must not connect to it");
@@ -1688,7 +2031,7 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
             tx.borrow_mut().take(); // the last request: the loop ends after it
             send(Event::Done { file: r.file.clone(), seq: r.seq, cards: vec![] });
         };
-        serve_jobs(&jobs, &send, &String::new, &mut draw);
+        serve_jobs(&jobs, &send, &String::new, &|| {}, &mut draw);
         let failed = ("failed".to_string(), 1, "internal error: boom".to_string());
         assert_eq!(*log.borrow(), vec![failed, ("done".to_string(), 2, String::new())]);
     }
@@ -1747,7 +2090,7 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         std::fs::create_dir_all(src.join("demo/extra")).unwrap();
         std::fs::write(src.join("demo/Card.kt"), "package demo\nclass Card\n").unwrap();
         std::fs::write(src.join("demo/extra/New.kt"), "package demo.extra\nclass New\n").unwrap();
-        let p = |files: Vec<PathBuf>| ProjectRef { root: d.clone(), scripts: vec![], files: std::sync::Arc::new(files) };
+        let p = |files: Vec<PathBuf>| ProjectRef { root: d.clone(), scripts: vec![], files: std::sync::Arc::new(files), changed: vec![] };
         let lib = LibraryCode { jars: vec!["/lib.jar".into()], ..Default::default() };
         let mut reads = Reads { libs: Some((d.clone(), lib)), ..Default::default() };
         let no_status = |_: &str, _| panic!("the libraries are read once per project");
@@ -1764,6 +2107,43 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         assert_eq!(packages.reads, 3, "Card, New, then Gone");
         assert_eq!(packages.package_for("demo.extra.New"), Some("demo"), "New.kt was removed");
         assert_eq!(packages.package_for("demo.gone.Gone"), Some("demo.gone"));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_file_edited_since_is_read_again_its_names_package_and_annotation_classes() {
+        let d = tmp("edited");
+        let src = d.join("app/src/main/java/demo");
+        std::fs::create_dir_all(&src).unwrap();
+        let (models, card) = (src.join("Models.kt"), src.join("Card.kt"));
+        std::fs::write(&models, "package demo\nclass Other\n").unwrap();
+        std::fs::write(&card, "package demo\n@Composable fun Card(i: Item) {}\n").unwrap();
+        let files = std::sync::Arc::new(vec![card.clone(), models.clone()]);
+        let p = |changed: Vec<PathBuf>| ProjectRef { root: d.clone(), scripts: vec![], files: files.clone(), changed };
+        let lib = LibraryCode::default();
+        let mut reads = Reads { libs: Some((d.clone(), lib)), ..Default::default() };
+        let no_status = |_: &str, _| {};
+        reads.refresh(&p(vec![]), &no_status);
+        let needs = |r: &Reads| r.packages.as_ref().unwrap().1.closure(&card, &std::fs::read_to_string(&card).unwrap(), 10).unwrap().0;
+        assert!(needs(&reads).is_empty(), "no file declares Item yet");
+        // Item added to the existing Models.kt, a multipreview too: the same file list
+        std::fs::write(&models, "package demo\nclass Other\ndata class Item(val n: Int)\n@Preview(name = \"Big\", fontScale = 2f)\nannotation class BigPreviews\n").unwrap();
+        reads.refresh(&p(vec![models.clone()]), &no_status);
+        assert_eq!(needs(&reads), std::slice::from_ref(&models), "Models.kt read again");
+        assert!(reads.packages.as_ref().unwrap().1.annotation_classes.contains_key("BigPreviews"));
+        // its package line changed: it leaves package demo
+        std::fs::write(&models, "package demo.moved\ndata class Item(val n: Int)\n").unwrap();
+        reads.refresh(&p(vec![models.clone()]), &no_status);
+        assert!(needs(&reads).is_empty(), "Item is in another package now");
+        assert!(!reads.packages.as_ref().unwrap().1.annotation_classes.contains_key("BigPreviews"));
+        // a request the loop drops passes its edited files on to the next one
+        let (tx, jobs) = channel();
+        let with = |seq, changed: Vec<PathBuf>| Request { project: Some(p(changed)), ..request(seq) };
+        tx.send(with(1, vec![models.clone()])).unwrap();
+        tx.send(with(2, vec![card.clone()])).unwrap();
+        let (_, send) = record();
+        let r = next_job(&jobs, &send, &|| String::new(), &|| {}).unwrap();
+        assert_eq!(r.project.unwrap().changed, [models.clone(), card.clone()]);
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -1884,7 +2264,7 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
             engines.into_iter().map(|e| e.join().unwrap()).collect::<Vec<_>>()
         });
         let starts = std::fs::read_to_string(d.join("starts")).unwrap_or_default();
-        stop_worker(&sock, Duration::from_secs(1));
+        stop_worker(&sock, None, Duration::from_secs(1));
         for (k, v) in vars.iter().zip(old) {
             match v {
                 Some(v) => unsafe { std::env::set_var(k, v) },
