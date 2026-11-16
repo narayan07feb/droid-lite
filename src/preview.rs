@@ -303,8 +303,8 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
         };
         // never Kotlin's own compiler-side jars on the worker's classpath: the worker's compiler would
         // load them as plugins (a scripting plugin of another version crashed it); it brings its stdlib
+        let text = std::fs::read_to_string(&r.file).unwrap_or_default();
         let specs = {
-            let text = std::fs::read_to_string(&r.file).unwrap_or_default();
             let empty = std::collections::HashMap::new();
             let classes = packages.as_ref().map_or(&empty, |(_, p)| &p.annotation_classes);
             specs_for(&text, &r.previews, classes)
@@ -316,6 +316,20 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
             module_res: if cp.is_empty() { Vec::new() } else { module_res.clone() },
             exploded: if cp.is_empty() { Vec::new() } else { exploded.clone() },
         };
+        // the same file, project code, previews and libraries as a recent draw: its pictures at once
+        let cache_dir = dir().join("cache");
+        let cache_key = crate::preview_cache::key(&[
+            &r.file.to_string_lossy(),
+            &text,
+            own.as_ref().map_or("", |o| o.key.as_str()),
+            &format!("{specs:?}"),
+            &version,
+            &format!("{:08x}", rt.key()),
+        ]);
+        if !stand_in && let Some(cards) = crate::preview_cache::lookup(&cache_dir, &cache_key, crate::preview_cache::now_secs()) {
+            send(Event::Done { file: r.file.clone(), cards });
+            continue;
+        }
         let worker_id = format!("{version}-{:08x}", rt.key());
         if conn_version != worker_id {
             conn = None; // another project's Kotlin or libraries: its own worker
@@ -346,6 +360,11 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
             let (w, rd) = conn.as_mut().unwrap();
             match ask(w, rd, id, &r, &specs, &cp, own.as_ref(), &send) {
                 Ok(e) => {
+                    if let Event::Done { file, cards } = &e
+                        && !stand_in
+                    {
+                        crate::preview_cache::store(&cache_dir, &cache_key, file, cards, crate::preview_cache::now_secs());
+                    }
                     send(e);
                     last_error.clear();
                     break;
