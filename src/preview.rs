@@ -116,8 +116,9 @@ fn own_code(pk: &crate::preview_src::Packages, open: &Path) -> Result<Own, Strin
 
 /// What comes back, by message only.
 pub enum Event {
-    /// Work in progress or a reason it cannot run ("Starting the preview worker…", "Skipped: …").
-    Status(String),
+    /// The real step in words ("Compiling the project code (42 files)", "Drawing 2 of 3 previews"),
+    /// with (done, total) when the count is known; or a reason it cannot run ("Skipped: …").
+    Status(String, Option<(u64, u64)>),
     /// One picture or one error text per preview, in request order.
     Done { file: PathBuf, cards: Vec<(String, Result<egui::ColorImage, String>)> },
     /// The whole request failed (compile error, missing class): the text for the cards.
@@ -225,14 +226,15 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
         }
         let why = room();
         if !why.is_empty() {
-            send(Event::Status(why));
+            send(Event::Status(why, None));
             continue;
         }
         let (cp, own) = match &r.project {
             Some(p) => {
                 if libs.as_ref().is_none_or(|(r0, _)| *r0 != p.root) {
-                    send(Event::Status("Reading the project's libraries…".into()));
-                    libs = Some((p.root.clone(), library_classpath(&p.root, &p.scripts)));
+                    send(Event::Status("Reading the project's libraries".into(), None));
+                    let progress = |i: usize, n: usize| send(Event::Status("Unpacking the project's libraries".into(), Some((i as u64, n as u64))));
+                    libs = Some((p.root.clone(), library_classpath(&p.root, &p.scripts, &progress)));
                     packages = Some((p.root.clone(), crate::preview_src::Packages::read(&p.files)));
                 }
                 let lc = libs.as_ref().map(|(_, l)| l.clone()).unwrap_or_default();
@@ -306,10 +308,10 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
                     }
                 }
             }
-            send(Event::Status(format!("Rendering {} preview(s)…", r.previews.len())));
+            send(Event::Status(format!("Sending {} preview(s) to the worker", r.previews.len()), None));
             id += 1;
             let (w, rd) = conn.as_mut().unwrap();
-            match ask(w, rd, id, &r, &cp, own.as_ref()) {
+            match ask(w, rd, id, &r, &cp, own.as_ref(), &send) {
                 Ok(e) => {
                     send(e);
                     last_error.clear();
@@ -344,8 +346,10 @@ fn connect_or_start(
     if std::env::var_os("DROID_LITE_PREVIEW_WORKER").is_none() && !base_ready(&base) {
         return Err("The preview pack is not downloaded yet.".into());
     }
-    send(Event::Status("Starting the preview worker…".into()));
+    send(Event::Status("Starting the preview worker".into(), None));
+    stop_other_workers(&sock);
     let mut child = start_worker(&base, &sock, kt, rt)?;
+    let _ = std::fs::write(dir().join("worker.pid"), format!("{} {}", child.id(), sock.display()));
     let until = Instant::now() + Duration::from_secs(60);
     while Instant::now() < until {
         if let Ok(s) = UnixStream::connect(&sock) {
@@ -369,6 +373,32 @@ fn connect_or_start(
         "The preview worker did not start in 60 s. Its log: {}",
         dir().join("worker.log").display()
     ))
+}
+
+/// Only one worker at a time: before a new one starts, any other preview worker of this preview folder
+/// (an older build's, another project's or Kotlin version's) is asked to stop (SIGTERM); a worker
+/// holds about a gigabyte. Found by its command line (worker source and socket), so older builds
+/// that wrote no pidfile are found too.
+fn stop_other_workers(keep: &Path) {
+    let Ok(out) = Command::new("ps").args(["-axo", "pid=,command="]).output() else { return };
+    let src = base_dir().join("PreviewWorker.java");
+    let (src, keep, me) = (src.to_string_lossy().into_owned(), keep.to_string_lossy().into_owned(), std::process::id());
+    let mut stopped = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let line = line.trim_start();
+        let Some((pid, cmd)) = line.split_once(' ') else { continue };
+        let Ok(pid) = pid.parse::<i32>() else { continue };
+        if pid as u32 != me && cmd.contains(&src) && !cmd.contains(&keep) {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            stopped.push(pid);
+        }
+    }
+    // give them a moment to go before the new one starts (memory)
+    let until = Instant::now() + Duration::from_secs(5);
+    while !stopped.is_empty() && Instant::now() < until {
+        stopped.retain(|p| unsafe { libc::kill(*p, 0) } == 0);
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Starts the worker detached (its own process group, output to worker.log), so it outlives nothing
@@ -408,7 +438,11 @@ fn start_worker(base: &Path, sock: &Path, kt: &Kotlin, rt: &ProjectRuntime) -> R
                 compile = format!("{compile}:{}", paths(&kt.runtime));
             }
             let mut cmd = Command::new(java());
-            cmd.arg("-Xmx2g")
+            // headless and no Dock icon: layoutlib renders without a window, and a JVM that touches
+            // AWT on macOS otherwise shows up in the Dock
+            cmd.arg("-Djava.awt.headless=true")
+                .arg("-Dapple.awt.UIElement=true")
+                .arg("-Xmx2g")
                 .arg("-XX:+UseSerialGC")
                 .arg(format!("-Dpaparazzi.layoutlib.runtime.root={}", base.join("layoutlib/runtime").display()))
                 .arg(format!("-Dpaparazzi.layoutlib.resources.root={}", base.join("layoutlib/resources").display()))
@@ -582,7 +616,7 @@ fn library_r_classes(rjava: &[String]) -> Result<Option<PathBuf>, String> {
     Ok(Some(out))
 }
 
-fn library_classpath(root: &Path, scripts: &[PathBuf]) -> LibraryCode {
+fn library_classpath(root: &Path, scripts: &[PathBuf], progress: &dyn Fn(usize, usize)) -> LibraryCode {
     let aars = dir().join("aar");
     let _ = std::fs::create_dir_all(&aars);
     let mut rjava = Vec::new();
@@ -592,10 +626,15 @@ fn library_classpath(root: &Path, scripts: &[PathBuf]) -> LibraryCode {
     // ids unique across all libraries (a library's own R.txt has placeholders); kept apart from the
     // ids of the project's modules (0x7f000001 up) by starting high
     let mut next_id = 0x7f80_0000u32;
-    let cp = crate::libs::class_archives(root, scripts)
+    let archives: Vec<PathBuf> = crate::libs::class_archives(root, scripts).into_iter().filter(|f| !build_or_test_only(f)).collect();
+    let total = archives.len();
+    let cp = archives
         .into_iter()
-        .filter(|f| !build_or_test_only(f))
-        .filter_map(|f| {
+        .enumerate()
+        .filter_map(|(i, f)| {
+            if i % 10 == 0 {
+                progress(i, total);
+            }
             if f.extension().is_some_and(|e| e == "jar") {
                 return Some(f);
             }
@@ -662,7 +701,8 @@ fn fnv(s: &str) -> u64 {
     s.bytes().fold(0xcbf29ce484222325, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
 }
 
-fn ask(w: &mut UnixStream, rd: &mut BufReader<UnixStream>, id: u64, r: &Request, cp: &[String], own: Option<&Own>) -> Result<Event, String> {
+#[allow(clippy::too_many_arguments)]
+fn ask(w: &mut UnixStream, rd: &mut BufReader<UnixStream>, id: u64, r: &Request, cp: &[String], own: Option<&Own>, send: &dyn Fn(Event)) -> Result<Event, String> {
     let line = serde_json::json!({
         "id": id, "file": r.file, "class": r.class, "previews": r.previews, "cp": cp,
         "sources": own.map_or(&[][..], |o| &o.sources[..]),
@@ -678,6 +718,12 @@ fn ask(w: &mut UnixStream, rd: &mut BufReader<UnixStream>, id: u64, r: &Request,
         let v: serde_json::Value = serde_json::from_str(&reply).map_err(|e| e.to_string())?;
         if v["id"].as_u64() != Some(id) || v["skipped"].as_bool() == Some(true) {
             continue; // an older answer
+        }
+        if let Some(step) = v["status"].as_str() {
+            // the worker's real step, while it works
+            let n = (v["done"].as_u64().unwrap_or(0), v["total"].as_u64().unwrap_or(0));
+            send(Event::Status(step.to_string(), (n.1 > 0).then_some(n)));
+            continue;
         }
         if v["ok"].as_bool() != Some(true) {
             let error = short_error(v["error"].as_str().unwrap_or("The preview failed."), &r.file);

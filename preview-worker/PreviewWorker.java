@@ -106,6 +106,7 @@ public class PreviewWorker {
             lastWork = System.currentTimeMillis();
             try {
                 if (sdk == null) {
+                    status(r, "Starting the renderer", 0, 0);
                     // the libraries' assets folders (fonts and Compose resources load from them)
                     List<String> assets = list("droidlite.assets");
                     // the R packages (their R classes are on this classpath) and resource folders, so
@@ -135,6 +136,7 @@ public class PreviewWorker {
         if (r.key.isEmpty() || (r.sources.isEmpty() && r.rjava.isEmpty())) return null;
         Path lib = work.resolve("lib-" + r.key);
         if (Files.exists(lib.resolve(".ok"))) return lib;
+        status(r, "Compiling the project code this preview needs (" + r.sources.size() + " files)", 0, 0);
         deleteTree(lib);
         Files.createDirectories(lib);
         if (!r.rjava.isEmpty()) javac(r.rjava, System.getProperty("droidlite.compile.cp"), lib);
@@ -266,6 +268,7 @@ public class PreviewWorker {
             return "{\"id\":" + r.id + ",\"ok\":false,\"error\":" + Json.str("In the project code this preview needs:\n" + e.getMessage()) + "}";
         }
         if (lib != null) cp = cp + ":" + lib;
+        status(r, "Compiling " + Path.of(r.file).getFileName(), 0, 0);
         List<String> args = new ArrayList<>();
         args.add(r.file);
         args.addAll(List.of("-d", out.toString(), "-classpath", cp,
@@ -291,7 +294,10 @@ public class PreviewWorker {
         try (URLClassLoader loader = new URLClassLoader(urls.toArray(URL[]::new), PreviewWorker.class.getClassLoader())) {
             Class<?> c = loader.loadClass(r.cls);
             StringBuilder images = new StringBuilder();
+            int drawn = 0;
             for (String p : r.previews) {
+                status(r, "Drawing " + (drawn + 1) + " of " + r.previews.size() + " previews", drawn, r.previews.size());
+                drawn++;
                 long t = System.nanoTime();
                 ComposableMethod m = ComposableMethodKt.getDeclaredComposableMethod(c, p);
                 m.asMethod().setAccessible(true);
@@ -350,6 +356,11 @@ public class PreviewWorker {
         } catch (IOException e) {
             System.err.println("reply: " + e); // Droid Lite went away: nothing to answer
         }
+    }
+
+    /** The real step, sent while a request runs: Droid Lite shows it under the loading card. */
+    static void status(Request r, String text, int done, int total) {
+        reply(r.out, "{\"id\":" + r.id + ",\"status\":" + Json.str(text) + ",\"done\":" + done + ",\"total\":" + total + "}");
     }
 
     static List<String> list(String property) {

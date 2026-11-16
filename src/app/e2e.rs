@@ -3802,8 +3802,19 @@ fn e2e_real_preview_shot() {
     open(&mut h, Path::new(&file));
     steps(&mut h, 5);
     let started = std::time::Instant::now(); // drawn by itself once the file is open
+    let loading_out = std::env::var("DROID_LITE_SHOT_LOADING_OUT").ok();
+    let mut loading_saved = false;
     while started.elapsed() < Duration::from_secs(180) {
         h.step();
+        // DROID_LITE_SHOT_LOADING_OUT: the window while the loading cards show (1.5 s in)
+        if let Some(o) = &loading_out
+            && !loading_saved
+            && h.state().previews.busy
+            && started.elapsed() > Duration::from_millis(1500)
+        {
+            h.render().expect("render").save(o).unwrap();
+            loading_saved = true;
+        }
         if !h.state().previews.busy && !h.state().previews.cards.is_empty() {
             break;
         }

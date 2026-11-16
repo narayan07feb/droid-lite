@@ -298,6 +298,10 @@ struct Previews {
     /// The latest status or skip reason, and whether a render is under way.
     note: String,
     busy: bool,
+    /// (done, total) of the current step when the count is known: a filling bar, else a moving one.
+    progress: Option<(u64, u64)>,
+    /// The previews being drawn, so their loading cards show before the pictures come.
+    pending: Vec<String>,
     /// The file and the hash of its saved text last sent, so each open or save renders once.
     sent: Option<(PathBuf, u64)>,
 }
@@ -3407,26 +3411,37 @@ impl App {
                 if previews.len() > render_req.as_ref().map_or(0, |r| r.previews.len()) {
                     ui.label(RichText::new("Previews inside a class or object are not drawn yet.").weak());
                 }
-                if !self.previews.note.is_empty() {
-                    ui.horizontal(|ui| {
-                        if self.previews.busy {
-                            ui.spinner();
-                        }
-                        ui.label(RichText::new(&self.previews.note).weak());
-                    });
-                }
-                if self.previews.file.as_deref() == Some(tab.path.as_path()) {
-                    for (name, card) in &self.previews.cards {
+                let mine = self.previews.file.as_deref() == Some(tab.path.as_path());
+                if self.previews.busy {
+                    // the real step and a thin bar first (always in view), then a loading card per
+                    // preview, the size of its last picture (dimmed) or a soft frame
+                    loading_step(ui, &self.previews.note, self.previews.progress);
+                    for name in &self.previews.pending {
                         ui.add_space(6.0);
                         ui.label(RichText::new(name).strong()).on_hover_text(name);
-                        match card {
-                            Ok(tex) => {
-                                let size = tex.size_vec2();
-                                let w = ui.available_width().min(size.x / 2.0);
-                                ui.image((tex.id(), egui::vec2(w, size.y * w / size.x)));
-                            }
-                            Err(e) => {
-                                ui.label(RichText::new(e).monospace().color(ERROR));
+                        let old = mine
+                            .then(|| self.previews.cards.iter().find(|(n, _)| n == name))
+                            .flatten()
+                            .and_then(|(_, c)| c.as_ref().ok());
+                        loading_card(ui, old);
+                    }
+                } else {
+                    if !self.previews.note.is_empty() {
+                        ui.label(RichText::new(&self.previews.note).weak());
+                    }
+                    if mine {
+                        for (name, card) in &self.previews.cards {
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(name).strong()).on_hover_text(name);
+                            match card {
+                                Ok(tex) => {
+                                    let size = tex.size_vec2();
+                                    let w = ui.available_width().min(size.x / 2.0);
+                                    ui.image((tex.id(), egui::vec2(w, size.y * w / size.x)));
+                                }
+                                Err(e) => {
+                                    ui.label(RichText::new(e).monospace().color(ERROR));
+                                }
                             }
                         }
                     }
@@ -3464,7 +3479,9 @@ impl App {
         if render && let Some(r) = render_req {
             let ctx = ui.ctx().clone();
             self.previews.busy = true;
-            self.previews.note = "Waiting for the preview worker…".into();
+            self.previews.progress = None;
+            self.previews.pending = r.previews.clone();
+            self.previews.note = "Waiting for the preview worker".into();
             self.previews.client.get_or_insert_with(|| crate::preview::Client::new(&ctx)).request(r);
         }
     }
@@ -3481,16 +3498,19 @@ impl App {
             if self.previews.sent.as_ref() != Some(&key) {
                 self.previews.sent = Some(key);
                 self.previews.busy = true;
-                self.previews.note = "Waiting for the preview worker…".into();
+                self.previews.progress = None;
+                self.previews.pending = r.previews.clone();
+                self.previews.note = "Waiting for the preview worker".into();
                 self.previews.client.get_or_insert_with(|| crate::preview::Client::new(ctx)).request(r);
             }
         }
         let p = &mut self.previews;
         while let Some(e) = p.client.as_ref().and_then(crate::preview::Client::poll) {
             match e {
-                crate::preview::Event::Status(s) => {
+                crate::preview::Event::Status(s, progress) => {
                     p.busy = !s.starts_with("Skipped");
                     p.note = s;
+                    p.progress = progress;
                 }
                 crate::preview::Event::Failed { file, error } => {
                     p.busy = false;
@@ -4256,6 +4276,74 @@ fn texture(
     let h = ctx.load_texture(path.to_string_lossy(), color, Default::default());
     cache.insert(path.to_path_buf(), (mtime, h.clone()));
     Some(h)
+}
+
+/// The size a preview picture is shown at (half its pixels, at most the panel's width).
+fn shown_size(ui: &Ui, tex: &egui::TextureHandle) -> egui::Vec2 {
+    let size = tex.size_vec2();
+    let w = ui.available_width().min(size.x / 2.0);
+    egui::vec2(w, size.y * w / size.x)
+}
+
+/// A loading preview card: the last picture dimmed, or a soft frame, with a slow, faint shimmer
+/// sweeping across it. Repaints at most ~30 times a second, only while a card loads; with macOS
+/// Reduce motion the card stays still.
+fn loading_card(ui: &mut Ui, old: Option<&egui::TextureHandle>) {
+    let size = old.map_or_else(|| egui::vec2(ui.available_width().min(240.0), 160.0), |t| shown_size(ui, t));
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let t = theme::t();
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, egui::CornerRadius::same(8), t.raised);
+    if let Some(tex) = old {
+        p.image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::from_white_alpha(70));
+    }
+    if theme::reduce_motion() {
+        return;
+    }
+    // a soft band, 40% of the width, crossing every 1.6 s
+    let now = ui.input(|i| i.time) as f32;
+    let band = rect.width() * 0.4;
+    let x = rect.left() - band + (now / 1.6).fract() * (rect.width() + band * 2.0);
+    let steps = 12;
+    for i in 0..steps {
+        let f = i as f32 / steps as f32;
+        let a = (1.0 - (f * 2.0 - 1.0).abs()) * 22.0; // brightest in the middle
+        let x0 = x + f * band;
+        let slice = egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x0 + band / steps as f32 + 0.5, rect.bottom()));
+        p.rect_filled(slice.intersect(rect), 0.0, egui::Color32::from_white_alpha(a as u8));
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+}
+
+/// The real step under the loading cards, and a thin bar: filling when the count is known, else a
+/// short segment moving back and forth (still with Reduce motion).
+fn loading_step(ui: &mut Ui, step: &str, progress: Option<(u64, u64)>) {
+    ui.add_space(6.0);
+    let text = match progress {
+        Some((done, total)) if total > 0 => format!("{step} ({done} of {total})"),
+        _ => step.to_string(),
+    };
+    ui.label(RichText::new(text).weak());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(240.0), 3.0), egui::Sense::hover());
+    let t = theme::t();
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, egui::CornerRadius::same(2), t.raised);
+    let fill = match progress {
+        Some((done, total)) if total > 0 => {
+            let w = rect.width() * (done as f32 / total as f32).clamp(0.0, 1.0);
+            egui::Rect::from_min_size(rect.min, egui::vec2(w, rect.height()))
+        }
+        _ if theme::reduce_motion() => egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * 0.3, rect.height())),
+        _ => {
+            let now = ui.input(|i| i.time) as f32;
+            let w = rect.width() * 0.3;
+            let phase = (now / 1.2).fract();
+            let x = rect.left() + (1.0 - (phase * 2.0 - 1.0).abs()) * (rect.width() - w);
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+            egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, rect.height()))
+        }
+    };
+    p.rect_filled(fill, egui::CornerRadius::same(2), t.accent);
 }
 
 /// One UI tree row, in the UI font. A leaf leaves the room of the ▸ arrow empty, so it lines up with
