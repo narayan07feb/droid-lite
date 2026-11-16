@@ -20,6 +20,7 @@ const emitters = [];
 const changed_fire = () => emitters.forEach((e) => e.fire());
 let provider;
 let tree;
+let status;
 class Pos { constructor(l, c) { this.line = l; this.character = c; } }
 const fake = {
   EventEmitter: class {
@@ -54,14 +55,17 @@ const fake = {
   },
   window: {
     activeTextEditor: undefined,
+    state: { focused: false },
     onDidChangeActiveTextEditor: () => ({}),
     createWebviewPanel: () => { throw new Error('not in this test'); },
     createTextEditorDecorationType: (o) => ({ o, dispose() {} }),
-    createStatusBarItem: () => ({ show() {}, hide() {}, dispose() {} }),
+    createStatusBarItem: () => (status = { show() { this.shown = true; }, hide() {}, dispose() {} }),
     createOutputChannel: () => ({ dispose() {} }),
     registerTreeDataProvider: (id, p) => { tree = p; return { dispose() {} }; },
   },
-  TreeItem: class { constructor(label) { this.label = label; } },
+  TreeItem: class { constructor(label, state) { this.label = label; this.state = state; } },
+  TreeItemCollapsibleState: { Expanded: 2 },
+  ThemeColor: class { constructor(id) { this.id = id; } },
   ThemeIcon: class { constructor(id) { this.id = id; } },
   commands: { registerCommand: (n, f) => { commands[n] = f; return { dispose() {} }; } },
 };
@@ -111,11 +115,15 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
     [3, 9, 14, 'underline 1.5px #E05050', undefined],
     [3, 37, 42, 'underline 1.5px #5FB865', undefined],
   ]);
-  // every tool in the sidebar runs a registered command
-  const items = tree.getChildren();
-  assert.strictEqual(items.length, 7);
-  for (const i of items) assert.ok(commands[i.command.command], i.command.command);
+  // the tools: grouped in the sidebar, each runs a registered command; the status bar opens the menu
+  const groups = tree.getChildren();
+  assert.deepStrictEqual(groups.map((g) => g.label), ['Compose', 'Device', 'Project']);
+  const leaves = groups.flatMap((g) => tree.getChildren(g));
+  assert.deepStrictEqual(leaves.map((i) => i.label),
+    ['Compose preview', 'Screenshot', 'Record screen', 'Show logcat', 'Index the project again']);
+  for (const i of leaves) assert.ok(commands[i.command.command], i.command.command);
+  assert.ok(status.shown && status.command === 'droidLite.menu' && commands['droidLite.menu'], 'status bar menu');
   for (const s of ctx.subscriptions) s.dispose?.();
   fs.rmSync(dir, { recursive: true, force: true });
-  console.log('ok: 9 checks');
+  console.log('ok: 11 checks');
 })().catch((e) => { console.error(e); process.exit(1); });

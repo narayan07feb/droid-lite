@@ -202,26 +202,56 @@ function guard(fn) {
 function activate(ctx) {
   // by file name: VS Code has no Kotlin language without a Kotlin extension
   const sel = { scheme: 'file', pattern: '**/*.{kt,kts,java}' };
-  const rec = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-  rec.text = '$(record) Recording';
-  rec.tooltip = 'Stop the screen recording';
-  rec.command = 'droidLite.recordStop';
   const out = vscode.window.createOutputChannel('Logcat', 'log');
-  // the Droid Lite icon in the activity bar: one click per tool
-  const tools = [
-    ['Compose preview', 'droidLite.preview', 'open-preview'],
-    ['Device screenshot', 'droidLite.screenshot', 'device-camera'],
-    ['Start screen recording', 'droidLite.recordStart', 'record'],
-    ['Stop screen recording', 'droidLite.recordStop', 'debug-stop'],
-    ['Show logcat', 'droidLite.logcat', 'output'],
-    ['Stop logcat', 'droidLite.logcatStop', 'close'],
-    ['Index the project again', 'droidLite.reindex', 'refresh'],
-  ].map(([label, command, icon]) => {
-    const item = new vscode.TreeItem(label);
-    item.command = { command, title: label };
-    item.iconPath = new vscode.ThemeIcon(icon);
-    return item;
-  });
+  // always visible: the phone in the status bar, a click opens every tool (stops a recording)
+  const main = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+  let device = 'Droid Lite';
+  const treeChanged = new vscode.EventEmitter();
+  const refresh = () => {
+    main.text = recording ? '$(record) Stop recording' : `$(device-mobile) ${device}`;
+    main.tooltip = recording ? `Recording ${recording}: click to stop and save` : 'Droid Lite tools';
+    main.command = recording ? 'droidLite.recordStop' : 'droidLite.menu';
+    main.backgroundColor = recording ? new vscode.ThemeColor('statusBarItem.errorBackground') : undefined;
+    main.show();
+    treeChanged.fire();
+  };
+  const findDevice = () => call(ctx, 'devices').then((all) => {
+    const on = all.filter((d) => d.online);
+    device = on.length === 1 ? on[0].label.replace(/ \(.*\)$/, '') : on.length ? `${on.length} devices` : 'No device';
+    refresh();
+  }, () => {});
+  const tool = (label, command, icon) => ({ label, command, icon });
+  const tools = () => [
+    ['Compose', [tool('Compose preview', 'droidLite.preview', 'open-preview')]],
+    ['Device', [
+      tool('Screenshot', 'droidLite.screenshot', 'device-camera'),
+      recording ? tool('Stop recording and save', 'droidLite.recordStop', 'debug-stop')
+        : tool('Record screen', 'droidLite.recordStart', 'record'),
+      logcat ? tool('Stop logcat', 'droidLite.logcatStop', 'close') : tool('Show logcat', 'droidLite.logcat', 'output'),
+    ]],
+    ['Project', [tool('Index the project again', 'droidLite.reindex', 'refresh')]],
+  ];
+  const tree = {
+    onDidChangeTreeData: treeChanged.event,
+    getTreeItem: (e) => e,
+    getChildren: (group) => {
+      if (group) return group.tools;
+      return tools().map(([name, list]) => {
+        const g = new vscode.TreeItem(name, vscode.TreeItemCollapsibleState.Expanded);
+        if (name === 'Device') g.description = device;
+        g.tools = list.map((t) => {
+          const i = new vscode.TreeItem(t.label);
+          i.command = { command: t.command, title: t.label };
+          i.iconPath = new vscode.ThemeIcon(t.icon);
+          return i;
+        });
+        return g;
+      });
+    },
+  };
+  const timer = setInterval(() => { if (vscode.window.state.focused) findDevice(); }, 20000);
+  findDevice();
+  refresh();
 
   // keep the index in step with unsaved edits and files changed outside the editor
   const timers = new Map();
@@ -239,7 +269,16 @@ function activate(ctx) {
   const watcher = vscode.workspace.createFileSystemWatcher('**/*.{kt,kts,java}');
 
   ctx.subscriptions.push(
-    vscode.window.registerTreeDataProvider('droidLite.tools', { getTreeItem: (i) => i, getChildren: () => tools }),
+    vscode.window.registerTreeDataProvider('droidLite.tools', tree),
+    main,
+    { dispose: () => clearInterval(timer) },
+    vscode.commands.registerCommand('droidLite.menu', guard(async () => {
+      findDevice();
+      const pick = await vscode.window.showQuickPick(
+        tools().flatMap(([, list]) => list).map((t) => ({ label: `$(${t.icon}) ${t.label}`, command: t.command })),
+        { title: `Droid Lite · ${device}` });
+      if (pick) await vscode.commands.executeCommand(pick.command);
+    })),
     vscode.languages.registerCodeLensProvider(sel, lenses(ctx)),
     vscode.window.onDidChangeActiveTextEditor((e) => paintStability(ctx, e)),
     changed.event(() => paintStability(ctx, vscode.window.activeTextEditor)),
@@ -250,7 +289,6 @@ function activate(ctx) {
     watcher.onDidCreate((u) => update(u.fsPath)),
     watcher.onDidChange((u) => update(u.fsPath)),
     watcher.onDidDelete((u) => update(u.fsPath, '')),
-    rec,
     out,
     vscode.commands.registerCommand('droidLite.goTo', guard(goTo)),
     vscode.commands.registerCommand('droidLite.reindex', guard(async () => {
@@ -259,7 +297,7 @@ function activate(ctx) {
       engine = undefined;
       ready = undefined;
       recording = undefined;
-      rec.hide();
+      refresh();
       await project(ctx, 'ping');
     })),
     vscode.commands.registerCommand('droidLite.screenshot', guard(async () => {
@@ -271,12 +309,12 @@ function activate(ctx) {
       if (!serial) return;
       await call(ctx, 'record_start', { serial });
       recording = serial;
-      rec.show();
+      refresh();
     })),
     vscode.commands.registerCommand('droidLite.recordStop', guard(async () => {
       if (!recording) throw new Error('No recording is running');
       recording = undefined;
-      rec.hide();
+      refresh();
       const file = await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: 'Saving the recording…' },
         () => call(ctx, 'record_stop'));
@@ -292,8 +330,9 @@ function activate(ctx) {
       out.show(true);
       const proc = cp.spawn(adb, ['-s', serial, 'logcat', '-v', 'threadtime', '-T', String(history)]);
       proc.stdout.setEncoding('utf8').on('data', (d) => out.append(d));
-      proc.on('exit', () => { if (logcat === proc) { logcat = undefined; out.appendLine('[logcat stopped]'); } });
+      proc.on('exit', () => { if (logcat === proc) { logcat = undefined; out.appendLine('[logcat stopped]'); refresh(); } });
       logcat = proc;
+      refresh();
     })),
     vscode.commands.registerCommand('droidLite.logcatStop', () => logcat?.kill()),
     { dispose: () => { logcat?.kill(); engine?.proc.stdin.end(); for (const t of [...badgeTypes.values(), ...lineTypes.values()]) t.dispose(); } },

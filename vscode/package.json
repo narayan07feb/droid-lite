@@ -2,7 +2,7 @@
   "name": "droid-lite",
   "displayName": "Droid Lite",
   "description": "Android tools for VS Code and Cursor: Compose previews without Gradle, implementation links, Compose stability, device screenshot, screen recording and logcat.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "forgebyte",
   "license": "MIT",
   "repository": {
@@ -32,11 +32,13 @@
       },
       {
         "command": "droidLite.screenshot",
-        "title": "Droid Lite: Device Screenshot"
+        "title": "Droid Lite: Device Screenshot",
+        "icon": "$(device-camera)"
       },
       {
         "command": "droidLite.recordStart",
-        "title": "Droid Lite: Start Screen Recording"
+        "title": "Droid Lite: Start Screen Recording",
+        "icon": "$(record)"
       },
       {
         "command": "droidLite.recordStop",
@@ -44,7 +46,8 @@
       },
       {
         "command": "droidLite.logcat",
-        "title": "Droid Lite: Show Logcat"
+        "title": "Droid Lite: Show Logcat",
+        "icon": "$(output)"
       },
       {
         "command": "droidLite.logcatStop",
@@ -53,6 +56,10 @@
       {
         "command": "droidLite.reindex",
         "title": "Droid Lite: Index the Project Again"
+      },
+      {
+        "command": "droidLite.menu",
+        "title": "Droid Lite: Tools…"
       }
     ],
     "configuration": {
@@ -92,6 +99,28 @@
         {
           "command": "droidLite.preview",
           "when": "resourceExtname == .kt",
+          "group": "navigation"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "droidLite.preview",
+          "when": "view == droidLite.tools",
+          "group": "navigation"
+        },
+        {
+          "command": "droidLite.screenshot",
+          "when": "view == droidLite.tools",
+          "group": "navigation"
+        },
+        {
+          "command": "droidLite.recordStart",
+          "when": "view == droidLite.tools",
+          "group": "navigation"
+        },
+        {
+          "command": "droidLite.logcat",
+          "when": "view == droidLite.tools",
           "group": "navigation"
         }
       ]
