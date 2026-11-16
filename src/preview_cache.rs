@@ -68,34 +68,33 @@ pub fn lookup(root: &Path, key: &str, now: u64) -> Option<Cards> {
 /// newest entries younger than the TTL up to MAX_IMAGES pictures. Cards with an error are not
 /// stored: the next request draws them again (a render error may not come back).
 pub fn store(root: &Path, key: &str, file: &Path, cards: &Cards, now: u64) {
-    if cards.iter().any(|c| c.1.is_err()) {
+    let Some(images) = cards
+        .iter()
+        .map(|(name, pic)| pic.as_ref().ok().map(|img| (name, img)))
+        .collect::<Option<Vec<_>>>()
+    else {
         return;
-    }
+    };
     let dir = root.join(key);
     let _ = std::fs::remove_dir_all(&dir);
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
     let mut list = Vec::new();
-    for (i, (name, pic)) in cards.iter().enumerate() {
-        match pic {
-            Ok(img) => {
-                let [w, h] = img.size;
-                let raw: Vec<u8> = img
-                    .pixels
-                    .iter()
-                    .flat_map(|c| c.to_srgba_unmultiplied())
-                    .collect();
-                let saved = image::RgbaImage::from_raw(w as u32, h as u32, raw)
-                    .is_some_and(|p| p.save(dir.join(format!("{i}.png"))).is_ok());
-                if !saved {
-                    let _ = std::fs::remove_dir_all(&dir); // never a half entry
-                    return;
-                }
-                list.push(serde_json::json!({ "name": name }));
-            }
-            Err(e) => list.push(serde_json::json!({ "name": name, "error": e })),
+    for (i, (name, img)) in images.into_iter().enumerate() {
+        let [w, h] = img.size;
+        let raw: Vec<u8> = img
+            .pixels
+            .iter()
+            .flat_map(|c| c.to_srgba_unmultiplied())
+            .collect();
+        let saved = image::RgbaImage::from_raw(w as u32, h as u32, raw)
+            .is_some_and(|p| p.save(dir.join(format!("{i}.png"))).is_ok());
+        if !saved {
+            let _ = std::fs::remove_dir_all(&dir); // never a half entry
+            return;
         }
+        list.push(serde_json::json!({ "name": name }));
     }
     let m = serde_json::json!({ "file": file, "at": now, "cards": list });
     if std::fs::write(dir.join("meta.json"), m.to_string()).is_err() {
@@ -105,8 +104,12 @@ pub fn store(root: &Path, key: &str, file: &Path, cards: &Cards, now: u64) {
     evict(root, key, file, now);
 }
 
+/// How long an entry with no meta.json yet may be another engine's store still writing it.
+const STORING_SECS: u64 = 10;
+
 /// Drops entries that are too old and other entries of the same file, then the oldest entries
-/// until at most MAX_IMAGES pictures are left (the newest entry always stays).
+/// until at most MAX_IMAGES pictures are left (the newest entry always stays). An entry with no
+/// meta.json younger than [`STORING_SECS`] stays: another engine is storing it.
 fn evict(root: &Path, keep_key: &str, file: &Path, now: u64) {
     let Ok(rd) = std::fs::read_dir(root) else {
         return;
@@ -115,6 +118,14 @@ fn evict(root: &Path, keep_key: &str, file: &Path, now: u64) {
     for e in rd.flatten() {
         let k = e.file_name().to_string_lossy().into_owned();
         let m = meta(root, &k);
+        let storing = || {
+            e.metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t.elapsed().map_or(true, |a| a.as_secs() < STORING_SECS))
+        };
+        if m.is_none() && storing() {
+            continue;
+        }
         let at = m.as_ref().and_then(|m| m["at"].as_u64());
         let same_file = m
             .as_ref()
@@ -269,6 +280,32 @@ mod tests {
             assert_eq!(entries(&root), 1, "round {i}");
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn an_entry_another_engine_is_still_storing_is_not_evicted() {
+        let root = tmp("storing");
+        // no meta.json yet: one just made, one left by a store that died a minute ago
+        let (fresh, dead) = (root.join("aaaa"), root.join("bbbb"));
+        for d in [&fresh, &dead] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("0.png"), "png").unwrap();
+        }
+        let ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::open(&dead)
+            .unwrap()
+            .set_modified(ago)
+            .unwrap();
+        store(
+            &root,
+            &key(&["x"]),
+            Path::new("/p/X.kt"),
+            &cards(),
+            now_secs(),
+        );
+        assert!(fresh.join("0.png").exists(), "being stored");
+        assert!(!dead.exists(), "a dead store's leftover");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

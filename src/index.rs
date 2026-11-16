@@ -11,8 +11,9 @@ use std::sync::Arc;
 #[derive(Default)]
 pub struct Index {
     pub files: HashMap<PathBuf, FileSyms>,
-    /// Files that declare each name, for lookups that do not scan every declaration.
-    by_name: HashMap<String, Vec<Arc<Path>>>,
+    /// Each name's declarations (file and place in its list), so a lookup never scans a file's
+    /// other declarations (lenses of a file with 20k declarations look up each one).
+    by_name: HashMap<String, Vec<(Arc<Path>, u32)>>,
     /// Files with a class that names each supertype, for "implemented by" lookups.
     subtypes: HashMap<String, Vec<Arc<Path>>>,
     /// One shared copy of each file's path for the maps above (a copy per name cost ~20 MB on a
@@ -69,13 +70,12 @@ impl Index {
     pub fn insert_scanned(&mut self, path: PathBuf, syms: FileSyms) {
         self.remove(&path);
         let shared: Arc<Path> = Arc::from(path.as_path());
-        for (map, keys) in [
-            (&mut self.by_name, names_of(&syms)),
-            (&mut self.subtypes, supers_of(&syms)),
-        ] {
-            for k in keys {
-                map.entry(k).or_default().push(shared.clone());
-            }
+        for (i, d) in syms.decls.iter().enumerate() {
+            let at = (shared.clone(), i as u32);
+            self.by_name.entry(d.name.clone()).or_default().push(at);
+        }
+        for k in supers_of(&syms) {
+            self.subtypes.entry(k).or_default().push(shared.clone());
         }
         self.shared.insert(path.clone(), shared);
         self.files.insert(path, syms);
@@ -93,16 +93,19 @@ impl Index {
             return;
         };
         self.shared.remove(path);
-        for (map, keys) in [
-            (&mut self.by_name, names_of(&old)),
-            (&mut self.subtypes, supers_of(&old)),
-        ] {
-            for k in keys {
-                if let Some(v) = map.get_mut(&k) {
-                    v.retain(|p| **p != *path);
-                    if v.is_empty() {
-                        map.remove(&k);
-                    }
+        for k in names_of(&old) {
+            if let Some(v) = self.by_name.get_mut(&k) {
+                v.retain(|(p, _)| **p != *path);
+                if v.is_empty() {
+                    self.by_name.remove(&k);
+                }
+            }
+        }
+        for k in supers_of(&old) {
+            if let Some(v) = self.subtypes.get_mut(&k) {
+                v.retain(|p| **p != *path);
+                if v.is_empty() {
+                    self.subtypes.remove(&k);
                 }
             }
         }
@@ -134,18 +137,12 @@ impl Index {
         name: &str,
     ) -> impl Iterator<Item = (&'a PathBuf, &'a FileSyms, &'a Decl)> + 'a {
         self.by_name
-            .get_key_value(name)
+            .get(name)
             .into_iter()
-            .flat_map(move |(key, paths)| {
-                paths
-                    .iter()
-                    .filter_map(move |p| self.files.get_key_value(&**p))
-                    .flat_map(move |(p, f)| {
-                        f.decls
-                            .iter()
-                            .filter(move |d| d.name == *key)
-                            .map(move |d| (p, f, d))
-                    })
+            .flatten()
+            .filter_map(move |(p, i)| {
+                let (p, f) = self.files.get_key_value(&**p)?;
+                Some((p, f, f.decls.get(*i as usize)?))
             })
     }
 
@@ -302,9 +299,14 @@ impl Index {
     /// `actual` one. They share the name, the package and the enclosing class, in other files;
     /// each hit's detail starts with its source set (`androidMain · …`).
     pub fn counterparts(&self, path: &Path, f: &FileSyms, d: &Decl) -> Vec<Hit> {
-        let Some(role) = kmp_role(f, d) else {
-            return Vec::new();
-        };
+        match kmp_role(f, d) {
+            Some(role) => self.counterparts_as(path, f, d, role),
+            None => Vec::new(),
+        }
+    }
+
+    /// [`Index::counterparts`] of a declaration whose role (`expect` or `actual`) is known.
+    pub fn counterparts_as(&self, path: &Path, f: &FileSyms, d: &Decl, role: &str) -> Vec<Hit> {
         let want = if role == "expect" { "actual" } else { "expect" };
         let mut hits: Vec<Hit> = self
             .named(&d.name)
@@ -348,6 +350,60 @@ impl Index {
             );
         }
         None
+    }
+
+    /// Each member of the type `container` (each file once), with its file.
+    fn members_in<'a>(
+        &'a self,
+        container: &'a str,
+    ) -> impl Iterator<Item = (&'a PathBuf, &'a FileSyms, &'a Decl)> + 'a {
+        let mut files: Vec<(&PathBuf, &FileSyms)> =
+            self.named(container).map(|(p, f, _)| (p, f)).collect();
+        files.dedup_by(|a, b| a.0 == b.0);
+        files.into_iter().flat_map(move |(p, f)| {
+            f.decls
+                .iter()
+                .filter(move |d| d.container.as_deref() == Some(container))
+                .map(move |d| (p, f, d))
+        })
+    }
+
+    /// [`Index::overridden`] for every member name of `container` at once, by one walk up its
+    /// supertypes (lenses of a class with thousands of members).
+    pub fn overridden_in(&self, container: &str) -> HashMap<String, Hit> {
+        let supers = |n: &str| -> Vec<String> {
+            self.named(n)
+                .filter(|(_, _, d)| d.kind.is_type())
+                .flat_map(|(_, _, d)| d.supers.clone())
+                .collect()
+        };
+        let (mut out, mut seen) = (HashMap::new(), HashSet::new());
+        let mut queue = std::collections::VecDeque::from(supers(container));
+        while let Some(s) = queue.pop_front() {
+            if !seen.insert(s.clone()) {
+                continue;
+            }
+            // the nearest supertype that declares a name wins, like `overridden`
+            for (p, f, d) in self.members_in(&s) {
+                out.entry(d.name.clone()).or_insert_with(|| hit(p, f, d));
+            }
+            queue.extend(supers(&s));
+        }
+        out
+    }
+
+    /// [`Index::member_implementations`] for every member name of `container` at once.
+    pub fn member_implementations_in(&self, container: &str) -> HashMap<String, Vec<Hit>> {
+        let mut out: HashMap<String, Vec<Hit>> = HashMap::new();
+        for c in self.implementations(container) {
+            let class = c.name.rsplit('.').next().unwrap_or(&c.name);
+            for (p, f, d) in self.members_in(class) {
+                if d.has_modifier("override") {
+                    out.entry(d.name.clone()).or_default().push(hit(p, f, d));
+                }
+            }
+        }
+        out
     }
 
     /// `override` members named `member` in the classes that implement `container`.
@@ -452,16 +508,28 @@ impl Index {
 }
 
 pub fn kmp_role(f: &FileSyms, d: &Decl) -> Option<&'static str> {
+    kmp_role_in(d, &expect_types(f))
+}
+
+/// The names of a file's `expect` types, for [`kmp_role_in`].
+pub fn expect_types(f: &FileSyms) -> HashSet<&str> {
+    f.decls
+        .iter()
+        .filter(|x| x.kind.is_type() && x.has_modifier("expect"))
+        .map(|x| x.name.as_str())
+        .collect()
+}
+
+/// [`kmp_role`] with the file's `expect` types found once (lenses ask for every declaration).
+pub fn kmp_role_in(d: &Decl, expect_types: &HashSet<&str>) -> Option<&'static str> {
     if d.has_modifier("expect") {
         return Some("expect");
     }
     if d.has_modifier("actual") {
         return Some("actual");
     }
-    let c = d.container.as_deref()?;
-    f.decls
-        .iter()
-        .any(|x| *x.name == *c && x.kind.is_type() && x.has_modifier("expect"))
+    expect_types
+        .contains(d.container.as_deref()?)
         .then_some("expect")
 }
 
@@ -758,6 +826,12 @@ mod tests {
         let mut m = names(i.member_implementations("Api", "load"));
         m.sort();
         assert_eq!(m, vec!["Impl.load", "Other.load"]);
+        // the same, for every member at once
+        assert_eq!(i.overridden_in("Impl")["load"].name, "Api.load");
+        assert!(i.overridden_in("Api").is_empty());
+        let mut all = names(i.member_implementations_in("Api").remove("load").unwrap());
+        all.sort();
+        assert_eq!(all, m);
         i.remove(Path::new("/p/Impl.kt"));
         assert_eq!(names(i.implementations("Api")), vec!["Base"]);
     }

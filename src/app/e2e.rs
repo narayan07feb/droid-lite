@@ -2736,7 +2736,19 @@ fn e2e_run_app_and_preview_on_a_device() {
 #[test]
 fn e2e_device_screenshot_and_recording() {
     let f = Fixture::new("capture");
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_adb.sh");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_adb.sh");
+    // the recording's size on the device ("fake mp4"): it is deleted there only once all of it came
+    let script = f.path("adb");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *\" shell stat -c %s \"*) echo 8;; *) exec {} \"$@\";; esac\n",
+            fixture.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .unwrap();
     let calls = f.path("adb-calls.txt");
     let out = f.path("captures");
     std::fs::create_dir_all(&out).unwrap();

@@ -9,7 +9,9 @@
 //! folder), `lenses {path, text?}`, `implementations {name, member?}`, `stability {path, text?}`;
 //! device tools without a project: `adb`, `devices`, `screenshot {serial}`,
 //! `record_start {serial}`, `record_stop`. Device tools run on their own thread and answer when
-//! done, so a device that hangs (each adb call is stopped after 20 to 30 s) holds up nothing else.
+//! done, so a device that hangs (each adb call is stopped after 20 s) holds up nothing else.
+//! `record_stop` copies the video before it answers: up to about 16 minutes for a long recording
+//! over a slow Wi-Fi adb (see [`capture::Recording::finish`]).
 //!
 //! `previews {path}` answers when the pictures are drawn (seconds), while other requests go on;
 //! meanwhile it sends `{"event":"preview_status","file","text","done"?,"total"?}` lines. A newer
@@ -317,18 +319,27 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 }
 
 /// The path as the index keeps it (the project root is opened canonical, e.g. /private/var on
-/// macOS); a deleted file keeps its canonical folder.
+/// macOS); a deleted file or folder keeps its nearest canonical folder.
 fn canon(p: &str) -> std::path::PathBuf {
     let p = Path::new(p);
-    std::fs::canonicalize(p).unwrap_or_else(|_| {
-        match (
-            p.parent().and_then(|d| std::fs::canonicalize(d).ok()),
-            p.file_name(),
-        ) {
-            (Some(d), Some(n)) => d.join(n),
-            _ => p.to_path_buf(),
+    for a in p.ancestors() {
+        if let Ok(c) = std::fs::canonicalize(a) {
+            return match p.strip_prefix(a) {
+                Ok(rest) if !rest.as_os_str().is_empty() => c.join(rest),
+                _ => c,
+            };
         }
-    })
+    }
+    p.to_path_buf()
+}
+
+/// Whether a canonical path is in the project: under its root, and no `..` left (a missing folder
+/// kept it) that could lead out again.
+fn in_project(root: Option<&Path>, path: &Path) -> bool {
+    root.is_none_or(|r| path.starts_with(r))
+        && !path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
 }
 
 fn adb() -> Result<std::path::PathBuf, String> {
@@ -487,6 +498,7 @@ impl Server {
                 }
                 let p = Project::open(root);
                 self.index = Index::build(&p.files);
+                self.texts.clear(); // texts of the old index: the editor sends its own again
                 let dirs: Vec<_> = p.modules.iter().map(|m| m.dir.clone()).collect();
                 self.reports = compose::load_reports(&dirs);
                 self.project = Some(project_ref(p.root.clone(), p.files.clone()));
@@ -500,8 +512,13 @@ impl Server {
                 }))
             }
             "update" => {
-                let path = &canon(s("path")?);
-                if ignored(self.project.as_ref().map(|p| p.root.as_path()), path) {
+                let raw = s("path")?;
+                let path = &canon(raw);
+                let root = self.project.as_ref().map(|p| p.root.as_path());
+                if !in_project(root, path) {
+                    return Err(format!("{raw:?} is not in the project"));
+                }
+                if ignored(root, path) {
                     return Ok(Value::Null);
                 }
                 // a folder created, moved or renamed: every source file in it
@@ -518,7 +535,15 @@ impl Server {
                 }
                 let src = match params["text"].as_str() {
                     Some(t) => t.to_string(),
-                    None => std::fs::read_to_string(path).map_err(|e| e.to_string())?,
+                    None => match std::fs::read_to_string(path) {
+                        Ok(t) => t,
+                        // deleted meanwhile: as `remove`
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            self.forget(path);
+                            return Ok(Value::Null);
+                        }
+                        Err(e) => return Err(e.to_string()),
+                    },
                 };
                 self.index.update(path, &src);
                 if params["text"].is_string() {
@@ -535,15 +560,10 @@ impl Server {
                 let raw = s("path")?;
                 let path = &canon(raw);
                 let root = self.project.as_ref().map(|p| p.root.as_path());
-                if raw.trim().is_empty() || root.is_some_and(|r| !path.starts_with(r)) {
+                if raw.trim().is_empty() || !in_project(root, path) {
                     return Err(format!("{raw:?} is not in the project"));
                 }
-                self.index.remove(path);
-                self.index.remove_under(path);
-                self.texts.retain(|p, _| !p.starts_with(path));
-                let before = self.files.len();
-                self.files.retain(|p| !p.starts_with(path));
-                self.files_changed |= self.files.len() != before;
+                self.forget(path);
                 Ok(Value::Null)
             }
             // Droid Lite's gutter links for one file: expect/actual, supertypes, implementations,
@@ -555,11 +575,17 @@ impl Server {
                 let lines = Lines::new(&text);
                 let mut placer = Placer::new(texts);
                 let mut out = Vec::new();
+                // looked up once per file or class, not per declaration: a file may have 20k
+                let expect_types = crate::index::expect_types(&syms);
+                let mut overrides: HashMap<&str, HashMap<String, Hit>> = HashMap::new();
+                let mut member_impls: HashMap<&str, HashMap<String, Vec<Hit>>> = HashMap::new();
                 for d in &syms.decls {
                     let (line, _) = lines.position(&text, d.offset);
-                    let kmp = self.index.counterparts(path, &syms, d);
+                    let role = crate::index::kmp_role_in(d, &expect_types);
+                    let kmp = role
+                        .map_or_else(Vec::new, |r| self.index.counterparts_as(path, &syms, d, r));
                     if !kmp.is_empty() {
-                        let expect = crate::index::kmp_role(&syms, d) == Some("expect");
+                        let expect = role == Some("expect");
                         let mut sets: Vec<&str> = kmp
                             .iter()
                             .filter_map(|h| h.detail.split(" · ").next())
@@ -600,16 +626,21 @@ impl Server {
                         && matches!(d.kind, Kind::Fun | Kind::Property)
                     {
                         if d.has_modifier("override") {
-                            if let Some(h) = self.index.overridden(c, &d.name) {
+                            let all = overrides
+                                .entry(c)
+                                .or_insert_with(|| self.index.overridden_in(c));
+                            if let Some(h) = all.get(&d.name) {
                                 let title = format!("↑ Overrides {}", h.name);
-                                out.push(placer.lens(line, title, &[h]));
+                                out.push(placer.lens(line, title, std::slice::from_ref(h)));
                             }
                         } else {
-                            let impls = self.index.member_implementations(c, &d.name);
-                            if !impls.is_empty() {
+                            let all = member_impls
+                                .entry(c)
+                                .or_insert_with(|| self.index.member_implementations_in(c));
+                            if let Some(impls) = all.get(&d.name) {
                                 let n = plural(impls.len(), "class", "classes");
                                 let title = format!("↓ Implemented in {n}");
-                                out.push(placer.lens(line, title, &impls));
+                                out.push(placer.lens(line, title, impls));
                             }
                         }
                     }
@@ -680,6 +711,17 @@ impl Server {
         }
     }
 
+    /// Drops a deleted file, or everything under a deleted folder: its index entries, texts and
+    /// place in the file list.
+    fn forget(&mut self, path: &Path) {
+        self.index.remove(path);
+        self.index.remove_under(path);
+        self.texts.retain(|p, _| !p.starts_with(path));
+        let before = self.files.len();
+        self.files.retain(|p| !p.starts_with(path));
+        self.files_changed |= self.files.len() != before;
+    }
+
     /// Starts drawing a file's previews. `Ok(Some)` answers now (no previews); `Ok(None)` means the
     /// answer comes later from the preview thread.
     pub fn previews(&mut self, id: &Value, params: &Value) -> Result<Option<Value>, String> {
@@ -696,6 +738,16 @@ impl Server {
             .map(|d| d.name.clone())
             .collect();
         if previews.is_empty() {
+            // an older request of this file still drawing: answered now, its pictures never sent
+            let older = self
+                .waiting
+                .lock()
+                .map_err(|e| e.to_string())?
+                .remove(&path);
+            if let Some((_, older)) = older {
+                self.out
+                    .emit(json!({ "id": older, "error": "replaced by a newer request" }));
+            }
             return Ok(Some(json!({ "file": path, "cards": [] })));
         }
         let class = crate::device::preview_name(&syms.package, &path, None, "x")
@@ -1439,6 +1491,141 @@ mod tests {
         }
         let r = call(&mut s, "implementations", json!({ "name": "Api" }));
         assert_eq!(r["result"][0]["name"], "RealApi", "{r}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_never_indexes_a_file_or_folder_outside_the_project() {
+        let root = project("outside");
+        let other = project("outside-other"); // a folder with an Api implementation of its own
+        let mut s = Server::default();
+        init(&mut s, &root);
+        let real = other.join("app/src/main/java/demo/RealApi.kt");
+        let text = "package demo\nclass Sneaky : Api\n";
+        let up = root
+            .join("app/missing/../../..")
+            .join(other.file_name().unwrap());
+        for (path, text) in [
+            (other.join("app/src/main/java/demo"), None),
+            (real.clone(), None),
+            (real.clone(), Some(text)),
+            (PathBuf::from("/"), None),
+            (up.join("app/src/main/java/demo/X.kt"), Some(text)),
+        ] {
+            let mut params = json!({ "path": path });
+            if let Some(t) = text {
+                params["text"] = json!(t);
+            }
+            let r = call(&mut s, "update", params);
+            assert!(r["error"].is_string(), "{path:?}: {r}");
+        }
+        let r = call(&mut s, "implementations", json!({ "name": "Api" }));
+        assert_eq!(r["result"].as_array().map(Vec::len), Some(1), "{r}");
+        assert!(s.texts.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(other);
+    }
+
+    #[test]
+    fn a_file_gone_before_its_update_is_dropped_like_remove() {
+        let root = std::fs::canonicalize(project("gone")).unwrap();
+        let mut s = Server::default();
+        init(&mut s, &root);
+        let f = root.join("app/src/main/java/demo/Other.kt");
+        let text = "package demo\nclass Other : Api\n";
+        std::fs::write(&f, text).unwrap();
+        call(&mut s, "update", json!({ "path": f, "text": text }));
+        assert_eq!(s.texts.len(), 1);
+        std::fs::remove_file(&f).unwrap();
+        let r = call(&mut s, "update", json!({ "path": f }));
+        assert!(r["error"].is_null(), "{r}");
+        let r = call(&mut s, "implementations", json!({ "name": "Api" }));
+        assert_eq!(r["result"].as_array().map(Vec::len), Some(1), "{r}");
+        assert!(s.texts.is_empty() && !s.files.contains(&f));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn initialize_again_drops_the_editors_texts() {
+        let root = project("reinit");
+        let mut s = Server::default();
+        init(&mut s, &root);
+        let f = root.join("app/src/main/java/demo/Api.kt");
+        call(
+            &mut s,
+            "update",
+            json!({ "path": f, "text": "package demo\n" }),
+        );
+        assert_eq!(s.texts.len(), 1);
+        init(&mut s, &root);
+        assert!(s.texts.is_empty(), "they do not match the index made again");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_file_left_with_no_previews_answers_its_older_request_replaced() {
+        let root = project("nopreview");
+        let mut s = Server::default();
+        let (tx, rx) = channel();
+        s.out = Out(Some(tx));
+        init(&mut s, &root);
+        let card = canon(
+            root.join("app/src/main/java/demo/Card.kt")
+                .to_str()
+                .unwrap(),
+        );
+        // request 7 is still drawing the file's last @Preview, which was then deleted
+        s.waiting
+            .lock()
+            .unwrap()
+            .insert(card.clone(), (1, json!(7)));
+        let r = s.previews(&json!(8), &json!({ "path": card })).unwrap();
+        assert_eq!(r.unwrap()["cards"], json!([]));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            json!({ "id": 7, "error": "replaced by a newer request" })
+        );
+        assert!(s.waiting.lock().unwrap().is_empty());
+        // its pictures come later and are never sent
+        let done = crate::preview::Event::Done {
+            file: card,
+            seq: 1,
+            cards: vec![],
+        };
+        assert_eq!(on_event(done, &s.waiting, &root), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lenses_of_a_large_class_hierarchy_take_no_quadratic_time() {
+        let root = project("hierarchy");
+        let mut s = Server::default();
+        init(&mut s, &root);
+        // 60 000 declarations: an interface, a class overriding each member, an expect class
+        let n = 20_000;
+        let mut text = String::from("package demo\ninterface Big {\n");
+        text.extend((0..n).map(|i| format!("    fun f{i}()\n")));
+        text.push_str("}\nclass Impl : Big {\n");
+        text.extend((0..n).map(|i| format!("    override fun f{i}() {{}}\n")));
+        text.push_str("}\nexpect class E {\n");
+        text.extend((0..n).map(|i| format!("    fun e{i}()\n")));
+        text.push_str("}\n");
+        let big = root.join("app/src/main/java/demo/Big.kt");
+        call(&mut s, "update", json!({ "path": big, "text": text }));
+        let t = Instant::now();
+        let r = call(&mut s, "lenses", json!({ "path": big, "text": text }));
+        let took = t.elapsed();
+        let lenses = r["result"].as_array().unwrap_or_else(|| panic!("{r}"));
+        let titles = |line: usize| -> Vec<&str> {
+            lenses
+                .iter()
+                .filter(|l| l["line"] == line)
+                .filter_map(|l| l["title"].as_str())
+                .collect()
+        };
+        assert_eq!(titles(2), ["↓ Implemented in 1 class"], "Big.f0");
+        assert_eq!(titles(n + 4), ["↑ Overrides Big.f0"], "Impl.f0");
+        assert!(took < Duration::from_millis(1000), "{took:?}");
         let _ = std::fs::remove_dir_all(root);
     }
 

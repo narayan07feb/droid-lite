@@ -298,7 +298,11 @@ fn resolve(
                 Some(((done + now.min(p.size)) / 1_000_000, total / 1_000_000)),
             )
         };
-        match download(p, own, fetch, &report) {
+        let waiting = || {
+            let text = format!("Waiting for another window's download of {}", p.label());
+            status(text, None)
+        };
+        match download(p, own, fetch, &report, &waiting) {
             Ok(f) => *slot = Some(f),
             Err(e) => failed.push(format!("  {} {}: {e}", p.label(), p.version)),
         }
@@ -315,30 +319,44 @@ fn resolve(
 }
 
 /// An exclusive lock on `path` (made if missing), held until the file is dropped: two engines never
-/// write one download or one unpacked folder at once.
-fn lock(path: &Path) -> Result<std::fs::File, String> {
+/// write one download or one unpacked folder at once. While another engine holds it, `waiting` is
+/// called at once and then every 2 s, so this engine's status says why it waits.
+fn lock(path: &Path, waiting: &dyn Fn()) -> Result<std::fs::File, String> {
     let f = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(path)
         .map_err(|e| e.to_string())?;
-    f.lock().map_err(|e| e.to_string())?;
-    Ok(f)
+    let mut said: Option<std::time::Instant> = None;
+    loop {
+        match f.try_lock() {
+            Ok(()) => return Ok(f),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if said.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(2)) {
+                    waiting();
+                    said = Some(std::time::Instant::now());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.to_string()),
+        }
+    }
 }
 
 /// One piece into `own`: through `<file>.part` (kept for a resume after a failure), renamed only when
 /// its size and SHA-1 are right. Under `<file>.lock`: another engine fetching the same piece is
-/// waited for, and its finished file used.
+/// waited for (`waiting` says so meanwhile), and its finished file used.
 fn download(
     p: &Piece,
     own: &Path,
     fetch: &dyn Fetch,
     progress: &dyn Fn(u64),
+    waiting: &dyn Fn(),
 ) -> Result<PathBuf, String> {
     let to = own_path(p, own);
     std::fs::create_dir_all(to.parent().unwrap()).map_err(|e| e.to_string())?;
-    let _lock = lock(&to.with_extension("jar.lock"))?;
+    let _lock = lock(&to.with_extension("jar.lock"), waiting)?;
     if size_of(&to) == p.size && to.is_file() {
         return Ok(to);
     }
@@ -362,13 +380,14 @@ fn download(
 }
 
 /// A layoutlib data jar unpacked into `to`, once per checksum (`<to>.sha1` says which jar it holds).
-/// Under `<to>.lock`: another engine's unpack is waited for, never replaced under its worker.
-fn unpacked(jar: &Path, sha1: &str, to: &Path) -> Result<(), String> {
+/// Under `<to>.lock`: another engine's unpack is waited for (`waiting` says so meanwhile), never
+/// replaced under its worker.
+fn unpacked(jar: &Path, sha1: &str, to: &Path, waiting: &dyn Fn()) -> Result<(), String> {
     if is_unpacked(to, sha1) {
         return Ok(());
     }
     std::fs::create_dir_all(to.parent().unwrap()).map_err(|e| e.to_string())?;
-    let _lock = lock(&to.with_extension("lock"))?;
+    let _lock = lock(&to.with_extension("lock"), waiting)?;
     if is_unpacked(to, sha1) {
         return Ok(()); // the other engine unpacked it meanwhile
     }
@@ -520,7 +539,11 @@ fn assemble(
             None => runtime.push(f),
             Some(to) => {
                 status(format!("Unpacking {}", p.label()), None);
-                unpacked(&f, p.sha1, &to)?;
+                let waiting = || {
+                    let text = format!("Waiting for another window to unpack {}", p.label());
+                    status(text, None)
+                };
+                unpacked(&f, p.sha1, &to, &waiting)?;
                 if f.starts_with(own) {
                     let _ = std::fs::remove_file(&f);
                 }
@@ -971,7 +994,7 @@ mod tests {
             std::io::Write::write_all(&mut z, b"a").unwrap();
             z.finish().unwrap();
         }
-        unpacked(&jar, "s1", &to).unwrap();
+        unpacked(&jar, "s1", &to, &|| {}).unwrap();
         assert!(!gone.exists(), "a killed run's folder");
         assert!(!junk.exists());
         assert!(kept.exists(), "a live run's folder stays");
@@ -992,19 +1015,19 @@ mod tests {
         }
         let to = d.join("layoutlib/runtime");
         std::fs::create_dir_all(to.parent().unwrap()).unwrap();
-        unpacked(&jar, "s1", &to).unwrap();
+        unpacked(&jar, "s1", &to, &|| {}).unwrap();
         assert_eq!(
             std::fs::read_to_string(to.join("data/fonts/a.ttf")).unwrap(),
             "font"
         );
         std::fs::write(to.join("data/fonts/a.ttf"), "kept").unwrap();
-        unpacked(&jar, "s1", &to).unwrap();
+        unpacked(&jar, "s1", &to, &|| {}).unwrap();
         assert_eq!(
             std::fs::read_to_string(to.join("data/fonts/a.ttf")).unwrap(),
             "kept",
             "same checksum: not again"
         );
-        unpacked(&jar, "s2", &to).unwrap();
+        unpacked(&jar, "s2", &to, &|| {}).unwrap();
         assert_eq!(
             std::fs::read_to_string(to.join("data/fonts/a.ttf")).unwrap(),
             "font",
@@ -1028,12 +1051,14 @@ mod tests {
         let p = piece("lib", HELLO_SHA1, 5);
         let to = own_path(&p, &own);
         std::fs::create_dir_all(to.parent().unwrap()).unwrap();
-        let held = lock(&to.with_extension("jar.lock")).unwrap(); // another engine downloading
+        let held = lock(&to.with_extension("jar.lock"), &|| {}).unwrap(); // another engine downloading
         let net = Counted(Default::default());
+        let said = std::sync::Mutex::new(0);
         std::thread::scope(|s| {
-            let t = s.spawn(|| download(&p, &own, &net, &|_| {}));
+            let t = s.spawn(|| download(&p, &own, &net, &|_| {}, &|| *said.lock().unwrap() += 1));
             std::thread::sleep(Duration::from_millis(300));
             assert!(!t.is_finished(), "waits for the other engine");
+            assert_eq!(*said.lock().unwrap(), 1, "and says so while it waits");
             std::fs::write(&to, "hello").unwrap(); // its finished file
             drop(held);
             assert_eq!(t.join().unwrap(), Ok(to.clone()));
@@ -1058,11 +1083,13 @@ mod tests {
         }
         let to = d.join("layoutlib/runtime");
         std::fs::create_dir_all(to.parent().unwrap()).unwrap();
-        let held = lock(&to.with_extension("lock")).unwrap(); // another engine unpacking
+        let held = lock(&to.with_extension("lock"), &|| {}).unwrap(); // another engine unpacking
+        let said = std::sync::Mutex::new(0);
         std::thread::scope(|s| {
-            let t = s.spawn(|| unpacked(&jar, "s1", &to));
+            let t = s.spawn(|| unpacked(&jar, "s1", &to, &|| *said.lock().unwrap() += 1));
             std::thread::sleep(Duration::from_millis(300));
             assert!(!t.is_finished(), "waits for the other engine");
+            assert_eq!(*said.lock().unwrap(), 1, "and says so while it waits");
             // its folder, which its worker now uses
             std::fs::create_dir_all(to.join("data")).unwrap();
             std::fs::write(to.join("data/a.txt"), "theirs").unwrap();

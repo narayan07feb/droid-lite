@@ -12,6 +12,7 @@
 //   <- {"id":7,"ok":true,"images":[{"name":"CardPreview","png":"/work/7-CardPreview.png","ms":48}],"compile_ms":210}
 //   <- {"id":7,"ok":false,"error":"e: Card.kt:3:5 Unresolved reference 'Foo'."}
 // One render at a time; the newest request wins (an older one waiting is dropped and answered "skipped").
+// A request waiting for the renderer gets a status line every 10 s, so its client never times it out.
 import app.cash.paparazzi.DeviceConfig;
 import app.cash.paparazzi.Environment;
 import app.cash.paparazzi.PaparazziSdk;
@@ -54,6 +55,12 @@ public class PreviewWorker {
         Thread watchdog = new Thread(() -> {
             while (true) {
                 sleep(10_000);
+                // a request waiting behind another client's long draw hears from us every 10 s, so its
+                // client does not take this worker for hung (it gives up after 120 s of silence)
+                synchronized (wake) {
+                    Request waiting = next.get();
+                    if (waiting != null) status(waiting, "Waiting for another preview to finish", 0, 0);
+                }
                 if (next.get() == null && System.currentTimeMillis() - lastWork > idle) {
                     try { Files.deleteIfExists(sock); } catch (IOException ignored) {}
                     System.exit(0); // idle: give the memory back

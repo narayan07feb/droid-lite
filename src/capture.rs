@@ -11,9 +11,18 @@ use std::time::{Duration, Instant};
 pub const MAX_RECORDING: Duration = Duration::from_secs(180);
 
 /// How long one adb call may take before it is stopped (a device that hangs, a stuck adb server);
-/// copying a finished recording may take longer.
+/// copying a finished recording may take longer (see [`pull_limit`]).
 pub const ADB_TIMEOUT: Duration = Duration::from_secs(20);
-const PULL_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest copy of a recording: 3 minutes of video (up to about 450 MB) over a slow Wi-Fi adb.
+pub const MAX_PULL: Duration = Duration::from_secs(15 * 60);
+
+/// How long copying a recording of `size` bytes may take: 30 s plus 1 MB/s (Wi-Fi adb can be that
+/// slow), at most [`MAX_PULL`]; [`MAX_PULL`] when the size is not known.
+pub fn pull_limit(size: Option<u64>) -> Duration {
+    size.map_or(MAX_PULL, |b| {
+        (Duration::from_secs(30) + Duration::from_secs(b / 1_000_000)).min(MAX_PULL)
+    })
+}
 
 fn read_all(r: Option<impl std::io::Read + Send + 'static>) -> Receiver<Vec<u8>> {
     let (tx, rx) = channel();
@@ -170,11 +179,10 @@ impl Recording {
     }
 
     fn adb(&self, args: &[&str]) -> Result<std::process::Output, String> {
-        let limit = if args.first() == Some(&"pull") {
-            PULL_TIMEOUT
-        } else {
-            ADB_TIMEOUT
-        };
+        self.adb_within(args, ADB_TIMEOUT)
+    }
+
+    fn adb_within(&self, args: &[&str], limit: Duration) -> Result<std::process::Output, String> {
         output_within(
             Command::new(&self.adb)
                 .args(["-s", &self.serial])
@@ -182,6 +190,14 @@ impl Recording {
             limit,
         )
         .map_err(|e| format!("adb: {e}"))
+    }
+
+    /// The size in bytes of the recording on the device, when it can be read.
+    fn remote_size(&self) -> Option<u64> {
+        let out = self
+            .adb(&["shell", "stat", "-c", "%s", &self.remote])
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
     }
 
     /// Stops screenrecord with SIGINT (so it finishes the mp4) by its own pid, never by name.
@@ -200,8 +216,11 @@ impl Recording {
         !matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// Stops the recording, copies the video into `dir` and deletes it from the device.
-    /// Blocks for a few seconds: call it off the UI thread.
+    /// Stops the recording, copies the video into `dir` and deletes it from the device, only once
+    /// the whole file arrived; when the copy fails the video stays on the device and the error names
+    /// it. Blocks for seconds, minutes for a long recording over Wi-Fi: call it off the UI thread.
+    /// At most about 16 minutes: 2 + 20 (stop) + 10 (finish) + 20 (size) + [`MAX_PULL`] + 20 (delete)
+    /// seconds, plus up to 1 s per adb call for its output.
     pub fn finish(mut self, dir: &Path) -> Result<PathBuf, String> {
         if matches!(self.child.try_wait(), Ok(None)) {
             if !self.interrupt(Duration::from_secs(2)) {
@@ -217,19 +236,40 @@ impl Recording {
         self.done = true;
         let local = dir.join(file_name("Recording", &self.serial, &stamp(), "mp4"));
         let local_s = local.to_string_lossy().into_owned();
-        let pulled = self.adb(&["pull", &self.remote, &local_s]);
-        // delete only the file this recording wrote
-        let _ = self.adb(&["shell", "rm", "-f", &self.remote]);
-        let out = pulled?;
-        if !out.status.success() || !local.is_file() {
-            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            return Err(if err.is_empty() {
-                "the device kept no video".into()
-            } else {
-                err
-            });
+        let size = self.remote_size();
+        let pulled = self.adb_within(&["pull", &self.remote, &local_s], pull_limit(size));
+        let got = std::fs::metadata(&local)
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.len());
+        let copied = pulled.as_ref().is_ok_and(|o| o.status.success()) && got.is_some();
+        if copied && size.is_none_or(|s| got == Some(s)) {
+            // delete only the file this recording wrote, and only once all of it is here (a size
+            // the device would not say: keep it there)
+            if size.is_some() {
+                let _ = self.adb(&["shell", "rm", "-f", &self.remote]);
+            }
+            return Ok(local);
         }
-        Ok(local)
+        let _ = std::fs::remove_file(&local); // a part of a video
+        let why = match pulled {
+            Err(e) => e,
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                match (size, got) {
+                    (None, _) if err.is_empty() => "the device kept no video".into(),
+                    (Some(s), Some(g)) if err.is_empty() && g != s => {
+                        format!("only {g} of {s} bytes arrived")
+                    }
+                    _ if err.is_empty() => "the copy failed".into(),
+                    _ => err,
+                }
+            }
+        };
+        Err(match size {
+            Some(_) => format!("{why}. The video is still on the device: {}", self.remote),
+            None => why,
+        })
     }
 }
 
@@ -265,6 +305,67 @@ mod tests {
             (&ok.stdout[..], &ok.stderr[..]),
             (&b"out\n"[..], &b"err\n"[..])
         );
+    }
+
+    #[test]
+    fn a_long_recording_gets_time_to_copy_in_proportion_to_its_size() {
+        assert_eq!(pull_limit(Some(1_000)), Duration::from_secs(30));
+        // 3 minutes at 20 Mbit/s: about 450 MB, 8 minutes at 1 MB/s
+        assert_eq!(pull_limit(Some(450_000_000)), Duration::from_secs(480));
+        assert_eq!(pull_limit(Some(10_000_000_000)), MAX_PULL);
+        assert_eq!(pull_limit(None), MAX_PULL);
+    }
+
+    /// A fake adb: screenrecord ends by itself, `stat` says 1000 bytes, `pull` does what the file
+    /// `pull` next to it says (`ok`, `short` or `fail`). Every call goes to `adb.log`.
+    fn fake_adb(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let adb = dir.join("adb");
+        let d = dir.display();
+        let script = format!(
+            "#!/bin/sh\necho \"$@\" >> {d}/adb.log\ncase \"$*\" in\n\
+             *screenrecord*) echo 4242; sleep 0.2;;\n\
+             *stat*) echo 1000;;\n\
+             *pull*) case $(cat {d}/pull) in\n\
+               ok) head -c 1000 /dev/zero > \"$5\";;\n\
+               short) head -c 600 /dev/zero > \"$5\";;\n\
+               *) echo 'adb: error: failed to copy' >&2; exit 1;;\n\
+             esac;;\nesac\n"
+        );
+        std::fs::write(&adb, script).unwrap();
+        std::fs::set_permissions(&adb, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        adb
+    }
+
+    #[test]
+    fn the_video_leaves_the_device_only_after_all_of_it_was_copied() {
+        let dir = std::env::temp_dir().join(format!("dl-capture-pull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let adb = fake_adb(&dir);
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let log = || std::fs::read_to_string(dir.join("adb.log")).unwrap_or_default();
+        for mode in ["fail", "short"] {
+            std::fs::write(dir.join("pull"), mode).unwrap();
+            let _ = std::fs::remove_file(dir.join("adb.log"));
+            let r = Recording::start(&adb, "emu").unwrap().finish(&out);
+            let e = r.expect_err(mode);
+            assert!(
+                e.contains("still on the device: /sdcard/droid-lite-"),
+                "{mode}: {e}"
+            );
+            assert!(!log().contains("rm -f"), "{mode}: {}", log());
+            assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0, "no part video");
+        }
+        std::fs::write(dir.join("pull"), "ok").unwrap();
+        let _ = std::fs::remove_file(dir.join("adb.log"));
+        let video = Recording::start(&adb, "emu").unwrap().finish(&out).unwrap();
+        assert_eq!(std::fs::metadata(&video).unwrap().len(), 1000);
+        let calls = log();
+        let (pull, rm) = (calls.find(" pull ").unwrap(), calls.find("rm -f").unwrap());
+        assert!(pull < rm, "deleted after the copy: {calls}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

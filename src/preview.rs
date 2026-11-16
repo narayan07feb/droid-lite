@@ -261,9 +261,9 @@ fn next_job(jobs: &Receiver<Request>, send: &dyn Fn(Event), room: &dyn Fn() -> S
 
 /// The preview cache key: what is drawn (file, text, project code, specs, Kotlin version), the
 /// libraries, the worker's source, the renderer and every resource and assets file.
-fn cache_key(draw: &[&str], rt: &ProjectRuntime, worker: &str, renderer: &str) -> String {
+fn cache_key(draw: &[&str], rt: &ProjectRuntime, worker: &str, renderer: &str, walks: &mut Walks) -> String {
     let mut parts = draw.to_vec();
-    let (libs, worker, files) = (format!("{:08x}", rt.key()), format!("{:016x}", fnv(worker)), format!("{:016x}", rt.files_key()));
+    let (libs, worker, files) = (format!("{:08x}", rt.key()), format!("{:016x}", fnv(worker)), format!("{:016x}", rt.files_key(walks)));
     parts.extend([libs.as_str(), &worker, renderer, &files]);
     crate::preview_cache::key(&parts)
 }
@@ -351,6 +351,18 @@ struct State {
     res_packages: Vec<String>,
     module_res: Vec<String>,
     exploded: Vec<String>,
+    walks: Walks,
+}
+
+/// The resource and assets folders' listings, each kept while the folder's own time is unchanged
+/// (a file added, removed or renamed in it changes that time): a cache hit then reads no folder
+/// again, only each file's time and size (an edit in place). On BranchAndroid 25 ms → 5 ms.
+#[derive(Default)]
+struct Walks {
+    /// Folder → (its time, sub-folders, files), sorted by name.
+    dirs: std::collections::HashMap<PathBuf, (std::time::SystemTime, Vec<PathBuf>, Vec<PathBuf>)>,
+    /// Folders read, for tests.
+    reads: usize,
 }
 
 impl State {
@@ -426,7 +438,7 @@ impl State {
         let cache_dir = dir().join("cache");
         let (file, specs_text) = (r.file.to_string_lossy(), format!("{specs:?}"));
         let draw = [file.as_ref(), &text, own.as_ref().map_or("", |o| o.key.as_str()), &specs_text, &version];
-        let cache_key = cache_key(&draw, &rt, WORKER_SOURCE, &crate::preview_base::fingerprint());
+        let cache_key = cache_key(&draw, &rt, WORKER_SOURCE, &crate::preview_base::fingerprint(), &mut self.walks);
         if !stand_in && let Some(cards) = crate::preview_cache::lookup(&cache_dir, &cache_key, crate::preview_cache::now_secs()) {
             return send(Event::Done { file: r.file.clone(), seq: r.seq, cards });
         }
@@ -440,8 +452,10 @@ impl State {
         // itself, up to 3 tries with a short back-off, then the error goes on the card
         let mut last_error = String::new();
         let mut base = None;
+        let mut lost = false;
         for attempt in 0..3u32 {
-            if attempt > 0 {
+            // a lost connection (a worker that exited when idle) connects again at once
+            if attempt > 0 && !std::mem::take(&mut lost) {
                 std::thread::sleep(Duration::from_millis(500 << attempt));
             }
             if self.conn.is_none() {
@@ -475,12 +489,18 @@ impl State {
                     self.conn = None;
                     last_error = "The preview worker stopped: another window's request replaced this one".into();
                 }
-                Err(NoAnswer::Stopped(e)) => {
+                Err(NoAnswer::Silent(e)) => {
                     // a hung worker would take the next connection too: stop it, so the next try
                     // starts a fresh one
                     self.conn = None;
                     stop_worker(&sock, STOP_GRACE);
                     last_error = format!("The preview worker stopped: {e}");
+                }
+                Err(NoAnswer::Lost(e)) => {
+                    // only this connection: the next try connects again (or starts a worker)
+                    self.conn = None;
+                    lost = true;
+                    last_error = format!("The preview worker closed the connection: {e}");
                 }
             }
         }
@@ -565,7 +585,7 @@ fn connect_or_start(
     stop_other_workers(sock);
     let mut child = start_worker(sock, kt, rt, base.as_ref())?;
     let _ = std::fs::write(dir().join("worker.pid"), format!("{} {}", child.id(), sock.display()));
-    let until = Instant::now() + Duration::from_secs(60);
+    let until = Instant::now() + START_TIMEOUT;
     while Instant::now() < until {
         if let Ok(s) = UnixStream::connect(sock) {
             std::thread::spawn(move || child.wait()); // reap it when it ends (idle exit)
@@ -584,11 +604,16 @@ fn connect_or_start(
         std::thread::sleep(Duration::from_millis(200));
     }
     let _ = child.kill();
+    let _ = child.wait(); // no zombie
     Err(format!(
-        "The preview worker did not start in 60 s. Its log: {}",
+        "The preview worker did not start in {} s. Its log: {}",
+        START_TIMEOUT.as_secs(),
         dir().join("worker.log").display()
     ))
 }
+
+/// How long a starting worker may take to listen.
+const START_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 60 });
 
 /// Workers that may run at once (about 2 GB each): the one starting and one other, so two windows
 /// on different projects (the app and VS Code) do not stop each other's worker mid-draw.
@@ -802,25 +827,42 @@ impl ProjectRuntime {
     }
 
     /// Every file of the resource and assets folders the renderer reads (path, time, size), so an
-    /// edited string or drawable draws the pictures again.
-    fn files_key(&self) -> u64 {
-        fn walk(d: &Path, h: &mut u64) {
-            let Ok(rd) = std::fs::read_dir(d) else { return };
-            let mut entries: Vec<_> = rd.flatten().collect();
-            entries.sort_by_key(|e| e.file_name());
-            for e in entries {
-                let Ok(m) = e.metadata() else { continue };
-                if m.is_dir() {
-                    walk(&e.path(), h);
-                } else {
-                    let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
-                    *h = (*h ^ fnv(&format!("{}|{t:?}|{}", e.path().display(), m.len()))).wrapping_mul(0x100000001b3);
+    /// edited string or drawable draws the pictures again. Folders are read again only when their
+    /// time changed ([`Walks`]).
+    fn files_key(&self, walks: &mut Walks) -> u64 {
+        fn walk(d: &Path, h: &mut u64, w: &mut Walks) {
+            let Some(time) = std::fs::metadata(d).ok().and_then(|m| m.modified().ok()) else { return };
+            let listing = match w.dirs.remove(d) {
+                Some(l) if l.0 == time => l,
+                _ => {
+                    let Ok(rd) = std::fs::read_dir(d) else { return };
+                    w.reads += 1;
+                    let mut entries: Vec<_> = rd.flatten().collect();
+                    entries.sort_by_key(|e| e.file_name());
+                    let (mut subs, mut files) = (Vec::new(), Vec::new());
+                    for e in entries {
+                        match e.file_type() {
+                            Ok(t) if t.is_dir() => subs.push(e.path()),
+                            Ok(_) => files.push(e.path()),
+                            Err(_) => {}
+                        }
+                    }
+                    (time, subs, files)
                 }
+            };
+            for f in &listing.2 {
+                let Ok(m) = std::fs::symlink_metadata(f) else { continue };
+                let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+                *h = (*h ^ fnv(&format!("{}|{t:?}|{}", f.display(), m.len()))).wrapping_mul(0x100000001b3);
             }
+            for s in &listing.1 {
+                walk(s, h, w);
+            }
+            w.dirs.insert(d.to_path_buf(), listing);
         }
         let mut h = fnv("files");
         for d in self.module_res.iter().chain(&self.assets) {
-            walk(Path::new(d), &mut h);
+            walk(Path::new(d), &mut h, walks);
         }
         h
     }
@@ -980,8 +1022,12 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 1
 enum NoAnswer {
     /// Another client's request took the worker's one waiting place: ask again, the worker is fine.
     Replaced,
-    /// The worker was silent past the reply timeout, closed the connection or sent garbage.
-    Stopped(String),
+    /// The worker was silent past the reply timeout (it sends a line at least every 10 s, also while
+    /// our request waits behind another client's draw): it hung.
+    Silent(String),
+    /// The connection ended or broke (the worker exited when idle, crashed, or sent garbage): connect
+    /// again; another client may have started a fresh worker on the same socket, never stop that one.
+    Lost(String),
 }
 
 /// Sends one request and waits for its answer, with the imports the compiler could not resolve
@@ -997,7 +1043,7 @@ fn ask(
     own: Option<&Own>,
     send: &dyn Fn(Event),
 ) -> Result<(Event, Vec<String>), NoAnswer> {
-    let stopped = |e: std::io::Error| NoAnswer::Stopped(e.to_string());
+    let lost = |e: std::io::Error| NoAnswer::Lost(e.to_string());
     let line = serde_json::json!({
         "id": id, "file": r.file, "class": r.class, "cp": cp,
         "previews": specs.iter().map(crate::preview_spec::Spec::json).collect::<Vec<_>>(),
@@ -1006,14 +1052,19 @@ fn ask(
         "key": own.map_or("", |o| o.key.as_str()),
     });
     // a worker that hangs is given up (a cold compile takes about 25 s between lines)
-    rd.get_ref().set_read_timeout(Some(REPLY_TIMEOUT)).map_err(stopped)?;
-    writeln!(w, "{line}").map_err(stopped)?;
+    rd.get_ref().set_read_timeout(Some(REPLY_TIMEOUT)).map_err(lost)?;
+    writeln!(w, "{line}").map_err(lost)?;
     loop {
         let mut reply = String::new();
-        if rd.read_line(&mut reply).map_err(stopped)? == 0 {
-            return Err(NoAnswer::Stopped("no answer".into()));
+        match rd.read_line(&mut reply) {
+            Ok(0) => return Err(NoAnswer::Lost("the connection closed".into())),
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                return Err(NoAnswer::Silent(format!("no answer in {} s", REPLY_TIMEOUT.as_secs())));
+            }
+            Err(e) => return Err(lost(e)),
         }
-        let v: serde_json::Value = serde_json::from_str(&reply).map_err(|e| NoAnswer::Stopped(e.to_string()))?;
+        let v: serde_json::Value = serde_json::from_str(&reply).map_err(|e| NoAnswer::Lost(e.to_string()))?;
         if v["id"].as_u64() != Some(id) {
             continue; // an older answer
         }
@@ -1248,6 +1299,133 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
     }
 
     #[test]
+    fn a_closed_connection_or_garbage_is_lost_not_silent() {
+        // the worker reads the request, then closes the connection (or sends garbage first)
+        for peer_says in [None, Some("not json\n")] {
+            let (mut w, peer) = UnixStream::pair().unwrap();
+            let mut rd = BufReader::new(w.try_clone().unwrap());
+            let worker = std::thread::spawn(move || {
+                let mut line = String::new();
+                BufReader::new(&peer).read_line(&mut line).unwrap();
+                if let Some(said) = peer_says {
+                    (&peer).write_all(said.as_bytes()).unwrap();
+                }
+            });
+            let err = ask(&mut w, &mut rd, 1, &request(1), &[], &[], None, &|_| {}).err();
+            assert!(matches!(err, Some(NoAnswer::Lost(_))), "{peer_says:?}: {err:?}");
+            worker.join().unwrap();
+        }
+        // a connection the worker closed before the request: writing fails
+        let (mut w, peer) = UnixStream::pair().unwrap();
+        let mut rd = BufReader::new(w.try_clone().unwrap());
+        drop(peer);
+        let err = ask(&mut w, &mut rd, 1, &request(1), &[], &[], None, &|_| {}).err();
+        assert!(matches!(err, Some(NoAnswer::Lost(_))), "{err:?}");
+        // a silent one, still connected
+        let (mut w, peer) = UnixStream::pair().unwrap();
+        let mut rd = BufReader::new(w.try_clone().unwrap());
+        let err = ask(&mut w, &mut rd, 1, &request(1), &[], &[], None, &|_| {}).err();
+        assert!(matches!(err, Some(NoAnswer::Silent(_))), "{err:?}");
+        drop(peer);
+    }
+
+    #[test]
+    fn a_request_waiting_behind_another_draw_is_kept_alive_by_status_lines() {
+        let (mut w, peer) = UnixStream::pair().unwrap();
+        let mut rd = BufReader::new(w.try_clone().unwrap());
+        let worker = std::thread::spawn(move || {
+            let mut line = String::new();
+            BufReader::new(peer.try_clone().unwrap()).read_line(&mut line).unwrap();
+            let mut p = peer;
+            // silent for longer than the reply timeout (1 s in tests) in all, never between lines
+            for _ in 0..6 {
+                writeln!(p, r#"{{"id":3,"status":"Waiting for another preview to finish","done":0,"total":0}}"#).unwrap();
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            writeln!(p, r#"{{"id":3,"ok":false,"error":"x"}}"#).unwrap();
+            p
+        });
+        let (log, send) = record();
+        let r = ask(&mut w, &mut rd, 3, &request(1), &[], &[], None, &send);
+        assert!(matches!(r, Ok((Event::Failed { .. }, _))), "{:?}", r.err());
+        assert_eq!(log.borrow()[0].2, "Waiting for another preview to finish");
+        drop(worker.join());
+        // the real worker sends those lines from its idle thread while a request waits
+        assert!(WORKER_SOURCE.contains("if (waiting != null) status(waiting, \"Waiting for another preview to finish\""));
+    }
+
+    #[test]
+    fn a_worker_that_closed_the_connection_is_connected_again_not_stopped() {
+        let _lock = crate::app::test_lock();
+        let d = tmp("lost");
+        // serves one request per connection, then closes it (like a worker that exited when idle
+        // and was started again by another window); counts its starts
+        let fake = "import json,os,shutil,signal,socket,sys\nsignal.alarm(30)\nopen(os.environ['STARTS'],'a').write('x')\n\
+                    s=socket.socket(socket.AF_UNIX)\ns.bind(sys.argv[1])\ns.listen(5)\nwhile True:\n\
+                    \tc,_=s.accept()\n\tf=c.makefile('rw')\n\tr=json.loads(f.readline())\n\
+                    \tpng=os.path.join(sys.argv[2],'%d.png'%r['id'])\n\tos.makedirs(sys.argv[2],exist_ok=True)\n\
+                    \tshutil.copy(os.environ['FAKE_PREVIEW_PNG'],png)\n\
+                    \tf.write(json.dumps({'id':r['id'],'ok':True,'images':[{'name':'P','png':png}]})+'\\n')\n\
+                    \tf.flush()\n\tf.close()\n\tc.close()\n";
+        std::fs::write(d.join("w.py"), fake).unwrap();
+        let vars = ["DROID_LITE_PREVIEW_DIR", "DROID_LITE_PREVIEW_WORKER", "FAKE_PREVIEW_PNG", "STARTS"];
+        let old: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        // SAFETY: the test lock is held, so no other test reads the environment meanwhile.
+        unsafe {
+            std::env::set_var(vars[0], d.join("pv"));
+            std::env::set_var(vars[1], format!("python3 {}", d.join("w.py").display()));
+            std::env::set_var(vars[2], Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icon-256.png"));
+            std::env::set_var(vars[3], d.join("starts"));
+        }
+        let (log, send) = record();
+        let mut state = State::default();
+        state.draw(&request(1), &send);
+        state.draw(&request(2), &send);
+        let kinds: Vec<(String, u64)> = log.borrow().iter().filter(|e| e.0 != "status").map(|e| (e.0.clone(), e.1)).collect();
+        assert_eq!(kinds, [("done".to_string(), 1), ("done".to_string(), 2)], "{:?}", log.borrow());
+        assert_eq!(std::fs::read_to_string(d.join("starts")).unwrap(), "x", "the same worker serves both");
+        for e in std::fs::read_dir(d.join("pv")).unwrap().flatten() {
+            if e.path().extension().is_some_and(|x| x == "sock") {
+                stop_worker(&e.path(), Duration::from_secs(1));
+            }
+        }
+        for (k, v) in vars.iter().zip(old) {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_worker_that_never_listens_is_killed_and_reaped() {
+        let _lock = crate::app::test_lock();
+        let d = tmp("nolisten");
+        let vars = ["DROID_LITE_PREVIEW_DIR", "DROID_LITE_PREVIEW_WORKER"];
+        let old: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        // SAFETY: the test lock is held, so no other test reads the environment meanwhile.
+        unsafe {
+            std::env::set_var(vars[0], d.join("pv"));
+            std::env::set_var(vars[1], "perl -e sleep(30)"); // takes the socket and work dir, never listens
+        }
+        let sock = d.join("pv/w-test.sock");
+        let r = connect_or_start(&|_| {}, Path::new("/p/A.kt"), &sock, &Kotlin::default(), &ProjectRuntime::default(), &mut None);
+        let e = r.err().unwrap_or_default();
+        assert!(e.contains("did not start in 2 s"), "{e}");
+        let pid: i32 = std::fs::read_to_string(d.join("pv/worker.pid")).unwrap().split(' ').next().unwrap().parse().unwrap();
+        // a zombie still answers signal 0; a reaped process is gone
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "pid {pid} was not reaped");
+        for (k, v) in vars.iter().zip(old) {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
     fn after_a_failed_request_libraries_packages_and_compiler_errors_are_read_again() {
         let mut reads = Reads { libs: Some((PathBuf::from("/p"), LibraryCode::default())), ..Default::default() };
         reads.kotlins.insert("2.2.20".into(), Ok(Kotlin::default()));
@@ -1270,16 +1448,26 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
             assets: vec![d.join("assets").to_string_lossy().into_owned()],
             ..Default::default()
         };
-        let k = || cache_key(&["/p/A.kt", "text"], &rt, "worker v1", "renderer v1");
-        let first = k();
-        assert_eq!(first, k(), "nothing changed");
-        assert_ne!(first, cache_key(&["/p/A.kt", "text"], &rt, "worker v2", "renderer v1"));
-        assert_ne!(first, cache_key(&["/p/A.kt", "text"], &rt, "worker v1", "renderer v2"));
+        let mut walks = Walks::default();
+        let mut k = |w: &str, r: &str| cache_key(&["/p/A.kt", "text"], &rt, w, r, &mut walks);
+        let first = k("worker v1", "renderer v1");
+        assert_eq!(first, k("worker v1", "renderer v1"), "nothing changed");
+        assert_ne!(first, k("worker v2", "renderer v1"));
+        assert_ne!(first, k("worker v1", "renderer v2"));
         std::fs::write(d.join("res/values/strings.xml"), "<a>b</a>").unwrap();
-        let second = k();
-        assert_ne!(first, second, "an edited string");
+        let second = k("worker v1", "renderer v1");
+        assert_ne!(first, second, "an edited string (its folder's time stays)");
         std::fs::write(d.join("assets/font.ttf"), "f").unwrap();
-        assert_ne!(second, k(), "a new asset");
+        let third = k("worker v1", "renderer v1");
+        assert_ne!(second, third, "a new asset");
+        std::fs::create_dir_all(d.join("res/drawable")).unwrap();
+        std::fs::write(d.join("res/drawable/a.xml"), "<v/>").unwrap();
+        assert_ne!(third, k("worker v1", "renderer v1"), "a new folder with a file");
+        // unchanged folders are not read again: res, res/values, res/drawable, assets read once
+        let before = walks.reads;
+        let again = cache_key(&["/p/A.kt", "text"], &rt, "worker v1", "renderer v1", &mut walks);
+        assert_eq!(walks.reads, before, "a cache hit reads no folder");
+        assert_eq!(again, cache_key(&["/p/A.kt", "text"], &rt, "worker v1", "renderer v1", &mut Walks::default()), "the same key as a full walk");
         let _ = std::fs::remove_dir_all(d);
     }
 
