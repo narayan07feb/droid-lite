@@ -8,4 +8,5 @@ mkdir -p vscode/bin
 cp target/release/droid-lite vscode/bin/droid-lite
 cd vscode
 DROID_LITE_ENGINE=bin/droid-lite node test/run.js
+node test/plugins.js
 npx --yes @vscode/vsce@3.6.2 package --target "$target" --allow-missing-repository

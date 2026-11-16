@@ -1,8 +1,8 @@
 {
   "name": "droid-lite",
   "displayName": "Droid Lite",
-  "description": "Android tools for VS Code and Cursor: Compose previews without Gradle, implementation links, Compose stability, device screenshot, screen recording and logcat.",
-  "version": "0.3.2",
+  "description": "Android tools for VS Code and Cursor: test tools in the Test Explorer, Compose previews without Gradle, implementation links, Compose stability, device screenshot, screen recording and logcat.",
+  "version": "0.4.0",
   "publisher": "forgebyte",
   "license": "MIT",
   "repository": {
@@ -60,6 +60,19 @@
       {
         "command": "droidLite.menu",
         "title": "Droid Lite: Tools…"
+      },
+      {
+        "command": "droidLite.addTestPlugin",
+        "title": "Droid Lite: Add Test Plugin…",
+        "icon": "$(add)"
+      },
+      {
+        "command": "droidLite.removeTestPlugin",
+        "title": "Droid Lite: Remove Test Plugin"
+      },
+      {
+        "command": "droidLite.testAction",
+        "title": "Droid Lite: Run Test Plugin Action"
       }
     ],
     "configuration": {
@@ -97,6 +110,10 @@
         {
           "id": "droidLite.tools",
           "name": "Tools"
+        },
+        {
+          "id": "droidLite.testPlugins",
+          "name": "Test plugins"
         }
       ]
     },
@@ -128,6 +145,21 @@
           "command": "droidLite.logcat",
           "when": "view == droidLite.tools",
           "group": "navigation"
+        },
+        {
+          "command": "droidLite.addTestPlugin",
+          "when": "view == droidLite.testPlugins",
+          "group": "navigation"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "droidLite.removeTestPlugin",
+          "when": "false"
+        },
+        {
+          "command": "droidLite.testAction",
+          "when": "false"
         }
       ]
     }

@@ -47,6 +47,12 @@ What it adds:
   (stable, unstable, runtime, unknown), the reasons on hover.
 - **Device tools**: screenshot, screen recording and logcat. The status bar button shows the
   connected phone and opens every tool; the Droid Lite icon in the left bar lists them in groups.
+- **Test tools** (the same plugins as the app's Tests tab, [docs/PLUGINS.md](docs/PLUGINS.md)) in
+  VS Code's Test Explorer: cases as a tree, ▶ in the gutter on a case's file, pass/fail, Stop, the
+  run's log. The Droid Lite sidebar shows each plugin's live state, views, actions and links.
+  Plugins in `~/.config/droid-lite/plugins/` and `<project>/.droid-lite/plugins/` show in both the
+  app and VS Code; **Add test plugin…** in the sidebar links a tool's folder there. Run all with
+  nothing picked never starts every device test: pick a case or group.
 - **Pull requests**: it brings GitHub Pull Requests with it ("Created by me", "Waiting for my
   review", side by side diffs).
 

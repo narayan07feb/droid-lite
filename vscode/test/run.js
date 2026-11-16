@@ -200,7 +200,7 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   const props = pkg.contributes.configuration.properties;
   check('enginePath is a machine setting', props['droidLite.enginePath'].scope === 'machine');
   check('logcatMaxLines setting', props['droidLite.logcatMaxLines'].default === 20000);
-  check('version 0.3.2', pkg.version === '0.3.2');
+  check('version 0.4.0', pkg.version === '0.4.0');
 
   // the rest runs on the fake engine
   cfg.enginePath = fakeEngine;

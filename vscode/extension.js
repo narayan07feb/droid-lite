@@ -285,6 +285,8 @@ function activate(ctx) {
   const remove = (p) => { if (source(p) || !path.extname(p)) send(p, 'remove'); };
   paintStability(ctx, vscode.window.activeTextEditor);
   preview.setup(ctx, project, events);
+  // test tools in Droid Lite's plugin format (docs/PLUGINS.md), in the Test Explorer
+  if (vscode.tests) require('./tests').setup(ctx, root());
   const watcher = vscode.workspace.createFileSystemWatcher('**/*.{kt,kts,java}', false, false, true);
   const deletes = vscode.workspace.createFileSystemWatcher('**/*', true, true, false);
 
