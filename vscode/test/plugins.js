@@ -109,7 +109,7 @@ const fake = {
       const items = new Map();
       const coll = () => {
         const m = new Map();
-        return { add: (i) => m.set(i.id, i), replace: (l) => { m.clear(); l.forEach((i) => m.set(i.id, i)); }, forEach: (f) => m.forEach((v) => f(v)), get: (id) => m.get(id), get size() { return m.size; } };
+        return { add: (i) => m.set(i.id, i), delete: (id) => m.delete(id), replace: (l) => { m.clear(); l.forEach((i) => m.set(i.id, i)); }, forEach: (f) => m.forEach((v) => f(v)), get: (id) => m.get(id), get size() { return m.size; } };
       };
       ctrl = {
         items: coll(),
@@ -589,6 +589,40 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   await allowGate();
   check('Allow replaces a v1 store with v2', readStore().version === 2 && !(gateId in readStore())
     && okOf(readStore(), project3, gateDir) === hashOf(gateDir) && !gateNeedsOk());
+  // the OK is checked again before every command (list, run, watch, views, actions), as in the app:
+  // a file of the folder changed after the load runs nothing, and the plugin asks for the OK again
+  const changedMsg = 'Gate changed since you allowed it; allow it again';
+  const gatePlugin = async () => (await tree.getChildren()).find((r) => r.label === 'Gate' && r.plugin)?.plugin;
+  const refusedBy = {
+    list: async (p) => { try { await tests.json(tests.argv(p.spec.list, p, project3), p, project3); } catch (e) { return e.message; } },
+    run: async () => (await go([ctrl.items.get(`plugin:${gateId}`).children.get(`${gateId}\u0000g`)])).find((e) => e[0] === 'errored')?.[2],
+    watch: async () => { visibility({ visible: false }); visibility({ visible: true }); await sleep(300); return ctrl.items.get(`needs-ok:${gateId}`)?.error; },
+    view: async (p) => {
+      const row = (await tree.getChildren()).find((r) => r.plugin === p);
+      const v = (await tree.getChildren(row)).find((i) => i.label === 'V');
+      return (await tree.getChildren(v))[0]?.label;
+    },
+    action: async (p) => {
+      commands['droidLite.testAction'](p, p.spec.actions[0]);
+      await sleep(100);
+      return output.find((l) => l.includes(changedMsg));
+    },
+  };
+  for (const [k, refuse] of Object.entries(refusedBy)) {
+    if (gateNeedsOk()) await allowGate();
+    await sleep(400); // the list and watch the load started end
+    fs.rmSync(marks, { force: true });
+    output.length = 0;
+    const p = await gatePlugin();
+    fs.writeFileSync(path.join(gateDir, 'lib', 'helper.sh'), `echo ${k}\n`);
+    const said = await refuse(p);
+    await sleep(300);
+    check(`${k}: a file changed since the OK runs nothing and asks for the OK again`, !fs.existsSync(marks)
+      && String(said).includes(changedMsg) && gateNeedsOk() && ctrl.items.get(`needs-ok:${gateId}`).error.startsWith(changedMsg)
+      && !(await tree.getChildren()).some((r) => r.label === 'Gate' && r.plugin));
+  }
+  await allowGate();
+  check('allowing it again runs it', !gateNeedsOk() && okOf(readStore(), project3, gateDir) === hashOf(gateDir));
   // an OK is for one project: the same folder's OK under another project's key allows nothing
   const projectB = path.join(tmp, 'projectB');
   const bDir = path.join(projectB, '.droid-lite', 'plugins', 'gate');
@@ -622,6 +656,12 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   fs.symlinkSync(path.join(project3, '.droid-lite'), path.join(projectL, '.droid-lite'));
   check('a project whose .droid-lite links outside is refused', tests.readPlugins(projectL)
     .filter((x) => x.folder.startsWith(real(project3))).every((x) => /links outside the project$/.test(x.error)));
+  const projectM = path.join(tmp, 'projectM');
+  fs.mkdirSync(path.join(projectM, '.droid-lite'), { recursive: true });
+  fs.symlinkSync(path.join(project3, '.droid-lite', 'plugins'), path.join(projectM, '.droid-lite', 'plugins'));
+  const linkedPlugins = tests.readPlugins(projectM).filter((x) => x.folder.startsWith(real(project3)));
+  check('a project whose .droid-lite/plugins links outside is refused', linkedPlugins.length > 1
+    && linkedPlugins.every((x) => /links outside the project$/.test(x.error)));
   // a link inside the folder, more than 2000 files or 8 MiB: too risky or too big to check
   const projectT = path.join(tmp, 'projectT');
   const tPlugin = (n, files) => {
@@ -663,7 +703,8 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
     check('keys use the on-disk case', c?.needsOk && c.project === real(caseDir) && c.project.endsWith('/CaseProj')
       && c.folder === path.join(real(caseDir), '.droid-lite', 'plugins', 'Cased'));
   } else console.log('skip: the disk is case-sensitive');
-  // writes take <store>.lock: an Allow waits while another process holds it, then keeps its entry
+  // writes take <store>.lock, a file the app creates the same way (create_new): an Allow waits while
+  // another process (the app) holds it, then keeps its entry
   const lock = `${store}.lock`;
   const P = real(project3);
   const before = readStore();
@@ -682,6 +723,13 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   const staleT0 = Date.now();
   await tests.approve(P, '/x/c', 'hc');
   check('a stale lock is removed', Date.now() - staleT0 < 2000 && readStore().approved[P]['/x/c'] === 'hc' && !fs.existsSync(lock));
+  // a lock that is never removed: it gives up after about 5 s and leaves the other's lock alone
+  fs.writeFileSync(lock, '');
+  const giveUpT0 = Date.now();
+  const gaveUp = await tests.approve(P, '/x/z', 'hz').then(() => '', (e) => e.message);
+  check('a held lock gives up after about 5 s', /is held by another Droid Lite; try again$/.test(gaveUp)
+    && Date.now() - giveUpT0 >= 5000 && Date.now() - giveUpT0 < 7000 && fs.existsSync(lock) && !readStore().approved[P]['/x/z']);
+  fs.unlinkSync(lock);
   // two Allows at once in one process, and two processes allowing 20 folders each: every entry kept
   await Promise.all([tests.approve(P, '/x/d', 'hd'), tests.approve('/y', '/y/.droid-lite/plugins/e', 'he')]);
   check('two interleaved Allows keep both', readStore().approved[P]['/x/d'] === 'hd' && readStore().approved['/y']['/y/.droid-lite/plugins/e'] === 'he');
@@ -711,6 +759,10 @@ const t = require(process.argv[2]);
   await allowGate();
   check('and Allow writes there', okOf(readStore(path.join(cfg, 'approved-plugins.json')), project3, gateDir) === hashOf(gateDir)
     && fs.readFileSync(store, 'utf8') === homeStore && !gateNeedsOk());
+  // an empty one counts as unset (as in the app): ~/.config/droid-lite
+  process.env.DROID_LITE_CONFIG_DIR = '';
+  await api3.load();
+  check('an empty DROID_LITE_CONFIG_DIR counts as unset', roots().some((i) => i.label === 'Dup') && !roots().some((i) => i.label === 'Mine'));
   delete process.env.DROID_LITE_CONFIG_DIR;
   ctx3.subscriptions.forEach((d) => d.dispose?.());
   await until('no tracked process', () => tests.procs.size === 0, 8000).catch(() => {});

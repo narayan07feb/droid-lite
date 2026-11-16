@@ -3001,6 +3001,59 @@ fn e2e_a_project_plugin_runs_nothing_until_allowed_and_asks_again_after_a_change
 }
 
 #[test]
+fn e2e_a_project_plugin_changed_after_the_ok_runs_nothing_and_asks_again() {
+    let f = Fixture::new("plugin-recheck");
+    let dir = f.path(".droid-lite/plugins/shared");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.json"),
+        r#"{"name":"Shared","list":["sh","{plugin}/list.sh"],"run":["sh","{plugin}/run.sh","{id}"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("list.sh"),
+        "echo '[{\"id\":\"a\",\"label\":\"Case A\"}]'\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("run.sh"), "touch \"$DROID_LITE_PROJECT/ran\"\n").unwrap();
+    let mut h = f.harness();
+    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE))
+        .click();
+    steps(&mut h, 3);
+    h.get_by_label("Allow").click();
+    wait(&mut h, "cases listed", |a| {
+        a.tests.plugins[0].cases.len() == 1
+    });
+    // allowed and loaded; then a file of the folder changes (no reload)
+    std::fs::write(dir.join("run.sh"), "touch \"$DROID_LITE_PROJECT/pwned\"\n").unwrap();
+    click_in_row(&mut h, "Case A", ic::PLAY);
+    steps(&mut h, 3);
+    let why = "Shared changed since you allowed it; allow it again";
+    assert_eq!(h.state().status, why);
+    assert!(h.state().tests.plugins[0].run.is_none(), "nothing runs");
+    assert!(!h.state().tests.plugins[0].m.allowed);
+    // in the tab (and the status bar)
+    assert!(h.get_all_by_label(why).count() >= 2);
+    h.get_by_label_contains("Needs your OK: runs ");
+    for _ in 0..20 {
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!f.path("pwned").exists() && !f.path("ran").exists());
+    // Allow covers the folder as it is now: the case runs again
+    h.get_by_label("Allow").click();
+    wait(&mut h, "listed again", |a| {
+        a.tests.plugins[0].m.allowed && a.tests.plugins[0].loading.is_none()
+    });
+    steps(&mut h, 3);
+    click_in_row(&mut h, "Case A", ic::PLAY);
+    wait(&mut h, "run", |a| {
+        a.tests.plugins[0].run.is_none() && a.tests.plugins[0].status.contains_key("a")
+    });
+    assert!(f.path("pwned").exists());
+}
+
+#[test]
 fn e2e_plugin_tests_tab_runs_cases_from_list_gutter_views_and_actions() {
     let f = Fixture::new("plugins");
     std::fs::create_dir_all(f.path("flows")).unwrap();

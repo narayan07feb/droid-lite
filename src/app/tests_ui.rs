@@ -256,11 +256,25 @@ impl App {
     fn list_cases(&mut self, i: usize, ctx: &egui::Context) {
         let root = self.project.as_ref().map(|p| p.root.clone());
         let p = &mut self.tests.plugins[i];
-        if let Some(list) = &p.m.list
-            && let Ok(cmd) = p.m.command(list, root.as_deref(), "")
-        {
-            p.loading = Some(fetch(cmd, ctx));
+        let Some(list) = p.m.list.clone() else {
+            return;
+        };
+        let allowed = p.m.allowed;
+        match p.m.command(&list, root.as_deref(), "") {
+            Ok(cmd) => p.loading = Some(fetch(cmd, ctx)),
+            // a not allowed plugin just waits for the OK; an allowed one changed meanwhile
+            Err(e) if allowed => self.refused(i, e),
+            Err(_) => {}
         }
+    }
+
+    /// A command of plugin `i` was refused because its folder changed since the OK: it shows
+    /// Needs your OK again, with why.
+    fn refused(&mut self, i: usize, why: String) {
+        if let Some(p) = self.tests.plugins.get_mut(i) {
+            p.error = Some(why.clone());
+        }
+        self.status = why;
     }
 
     /// The user's OK for project plugin `i` as it was read: kept in the approvals file, then its
@@ -276,6 +290,7 @@ impl App {
         match plugins::approve(&store, &p.m) {
             Ok(()) => {
                 p.m.allowed = true;
+                p.error = None;
                 self.status = format!("Allowed the plugin {}", p.m.name);
                 self.list_cases(i, ctx);
             }
@@ -286,8 +301,10 @@ impl App {
     fn load_view(&mut self, i: usize, v: usize, ctx: &egui::Context) {
         let root = self.project.as_ref().map(|p| p.root.clone());
         let p = &mut self.tests.plugins[i];
-        match p.m.command(&p.m.views[v].argv, root.as_deref(), "") {
+        let (argv, allowed) = (p.m.views[v].argv.clone(), p.m.allowed);
+        match p.m.command(&argv, root.as_deref(), "") {
             Ok(cmd) => p.rows_rx = Some(fetch(cmd, ctx)),
+            Err(e) if allowed => self.refused(i, e),
             Err(e) => p.rows_error = Some(e),
         }
     }
@@ -314,8 +331,15 @@ impl App {
                 None => return,
             },
         };
+        let allowed = p.m.allowed;
         let cmd = match p.m.command(&argv, root.as_deref(), id) {
             Ok(c) => c,
+            Err(e) if allowed => {
+                self.refused(i, e);
+                self.tests.active = i;
+                self.bottom = Bottom::Tests;
+                return;
+            }
             Err(e) => {
                 self.status = e;
                 return;
@@ -444,14 +468,20 @@ impl App {
     pub(super) fn keep_watch(&mut self, ctx: &egui::Context) {
         let root = self.project.as_ref().map(|p| p.root.clone());
         let shown = self.bottom == Bottom::Tests;
+        let mut refused = None;
         for (i, p) in self.tests.plugins.iter_mut().enumerate() {
             let want = shown && i == self.tests.active;
             match (&p.watch, &p.m.watch) {
-                (None, Some(w)) if want => {
-                    p.watch =
-                        p.m.command(w, root.as_deref(), "")
-                            .ok()
-                            .and_then(|c| Run::spawn(c, ctx.clone()).ok());
+                // not allowed (or refused once): nothing to start, no check each frame
+                (None, Some(w)) if want && p.m.allowed => {
+                    let w = w.clone();
+                    p.watch = match p.m.command(&w, root.as_deref(), "") {
+                        Ok(c) => Run::spawn(c, ctx.clone()).ok(),
+                        Err(e) => {
+                            refused = Some((i, e));
+                            None
+                        }
+                    };
                 }
                 (Some(_), _) if !want => {
                     if let Some(mut w) = p.watch.take() {
@@ -461,6 +491,9 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        if let Some((i, e)) = refused {
+            self.refused(i, e);
         }
     }
 
@@ -584,6 +617,9 @@ impl App {
         ui.separator();
         // a project plugin the user has not allowed: what it would run, and nothing else
         if !self.tests.plugins[active].m.allowed {
+            if let Some(e) = &self.tests.plugins[active].error {
+                ui.colored_label(crate::highlight::ERROR, e);
+            }
             ui.label(RichText::new(self.tests.plugins[active].m.approval_text()).strong());
             ui.label("It comes with the project's files. Allow it only if you trust what it runs; a change to any file in its folder asks again.");
             if ui.button("Allow").clicked() {

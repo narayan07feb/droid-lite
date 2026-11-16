@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 /// A command (argv) with a name, for an action or a view.
 #[derive(Clone, Debug, PartialEq)]
@@ -191,9 +192,10 @@ impl Manifest {
 
     /// The command for `argv`, with `{plugin}`, `{project}` and `{id}` filled in, run in `dir`.
     /// Its stdin is empty: a plugin must never wait for typed input. An error for a project plugin
-    /// the user has not allowed ([`Manifest::allowed`]): nothing of it runs.
+    /// the user has not allowed ([`Manifest::allowed`]): nothing of it runs. A project plugin's
+    /// folder is checked again first (`unchanged`).
     pub fn command(
-        &self,
+        &mut self,
         argv: &[String],
         project: Option<&Path>,
         id: &str,
@@ -201,6 +203,7 @@ impl Manifest {
         if !self.allowed {
             return Err(format!("{} needs your OK first (Tests tab)", self.name));
         }
+        self.unchanged()?;
         let project = project.map(|p| p.display().to_string()).unwrap_or_default();
         let fill = |s: &str| {
             s.replace("{plugin}", &self.folder.display().to_string())
@@ -216,6 +219,32 @@ impl Manifest {
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
         Ok(cmd)
+    }
+
+    /// A project plugin's folder as it is on disk now must be the one the user allowed: read
+    /// again (the same checks as when it was found) and hashed. When it is not, it is no longer
+    /// allowed and is replaced by what its folder holds now (so the OK shows the new commands),
+    /// and the error says to allow it again. The user's own plugins pass.
+    fn unchanged(&mut self) -> Result<(), String> {
+        let Some(t) = &self.trust else {
+            return Ok(());
+        };
+        let root = Path::new(&t.project);
+        let now = root
+            .join(".droid-lite/plugins")
+            .canonicalize()
+            .map_err(|e| e.to_string())
+            .and_then(|plugins| project_plugin(&self.folder, root, &plugins));
+        if now.as_ref().is_ok_and(|m| m.trust.as_ref() == Some(t)) {
+            return Ok(());
+        }
+        let why = format!("{} changed since you allowed it; allow it again", self.name);
+        self.allowed = false;
+        match now {
+            Ok(m) => *self = m,
+            Err(e) => return Err(format!("{why} ({e})")),
+        }
+        Err(why)
     }
 }
 
@@ -332,10 +361,60 @@ pub fn is_approved(store: &Path, m: &Manifest) -> bool {
     is_v2(&v) && v["approved"][&t.project][&t.folder].as_str() == Some(t.hash.as_str())
 }
 
-/// Allows a project plugin as it was read ([`Manifest::trust`]), every other entry kept. Under a
-/// lock on `<store>.lock`, so two windows (or the VS Code extension) allowing at once keep both;
-/// written through a 0600 temp file and a rename. A file that is not a JSON object is never
-/// overwritten; one of another shape (the older flat map) is replaced.
+/// How long [`approve`] waits for the lock, and the age at which a lock counts as left by a
+/// process that died (as in the VS Code extension).
+const LOCK_WAIT: Duration = Duration::from_secs(5);
+const LOCK_STALE: Duration = Duration::from_secs(30);
+
+/// `<store>.lock`, held until dropped (then removed).
+struct Lock(PathBuf);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Takes the lock file `path` the way the VS Code extension does: created only when it does not
+/// exist yet, else tried again with a growing pause for up to [`LOCK_WAIT`]. A lock older than
+/// [`LOCK_STALE`] is removed first.
+fn lock(path: PathBuf) -> Result<Lock, String> {
+    let end = Instant::now() + LOCK_WAIT;
+    let mut wait = Duration::from_millis(10);
+    loop {
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+        match o.open(&path) {
+            Ok(_) => return Ok(Lock(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+        match std::fs::metadata(&path).and_then(|m| m.modified()) {
+            Ok(t) if t.elapsed().is_ok_and(|age| age > LOCK_STALE) => {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            Err(_) => continue, // gone meanwhile: try again at once
+            Ok(_) => {}
+        }
+        if Instant::now() > end {
+            return Err(format!(
+                "{} is held by another Droid Lite; try again",
+                path.display()
+            ));
+        }
+        std::thread::sleep(wait);
+        wait = (wait * 2).min(Duration::from_millis(250));
+    }
+}
+
+/// Allows a project plugin as it was read ([`Manifest::trust`]), every other entry kept. Under
+/// the lock file `<store>.lock` ([`lock`]), shared with the VS Code extension, so two windows (or
+/// the extension) allowing at once keep both; written through a 0600 temp file and a rename. A
+/// file that is not a JSON object is never overwritten; one of another shape (the older flat map)
+/// is replaced.
 pub fn approve(store: &Path, m: &Manifest) -> Result<(), String> {
     let t = m
         .trust
@@ -348,13 +427,7 @@ pub fn approve(store: &Path, m: &Manifest) -> Result<(), String> {
         .to_string_lossy();
     let err = |e: std::io::Error| format!("{}: {e}", store.display());
     std::fs::create_dir_all(dir).map_err(err)?;
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join(format!("{name}.lock")))
-        .map_err(err)?;
-    lock.lock().map_err(err)?;
+    let _lock = lock(dir.join(format!("{name}.lock")))?;
     let mut v = match read_store(store)? {
         Some(v) if is_v2(&v) => v,
         _ => serde_json::json!({"version": 2, "approved": {}}),
@@ -444,11 +517,13 @@ fn tree_hash(files: &[(String, Vec<u8>)]) -> String {
 }
 
 /// A project plugin in `folder` (under `<project>/.droid-lite/plugins`), read from the same bytes
-/// it is hashed from. Refused when its real folder is not inside the project's real plugins
-/// folder, or when [`tree`] refuses it.
+/// it is hashed from. `project` and `plugins` are real paths. Refused when the real plugins folder
+/// is not inside the real project (a linked `.droid-lite` or `.droid-lite/plugins`), when its real
+/// folder is not inside the real plugins folder, or when [`tree`] refuses it.
 fn project_plugin(folder: &Path, project: &Path, plugins: &Path) -> Result<Manifest, String> {
     let real = folder.canonicalize().map_err(|e| e.to_string())?;
-    if real == plugins || !real.starts_with(plugins) {
+    let inside = |dir: &Path, p: &Path| p != dir && p.starts_with(dir);
+    if !inside(project, plugins) || !inside(plugins, &real) {
         return Err(format!("links outside the project ({})", real.display()));
     }
     let files = tree(&real)?;
@@ -729,20 +804,18 @@ mod tests {
         assert_eq!(m.views[0].name, "Failures");
         assert_eq!(m.links, vec![("Live".into(), "http://127.0.0.1:1".into())]);
         assert!(m.watch.is_none());
+        let (run, list) = (m.run.clone().unwrap(), m.list.clone().unwrap());
+        let mut m = m;
         assert!(
-            m.command(m.run.as_ref().unwrap(), None, "").is_err(),
+            m.command(&run, None, "").is_err(),
             "not allowed: nothing runs"
         );
-        let m = Manifest { allowed: true, ..m };
-        let cmd = m
-            .command(m.run.as_ref().unwrap(), Some(Path::new("/proj")), "a b")
-            .unwrap();
+        m.allowed = true;
+        let cmd = m.command(&run, Some(Path::new("/proj")), "a b").unwrap();
         let args: Vec<_> = cmd.get_args().collect();
         assert_eq!(args, ["a b"], "the id is one argument, never split");
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/p/demo")));
-        let list = m
-            .command(m.list.as_ref().unwrap(), Some(Path::new("/proj")), "")
-            .unwrap();
+        let list = m.command(&list, Some(Path::new("/proj")), "").unwrap();
         assert_eq!(list.get_args().collect::<Vec<_>>(), ["/proj"]);
         assert!(Manifest::parse(r#"{"list":["x"]}"#, Path::new("/p")).is_err());
         assert!(Manifest::parse("not json", Path::new("/p")).is_err());
@@ -878,7 +951,9 @@ mod tests {
         assert!(mine.trust.is_none());
         assert!(!sh.allowed, "a project plugin waits for the user's OK");
         assert!(
-            sh.command(sh.list.as_ref().unwrap(), None, "").is_err(),
+            sh.clone()
+                .command(sh.list.as_ref().unwrap(), None, "")
+                .is_err(),
             "and runs nothing meanwhile"
         );
         assert_eq!(
@@ -925,16 +1000,12 @@ mod tests {
         left.sort();
         assert_eq!(
             left,
-            [
-                "approved-plugins.json",
-                "approved-plugins.json.lock",
-                "plugins"
-            ],
-            "no temp file left"
+            ["approved-plugins.json", "plugins"],
+            "no temp or lock file left"
         );
-        let sh = found(Some(&store)).remove(1);
+        let mut sh = found(Some(&store)).remove(1);
         assert!(sh.allowed);
-        assert!(sh.command(sh.list.as_ref().unwrap(), None, "").is_ok());
+        assert!(sh.command(&sh.list.clone().unwrap(), None, "").is_ok());
         assert!(!found(None)[1].allowed, "no approvals file: not allowed");
         // a changed script in the folder needs the OK again, and so does a new file
         std::fs::write(shared.join("bin/go.sh"), "rm -rf ~\n").unwrap();
@@ -1020,30 +1091,190 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    #[test]
+    fn an_ok_for_one_project_is_not_an_ok_for_another() {
+        let d = temp("per-project");
+        let a = d.join("a/.droid-lite/plugins/p");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("plugin.json"), r#"{"name":"P"}"#).unwrap();
+        let store = approvals_file(&d.join("config"));
+        let pa = project_plugins(&d.join("a"), Some(&store)).remove(0);
+        let t = pa.trust.clone().unwrap();
+        // the same folder and hash under another project's key
+        std::fs::create_dir_all(d.join("config")).unwrap();
+        let other = serde_json::json!({"version": 2, "approved": {"/other": {&t.folder: &t.hash}}});
+        std::fs::write(&store, other.to_string()).unwrap();
+        assert!(!project_plugins(&d.join("a"), Some(&store))[0].allowed);
+        approve(&store, &pa).unwrap();
+        assert!(project_plugins(&d.join("a"), Some(&store))[0].allowed);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The VS Code extension refuses these too: the real plugins folder must be inside the real
+    /// project, or one OK would cover another project's files.
     #[cfg(unix)]
     #[test]
-    fn an_ok_for_one_project_is_not_an_ok_for_another_with_the_same_plugin_folder() {
-        let d = temp("per-project");
-        let a = d.join("a");
-        std::fs::create_dir_all(a.join(".droid-lite/plugins/p")).unwrap();
-        std::fs::write(
-            a.join(".droid-lite/plugins/p/plugin.json"),
-            r#"{"name":"P"}"#,
+    fn a_project_whose_droid_lite_or_plugins_folder_links_outside_it_is_refused() {
+        let d = temp("linked-root");
+        let a = d.join("a/.droid-lite/plugins/p");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("plugin.json"), r#"{"name":"P","list":["x"]}"#).unwrap();
+        let store = approvals_file(&d.join("config"));
+        // b's .droid-lite is a's; c's .droid-lite/plugins is a's
+        std::fs::create_dir_all(d.join("b")).unwrap();
+        std::os::unix::fs::symlink(d.join("a/.droid-lite"), d.join("b/.droid-lite")).unwrap();
+        std::fs::create_dir_all(d.join("c/.droid-lite")).unwrap();
+        std::os::unix::fs::symlink(
+            d.join("a/.droid-lite/plugins"),
+            d.join("c/.droid-lite/plugins"),
         )
         .unwrap();
-        // project b's .droid-lite is project a's: the same real plugin folder
-        std::fs::create_dir_all(d.join("b")).unwrap();
-        std::os::unix::fs::symlink(a.join(".droid-lite"), d.join("b/.droid-lite")).unwrap();
-        let store = approvals_file(&d.join("config"));
-        let pa = project_plugins(&a, Some(&store)).remove(0);
-        approve(&store, &pa).unwrap();
-        assert!(project_plugins(&a, Some(&store))[0].allowed);
-        let pb = project_plugins(&d.join("b"), Some(&store)).remove(0);
-        assert_eq!(
-            pb.trust.as_ref().unwrap().folder,
-            pa.trust.as_ref().unwrap().folder
+        for p in ["b", "c"] {
+            let mut found = discover_all(&[], Some(&d.join(p)), Some(&store));
+            assert_eq!(found.len(), 1, "{p}: {found:?}");
+            let e = found.remove(0).unwrap_err();
+            assert!(
+                e.contains("p/plugin.json: links outside the project ("),
+                "{p}: {e}"
+            );
+        }
+        // a .droid-lite linked to a folder inside the project is fine
+        std::fs::create_dir_all(d.join("e/config")).unwrap();
+        std::fs::rename(d.join("a/.droid-lite"), d.join("e/config/dl")).unwrap();
+        std::os::unix::fs::symlink(d.join("e/config/dl"), d.join("e/.droid-lite")).unwrap();
+        assert!(
+            project_plugins(&d.join("e"), Some(&store))[0]
+                .trust
+                .is_some()
         );
-        assert!(!pb.allowed, "allowed for a, not for b");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn every_command_checks_the_folder_again_and_a_change_asks_for_the_ok_again() {
+        let d = temp("recheck");
+        let dir = d.join("proj/.droid-lite/plugins/p");
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = r#"{"name":"P","list":["./list.sh"],"run":["./run.sh","{id}"],"watch":["./w.sh"],
+            "views":[{"name":"V","run":["./v.sh"]}],"actions":[{"name":"A","run":["./a.sh"]}]}"#;
+        std::fs::write(dir.join("plugin.json"), json).unwrap();
+        std::fs::write(dir.join("list.sh"), "echo []\n").unwrap();
+        let store = approvals_file(&d.join("config"));
+        let found = || project_plugins(&d.join("proj"), Some(&store)).remove(0);
+        approve(&store, &found()).unwrap();
+        let loaded = found();
+        assert!(loaded.allowed);
+        let argvs: Vec<Vec<String>> = loaded
+            .commands()
+            .into_iter()
+            .map(<[String]>::to_vec)
+            .collect();
+        assert_eq!(argvs.len(), 5, "list, run, watch, view, action");
+        for argv in &argvs {
+            let mut m = loaded.clone();
+            assert!(
+                m.command(argv, None, "").is_ok(),
+                "unchanged: {argv:?} runs"
+            );
+        }
+        // any file of the folder changes after the load: no command runs
+        std::fs::write(dir.join("list.sh"), "rm -rf ~\n").unwrap();
+        let mut m = loaded.clone();
+        for argv in &argvs {
+            m = loaded.clone();
+            let e = m.command(argv, None, "").unwrap_err();
+            assert_eq!(
+                e, "P changed since you allowed it; allow it again",
+                "{argv:?}"
+            );
+            assert!(!m.allowed, "Needs your OK again");
+            assert_ne!(m.trust, loaded.trust);
+            assert_eq!(
+                m.trust,
+                found().trust,
+                "read again: the folder as it is now"
+            );
+        }
+        // allowing what it read now runs it again
+        approve(&store, &m).unwrap();
+        m.allowed = true;
+        assert!(m.command(&argvs[0], None, "").is_ok());
+        // a folder that can no longer be checked is refused with its reason
+        let mut m = found();
+        m.allowed = true;
+        std::fs::write(dir.join("big"), vec![0u8; TREE_MAX_BYTES as usize]).unwrap();
+        let e = m.command(&argvs[0], None, "").unwrap_err();
+        assert!(
+            e.starts_with("P changed since you allowed it; allow it again (too big"),
+            "{e}"
+        );
+        assert!(!m.allowed);
+        // the user's own plugins are not checked
+        let mut own = Manifest::parse(json, &d.join("nowhere")).unwrap();
+        own.allowed = true;
+        assert!(own.command(&argvs[0], None, "").is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The lock is a file created only when it does not exist, the same as in the VS Code
+    /// extension, so a lock either one holds makes the other wait.
+    #[test]
+    fn an_ok_waits_for_the_lock_file_the_extension_holds_and_a_stale_one_is_removed() {
+        let d = temp("lockfile");
+        let store = approvals_file(&d.join("config"));
+        let lock = d.join("config/approved-plugins.json.lock");
+        std::fs::create_dir_all(d.join("config")).unwrap();
+        let m = |folder: &str| Manifest {
+            name: "P".into(),
+            trust: Some(Trust {
+                project: "/proj".into(),
+                folder: folder.into(),
+                hash: "ab".into(),
+            }),
+            ..Default::default()
+        };
+        // held by the extension (it creates the file with 'wx')
+        std::fs::write(&lock, "").unwrap();
+        let (a, s) = (m("/proj/a"), store.clone());
+        let t0 = Instant::now();
+        let waiting = std::thread::spawn(move || approve(&s, &a));
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!waiting.is_finished(), "waits while the lock is held");
+        assert!(!store.exists());
+        // the holder writes, then removes its lock
+        std::fs::write(
+            &store,
+            r#"{"version":2,"approved":{"/proj":{"/proj/b":"cd"}}}"#,
+        )
+        .unwrap();
+        std::fs::remove_file(&lock).unwrap();
+        waiting.join().unwrap().unwrap();
+        assert!(t0.elapsed() < LOCK_WAIT);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
+        assert_eq!(v["approved"]["/proj"]["/proj/a"], "ab");
+        assert_eq!(
+            v["approved"]["/proj"]["/proj/b"], "cd",
+            "the holder's write is kept"
+        );
+        assert!(!lock.exists(), "removed after the rename");
+        // a lock older than 30 s was left by a process that died
+        let f = std::fs::File::create(&lock).unwrap();
+        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+        let t0 = Instant::now();
+        approve(&store, &m("/proj/c")).unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(2));
+        assert!(!lock.exists());
+        // a fresh lock that is never removed: it gives up after about 5 s
+        std::fs::write(&lock, "").unwrap();
+        let e = approve(&store, &m("/proj/d")).unwrap_err();
+        assert!(
+            e.ends_with("is held by another Droid Lite; try again"),
+            "{e}"
+        );
+        assert!(lock.exists(), "another's lock is left alone");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
+        assert!(v["approved"]["/proj"].get("/proj/d").is_none());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1117,6 +1348,21 @@ mod tests {
         assert_eq!(
             tree_hash(&files),
             "785f791d17fa1ef53828f417bb59ba3da0d7e7e426a16e1839df07d75c88577f"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+        // and the extension's own vector
+        let d = temp("vector-js");
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(
+            d.join("plugin.json"),
+            r#"{"name":"V","list":["sh","list.sh"]}"#,
+        )
+        .unwrap();
+        std::fs::write(d.join("list.sh"), "echo []\n").unwrap();
+        std::fs::write(d.join("sub/a.txt"), "a").unwrap();
+        assert_eq!(
+            tree_hash(&tree(&d).unwrap()),
+            "85cf4b35bd11fc3ed3e9c64b0ad55846b230a2bd35e7fbf70122b98e1b8f3a5a"
         );
         let _ = std::fs::remove_dir_all(&d);
     }

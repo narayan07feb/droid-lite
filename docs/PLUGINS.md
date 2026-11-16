@@ -36,20 +36,31 @@ it would run; **Allow** runs it from then on.
   even when both reach the same plugin folder.
 - **The OK is for the whole plugin folder.** A change to any file in it (`plugin.json`, a script,
   a new or deleted file) asks again.
+- **The OK is checked before every command.** Droid Lite reads the folder again right before each
+  command the plugin runs (`list`, `run`, `watch`, a view, an action). When it changed since you
+  allowed it, nothing runs: you see "changed since you allowed it; allow it again" and the plugin
+  shows **Needs your OK** again.
 - **Not for code outside the folder.** Allowing trusts this plugin's folder. Its commands may also
   run project code outside it (for example a script in the repo, or `dir` pointing elsewhere);
   changes to that code do not ask again.
 
 Some project plugins are refused (shown as an error in the tab, never runnable, never approvable):
 
-- its folder links outside the project's `.droid-lite/plugins` folder ("links outside the project");
+- its folder links outside the project's `.droid-lite/plugins` folder, or the project's
+  `.droid-lite` or `.droid-lite/plugins` folder links outside the project ("links outside the
+  project");
 - a link (symlink) anywhere inside its folder ("contains links");
 - more than 2000 files or 8 MiB in its folder ("too big to check").
 
 Plugins you add yourself (`~/.config/droid-lite/plugins/`, **Add plugin…**) need no OK.
 
-The OKs are kept in `approved-plugins.json` in the config folder (`$DROID_LITE_CONFIG_DIR`, else
-`~/.config/droid-lite`), shared by the app and the VS Code extension:
+**For authors of project plugins:** every file in the plugin folder is part of the OK. Keep the
+plugin's own state, cache and log files outside its folder (for example under the project's build
+folder, or `~/Library/Caches/<your tool>`). A plugin that writes into its own folder changes it, so
+it is refused at its next command and asked about again on every load.
+
+The OKs are kept in `approved-plugins.json` in the config folder (`$DROID_LITE_CONFIG_DIR` when it
+is set and not empty, else `~/.config/droid-lite`), shared by the app and the VS Code extension:
 
 ```json
 {"version": 2, "approved": {"<project real path>": {"<plugin folder real path>": "<folder hash>"}}}
@@ -61,6 +72,10 @@ compared as UTF-8 bytes); for each file: its path, one zero byte, its length as 
 then its bytes. A file of any other shape (the older flat map too) holds no OKs, so you are asked
 again, and the first **Allow** replaces it. A file that is not a JSON object is never overwritten:
 fix or delete it. Delete an entry to be asked again.
+
+A write takes the lock file `approved-plugins.json.lock` next to it: created only when it does not
+exist, tried again for about 5 s, and removed after the write. A lock file older than 30 s was left
+by a process that stopped, and is removed.
 
 ## plugin.json
 

@@ -4,8 +4,8 @@
 // lists (`views`), buttons (`actions`), `links` and the live state (`watch`) go in the Droid Lite
 // sidebar. A project plugin runs nothing until the user allows it once for that project (shared
 // with the app: <config>/approved-plugins.json, see `approve`); any change to a file in its folder
-// asks again. The user's own plugins need no OK. <config> is $DROID_LITE_CONFIG_DIR, else
-// ~/.config/droid-lite.
+// asks again, checked before every command it runs. The user's own plugins need no OK. <config> is
+// $DROID_LITE_CONFIG_DIR (when set and not empty, as in the app), else ~/.config/droid-lite.
 const vscode = require('vscode');
 const cp = require('child_process');
 const crypto = require('crypto');
@@ -132,6 +132,15 @@ function inspect(project, folder) {
   if (!inside(realpath(project), plugins) || !inside(plugins, real)) throw new Error('links outside the project');
   return { real, ...treeHash(real) };
 }
+
+// why a loaded project plugin may not run now: its folder (read again, the same checks) is not the
+// one allowed at load, as in the app; undefined when it is, and for the user's own plugins
+function changed(plugin) {
+  if (!plugin.hash) return undefined;
+  let why = '';
+  try { if (inspect(plugin.project, plugin.folder).hash === plugin.hash) return undefined; } catch (e) { why = ` (${e.message})`; }
+  return `${plugin.name} changed since you allowed it; allow it again${why}`;
+}
 const MAX_LOG = 20000; // lines kept per run in the test output
 const MAX_LOG_CHARS = 8 << 20; // and characters (about 8 MB) in all
 const MAX_LINE = 64 << 10; // longest line kept (chars); the rest of a longer one is dropped
@@ -196,13 +205,15 @@ function readPlugins(project) {
         let bytes;
         let ok = own;
         let key;
+        let hash;
         if (own) bytes = fs.readFileSync(file);
         else {
           key = realpath(project);
           const seen = inspect(project, folder);
           bytes = seen.manifest;
           if (!bytes) throw new Error('not a file');
-          ok = approved[key]?.[real] === seen.hash;
+          hash = seen.hash;
+          ok = approved[key]?.[real] === hash;
         }
         const spec = JSON.parse(bytes.toString('utf8'));
         const bad = problem(spec);
@@ -212,7 +223,8 @@ function readPlugins(project) {
           continue;
         }
         const dir = spec.dir ? spec.dir.replace(/^~\//, `${os.homedir()}/`) : '.';
-        out.push({ name: spec.name, folder: real, cwd: path.resolve(real, dir), spec });
+        // a project plugin keeps what it was allowed under: spawn checks it before every command
+        out.push({ name: spec.name, folder: real, cwd: path.resolve(real, dir), spec, ...(hash && { project: key, hash }) });
       } catch (e) {
         out.push({ error: `${file}: ${e.message}`, folder: real });
       }
@@ -229,16 +241,23 @@ function argv(cmd, plugin, project, id = '') {
 
 // runs a command in its own process group (Stop reaches the tools it started), stdin empty.
 // `onEnd(code, error)` runs once: after the exit plus a short grace for the last output (a tool
-// it left running may hold the pipes), or when it could not start.
+// it left running may hold the pipes), or when it could not start. A project plugin whose folder
+// changed since it was allowed (`changed`) starts nothing: it fails like a missing command and
+// `plugin.revoke` marks it Needs your OK.
 function spawn(cmd, plugin, project, onEnd = () => {}) {
   const [bin, ...args] = Array.isArray(cmd) ? cmd.map(String) : [];
   let proc;
   try {
+    const why = changed(plugin);
+    if (why) {
+      plugin.revoke?.(why);
+      throw new Error(why);
+    }
     proc = cp.spawn(bin, args, {
       cwd: plugin.cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, DROID_LITE_PROJECT: project || '' },
     });
-  } catch (err) { // no command at all: fails like a missing one
+  } catch (err) { // no command at all (or refused): fails like a missing one
     proc = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough() });
     proc.stdout.end();
     proc.stderr.end();
@@ -352,6 +371,25 @@ function setup(ctx, projectOf) {
     }
   };
 
+  // a project plugin not allowed: right-click > Allow… (package.json: testing/item/context)
+  const needsOkItem = (p) => {
+    const root = ctrl.createTestItem(`needs-ok:${p.folder}`, p.name || path.basename(p.folder));
+    root.description = 'Needs your OK';
+    root.error = `${p.why ? `${p.why}. ` : ''}Needs your OK: this project plugin runs nothing until you allow it (right-click > Allow…, or Allow… under Test plugins in the Droid Lite sidebar). ${TRUST} ${p.folder}`;
+    return root;
+  };
+  // a loaded project plugin whose folder changed since the OK (found by spawn): Needs your OK again
+  const revoke = (p, why) => {
+    if (p.needsOk || !plugins.includes(p)) return;
+    Object.assign(p, { needsOk: true, file: path.join(p.folder, 'plugin.json'), why });
+    delete p.spec;
+    live.delete(p.folder);
+    pluginRows.delete(p.folder);
+    ctrl.items.delete(`plugin:${p.folder}`);
+    ctrl.items.add(needsOkItem(p));
+    sidebar.fire();
+  };
+
   // loads may overlap (a refresh while a slow list runs): only the newest one writes its results
   let loads = 0;
   async function load() {
@@ -359,15 +397,13 @@ function setup(ctx, projectOf) {
     const stale = () => mine !== loads;
     project = projectOf();
     plugins = readPlugins(project);
+    for (const p of plugins) if (p.hash) p.revoke = (why) => revoke(p, why);
     meta.clear();
     ctrl.items.replace([]);
     await Promise.all(plugins.map(async (p) => {
       const label = p.name || path.basename(p.folder);
-      if (p.needsOk) { // right-click > Allow… (package.json: testing/item/context)
-        const root = ctrl.createTestItem(`needs-ok:${p.folder}`, label);
-        root.description = 'Needs your OK';
-        root.error = `Needs your OK: this project plugin runs nothing until you allow it (right-click > Allow…, or Allow… under Test plugins in the Droid Lite sidebar). ${TRUST} ${p.folder}`;
-        ctrl.items.add(root);
+      if (p.needsOk) {
+        ctrl.items.add(needsOkItem(p));
         return;
       }
       const root = ctrl.createTestItem(`plugin:${p.folder}`, label);
@@ -394,7 +430,7 @@ function setup(ctx, projectOf) {
   function runOne(run, item, token) {
     const { plugin: p, caseId } = meta.get(item.id) || {};
     return new Promise((resolve) => {
-      if (!p?.spec.run || !caseId) { run.skipped(item); return resolve(); }
+      if (!p?.spec?.run || !caseId) { run.skipped(item); return resolve(); }
       try { start(resolve); } catch (e) { run.errored(item, new vscode.TestMessage(e.message)); resolve(); }
     });
     function start(resolve) {
@@ -513,7 +549,7 @@ function setup(ctx, projectOf) {
           const g = new vscode.TreeItem(p.name, vscode.TreeItemCollapsibleState.Expanded);
           g.iconPath = new vscode.ThemeIcon('shield');
           g.description = 'Needs your OK';
-          g.tooltip = `${p.folder}\nThis project plugin runs nothing until you allow it. ${TRUST}`;
+          g.tooltip = `${p.why ? `${p.why}\n` : ''}${p.folder}\nThis project plugin runs nothing until you allow it. ${TRUST}`;
           g.pending = p;
           return g;
         }));
@@ -528,6 +564,7 @@ function setup(ctx, projectOf) {
         return rows;
       }
       if (node.pending) return [item('Allow…', 'unlock', 'droidLite.allowTestPlugin', [node.pending])];
+      if (node.plugin && !node.plugin.spec) return []; // asks for the OK again
       if (node.plugin && !node.view) {
         const p = node.plugin;
         const out = [];
@@ -685,4 +722,4 @@ function setup(ctx, projectOf) {
   return { load, readPlugins, loaded };
 }
 
-module.exports = { setup, readPlugins, argv, findPluginJson, location, limits, procs, treeHash, approve };
+module.exports = { setup, readPlugins, argv, json, findPluginJson, location, limits, procs, treeHash, approve };

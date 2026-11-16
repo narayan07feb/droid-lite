@@ -4603,22 +4603,29 @@ fn config_file() -> Option<PathBuf> {
     setting_file("last-project")
 }
 
-/// `~/.config/droid-lite` (or `$DROID_LITE_CONFIG_DIR`). Tests never touch the user's folder:
-/// without the variable they get no config folder at all.
 /// Serialises tests that change process-wide state (environment, theme) with the e2e tests.
 #[cfg(test)]
 pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     e2e::SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// `~/.config/droid-lite` (or `$DROID_LITE_CONFIG_DIR`). Tests never touch the user's folder:
+/// without the variable they get no config folder at all.
 fn config_dir() -> Option<PathBuf> {
-    if let Some(d) = std::env::var_os("DROID_LITE_CONFIG_DIR") {
-        return Some(PathBuf::from(d));
+    let home = if cfg!(test) { None } else { std::env::var_os("HOME") };
+    config_dir_of(std::env::var_os("DROID_LITE_CONFIG_DIR"), home)
+}
+
+/// `$DROID_LITE_CONFIG_DIR` (`var`) when it is set and not empty, as the VS Code extension reads
+/// it, else `<home>/.config/droid-lite`.
+fn config_dir_of(
+    var: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    match var {
+        Some(d) if !d.is_empty() => Some(PathBuf::from(d)),
+        _ => home.map(|h| PathBuf::from(h).join(".config/droid-lite")),
     }
-    if cfg!(test) {
-        return None;
-    }
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/droid-lite"))
 }
 
 fn setting_file(name: &str) -> Option<PathBuf> {
@@ -4678,6 +4685,25 @@ fn with_recent(mut list: Vec<PathBuf>, root: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_config_dir_variable_counts_as_unset() {
+        let home = Some("/h".into());
+        assert_eq!(
+            config_dir_of(Some("".into()), home.clone()),
+            Some(PathBuf::from("/h/.config/droid-lite")),
+            "as the VS Code extension reads it"
+        );
+        assert_eq!(
+            config_dir_of(None, home.clone()),
+            Some(PathBuf::from("/h/.config/droid-lite"))
+        );
+        assert_eq!(
+            config_dir_of(Some("/c".into()), home),
+            Some(PathBuf::from("/c"))
+        );
+        assert_eq!(config_dir_of(Some("".into()), None), None);
+    }
 
     #[test]
     fn scope_heads_follow_indentation_and_skip_closers_and_annotations() {
