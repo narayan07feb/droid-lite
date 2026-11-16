@@ -178,20 +178,26 @@ pub fn dir() -> PathBuf {
     )
 }
 
-/// The base pack: what every preview needs.
-///   runtime/*.jar     the renderer (Paparazzi and what it needs)
-///   compose/*.jar     Compose and AndroidX for a project that has none in the Gradle cache
-///   compile/*.jar     what such a project's file compiles against
-///   android.jar, compose-plugin.jar, layoutlib/runtime, layoutlib/resources
+/// The worker's folder: its source (PreviewWorker.java) and layoutlib's unpacked runtime and resources
+/// (`layoutlib/`). The renderer's jars are found or downloaded at every worker start
+/// ([`crate::preview_base`]): Gradle's cache, else `m2/` next to it. Optional, from older packs:
+///   compose/*.jar, compile/*.jar  Compose for a project that has none in the Gradle cache
+///   compose-plugin.jar            the Compose compiler plugin when the project's Kotlin has none there
 pub fn base_dir() -> PathBuf {
     dir().join("base")
 }
 
-pub fn base_ready(base: &Path) -> bool {
-    ["runtime", "compose", "compile", "android.jar", "layoutlib/runtime", "layoutlib/resources", "compose-plugin.jar"]
-        .iter()
-        .all(|p| base.join(p).exists())
+/// Jars in `base/<sub>`, sorted (an older pack names android.jar zz-android.jar so it comes last).
+fn base_jars(sub: &str) -> Vec<String> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(base_dir().join(sub))
+        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "jar")).collect())
+        .unwrap_or_default();
+    v.sort();
+    v.iter().map(|p| p.to_string_lossy().into_owned()).collect()
 }
+
+const NO_COMPOSE: &str = "This project's Compose libraries are not in the Gradle cache (~/.gradle/caches) yet. \
+Build the project once with Gradle (any task that compiles it), then open the preview again.";
 
 /// Why previews must wait now ("" = go): mac-guard says memory is critical, or the disk is under 8 GB.
 pub fn room() -> String {
@@ -282,6 +288,10 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
         };
         let version = kotlin_version(r.project.as_ref().map(|p| p.root.as_path()));
         let stand_in = std::env::var_os("DROID_LITE_PREVIEW_WORKER").is_some(); // tests: no compiler needed
+        if cp.is_empty() && !stand_in && base_jars("compose").is_empty() {
+            send(Event::Failed { file: r.file.clone(), error: NO_COMPOSE.into() });
+            continue;
+        }
         let kt = match kotlins.entry(version.clone()).or_insert_with(|| {
             if stand_in { Ok(Kotlin { version: version.clone(), ..Default::default() }) } else { kotlin(&version) }
         }) {
@@ -314,15 +324,19 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
         // the worker may have ended (idle exit, a crash) or never started: start it and connect by
         // itself, up to 3 tries with a short back-off, then the error goes on the card
         let mut last_error = String::new();
+        let mut base = None;
         for attempt in 0..3u32 {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_millis(500 << attempt));
             }
             if conn.is_none() {
-                match connect_or_start(&send, &kt, &rt) {
+                match connect_or_start(&send, &kt, &rt, &mut base) {
                     Ok(c) => conn = Some(c),
                     Err(e) => {
                         last_error = e;
+                        if base.is_none() && !stand_in {
+                            break; // the renderer's files are missing: the card says which, no retry
+                        }
                         continue;
                     }
                 }
@@ -352,6 +366,7 @@ fn connect_or_start(
     send: &dyn Fn(Event),
     kt: &Kotlin,
     rt: &ProjectRuntime,
+    base: &mut Option<crate::preview_base::Base>,
 ) -> Result<(UnixStream, BufReader<UnixStream>), String> {
     // one socket per worker source and Kotlin version: after an update, or for a project on another
     // Kotlin, a new worker starts; an old one exits when idle
@@ -361,13 +376,15 @@ fn connect_or_start(
         let rd = BufReader::new(s.try_clone().map_err(|e| e.to_string())?);
         return Ok((s, rd));
     }
-    let base = base_dir();
-    if std::env::var_os("DROID_LITE_PREVIEW_WORKER").is_none() && !base_ready(&base) {
-        return Err("The preview pack is not downloaded yet.".into());
+    // the renderer's files, checked at every worker start: one that went away is found again or
+    // downloaded; never a start with a partial set
+    if base.is_none() && std::env::var_os("DROID_LITE_PREVIEW_WORKER").is_none() {
+        let status = |t: String, n| send(Event::Status(t, n));
+        *base = Some(crate::preview_base::ensure(&base_dir(), &dir().join("m2"), &status)?);
     }
     send(Event::Status("Starting the preview worker".into(), None));
     stop_other_workers(&sock);
-    let mut child = start_worker(&base, &sock, kt, rt)?;
+    let mut child = start_worker(&sock, kt, rt, base.as_ref())?;
     let _ = std::fs::write(dir().join("worker.pid"), format!("{} {}", child.id(), sock.display()));
     let until = Instant::now() + Duration::from_secs(60);
     while Instant::now() < until {
@@ -422,8 +439,14 @@ fn stop_other_workers(keep: &Path) {
 
 /// Starts the worker detached (its own process group, output to worker.log), so it outlives nothing
 /// it should not and a restart of Droid Lite finds it still warm.
-fn start_worker(base: &Path, sock: &Path, kt: &Kotlin, rt: &ProjectRuntime) -> Result<std::process::Child, String> {
+fn start_worker(
+    sock: &Path,
+    kt: &Kotlin,
+    rt: &ProjectRuntime,
+    renderer: Option<&crate::preview_base::Base>,
+) -> Result<std::process::Child, String> {
     let d = dir();
+    let base = base_dir();
     std::fs::create_dir_all(d.join("work")).map_err(|e| e.to_string())?;
     let log = std::fs::File::create(d.join("worker.log")).map_err(|e| e.to_string())?;
     let mut cmd = match std::env::var("DROID_LITE_PREVIEW_WORKER") {
@@ -435,24 +458,29 @@ fn start_worker(base: &Path, sock: &Path, kt: &Kotlin, rt: &ProjectRuntime) -> R
             cmd
         }
         Err(_) => {
+            let r = renderer.ok_or("The preview renderer's files were not checked.")?;
+            std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
             let src = base.join("PreviewWorker.java");
             if std::fs::read_to_string(&src).ok().as_deref() != Some(WORKER_SOURCE) {
                 std::fs::write(&src, WORKER_SOURCE).map_err(|e| e.to_string())?;
             }
-            let jars = |sub: &str| {
-                let mut v: Vec<PathBuf> = std::fs::read_dir(base.join(sub))
-                    .map(|rd| rd.flatten().map(|e| e.path()).collect())
-                    .unwrap_or_default();
-                v.sort(); // android.jar is named zz-android.jar so it comes last, after layoutlib
-                v.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join(":")
-            };
             let paths = |v: &[PathBuf]| v.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join(":");
             let compose = kt.compose_plugin.clone().unwrap_or_else(|| base.join("compose-plugin.jar"));
+            if !compose.is_file() {
+                return Err(format!(
+                    "The Compose compiler plugin for Kotlin {} is not in the Gradle cache yet (kotlin-compose-compiler-plugin-embeddable). \
+                     Build the project once with Gradle, then open the preview again.",
+                    kt.version
+                ));
+            }
             let plugins: Vec<PathBuf> = std::iter::once(compose)
                 .chain(kt.parcelize_plugin.clone())
                 .chain(kt.serialization_plugin.clone())
                 .collect();
-            let mut compile = jars("compile");
+            // what the open file compiles against besides the project's libraries: android.jar, or an
+            // older pack's compile/ folder (its Compose, android.jar last) for a project with none
+            let android = r.android_jar.to_string_lossy().into_owned();
+            let mut compile = if rt.jars.is_empty() { base_jars("compile").join(":") } else { android.clone() };
             if !kt.runtime.is_empty() {
                 compile = format!("{compile}:{}", paths(&kt.runtime));
             }
@@ -463,8 +491,8 @@ fn start_worker(base: &Path, sock: &Path, kt: &Kotlin, rt: &ProjectRuntime) -> R
                 .arg("-Dapple.awt.UIElement=true")
                 .arg("-Xmx2g")
                 .arg("-XX:+UseSerialGC")
-                .arg(format!("-Dpaparazzi.layoutlib.runtime.root={}", base.join("layoutlib/runtime").display()))
-                .arg(format!("-Dpaparazzi.layoutlib.resources.root={}", base.join("layoutlib/resources").display()))
+                .arg(format!("-Dpaparazzi.layoutlib.runtime.root={}", r.layoutlib_runtime.display()))
+                .arg(format!("-Dpaparazzi.layoutlib.resources.root={}", r.layoutlib_resources.display()))
                 .arg(format!("-Ddroidlite.plugins={}", paths(&plugins)))
                 .arg(format!("-Ddroidlite.compile.cp={compile}"))
                 .arg(format!("-Ddroidlite.assets={}", rt.assets.join(":")))
@@ -473,13 +501,12 @@ fn start_worker(base: &Path, sock: &Path, kt: &Kotlin, rt: &ProjectRuntime) -> R
                 .arg(format!("-Ddroidlite.aar.dirs={}", rt.exploded.join(":")))
                 .arg("-cp")
                 // the project's Kotlin compiler (and its stdlib) first, then the renderer, then the
-                // project's libraries (or the base pack's Compose), android.jar last (after layoutlib)
+                // project's libraries (or an older pack's Compose), android.jar last (after layoutlib)
                 .arg(format!(
-                    "{}:{}:{}:{}",
+                    "{}:{}:{}:{android}",
                     paths(&kt.compiler),
-                    jars("runtime"),
-                    if rt.jars.is_empty() { jars("compose") } else { rt.jars.join(":") },
-                    base.join("android.jar").display()
+                    paths(&r.runtime),
+                    if rt.jars.is_empty() { base_jars("compose").join(":") } else { rt.jars.join(":") },
                 ))
                 .arg(&src);
             cmd
