@@ -2,28 +2,53 @@
   "name": "droid-lite",
   "displayName": "Droid Lite",
   "description": "Android tools for VS Code and Cursor: implementation links, Compose stability, device screenshot, screen recording and logcat.",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "publisher": "forgebyte",
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/narayan07feb/droid-lite" },
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["Programming Languages", "Other"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/narayan07feb/droid-lite"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
   "main": "./extension.js",
   "activationEvents": [
-    "workspaceContains:**/settings.gradle",
-    "workspaceContains:**/settings.gradle.kts",
-    "onLanguage:kotlin",
-    "onLanguage:java"
+    "onStartupFinished"
   ],
-  "extensionPack": ["GitHub.vscode-pull-request-github"],
+  "extensionPack": [
+    "GitHub.vscode-pull-request-github"
+  ],
   "contributes": {
     "commands": [
-      { "command": "droidLite.screenshot", "title": "Droid Lite: Device Screenshot" },
-      { "command": "droidLite.recordStart", "title": "Droid Lite: Start Screen Recording" },
-      { "command": "droidLite.recordStop", "title": "Droid Lite: Stop Screen Recording" },
-      { "command": "droidLite.logcat", "title": "Droid Lite: Show Logcat" },
-      { "command": "droidLite.logcatStop", "title": "Droid Lite: Stop Logcat" },
-      { "command": "droidLite.reindex", "title": "Droid Lite: Index the Project Again" }
+      {
+        "command": "droidLite.screenshot",
+        "title": "Droid Lite: Device Screenshot"
+      },
+      {
+        "command": "droidLite.recordStart",
+        "title": "Droid Lite: Start Screen Recording"
+      },
+      {
+        "command": "droidLite.recordStop",
+        "title": "Droid Lite: Stop Screen Recording"
+      },
+      {
+        "command": "droidLite.logcat",
+        "title": "Droid Lite: Show Logcat"
+      },
+      {
+        "command": "droidLite.logcatStop",
+        "title": "Droid Lite: Stop Logcat"
+      },
+      {
+        "command": "droidLite.reindex",
+        "title": "Droid Lite: Index the Project Again"
+      }
     ],
     "configuration": {
       "title": "Droid Lite",
@@ -39,6 +64,30 @@
           "description": "Logcat lines to show from before the stream starts."
         }
       }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "droidLite",
+          "title": "Droid Lite",
+          "icon": "media/droid.svg"
+        }
+      ]
+    },
+    "views": {
+      "droidLite": [
+        {
+          "id": "droidLite.tools",
+          "name": "Tools"
+        }
+      ]
     }
-  }
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Droid Lite runs its engine and adb on your Mac."
+    }
+  },
+  "icon": "media/icon.png"
 }

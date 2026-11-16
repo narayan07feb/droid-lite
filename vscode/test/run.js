@@ -17,6 +17,7 @@ fs.writeFileSync(path.join(src, 'Card.kt'),
 
 const commands = {};
 let provider;
+let tree;
 class Pos { constructor(l, c) { this.line = l; this.character = c; } }
 const fake = {
   EventEmitter: class { constructor() { this.event = () => {}; } fire() {} },
@@ -43,7 +44,10 @@ const fake = {
   window: {
     createStatusBarItem: () => ({ show() {}, hide() {}, dispose() {} }),
     createOutputChannel: () => ({ dispose() {} }),
+    registerTreeDataProvider: (id, p) => { tree = p; return { dispose() {} }; },
   },
+  TreeItem: class { constructor(label) { this.label = label; } },
+  ThemeIcon: class { constructor(id) { this.id = id; } },
   commands: { registerCommand: (n, f) => { commands[n] = f; return { dispose() {} }; } },
 };
 const load = Module._load;
@@ -72,7 +76,11 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   const [lens] = await provider.provideCodeLenses(doc('Api.kt'));
   assert.strictEqual(lens.command.command, 'droidLite.goTo');
   assert.strictEqual(lens.command.arguments[2][0].path, fs.realpathSync(path.join(src, 'RealApi.kt')));
+  // every tool in the sidebar runs a registered command
+  const items = tree.getChildren();
+  assert.strictEqual(items.length, 6);
+  for (const i of items) assert.ok(commands[i.command.command], i.command.command);
   for (const s of ctx.subscriptions) s.dispose?.();
   fs.rmSync(dir, { recursive: true, force: true });
-  console.log('ok: 6 checks');
+  console.log('ok: 8 checks');
 })().catch((e) => { console.error(e); process.exit(1); });

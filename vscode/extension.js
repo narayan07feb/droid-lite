@@ -146,6 +146,20 @@ function activate(ctx) {
   rec.tooltip = 'Stop the screen recording';
   rec.command = 'droidLite.recordStop';
   const out = vscode.window.createOutputChannel('Logcat', 'log');
+  // the Droid Lite icon in the activity bar: one click per tool
+  const tools = [
+    ['Device screenshot', 'droidLite.screenshot', 'device-camera'],
+    ['Start screen recording', 'droidLite.recordStart', 'record'],
+    ['Stop screen recording', 'droidLite.recordStop', 'debug-stop'],
+    ['Show logcat', 'droidLite.logcat', 'output'],
+    ['Stop logcat', 'droidLite.logcatStop', 'close'],
+    ['Index the project again', 'droidLite.reindex', 'refresh'],
+  ].map(([label, command, icon]) => {
+    const item = new vscode.TreeItem(label);
+    item.command = { command, title: label };
+    item.iconPath = new vscode.ThemeIcon(icon);
+    return item;
+  });
 
   // keep the index in step with unsaved edits and files changed outside the editor
   const timers = new Map();
@@ -161,6 +175,7 @@ function activate(ctx) {
   const watcher = vscode.workspace.createFileSystemWatcher('**/*.{kt,kts,java}');
 
   ctx.subscriptions.push(
+    vscode.window.registerTreeDataProvider('droidLite.tools', { getTreeItem: (i) => i, getChildren: () => tools }),
     vscode.languages.registerCodeLensProvider(sel, lenses(ctx)),
     vscode.workspace.onDidChangeTextDocument((e) => {
       if (/\.(kt|kts|java)$/.test(e.document.uri.fsPath)) update(e.document.uri.fsPath, e.document.getText());
