@@ -18,18 +18,24 @@ fs.writeFileSync(path.join(src, 'Card.kt'),
 process.env.DROID_LITE_PREVIEW_DIR = dir;
 
 // a fake engine: logs each request; never answers screenshot, previews or the methods listed in
-// silent.json; sends progress for previews (another file's first); ends with its stdin
+// silent.json; answers the methods in delay.json after that many ms each, one after another; adb with adb.json's path when it exists, record_stop with "no recording is running";
+// sends progress for previews (another file's first); ends with its stdin
 const log = path.join(dir, 'requests.log');
 const silent = path.join(dir, 'silent.json');
+const delayFile = path.join(dir, 'delay.json');
+const adbFile = path.join(dir, 'adb.json');
 const progressFile = path.join(dir, 'progress.json'); // previews: n progress lines, one each `every` ms
 const fakeEngine = path.join(dir, 'fake-engine');
 const fakeAdb = path.join(dir, 'fake-adb');
 fs.writeFileSync(fakeEngine, `#!/usr/bin/env node
 const fs = require('fs');
+let busy = Promise.resolve();
 require('readline').createInterface({ input: process.stdin }).on('line', (l) => {
   const { id, method, params } = JSON.parse(l);
   fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ pid: process.pid, method, params }) + '\\n');
-  const answers = { devices: [{ serial: 'S1', label: 'Fake (S1)', online: true }], adb: ${JSON.stringify(fakeAdb)}, lenses: [], stability: [] };
+  const read = (f, d) => (fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : d);
+  const answers = { devices: [{ serial: 'S1', label: 'Fake (S1)', online: true }], adb: read(${JSON.stringify(adbFile)}, ${JSON.stringify(fakeAdb)}), lenses: [], stability: [] };
+  const wait = read(${JSON.stringify(delayFile)}, {})[method];
   const quiet = fs.existsSync(${JSON.stringify(silent)}) ? JSON.parse(fs.readFileSync(${JSON.stringify(silent)}, 'utf8')) : [];
   const prog = method === 'previews' && fs.existsSync(${JSON.stringify(progressFile)})
     && JSON.parse(fs.readFileSync(${JSON.stringify(progressFile)}, 'utf8'));
@@ -43,7 +49,10 @@ require('readline').createInterface({ input: process.stdin }).on('line', (l) => 
     console.log(JSON.stringify({ event: 'preview_status', file: '/elsewhere/Other.kt', text: 'other file' }));
     console.log(JSON.stringify({ event: 'preview_status', file: fs.realpathSync(params.path), text: 'this file' }));
   }
-  if (method !== 'screenshot' && method !== 'previews' && !quiet.includes(method)) console.log(JSON.stringify({ id, result: answers[method] ?? null }));
+  const answer = method === 'record_stop' ? { id, error: 'no recording is running' } : { id, result: answers[method] ?? null };
+  if (method === 'screenshot' || method === 'previews' || quiet.includes(method)) return;
+  if (wait) busy = busy.then(() => new Promise((r) => setTimeout(r, wait))).then(() => console.log(JSON.stringify(answer)));
+  else console.log(JSON.stringify(answer));
 });
 `, { mode: 0o755 });
 // a fake adb: 1 MB on stderr (blocks unless it is read), then 25 lines on stdout in 5 writes
@@ -71,7 +80,10 @@ const emitters = [];
 const changed_fire = () => emitters.forEach((e) => e.fire());
 let provider;
 let tree;
-let status;
+let status; // the first status bar item: the phone
+const bars = []; // every status bar item
+const infos = [];
+let testPlugins; // what extension.js gave the test plugins (a stub of tests.js)
 const errors = [];
 const docChanges = [];
 const docCloses = [];
@@ -145,8 +157,15 @@ const fake = {
       return p;
     },
     showErrorMessage: (m) => { errors.push(m); },
+    showInformationMessage: (m) => { infos.push(m); return Promise.resolve(); },
+    withProgress: (o, f) => f(),
     createTextEditorDecorationType: (o) => ({ o, dispose() {} }),
-    createStatusBarItem: () => (status = { show() { this.shown = true; }, hide() {}, dispose() {} }),
+    createStatusBarItem: () => {
+      const b = { show() { this.shown = true; }, hide() { this.shown = false; }, dispose() {} };
+      bars.push(b);
+      status ??= b;
+      return b;
+    },
     createOutputChannel: () => ({
       clear() { output.length = 0; clears++; },
       append(d) { output.push(d); everything += d; },
@@ -161,10 +180,15 @@ const fake = {
   ThemeColor: class { constructor(id) { this.id = id; } },
   ThemeIcon: class { constructor(id) { this.id = id; } },
   commands: { registerCommand: (n, f) => { commands[n] = f; return { dispose() {} }; } },
+  tests: {},
 };
+const testsStub = { setup: (c, project) => (testPlugins = { project, loads: 0, load() { this.loads++; } }) };
 folders = [{ uri: { fsPath: dir } }];
 const load = Module._load;
-Module._load = function (req, ...rest) { return req === 'vscode' ? fake : load.call(this, req, ...rest); };
+Module._load = function (req, ...rest) {
+  if (req === './tests') return testsStub;
+  return req === 'vscode' ? fake : load.call(this, req, ...rest);
+};
 
 const ext = require('../extension.js');
 const preview = require('../preview.js');
@@ -231,7 +255,7 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   const props = pkg.contributes.configuration.properties;
   check('enginePath is a machine setting', props['droidLite.enginePath'].scope === 'machine');
   check('logcatMaxLines setting', props['droidLite.logcatMaxLines'].default === 20000);
-  check('version 0.4.2', pkg.version === '0.4.2');
+  check('version 0.4.3', pkg.version === '0.4.3');
 
   // the rest runs on the fake engine
   cfg.enginePath = fakeEngine;
@@ -246,6 +270,9 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   const api = path.join(src, 'Api.kt');
   files.ls.Change({ fsPath: path.join(dir, 'app/build/generated/source/Gen.kt') });
   files.ls.Change({ fsPath: path.join(dir, '.gradle/kotlin/X.kt') });
+  // the engine's skip list: node_modules and every hidden folder too
+  for (const f of ['node_modules/pkg/A.kt', 'app/.cxx/B.kt', 'app/src/.hidden/C.kt', '.idea/D.kt']) files.ls.Change({ fsPath: path.join(dir, f) });
+  for (const d of ['node_modules', 'app/.cxx']) all.ls.Create({ fsPath: path.join(dir, d) });
   files.ls.Create({ fsPath: path.join(src, 'New.kt') });
   // folders created, renamed or moved in (a dot in a folder name too); a new plain file is not sent
   for (const d of ['moved', 'com.example', '../../build/tmp']) fs.mkdirSync(path.join(src, d), { recursive: true });
@@ -287,6 +314,7 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
     sent.some(([m, p, t]) => m === 'update' && p.endsWith(f) && t === undefined)));
   check('a created plain file is not sent', !sent.some(([, p]) => p.endsWith('readme.txt')));
   check('build and .gradle paths are skipped', !sent.some(([, p]) => /(^|\/)(build|\.gradle)(\/|$)/.test(p)));
+  check('node_modules and hidden folders are skipped', !sent.some(([, p]) => /(^|\/)(node_modules|\.cxx|\.hidden|\.idea)(\/|$)/.test(p)));
   check('every deleted path sends remove (folders with a dot too)', ['demo/old', 'demo/old.dir', 'Gone.kt', 'notes.txt']
     .every((f) => sent.some(([m, p]) => m === 'remove' && p.endsWith(f))));
   check('no update with empty text', !sent.some(([m, , t]) => m === 'update' && t === ''));
@@ -327,10 +355,46 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   check('closing an unsaved tab still sends no text', closed.length === 1 && closed[0].params.text === undefined);
   fake.workspace.textDocuments = [];
 
+  // many index changes in a row (a branch switch): one repaint, not one per file
+  const stabilityCalls = () => requests().filter((r) => r.method === 'stability').length;
+  await sleep(300); // the last repaint of the steps above
+  const paints = stabilityCalls();
+  for (let i = 0; i < 20; i++) files.ls.Change({ fsPath: path.join(src, `Many${i}.kt`) });
+  await until('20 updates', () => requests().filter((r) => r.method === 'update' && /Many\d+\.kt$/.test(r.params.path)).length === 20);
+  await sleep(400);
+  check('index changes repaint once', stabilityCalls() - paints === 1);
+
+  // deletes: a removed folder takes the removes under it along (files first or the folder first)
+  const removes = (re) => requests().filter((r) => r.method === 'remove' && re.test(r.params.path)).length;
+  for (let i = 0; i < 200; i++) all.ls.Delete({ fsPath: path.join(src, 'gone', `F${i}.kt`) });
+  all.ls.Delete({ fsPath: path.join(src, 'gone') });
+  all.ls.Delete({ fsPath: path.join(src, 'gone2') });
+  for (let i = 0; i < 200; i++) all.ls.Delete({ fsPath: path.join(src, 'gone2', `F${i}.kt`) });
+  await sleep(700);
+  check('a removed folder takes the removes under it along', removes(/\/gone2?(\/|$)/) < 10
+    && removes(/\/gone$/) === 1 && removes(/\/gone2$/) === 1);
+  // a folder removed, then a file made in it again: the remove goes first
+  all.ls.Delete({ fsPath: path.join(src, 'again') });
+  await sleep(20);
+  files.ls.Create({ fsPath: path.join(src, 'again', 'A.kt') });
+  await sleep(700);
+  const again = requests().filter((r) => r.params?.path?.includes(`${path.sep}again`)).map((r) => r.method);
+  check('a remove and a later update of a file in that folder keep their order', again.join() === 'remove,update');
+  // many removes (no folder): they go one at a time, so a lens call does not wait behind all of them
+  fs.writeFileSync(delayFile, '{"remove":5}');
+  for (let i = 0; i < 200; i++) all.ls.Delete({ fsPath: path.join(src, `d${i}`, 'X.kt') });
+  await until('the first remove', () => removes(/\/d\d+\/X\.kt$/) > 0);
+  const lensDone = provider.provideCodeLenses(doc('Api.kt'));
+  await until('every remove', () => removes(/\/d\d+\/X\.kt$/) === 200, 10000);
+  await lensDone;
+  const order = requests().map((r) => r.method);
+  check('a lens call does not wait behind every remove', order.lastIndexOf('lenses') < order.lastIndexOf('remove'));
+  fs.rmSync(delayFile);
+
   // every engine call has a time limit: one never answered does not wait forever
   check('every engine method has a limit', ['initialize', 'ping', 'update', 'remove', 'lenses', 'stability',
     'implementations', 'previews', 'devices', 'adb', 'screenshot', 'record_start', 'record_stop']
-    .every((m) => ext.limits[m] > 0) && ext.limits.initialize === 60000 && ext.limits.update === 15000
+    .every((m) => ext.limits[m] > 0) && ext.limits.initialize === 600000 && ext.limits.update === 15000
     && ext.limits.lenses === 15000 && ext.limits.record_stop === 1080000);
   fs.writeFileSync(silent, '["lenses"]');
   ext.limits.lenses = 100;
@@ -404,6 +468,29 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   check('logcat is capped', clears > 1
     && shown.includes('[older lines cleared]') && kept.split('\n').length - 3 <= 10 && kept.includes('line 24'));
 
+  // an adb that cannot run: logcat shows the error and is off again
+  fs.writeFileSync(adbFile, JSON.stringify(path.join(dir, 'no-such-adb')));
+  errors.length = 0;
+  await commands['droidLite.logcat']();
+  await until('the logcat error', () => errors.length, 2000).catch(() => {});
+  fs.rmSync(adbFile);
+  const deviceTools = () => tree.getChildren(tree.getChildren().find((g) => g.label === 'Device')).map((i) => i.label);
+  check('a logcat that cannot run shows its error and is off', errors.some((m) => /logcat could not run: .*ENOENT/.test(m))
+    && deviceTools().includes('Show logcat'));
+
+  // a record_start that does not answer (it waits behind other device calls): Stop works
+  fs.writeFileSync(silent, '["record_start"]');
+  ext.limits.record_start = 100;
+  errors.length = 0;
+  await commands['droidLite.recordStart']();
+  check('a record_start time-out leaves Stop', errors.some((m) => /did not answer record_start.*Stop recording ends it/.test(m))
+    && status.command === 'droidLite.recordStop' && deviceTools().includes('Stop recording and save'));
+  await commands['droidLite.recordStop']();
+  check('Stop with no recording running resets the state', status.command === 'droidLite.menu'
+    && infos.some((m) => /no recording was running/.test(m)) && deviceTools().includes('Record screen'));
+  ext.limits.record_start = 60000;
+  fs.rmSync(silent);
+
   // a recording ends with its engine: the status bar shows the phone again
   await commands['droidLite.recordStart']();
   check('recording shows in the status bar', status.command === 'droidLite.recordStop');
@@ -453,6 +540,7 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
 
   // no folder: indexing fails and is not kept; a folder that appears is indexed
   cfg.enginePath = fakeEngine;
+  const testLoads = testPlugins.loads;
   folders = [];
   folderChanges.forEach((l) => l());
   errors.length = 0;
@@ -465,6 +553,29 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
     .catch(() => {});
   check('a folder that appears is indexed', requests().slice(known).some((r) => r.method === 'initialize'
     && r.params.root === dir));
+  check('folder changes load the test plugins again, for the new folder', testPlugins.loads === testLoads + 2
+    && typeof testPlugins.project === 'function' && testPlugins.project() === dir);
+
+  // a big project: one initialize while the engine works on it, however long; later calls wait for it
+  fs.writeFileSync(silent, '["initialize"]');
+  ext.limits.initialize = 200;
+  errors.length = 0;
+  const note = bars[1];
+  const reindexing = commands['droidLite.reindex']();
+  await sleep(50);
+  check('the status bar shows indexing', note.shown && /indexing/.test(note.text));
+  await reindexing;
+  check('a caller gives up after limits.initialize', errors.some((m) => /did not answer initialize in 0\.2 s/.test(m)));
+  await provider.provideCodeLenses(doc('Api.kt'));
+  await provider.provideCodeLenses(doc('Api.kt'));
+  const bigPid = requests().at(-1).pid;
+  const mine = requests().filter((r) => r.pid === bigPid).map((r) => r.method);
+  check('initialize is never sent again while it runs', mine.filter((m) => m === 'initialize').length === 1
+    && !mine.includes('lenses') && note.shown);
+  fs.rmSync(silent);
+  ext.limits.initialize = 600000;
+  await commands['droidLite.reindex']();
+  check('the indexing note goes when the index is ready', !note.shown);
 
   // a missing engine binary: calls fail, activation (device lookup) does not throw
   cfg.enginePath = path.join(dir, 'no-such-engine');

@@ -35,13 +35,14 @@ fs.writeFileSync(path.join(toolsDir, 'plugin.json'), JSON.stringify({
 fs.writeFileSync(path.join(toolsDir, 'tools.sh'), `#!/bin/sh
 case "$1" in
   list) echo '[{"id":"group","label":"two children"},{"id":"term","label":"ignores TERM"},{"id":"left","label":"leaves a child"},
-    {"id":"long","label":"one huge line"},{"id":"garbage","label":"garbage place","file":5,"line":"x"},{"id":"flood","label":"floods"}]' ;;
+    {"id":"long","label":"one huge line"},{"id":"garbage","label":"garbage place","file":5,"line":"x"},{"id":"flood","label":"floods"},{"id":"big","label":"12 MB"}]' ;;
   run) case "$3" in
     group) sleep 300 & echo $! >> "$2/pids"; sleep 300 & echo $! >> "$2/pids"; wait ;;
     term) trap '' TERM; echo $$ >> "$2/pids"; sleep 300 & echo $! >> "$2/pids"; wait ;;
     left) sleep 300 & echo $! >> "$2/left"; exit 0 ;;
     long) head -c 200000 /dev/zero | tr '\\0' x; echo; echo after ;;
     garbage) echo '{"case":"garbage","status":"failed","message":{"a":1},"file":["x"],"line":{}}'; exit 1 ;;
+    big) line=$(head -c 60000 /dev/zero | tr '\\0' x); i=0; while [ $i -lt 200 ]; do echo "$line"; i=$((i+1)); done; echo after ;;
     flood) seq 30000 | sed 's/.*/{"status":"passed","label":"step"}/'; seq 30000 | sed 's/.*/{"case":"flood","status":"failed","message":"m"}/'; exit 1 ;;
   esac ;;
   watch) echo $$ >> "$2/watch"; i=0; while :; do echo "{\\"title\\":\\"tick $i\\"}"; i=$((i+1)); sleep 0.2; done ;;
@@ -119,6 +120,8 @@ const until = async (what, ok, ms = 5000) => {
 const pidsIn = (f) => (fs.existsSync(f) ? fs.readFileSync(f, 'utf8').trim().split('\n').filter(Boolean).map(Number) : []);
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const pids = path.join(toolsDir, 'pids');
+// a plugin's id: its folder's real path
+const idOf = (n) => fs.realpathSync(path.join(project, '.droid-lite', 'plugins', n));
 let checks = 0;
 const check = (name, ok) => { assert.ok(ok, name); checks++; };
 
@@ -170,18 +173,19 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   assert.ok(tests.findPluginJson(path.join(project, '.droid-lite', 'plugins', 'example')));
 
   const ctx = { subscriptions: [] };
-  const api = tests.setup(ctx, project);
+  const api = tests.setup(ctx, () => project);
   await api.load();
-  const root = ctrl.items.get('plugin:Example tests');
-  assert.ok(root && !root.error, 'example plugin listed');
-  const login = root.children.get('Example tests\u0000Login');
-  const ok = login.children.get('Example tests\u0000ok');
-  const bad = login.children.get('Example tests\u0000bad');
+  const ex = idOf('example');
+  const root = ctrl.items.get(`plugin:${ex}`);
+  assert.ok(root && !root.error && root.label === 'Example tests', 'example plugin listed');
+  const login = root.children.get(`${ex}\u0000Login`);
+  const ok = login.children.get(`${ex}\u0000ok`);
+  const bad = login.children.get(`${ex}\u0000bad`);
   assert.strictEqual(ok.uri.fsPath, path.join(project, 'flows/login.yaml'), 'file relative to the project');
   assert.strictEqual(ok.range.start.line, 1, '1-based line 2 -> 0-based 1');
-  assert.ok(ctrl.items.get('plugin:broken').error, 'broken plugin shows its error');
+  assert.ok(ctrl.items.get(`plugin:${idOf('broken')}`).error, 'broken plugin shows its error');
   check('a plugin with a string run shows its error in the Test Explorer',
-    /badrun\/plugin\.json: run must be a list of strings$/.test(ctrl.items.get('plugin:badrun').error));
+    /badrun\/plugin\.json: run must be a list of strings$/.test(ctrl.items.get(`plugin:${idOf('badrun')}`).error));
   check('and in the sidebar', (await tree.getChildren()).some((r) => r.iconPath?.id === 'warning'
     && /badrun\/plugin\.json: run must be a list of strings$/.test(r.label)));
 
@@ -215,9 +219,13 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   assert.deepStrictEqual(ev, []);
   assert.ok(fake.info.includes('Pick a case'), fake.info);
   assert.ok(commands['droidLite.addTestPlugin'] && commands['droidLite.removeTestPlugin'] && commands['droidLite.testAction']);
+  // Remove with no user plugins folder at all: the plugin comes with the project
+  fake.info = '';
+  await commands['droidLite.removeTestPlugin']((await tree.getChildren()).find((r) => r.label === 'Example tests').plugin);
+  check('Remove without a user plugins folder says it comes with the project', /comes with the project/.test(fake.info));
 
-  const tools = ctrl.items.get('plugin:Tools');
-  const toolCase = (id) => tools.children.get(`Tools\u0000${id}`);
+  const tools = ctrl.items.get(`plugin:${idOf('tools')}`);
+  const toolCase = (id) => tools.children.get(`${idOf('tools')}\u0000${id}`);
   const quiet = (ev) => ev.filter((e) => e[0] !== 'out');
 
   // garbage file/line: no place, no throw
@@ -268,7 +276,7 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
     && outs.includes('after'));
 
   // a missing command: reported once (errored, not also failed), nothing throws
-  const missing = ctrl.items.get('plugin:Missing').children.get('Missing\u0000m');
+  const missing = ctrl.items.get(`plugin:${idOf('missing')}`).children.get(`${idOf('missing')}\u0000m`);
   ev = await go([missing]);
   check('a missing command is reported once', JSON.stringify(quiet(ev).slice(1, -1).map((e) => e[0])) === '["errored"]');
   const rowsOf = async () => tree.getChildren();
@@ -288,6 +296,11 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   const floodFailed = ev.filter((e) => e[0] === 'failed').length;
   check('status lines count toward the output limit', floodOut <= 20001 && ev.some((e) => e[0] === 'out' && /more than 20000 lines/.test(e[1])));
   check('past the limit a case ends once', floodFailed === 1 && ev.at(-1)[0] === 'end');
+  // a run's output is capped at 8 MB too (200 lines of 60 000 characters)
+  ev = await go([toolCase('big')]);
+  const bigOut = ev.filter((e) => e[0] === 'out').map((e) => e[1]);
+  check('a run shows at most 8 MB of output', bigOut.join('').length <= 8 << 20 && !bigOut.includes('after')
+    && bigOut.some((l) => /more than 20000 lines or 8 MB/.test(l)) && bigOut.length > 100);
   const missingPlugin = (await rowsOf()).find((r) => r.label === 'Missing').plugin;
   commands['droidLite.testAction'](missingPlugin, missingPlugin.spec.actions[0]);
   await until('the missing action', () => output.some((l) => /Gone could not start/.test(l)), 2000).catch(() => {});
@@ -393,6 +406,53 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   check('dispose ends every plugin process', leftOver.length === 7 && !leftOver.some(alive));
   await until('no tracked process', () => tests.procs.size === 0, 2000).catch(() => {});
   check('no tracked process left', tests.procs.size === 0);
+
+  // the project is read on each load (a folder opened later); a user and a project plugin may share
+  // a name: test items, live state, views and actions stay apart
+  const project2 = path.join(tmp, 'project2');
+  const dup = (folder) => {
+    fs.mkdirSync(folder, { recursive: true });
+    const say = (what) => ['sh', '-c', `echo "${what}"`, '{plugin}'];
+    fs.writeFileSync(path.join(folder, 'plugin.json'), JSON.stringify({
+      name: 'Dup', list: say('[{\\"id\\":\\"c\\",\\"label\\":\\"$0\\"}]'),
+      watch: ['sh', '-c', 'echo "{\\"title\\":\\"$0\\"}"; sleep 300', '{plugin}'],
+      views: [{ name: 'V', run: say('[{\\"label\\":\\"$0\\"}]') }],
+      actions: [{ name: 'Go', run: ['sleep', '300'] }],
+    }));
+    return fs.realpathSync(folder);
+  };
+  const userDup = dup(path.join(home, '.config', 'droid-lite', 'plugins', 'dup'));
+  const projectDup = dup(path.join(project2, '.droid-lite', 'plugins', 'dup'));
+  let current = project;
+  const ctx2 = { subscriptions: [] };
+  const api2 = tests.setup(ctx2, () => current);
+  await api2.load();
+  const roots = () => { const r = []; ctrl.items.forEach((i) => r.push(i)); return r; };
+  check('the first project\'s plugins load', roots().some((i) => i.label === 'Tools'));
+  current = project2;
+  await api2.load();
+  check('a load reads the project again', !roots().some((i) => i.label === 'Tools')
+    && roots().filter((i) => i.label === 'Dup').length === 2);
+  check('same-name plugins get their own test items', [userDup, projectDup].every((f) =>
+    ctrl.items.get(`plugin:${f}`)?.children.get(`${f}\u0000c`)?.label === f));
+  const dupRows = (await tree.getChildren()).filter((r) => r.label === 'Dup');
+  visibility({ visible: true });
+  const rowOf = async (r) => tree.getChildren(r);
+  let firstRows;
+  for (const end = Date.now() + 5000; Date.now() < end; await sleep(50)) {
+    firstRows = await Promise.all(dupRows.map(rowOf));
+    if (firstRows.every((kids) => kids[0]?.iconPath.id === 'pulse')) break;
+  }
+  check('same-name plugins keep their own live state', dupRows.length === 2
+    && firstRows.every((kids, i) => kids[0].label === dupRows[i].plugin.folder));
+  const views = await Promise.all(firstRows.map((kids) => tree.getChildren(kids.find((k) => k.label === 'V'))));
+  check('same-name plugins keep their own views', views.every((v, i) => v[0].label === dupRows[i].plugin.folder));
+  commands['droidLite.testAction'](dupRows[0].plugin, dupRows[0].plugin.spec.actions[0]);
+  const [a0, a1] = await Promise.all(dupRows.map(rowOf));
+  check('same-name plugins keep their own actions', a0.some((i) => i.label === 'Stop Go') && a1.some((i) => i.label === 'Go'));
+  ctx2.subscriptions.forEach((d) => d.dispose?.());
+  await until('no tracked process', () => tests.procs.size === 0, 8000).catch(() => {});
+  check('no plugin process left', tests.procs.size === 0);
 
   fs.rmSync(tmp, { recursive: true, force: true });
   console.log(`ok: test plugins, ${checks} checks`);

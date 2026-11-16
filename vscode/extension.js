@@ -8,11 +8,17 @@ const preview = require('./preview');
 
 let engine; // { proc, pending, nextId }
 let ready; // Promise of the initialize reply
-let recording; // serial while a screen recording runs
+let indexing; // that promise while the engine has not answered it (one initialize at a time)
+let recording; // serial while a screen recording runs (UNKNOWN: record_start did not answer)
+const UNKNOWN = '?';
 let logcat; // running `adb logcat` process
 let onStopped = () => {}; // the current engine stopped (set in activate)
 let onIndexed = () => {}; // an initialize answered (set in activate)
+let onIndexing = () => {}; // an initialize was sent or answered (set in activate)
 const changed = new vscode.EventEmitter();
+// many index changes in a row (a branch switch) repaint and refresh the lenses once
+let changeTimer;
+const changedSoon = () => { clearTimeout(changeTimer); changeTimer = setTimeout(() => changed.fire(), 200); };
 const events = new vscode.EventEmitter(); // engine lines without an id (preview progress)
 
 function enginePath(ctx) {
@@ -47,9 +53,11 @@ function start(ctx) {
   engine = e;
 }
 
-// longest wait for an answer (ms), so no waiting call outlives a stuck engine; others wait 15 s
+// longest wait for an answer (ms), so no waiting call outlives a stuck engine; others wait 15 s.
+// initialize: how long each project call waits for the index; the initialize itself is never sent
+// again while the engine works on it (a big project may take minutes)
 const limits = {
-  initialize: 60000, ping: 15000, update: 15000, remove: 15000, lenses: 15000, stability: 15000, implementations: 15000,
+  initialize: 600000, ping: 15000, update: 15000, remove: 15000, lenses: 15000, stability: 15000, implementations: 15000,
   previews: 180000, devices: 60000, adb: 60000, screenshot: 60000, record_start: 60000, record_stop: 1080000, // engine worst case ~976 s (pull capped at 15 min)
 };
 // a previews call starts its limit again on each progress line for its file (a first run downloads
@@ -84,7 +92,7 @@ function call(ctx, method, params = {}) {
     const progress = cap && events.event((m) => {
       if (m.event === 'preview_status' && [undefined, params.path, real].includes(m.file)) arm();
     });
-    arm();
+    if (method !== 'initialize') arm();
     const done = (f) => (v) => { clearTimeout(timer); progress?.dispose(); f(v); };
     e.pending.set(id, { resolve: done(resolve), reject: done(reject) });
     e.proc.stdin.write(JSON.stringify({ id, method, params }) + '\n');
@@ -107,16 +115,25 @@ function root() {
 const wellFormed = (s) => (s.toWellFormed ? s.toWellFormed()
   : s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD'));
 
+// `p`, or an error after `ms`
+const within = (p, ms, method) => new Promise((resolve, reject) => {
+  const t = setTimeout(() => reject(new Error(`Droid Lite engine did not answer ${method} in ${ms / 1000} s`)), ms);
+  p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+});
+
 // project calls wait for the index; device tools do not
 function project(ctx, method, params) {
   if (!ready) {
     const dir = root();
     const r = dir ? call(ctx, 'initialize', { root: dir }) : Promise.reject(new Error('Open a folder first'));
     ready = r;
-    // a failed index is not kept: the next project call tries again
-    r.then(() => { changed.fire(); if (ready === r) onIndexed(); }, () => { if (ready === r) ready = undefined; });
+    if (dir) { indexing = r; onIndexing(); }
+    const settled = () => { if (indexing === r) { indexing = undefined; onIndexing(); } };
+    // a failed index is not kept: the next project call tries again (an engine that stops fails it)
+    r.then(() => { settled(); changed.fire(); if (ready === r) onIndexed(); },
+      () => { settled(); if (ready === r) ready = undefined; });
   }
-  return ready.then(() => call(ctx, method, params));
+  return within(ready, limits.initialize, 'initialize').then(() => call(ctx, method, params));
 }
 
 const loc = (h) => new vscode.Location(vscode.Uri.file(h.path), new vscode.Position(h.line, h.col));
@@ -254,11 +271,17 @@ function activate(ctx) {
   const out = vscode.window.createOutputChannel('Logcat', 'log');
   // always visible: the phone in the status bar, a click opens every tool (stops a recording)
   const main = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+  const note = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
+  note.text = '$(sync~spin) Droid Lite: indexing…';
+  note.tooltip = 'Droid Lite is reading the project: links and badges come when it is done';
+  onIndexing = () => (indexing ? note.show() : note.hide());
+  onIndexing();
   let device = 'Droid Lite';
   const treeChanged = new vscode.EventEmitter();
   const refresh = () => {
     main.text = recording ? '$(record) Stop recording' : `$(device-mobile) ${device}`;
-    main.tooltip = recording ? `Recording ${recording}: click to stop and save` : 'Droid Lite tools';
+    main.tooltip = recording === UNKNOWN ? 'A recording may be running (record_start did not answer): click to stop it'
+      : recording ? `Recording ${recording}: click to stop and save` : 'Droid Lite tools';
     main.command = recording ? 'droidLite.recordStop' : 'droidLite.menu';
     main.backgroundColor = recording ? new vscode.ThemeColor('statusBarItem.errorBackground') : undefined;
     main.show();
@@ -311,20 +334,43 @@ function activate(ctx) {
   // keep the index in step with unsaved edits and files changed outside the editor; one request
   // per path, so a newer one replaces an unsent older one (outputs and tool folders never count).
   // `text` is a function read when the request goes, not on every keystroke.
+  // The requests go one at a time, so a lens or badge call waits behind one at most (a branch
+  // switch changes thousands of files); a removed folder takes the waiting requests under it along.
   const timers = new Map();
+  const queue = []; // { p, method, text }, oldest first
+  let sending = false;
+  const under = (d, p) => p === d || p.startsWith(d + path.sep); // p is d or inside it
+  const pump = () => {
+    if (sending || !queue.length) return;
+    sending = true;
+    const { p, method, text } = queue.shift();
+    project(ctx, method, { path: p, ...(text && { text: wellFormed(text()) }) })
+      .then(changedSoon, () => {})
+      .finally(() => { sending = false; pump(); });
+  };
+  const enqueue = (w) => {
+    for (let i = queue.length - 1; i >= 0; i--) {
+      if (w.method === 'remove' ? under(w.p, queue[i].p) : queue[i].p === w.p) queue.splice(i, 1);
+    }
+    // a folder above it is removed first: nothing after that brings it back
+    if (w.method === 'remove' && queue.some((q) => q.method === 'remove' && under(q.p, w.p))) return;
+    queue.push(w);
+    setImmediate(pump); // after the other requests of this batch of events
+  };
   const source = (p) => /\.(kt|kts|java)$/.test(p);
   // only paths under the project folder (another folder of a multi-root workspace is not indexed)
   const indexed = (p) => {
     const r = root() && path.relative(root(), p);
     return typeof r === 'string' && r !== '..' && !r.startsWith(`..${path.sep}`) && !path.isAbsolute(r)
-      && !/(^|[\\/])(build|\.gradle|\.idea|\.git)([\\/]|$)/.test(r);
+      // the engine's skip list: build, node_modules and hidden folders (.gradle, .idea, .git, .cxx)
+      && !/(^|[\\/])(build|node_modules|\.[^\\/]+)([\\/]|$)/.test(r);
   };
   const send = (p, method, text) => {
     if (!ready || !indexed(p)) return;
     clearTimeout(timers.get(p));
     timers.set(p, setTimeout(() => {
       timers.delete(p);
-      project(ctx, method, { path: p, ...(text && { text: wellFormed(text()) }) }).then(() => changed.fire(), () => {});
+      enqueue({ p, method, text });
     }, 400));
   };
   // an open file with unsaved edits: its text, so a late watcher event never undoes them
@@ -347,7 +393,8 @@ function activate(ctx) {
   paintStability(ctx, vscode.window.activeTextEditor);
   preview.setup(ctx, project, events);
   // test tools in Droid Lite's plugin format (docs/PLUGINS.md), in the Test Explorer
-  if (vscode.tests) require('./tests').setup(ctx, root());
+  // (the project folder is read on each load: a folder opened later brings its project plugins)
+  const testPlugins = vscode.tests && require('./tests').setup(ctx, root);
   const watcher = vscode.workspace.createFileSystemWatcher('**/*.{kt,kts,java}', false, false, true);
   const paths = vscode.workspace.createFileSystemWatcher('**/*', false, true, false);
 
@@ -375,6 +422,7 @@ function activate(ctx) {
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
       rootDir = null;
+      testPlugins?.load();
       if (!ready) project(ctx, 'ping').catch(() => {}); // a folder to index may have appeared
     }),
     watcher,
@@ -402,17 +450,34 @@ function activate(ctx) {
     vscode.commands.registerCommand('droidLite.recordStart', guard(async () => {
       const serial = await pickDevice(ctx);
       if (!serial) return;
-      await call(ctx, 'record_start', { serial });
+      try {
+        await call(ctx, 'record_start', { serial });
+      } catch (e) {
+        // it waited behind other device calls and may still start: Stop works either way
+        if (!/did not answer|already running/.test(e.message)) throw e;
+        recording = UNKNOWN;
+        refresh();
+        throw new Error(`${e.message}. A recording may be running: Stop recording ends it.`);
+      }
       recording = serial;
       refresh();
     })),
     vscode.commands.registerCommand('droidLite.recordStop', guard(async () => {
       if (!recording) throw new Error('No recording is running');
+      const was = recording;
       recording = undefined;
       refresh();
-      const file = await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: 'Saving the recording…' },
-        () => call(ctx, 'record_stop'));
+      let file;
+      try {
+        file = await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: 'Saving the recording…' },
+          () => call(ctx, 'record_stop'));
+      } catch (e) {
+        if (was === UNKNOWN && /no recording is running/.test(e.message)) {
+          return vscode.window.showInformationMessage('Droid Lite: no recording was running.');
+        }
+        throw e;
+      }
       revealFile(file, 'Recording');
     })),
     vscode.commands.registerCommand('droidLite.logcat', guard(async () => {
@@ -440,11 +505,17 @@ function activate(ctx) {
       proc.stdout.setEncoding('utf8').on('data', write);
       proc.stderr.setEncoding('utf8').on('data', write);
       proc.on('exit', () => { if (logcat === proc) { logcat = undefined; out.appendLine('[logcat stopped]'); refresh(); } });
+      proc.on('error', (err) => {
+        if (logcat === proc) { logcat = undefined; refresh(); }
+        out.appendLine(`[logcat could not run: ${err.message}]`);
+        vscode.window.showErrorMessage(`Droid Lite: logcat could not run: ${err.message}`);
+      });
       logcat = proc;
       refresh();
     })),
     vscode.commands.registerCommand('droidLite.logcatStop', () => logcat?.kill()),
-    { dispose: () => { logcat?.kill(); engine?.proc.stdin.end(); for (const t of [...badgeTypes.values(), ...lineTypes.values()]) t.dispose(); } },
+    note,
+    { dispose: () => { clearTimeout(changeTimer); logcat?.kill(); engine?.proc.stdin.end(); for (const t of [...badgeTypes.values(), ...lineTypes.values()]) t.dispose(); } },
   );
 }
 

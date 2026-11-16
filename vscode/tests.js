@@ -13,6 +13,7 @@ const { PassThrough } = require('stream');
 
 const userDir = () => path.join(os.homedir(), '.config', 'droid-lite', 'plugins');
 const MAX_LOG = 20000; // lines kept per run in the test output
+const MAX_LOG_CHARS = 8 << 20; // and characters (about 8 MB) in all
 const MAX_LINE = 64 << 10; // longest line kept (chars); the rest of a longer one is dropped
 const limits = { json: 120000, grace: 500, kill: 5000 }; // ms: list/view time, output after exit, TERM -> KILL
 const procs = new Set(); // every plugin process group still running (runs, actions, watch, list, views)
@@ -45,7 +46,15 @@ function problem(spec) {
   }
 }
 
-// every plugin: { name, folder, cwd, spec } or { error, folder }
+// true while a run may still show one more line (MAX_LOG lines, MAX_LOG_CHARS characters)
+function budget() {
+  let n = 0;
+  let chars = 0;
+  return (line) => ++n <= MAX_LOG && (chars += line.length) <= MAX_LOG_CHARS;
+}
+
+// every plugin: { name, folder, cwd, spec } or { error, folder }; `folder` (its real path) is its
+// id, two plugins may share a name
 function readPlugins(project) {
   const roots = [userDir(), project && path.join(project, '.droid-lite', 'plugins')].filter(Boolean);
   const out = [];
@@ -56,15 +65,16 @@ function readPlugins(project) {
       const folder = path.join(root, n);
       const file = path.join(folder, 'plugin.json');
       if (!fs.existsSync(file)) continue;
+      let real = folder;
       try {
+        real = fs.realpathSync(folder);
         const spec = JSON.parse(fs.readFileSync(file, 'utf8'));
         const bad = problem(spec);
         if (bad) throw new Error(bad);
-        const real = fs.realpathSync(folder);
         const dir = spec.dir ? spec.dir.replace(/^~\//, `${os.homedir()}/`) : '.';
         out.push({ name: spec.name, folder: real, cwd: path.resolve(real, dir), spec });
       } catch (e) {
-        out.push({ error: `${file}: ${e.message}`, folder });
+        out.push({ error: `${file}: ${e.message}`, folder: real });
       }
     }
   }
@@ -173,22 +183,25 @@ function location(project, file, line) {
   return new vscode.Location(uri, new vscode.Position(Math.max(Math.floor(n) - 1, 0), 0));
 }
 
-function setup(ctx, project) {
+// projectOf(): the project folder, read again on each load
+function setup(ctx, projectOf) {
+  let project = projectOf();
   const ctrl = vscode.tests.createTestController('droidLite.tests', 'Droid Lite tests');
   const sidebar = new vscode.EventEmitter();
   let plugins = [];
   const meta = new Map(); // test item id -> { plugin, caseId }
-  const live = new Map(); // plugin name -> latest watch state
-  const pluginRows = new Map(); // plugin name -> its sidebar row (to refresh only that row)
+  // keyed by the plugin's folder (its id), never its name
+  const live = new Map(); // plugin -> latest watch state
+  const pluginRows = new Map(); // plugin -> its sidebar row (to refresh only that row)
   const viewCache = new Map(); // plugin + view name -> its entries until that view is refreshed
   const actions = new Map(); // plugin + action name -> its running process
   let watchers = [];
   let watching = false; // the sidebar shows
-  const fireRow = (name) => { const r = pluginRows.get(name); if (r) sidebar.fire(r); };
+  const fireRow = (folder) => { const r = pluginRows.get(folder); if (r) sidebar.fire(r); };
 
   const addCases = (plugin, parent, cases) => {
     for (const c of cases || []) {
-      const id = `${plugin.name}\u0000${c.id ?? c.label}`;
+      const id = `${plugin.folder}\u0000${c.id ?? c.label}`;
       const loc = location(project, c.file, c.line);
       const item = ctrl.createTestItem(id, c.label || c.id, loc?.uri);
       if (loc) item.range = new vscode.Range(loc.range.start, loc.range.start);
@@ -200,12 +213,13 @@ function setup(ctx, project) {
   };
 
   async function load() {
+    project = projectOf();
     plugins = readPlugins(project);
     meta.clear();
     ctrl.items.replace([]);
     await Promise.all(plugins.map(async (p) => {
       const label = p.name || path.basename(p.folder);
-      const root = ctrl.createTestItem(`plugin:${label}`, label);
+      const root = ctrl.createTestItem(`plugin:${p.folder}`, label);
       ctrl.items.add(root);
       if (p.error) { root.error = p.error; return; }
       if (!p.spec.list) return;
@@ -218,7 +232,7 @@ function setup(ctx, project) {
       root.busy = false;
     }));
     viewCache.clear();
-    for (const name of live.keys()) if (!plugins.some((p) => p.name === name)) live.delete(name);
+    for (const folder of live.keys()) if (!plugins.some((p) => p.folder === folder)) live.delete(folder);
     sidebar.fire();
     if (watching) startWatch(); // plugins came or went
   }
@@ -236,7 +250,8 @@ function setup(ctx, project) {
       const walk = (i) => { const c = meta.get(i.id)?.caseId; if (c) byCase.set(c, i); i.children.forEach(walk); };
       walk(item);
       const ended = new Set();
-      let logged = 0; // every line counts, status lines too: a flooding plugin cannot grow memory
+      const room = budget(); // every line counts, status lines too: a flooding plugin cannot grow memory
+      let told = false;
       let cancel;
       const proc = spawn(argv(p.spec.run, p, project, caseId), p, project, (code, err) => {
         cancel.dispose(); // a later cancel never signals a pid that is free again
@@ -254,8 +269,11 @@ function setup(ctx, project) {
         let m;
         try { m = JSON.parse(line); } catch { m = { log: line }; }
         if (typeof m !== 'object' || m === null) m = { log: line };
-        const full = logged >= MAX_LOG;
-        if (logged++ === MAX_LOG) run.appendOutput(`[more than ${MAX_LOG} lines: the rest is not shown]\r\n`);
+        const full = !room(line);
+        if (full && !told) {
+          told = true;
+          run.appendOutput(`[more than ${MAX_LOG} lines or ${MAX_LOG_CHARS >> 20} MB: the rest is not shown]\r\n`);
+        }
         if (m.log !== undefined || !m.status) {
           if (!full) run.appendOutput(`${m.log ?? line}\r\n`);
           return;
@@ -308,14 +326,14 @@ function setup(ctx, project) {
         lines(proc.stdout, (l) => {
           let state;
           try { state = JSON.parse(l); } catch { return; /* not a state line */ }
-          if (state && typeof state === 'object') { live.set(p.name, state); fireRow(p.name); }
+          if (state && typeof state === 'object') { live.set(p.folder, state); fireRow(p.folder); }
         });
         proc.stderr.resume();
         watchers.push(proc);
         // an ended watcher is never signalled: its group id may belong to another process by then
         proc.on('close', () => { watchers = watchers.filter((w) => w !== proc); });
       } catch (e) {
-        live.set(p.name, { title: 'Live', status: `watch: ${e.message}` });
+        live.set(p.folder, { title: 'Live', status: `watch: ${e.message}` });
       }
     }
   }
@@ -341,7 +359,7 @@ function setup(ctx, project) {
         rows.push(...plugins.filter((p) => p.spec).map((p) => {
           const g = new vscode.TreeItem(p.name, vscode.TreeItemCollapsibleState.Expanded);
           g.plugin = p;
-          pluginRows.set(p.name, g);
+          pluginRows.set(p.folder, g);
           return g;
         }));
         rows.push(item('Add test plugin…', 'add', 'droidLite.addTestPlugin'));
@@ -351,7 +369,7 @@ function setup(ctx, project) {
       if (node.plugin && !node.view) {
         const p = node.plugin;
         const out = [];
-        const state = live.get(p.name);
+        const state = live.get(p.folder);
         if (state) {
           const stateRows = (Array.isArray(state.rows) ? state.rows : []).map((r) => (Array.isArray(r) ? r : [r]).map(String));
           const s = item(String(state.title || 'Live'), 'pulse', undefined, undefined, state.status);
@@ -367,7 +385,7 @@ function setup(ctx, project) {
           out.push(i);
         }
         for (const a of p.spec.actions || []) {
-          out.push(actions.has(`${p.name}\u0000${a.name}`)
+          out.push(actions.has(`${p.folder}\u0000${a.name}`)
             ? item(`Stop ${a.name}`, 'debug-stop', 'droidLite.stopTestAction', [p, a], 'running')
             : item(a.name, 'play', 'droidLite.testAction', [p, a]));
         }
@@ -376,7 +394,7 @@ function setup(ctx, project) {
         return out;
       }
       if (node.view) {
-        const key = `${node.plugin.name}\u0000${node.view.name}`;
+        const key = `${node.plugin.folder}\u0000${node.view.name}`;
         if (!viewCache.has(key)) viewCache.set(key, json(argv(node.view.run, node.plugin, project), node.plugin, project));
         try {
           const entries = await viewCache.get(key);
@@ -406,28 +424,28 @@ function setup(ctx, project) {
     // every process group a plugin started ends with the extension
     { dispose: () => { watching = false; procs.forEach((p) => stop(p, true)); } },
     vscode.commands.registerCommand('droidLite.testAction', (p, a) => {
-      const key = `${p.name}\u0000${a.name}`;
+      const key = `${p.folder}\u0000${a.name}`;
       out.show(true);
       if (actions.has(key)) return out.appendLine(`${a.name} is still running`);
       out.appendLine(`▶ ${p.name}: ${a.name}`);
-      let logged = 0;
+      const room = budget();
       const proc = spawn(argv(a.run, p, project), p, project, (code, err) => {
         actions.delete(key);
         out.appendLine(err ? `■ ${a.name} could not start: ${err.message}` : `■ ${a.name} ended (exit code ${code})`);
-        fireRow(p.name);
+        fireRow(p.folder);
       });
       actions.set(key, proc);
-      fireRow(p.name);
-      const log = (l) => { if (logged++ < MAX_LOG) out.appendLine(l); };
+      fireRow(p.folder);
+      const log = (l) => { if (room(l)) out.appendLine(l); };
       lines(proc.stdout, log);
       lines(proc.stderr, log);
     }),
     vscode.commands.registerCommand('droidLite.stopTestAction', (p, a) => {
-      const proc = actions.get(`${p.name}\u0000${a.name}`);
+      const proc = actions.get(`${p.folder}\u0000${a.name}`);
       if (proc) stop(proc);
     }),
     vscode.commands.registerCommand('droidLite.refreshTestView', (node) => {
-      viewCache.delete(`${node.plugin.name}\u0000${node.view.name}`);
+      viewCache.delete(`${node.plugin.folder}\u0000${node.view.name}`);
       sidebar.fire(node);
     }),
     // Add: link the tool's plugin folder into the shared folder the app reads too
@@ -450,7 +468,9 @@ function setup(ctx, project) {
     }),
     // Remove drops only the link, never the tool's folder
     vscode.commands.registerCommand('droidLite.removeTestPlugin', async (p) => {
-      const links = fs.readdirSync(userDir()).map((n) => path.join(userDir(), n))
+      let names = [];
+      try { names = fs.readdirSync(userDir()); } catch { /* no user plugins: it comes with the project */ }
+      const links = names.map((n) => path.join(userDir(), n))
         .filter((l) => { try { return fs.realpathSync(l) === p.folder; } catch { return false; } });
       if (!links.length) return vscode.window.showInformationMessage(`${p.name} comes with the project (.droid-lite/plugins): remove it there.`);
       const ok = await vscode.window.showWarningMessage(`Remove ${p.name}? Only the link goes; the tool's folder stays.`, { modal: true }, 'Remove');
