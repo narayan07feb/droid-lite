@@ -100,7 +100,7 @@ function lenses(ctx) {
       const params = { path: doc.uri.fsPath, text: doc.getText() };
       const [links, stab] = await Promise.all([
         project(ctx, 'lenses', params).catch(() => []),
-        doc.languageId === 'kotlin' ? project(ctx, 'stability', params).catch(() => []) : [],
+        /\.kts?$/.test(doc.uri.fsPath) ? project(ctx, 'stability', params).catch(() => []) : [],
       ]);
       const at = (line) => new vscode.Range(line, 0, line, 0);
       return [
@@ -139,7 +139,8 @@ function guard(fn) {
 }
 
 function activate(ctx) {
-  const sel = [{ language: 'kotlin', scheme: 'file' }, { language: 'java', scheme: 'file' }];
+  // by file name: VS Code has no Kotlin language without a Kotlin extension
+  const sel = { scheme: 'file', pattern: '**/*.{kt,kts,java}' };
   const rec = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   rec.text = '$(record) Recording';
   rec.tooltip = 'Stop the screen recording';

@@ -33,7 +33,13 @@ const fake = {
     onDidChangeTextDocument: () => ({ dispose() {} }),
     createFileSystemWatcher: () => ({ onDidCreate: () => ({}), onDidChange: () => ({}), onDidDelete: () => ({}), dispose() {} }),
   },
-  languages: { registerCodeLensProvider: (_, p) => { provider = p; return { dispose() {} }; } },
+  languages: {
+    registerCodeLensProvider: (sel, p) => {
+      assert.strictEqual(sel.pattern, '**/*.{kt,kts,java}');
+      provider = p;
+      return { dispose() {} };
+    },
+  },
   window: {
     createStatusBarItem: () => ({ show() {}, hide() {}, dispose() {} }),
     createOutputChannel: () => ({ dispose() {} }),
@@ -49,7 +55,7 @@ ext.activate(ctx);
 
 const doc = (file, text) => ({
   uri: { fsPath: path.join(src, file) },
-  languageId: 'kotlin',
+  languageId: 'plaintext', // VS Code without a Kotlin extension
   getText: () => text ?? fs.readFileSync(path.join(src, file), 'utf8'),
 });
 const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.range.start.line, l.command.title]);
