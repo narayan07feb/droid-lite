@@ -105,6 +105,18 @@ impl Fixture {
         unsafe { std::env::set_var("DROID_LITE_LSP", "/nonexistent/droid-lite-no-lsp") };
         // nor any real phone: adb is missing unless a Logcat test sets the fake one
         unsafe { std::env::set_var("DROID_LITE_ADB", "/nonexistent/droid-lite-no-adb") };
+        // previews draw by themselves: every test gets the stand-in worker and its own preview folder,
+        // never the real JVM worker or ~/Library/Caches
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        unsafe {
+            std::env::set_var("DROID_LITE_PREVIEW_DIR", std::env::temp_dir().join(format!("dlpv-{name}-{}", std::process::id())));
+            std::env::set_var(
+                "DROID_LITE_PREVIEW_WORKER",
+                format!("python3 {}", manifest.join("tests/fixtures/fake_preview_worker.py").display()),
+            );
+            std::env::set_var("FAKE_PREVIEW_PNG", manifest.join("assets/icon-256.png"));
+            std::env::set_var("DROID_LITE_MAC_GUARD", "/nonexistent/mac-guard");
+        }
         // and never index the real Gradle cache of this Mac
         unsafe {
             std::env::set_var(
@@ -310,6 +322,11 @@ fn e2e_compose_panel_tree_stability_lints_preview_render() {
     open(&mut h, &f.path("app/src/main/java/com/demo/ui/UserCard.kt"));
     place_cursor(&mut h, "Column(", 0);
     steps(&mut h, 3);
+    // only the previews by default: the UI tree is behind "Structure", which is remembered
+    assert!(h.query_by_label("Column").is_none(), "the UI tree is hidden by default");
+    h.get_by_label(&format!("{}  Structure", ic::TREE_STRUCTURE)).click();
+    steps(&mut h, 3);
+    assert!(h.state().show_structure, "the toggle turns the structure on");
     for label in ["Column", "Text"] {
         h.get_by_label(label);
     }
@@ -392,21 +409,23 @@ fn e2e_compose_panel_tree_stability_lints_preview_render() {
         rules.contains(&"remember-state") && rules.contains(&"modifier-default"),
         "{rules:?}"
     );
-    // Render previews runs the module's Paparazzi task and shows the image
-    h.get_by_label(&format!("{}  Render previews", ic::IMAGE))
-        .click();
-    steps(&mut h, 2);
-    wait(&mut h, "preview build", |a| {
-        a.gradle.is_none() && a.console.iter().any(|l| l == "BUILD SUCCESSFUL")
+    // previews draw by themselves (no click) through the preview worker (the fixture's stand-in), no Gradle
+    wait(&mut h, "preview picture", |a| {
+        matches!(a.previews.cards.as_slice(), [(name, Ok(_))] if name == "UserCardPreview")
     });
-    assert!(
-        h.state()
-            .console
-            .iter()
-            .any(|l| l == "> Task :app:recordPaparazziDebug")
-    );
-    wait(&mut h, "preview image", |a| {
-        a.compose_view.as_ref().is_some_and(|v| v.images.len() == 1) && a.textures.len() == 1
+    assert!(h.state().gradle.is_none(), "no Gradle run for a preview");
+    assert!(h.query_all_by_label("UserCardPreview").count() >= 2, "the card title beside the list link");
+    // a file that does not compile shows the compiler's text on the card
+    let broken = f.path("app/src/main/java/com/demo/ui/BrokenPreview.kt");
+    std::fs::write(
+        &broken,
+        "package com.demo.ui\n\nimport androidx.compose.ui.tooling.preview.Preview\n\n@Preview\n@Composable\nfun BrokenCardPreview() { Oops() }\n",
+    )
+    .unwrap();
+    open(&mut h, &broken);
+    wait(&mut h, "error card", |a| {
+        a.previews.file.as_deref() == Some(broken.as_path())
+            && matches!(a.previews.cards.as_slice(), [(_, Err(e))] if e.contains("unresolved reference 'Oops'"))
     });
 }
 
@@ -3757,4 +3776,157 @@ fn e2e_toolbar_items_never_overlap_at_any_width() {
             assert!(h.query_by_label_contains("rename-shared-p2p").is_none(), "{width}: the branch name is elided");
         }
     }
+}
+
+/// Real preview check (not run by default): opens `DROID_LITE_SHOT_PROJECT`, the Kotlin file
+/// `DROID_LITE_SHOT_FILE`, presses Render previews with the real worker and base pack, and saves the
+/// window to `DROID_LITE_SHOT_OUT` once the cards are there (up to 3 min). Headless, no window.
+#[test]
+#[ignore]
+fn e2e_real_preview_shot() {
+    let (Ok(project), Ok(file), Ok(out)) = (
+        std::env::var("DROID_LITE_SHOT_PROJECT"),
+        std::env::var("DROID_LITE_SHOT_FILE"),
+        std::env::var("DROID_LITE_SHOT_OUT"),
+    ) else {
+        return;
+    };
+    let _f = Fixture::new("real-preview"); // the lock and a throwaway config dir
+    // SAFETY: the SERIAL lock is held
+    unsafe {
+        std::env::remove_var("DROID_LITE_PREVIEW_WORKER");
+        std::env::remove_var("DROID_LITE_PREVIEW_DIR");
+        std::env::remove_var("DROID_LITE_MAC_GUARD");
+        std::env::remove_var("DROID_LITE_GRADLE_HOME"); // the real Gradle cache, read only
+    }
+    let root = PathBuf::from(project);
+    let mut h = Harness::builder()
+        .with_size([1600.0, 1000.0])
+        .build_eframe(move |cc| App::new(cc, Some(root)));
+    wait(&mut h, "index", |a| a.indexing.is_none() && a.index.symbol_count() > 0);
+    open(&mut h, Path::new(&file));
+    steps(&mut h, 5);
+    let started = std::time::Instant::now(); // drawn by itself once the file is open
+    let loading_out = std::env::var("DROID_LITE_SHOT_LOADING_OUT").ok();
+    let mut loading_saved = false;
+    while started.elapsed() < Duration::from_secs(180) {
+        h.step();
+        // DROID_LITE_SHOT_LOADING_OUT: the window while the loading cards show (1.5 s in)
+        if let Some(o) = &loading_out
+            && !loading_saved
+            && h.state().previews.busy
+            && started.elapsed() > Duration::from_millis(1500)
+        {
+            h.render().expect("render").save(o).unwrap();
+            loading_saved = true;
+        }
+        if !h.state().previews.busy && !h.state().previews.cards.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let p = &h.state().previews;
+    eprintln!("preview: {:.1} s, note {:?}, cards {:?}", started.elapsed().as_secs_f32(), p.note,
+        p.cards.iter().map(|(n, c)| (n.clone(), c.as_ref().err().cloned())).collect::<Vec<_>>());
+    steps(&mut h, 4);
+    h.render().expect("render needs the wgpu feature").save(&out).unwrap();
+}
+
+#[test]
+fn e2e_tab_close_button_closes_the_tab() {
+    let f = Fixture::new("tabclose");
+    let mut h = f.harness();
+    open(&mut h, &f.path("app/src/main/java/com/demo/data/User.kt"));
+    open(&mut h, &f.path("app/src/main/java/com/demo/ui/UserCard.kt"));
+    assert_eq!(h.state().tabs.len(), 2);
+    // the × of the active tab (UserCard.kt): the tab closes, the other stays
+    let xs: Vec<_> = h.query_all_by_label(ic::X).collect();
+    assert_eq!(xs.len(), 2, "one × per tab");
+    xs[1].click();
+    steps(&mut h, 3);
+    assert_eq!(h.state().tabs.len(), 1, "the × closed its tab");
+    assert!(h.state().tabs[0].path.ends_with("User.kt"));
+    // ⌘W closes the active one too
+    key(&mut h, Modifiers::COMMAND, Key::W);
+    assert!(h.state().tabs.is_empty(), "⌘W closed the last tab");
+}
+
+#[test]
+fn e2e_tab_of_a_deleted_file_closes() {
+    let f = Fixture::new("tabgone");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    open(&mut h, &user);
+    open(&mut h, &card);
+    // UserCard.kt has an edit that was never saved, User.kt has none
+    place_cursor(&mut h, "fun ", 0);
+    type_text(&mut h, "// edit\n");
+    std::fs::remove_file(&user).unwrap();
+    std::fs::remove_file(&card).unwrap();
+    wait(&mut h, "both tabs marked deleted", |a| {
+        a.tabs.iter().filter(|t| t.deleted).count() == 2
+    });
+    // the × of a deleted file's tab closes it, edited or not
+    for _ in 0..2 {
+        let xs: Vec<_> = h.query_all_by_label(ic::X).collect();
+        xs[0].click();
+        steps(&mut h, 3);
+    }
+    assert!(h.state().tabs.is_empty(), "{:?}", h.state().status);
+}
+
+#[test]
+fn e2e_sidebar_pull_requests_open_a_file_diff_beside_the_editor() {
+    let f = Fixture::new("prsidebar");
+    let mut h = f.harness();
+    // gh needs GitHub: the lists and the PR's files come in as gh would send them
+    let item = |n, t: &str| crate::git::PrItem {
+        number: n,
+        title: t.into(),
+        author: "ana".into(),
+        draft: false,
+        url: String::new(),
+        review: "APPROVED".into(),
+    };
+    {
+        let s = h.state_mut();
+        s.prs
+            .lists
+            .insert(crate::git::PrFilter::Mine, Ok(vec![item(7, "Fix login")]));
+        s.prs
+            .lists
+            .insert(crate::git::PrFilter::Review, Ok(vec![item(9, "Add cards")]));
+    }
+    h.get_by_label(&format!("{}  Pull requests", ic::GIT_PULL_REQUEST))
+        .click();
+    steps(&mut h, 3);
+    assert!(h.query_by_label("#7 Fix login").is_some(), "your PRs first");
+    h.get_by_label("Awaiting your review").click();
+    steps(&mut h, 3);
+    assert!(h.query_by_label("#7 Fix login").is_none());
+    assert!(
+        h.query_by_label("#9 Add cards").is_some(),
+        "the review filter"
+    );
+    // an opened PR lists its files; a file's diff opens in the side panel, side by side
+    let diff = "diff --git a/A.kt b/A.kt\n@@ -1 +1 @@\n-val a = 1\n+val a = 2\n";
+    h.state_mut().prs.open = Some((9, Some(Ok(vec![("app/A.kt".into(), diff.into())]))));
+    steps(&mut h, 3);
+    h.get_by_label("A.kt").click();
+    wait(&mut h, "diff panel", |a| {
+        a.commit_lines()
+            .is_some_and(|l| l.iter().any(|l| l == "+val a = 2"))
+    });
+    assert!(
+        h.query_by_label("Side by side").is_some(),
+        "docked panel, not a window"
+    );
+    key(&mut h, Modifiers::NONE, Key::Escape);
+    assert!(h.state().commit_lines().is_none(), "Esc closes the diff");
+    // back to the Project tree
+    h.get_by_label(&format!("{}  Project", ic::TREE_STRUCTURE))
+        .click();
+    steps(&mut h, 2);
+    assert!(!h.state().prs.shown);
 }

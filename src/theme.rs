@@ -340,6 +340,25 @@ pub fn elide(ui: &egui::Ui, text: &str, font: &egui::FontId, max: f32) -> String
     chars[..lo].iter().chain(std::iter::once(&'…')).collect()
 }
 
+/// macOS "Reduce motion" (Accessibility → Display): read once in the background (a `defaults`
+/// call takes a few ms, never on a frame); false until known.
+pub fn reduce_motion() -> bool {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ON: AtomicBool = AtomicBool::new(false);
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        std::thread::spawn(|| {
+            let on = std::process::Command::new("defaults")
+                .args(["read", "com.apple.universalaccess", "reduceMotion"])
+                .output()
+                .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "1");
+            ON.store(on, Ordering::Relaxed);
+        });
+    });
+    ON.load(Ordering::Relaxed)
+}
+
 pub fn button(
     ui: &mut egui::Ui,
     enabled: bool,

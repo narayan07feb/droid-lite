@@ -13,6 +13,7 @@ mod gutter;
 mod libs_ui;
 mod logcat_ui;
 mod perf;
+mod prs_ui;
 mod refactor_ui;
 mod run_ui;
 mod tests_ui;
@@ -24,7 +25,7 @@ mod usage_filter;
 
 use crate::compose::{self, Lint, Severity, Stability};
 use crate::edit;
-use crate::gradle::{self, PreviewTool};
+use crate::gradle;
 use crate::highlight::{self, ERROR, INFO, WARN};
 use crate::icons as ic;
 use crate::index::{self, Hit, Index};
@@ -286,8 +287,55 @@ enum Right {
 struct ComposeView {
     key: (PathBuf, u64, u64, u64, String),
     tree: Vec<compose::Node>,
-    tool: Option<(crate::project::Module, PreviewTool)>,
-    images: Vec<(String, PathBuf)>,
+}
+
+/// The Compose panel's preview cards, drawn by the preview worker (`preview.rs`).
+#[derive(Default)]
+struct Previews {
+    client: Option<crate::preview::Client>,
+    /// The file the cards belong to; cards of another file are not shown.
+    file: Option<PathBuf>,
+    cards: Vec<(String, Result<egui::TextureHandle, String>)>,
+    /// The latest status or skip reason, and whether a render is under way.
+    note: String,
+    busy: bool,
+    /// (done, total) of the current step when the count is known: a filling bar, else a moving one.
+    progress: Option<(u64, u64)>,
+    /// The previews being drawn, so their loading cards show before the pictures come.
+    pending: Vec<String>,
+    /// The card open full size.
+    zoom: Option<usize>,
+    /// The file and the hash of its saved text last sent, so each open or save renders once.
+    sent: Option<(PathBuf, u64)>,
+}
+
+/// What the worker needs to draw a tab's previews: its top-level `@Preview` functions (their class is
+/// the file's `…Kt` class); None when it has none.
+fn preview_request(tab: &Tab, project: Option<&crate::project::Project>) -> Option<crate::preview::Request> {
+    let previews: Vec<String> = tab
+        .syms
+        .decls
+        .iter()
+        .filter(|d| d.is_preview() && d.container.is_none())
+        .map(|d| d.name.clone())
+        .collect();
+    (!previews.is_empty()).then(|| crate::preview::Request {
+        file: tab.path.clone(),
+        class: crate::device::preview_name(&tab.syms.package, &tab.path, None, "x")
+            .trim_end_matches(".x")
+            .to_string(),
+        previews,
+        project: project.map(|p| crate::preview::ProjectRef {
+            root: p.root.clone(),
+            scripts: p
+                .files
+                .iter()
+                .filter(|f| f.extension().is_some_and(|e| e == "kts" || e == "gradle"))
+                .cloned()
+                .collect(),
+            files: std::sync::Arc::new(p.files.clone()),
+        }),
+    })
 }
 
 /// The ⌘-hovered name, a resource reference it may be (kind, name), and its response.
@@ -354,6 +402,8 @@ pub struct App {
     /// Disk changes being read and scanned on worker threads.
     disk_rx: Vec<Receiver<Vec<disk::DiskChange>>>,
     git: git_ui::GitState,
+    /// The sidebar's Pull requests view.
+    prs: prs_ui::PrsState,
     /// Current git branch of the project, shown in the toolbar.
     branch: Option<String>,
     /// Bumped when a build or a report reload may have changed previews and stability.
@@ -371,6 +421,9 @@ pub struct App {
     libs: crate::libs::Libraries,
     libs_rx: Option<Receiver<crate::libs::Libraries>>,
     compose_view: Option<ComposeView>,
+    previews: Previews,
+    /// The Compose panel's structure sections (composables, UI tree, …) are shown; per project.
+    show_structure: bool,
     ctx: Option<egui::Context>,
     keymap: Keymap,
     show_shortcuts: bool,
@@ -472,6 +525,7 @@ impl App {
             watcher: None,
             disk_rx: Vec::new(),
             git: Default::default(),
+            prs: Default::default(),
             branch: None,
             outputs_gen: 0,
             decl_usages: None,
@@ -483,6 +537,8 @@ impl App {
             libs: Default::default(),
             libs_rx: None,
             compose_view: None,
+            previews: Previews::default(),
+            show_structure: false,
             ctx: Some(cc.egui_ctx.clone()),
             keymap: load_setting("keymap").map_or(Keymap::Eclipse, |s| Keymap::from_name(&s)),
             show_shortcuts: false,
@@ -763,7 +819,8 @@ impl App {
 
     fn close_tab(&mut self, i: usize) {
         if i < self.tabs.len() {
-            if self.tabs[i].dirty() {
+            // a deleted file's tab closes like Android Studio's: ⌘S would bring the file back
+            if self.tabs[i].dirty() && !self.tabs[i].deleted {
                 self.status = format!(
                     "{} has unsaved changes: save (⌘S) or revert first",
                     self.tabs[i].path.display()
@@ -1116,6 +1173,7 @@ impl App {
     // ---------- per-frame background work ----------
 
     fn poll(&mut self, ctx: &egui::Context) {
+        self.poll_previews(ctx);
         if let Some(rx) = &self.indexing
             && let Ok((project, index, branch, tree, res)) = rx.try_recv()
         {
@@ -2119,6 +2177,23 @@ impl App {
     }
 
     fn project_panel(&mut self, ui: &mut Ui) {
+        // the sidebar shows the Project tree or the pull requests
+        ui.horizontal(|ui| {
+            let mut tabs = theme::Tabs::new(ui, "sidebar");
+            for (prs, label) in [
+                (false, format!("{}  Project", ic::TREE_STRUCTURE)),
+                (true, format!("{}  Pull requests", ic::GIT_PULL_REQUEST)),
+            ] {
+                if tabs.tab(ui, self.prs.shown == prs, label).clicked() {
+                    self.prs.shown = prs;
+                }
+            }
+            tabs.finish(ui);
+        });
+        if self.prs.shown {
+            self.prs_panel(ui);
+            return;
+        }
         ui.horizontal(|ui| {
             theme::section(ui, ic::TREE_STRUCTURE, "Project");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3268,9 +3343,21 @@ impl App {
         let mut jump: Option<usize> = None;
         let mut pick = None;
         let mut render = false;
+        let mut zoom: Option<usize> = None;
+        let mut render_req: Option<crate::preview::Request> = None;
+        // only the previews by default; the composables list, UI tree, preview names and Compose
+        // checks sit behind "Structure" (remembered per project)
+        let mut structure = self.show_structure;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.toggle_value(&mut structure, RichText::new(format!("{}  Structure", ic::TREE_STRUCTURE)).small())
+                            .on_hover_text("Show the composables, the UI tree, the preview names and the Compose checks");
+                    });
+                });
+                if structure {
                 egui::CollapsingHeader::new(
                     RichText::new(format!("{}  Composables ({})", ic::CUBE, composables.len()))
                         .strong(),
@@ -3299,6 +3386,7 @@ impl App {
                             }
                         });
                 });
+                }
                 let Some(d) = composables.iter().find(|d| d.name == current) else {
                     return;
                 };
@@ -3311,43 +3399,26 @@ impl App {
                 );
                 if self.compose_view.as_ref().is_none_or(|v| v.key != key) {
                     let is_ui = |n: &str| compose::is_ui_call(n, &self.index, &self.libs);
-                    let previews: Vec<String> = tab
-                        .syms
-                        .decls
-                        .iter()
-                        .filter(|d| d.is_preview())
-                        .map(|d| d.name.clone())
-                        .collect();
-                    let tool = self
-                        .project
-                        .as_ref()
-                        .and_then(|pr| pr.module_of(&tab.path))
-                        .and_then(|m| PreviewTool::detect(m).map(|t| (m.clone(), t)));
-                    let images = tool
-                        .as_ref()
-                        .map(|(m, t)| t.images(m, &previews))
-                        .unwrap_or_default();
                     self.compose_view = Some(ComposeView {
                         key,
                         tree: compose::tree(&tab.text, d, &is_ui),
-                        tool,
-                        images,
                     });
                 }
                 let Some(view) = &self.compose_view else {
                     return;
                 };
-                ui.separator();
-                theme::section(ui, ic::TREE_STRUCTURE, &format!("UI tree · {}", d.name));
-                if view.tree.is_empty() {
-                    ui.label(RichText::new("No UI calls found.").weak());
+                if structure {
+                    ui.separator();
+                    theme::section(ui, ic::TREE_STRUCTURE, &format!("UI tree · {}", d.name));
+                    if view.tree.is_empty() {
+                        ui.label(RichText::new("No UI calls found.").weak());
+                    }
+                    for n in &view.tree {
+                        node_ui(ui, n, &mut jump);
+                    }
+                    ui.separator();
+                    theme::section(ui, ic::IMAGE, "Previews");
                 }
-                for n in &view.tree {
-                    node_ui(ui, n, &mut jump);
-                }
-
-                ui.separator();
-                theme::section(ui, ic::IMAGE, "Previews");
                 let previews: Vec<String> = tab
                     .syms
                     .decls
@@ -3359,7 +3430,7 @@ impl App {
                     ui.label(RichText::new("No @Preview functions in this file.").weak());
                 }
                 let font = egui::TextStyle::Body.resolve(ui.style());
-                for p in &previews {
+                for p in previews.iter().filter(|_| structure) {
                     let room = ui.available_width() - 8.0;
                     if ui.link(theme::elide(ui, p, &font, room)).on_hover_text(p).clicked() {
                         jump = tab
@@ -3370,41 +3441,62 @@ impl App {
                             .map(|d| d.offset);
                     }
                 }
-                match &view.tool {
-                    Some((m, tool)) => {
-                        ui.horizontal(|ui| {
-                            render = ui
-                                .add_enabled(
-                                    self.gradle.is_none(),
-                                    egui::Button::new(format!("{}  Render previews", ic::IMAGE)),
-                                )
-                                .on_hover_text(tool.task(m))
-                                .clicked();
-                            ui.label(RichText::new(format!("{tool:?}")).weak());
-                        });
-                        // drop textures of images no longer shown, so memory stays flat
-                        self.textures
-                            .retain(|p, _| view.images.iter().any(|(_, q)| q == p));
-                        for (name, path) in &view.images {
-                            ui.label(RichText::new(name).small());
-                            if let Some(tex) = texture(ui.ctx(), &mut self.textures, path) {
-                                let size = tex.size_vec2();
-                                let w = ui.available_width().min(size.x);
-                                ui.image((tex.id(), egui::vec2(w, size.y * w / size.x)));
+                render_req = preview_request(tab, self.project.as_ref());
+                if render_req.is_some() {
+                    render = ui
+                        .add_enabled(!self.previews.busy, egui::Button::new(format!("{}  Render again", ic::IMAGE)))
+                        .on_hover_text("Previews are drawn by themselves when the file opens or is saved")
+                        .clicked();
+                }
+                if previews.len() > render_req.as_ref().map_or(0, |r| r.previews.len()) {
+                    ui.label(RichText::new("Previews inside a class or object are not drawn yet.").weak());
+                }
+                let mine = self.previews.file.as_deref() == Some(tab.path.as_path());
+                if self.previews.busy {
+                    // the real step and a thin bar first (always in view), then a loading card per
+                    // preview, the size of its last picture (dimmed) or a soft frame
+                    loading_step(ui, &self.previews.note, self.previews.progress);
+                    for name in &self.previews.pending {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(name).strong()).on_hover_text(name);
+                        let old = mine
+                            .then(|| self.previews.cards.iter().find(|(n, _)| n == name))
+                            .flatten()
+                            .and_then(|(_, c)| c.as_ref().ok());
+                        loading_card(ui, old);
+                    }
+                } else {
+                    if !self.previews.note.is_empty() {
+                        ui.label(RichText::new(&self.previews.note).weak());
+                    }
+                    if mine {
+                        for (i, (name, card)) in self.previews.cards.iter().enumerate() {
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(name).strong()).on_hover_text(name);
+                            match card {
+                                Ok(tex) => {
+                                    // the whole picture, scaled to the panel's width; a click opens it full size
+                                    let size = tex.size_vec2();
+                                    let w = ui.available_width() - 4.0;
+                                    let r = ui
+                                        .add(egui::Image::new((tex.id(), egui::vec2(w, size.y * w / size.x))).sense(egui::Sense::click()))
+                                        .on_hover_cursor(egui::CursorIcon::ZoomIn)
+                                        .on_hover_text("Open full size");
+                                    if r.clicked() {
+                                        zoom = Some(i);
+                                    }
+                                }
+                                Err(e) => {
+                                    ui.label(RichText::new(e).monospace().color(ERROR));
+                                }
                             }
                         }
                     }
-                    None if !previews.is_empty() => {
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(gradle::SETUP_HELP).weak());
-                        ui.hyperlink_to(
-                            "Setup and newest version",
-                            "https://developer.android.com/studio/preview/compose-screenshot-testing",
-                        );
-                    }
-                    _ => {}
                 }
 
+                if !structure {
+                    return;
+                }
                 ui.separator();
                 theme::section(ui, ic::CHECK_CIRCLE, "Compose checks");
                 for l in tab.lints.iter() {
@@ -3428,23 +3520,93 @@ impl App {
                 }
             });
         let path = tab.path.clone();
+        if structure != self.show_structure {
+            self.show_structure = structure;
+            self.save_session(true);
+        }
         if let Some(n) = pick {
             self.selected_composable = Some(n);
         }
         if let Some(o) = jump {
             self.open_file(&path, Some(o));
         }
-        let task_module = self
-            .project
-            .as_ref()
-            .and_then(|p| p.module_of(&path))
-            .cloned();
-        if render
-            && let Some(m) = &task_module
-            && let Some(tool) = PreviewTool::detect(m)
+        if zoom.is_some() {
+            self.previews.zoom = zoom;
+        }
+        if let Some(i) = self.previews.zoom
+            && let Some((name, Ok(tex))) = self.previews.cards.get(i)
         {
+            // full size: the picture at its pixels (half on a Retina screen, as rendered at 2x)
+            let mut open = true;
+            let size = tex.size_vec2() / 2.0;
+            egui::Window::new(name.as_str())
+                .id(egui::Id::unique("preview_zoom"))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_size(size.min(egui::vec2(900.0, 900.0)))
+                .show(ui.ctx(), |ui| {
+                    egui::ScrollArea::both().show(ui, |ui| ui.image((tex.id(), size)));
+                });
+            if !open {
+                self.previews.zoom = None;
+            }
+        }
+        if render && let Some(r) = render_req {
             let ctx = ui.ctx().clone();
-            self.run_gradle(tool.task(m), &ctx);
+            self.previews.busy = true;
+            self.previews.progress = None;
+            self.previews.pending = r.previews.clone();
+            self.previews.note = "Waiting for the preview worker".into();
+            self.previews.client.get_or_insert_with(|| crate::preview::Client::new(&ctx)).request(r);
+        }
+    }
+
+    /// Preview worker messages: status lines, pictures (decoded off the UI thread; only the texture
+    /// upload happens here) and error texts for the cards.
+    fn poll_previews(&mut self, ctx: &egui::Context) {
+        // by itself: a file with previews that was just opened or saved (no unsaved edits) is drawn
+        if let Some(tab) = self.tabs.get(self.active)
+            && tab.text == tab.saved
+            && let Some(r) = preview_request(tab, self.project.as_ref())
+        {
+            let key = (tab.path.clone(), hash(&tab.saved));
+            if self.previews.sent.as_ref() != Some(&key) {
+                self.previews.sent = Some(key);
+                self.previews.busy = true;
+                self.previews.progress = None;
+                self.previews.pending = r.previews.clone();
+                self.previews.note = "Waiting for the preview worker".into();
+                self.previews.client.get_or_insert_with(|| crate::preview::Client::new(ctx)).request(r);
+            }
+        }
+        let p = &mut self.previews;
+        while let Some(e) = p.client.as_ref().and_then(crate::preview::Client::poll) {
+            match e {
+                crate::preview::Event::Status(s, progress) => {
+                    p.busy = !s.starts_with("Skipped");
+                    p.note = s;
+                    p.progress = progress;
+                }
+                crate::preview::Event::Failed { file, error } => {
+                    p.busy = false;
+                    p.note = String::new();
+                    p.cards = vec![("Could not draw the previews".into(), Err(error))];
+                    p.file = Some(file);
+                }
+                crate::preview::Event::Done { file, cards } => {
+                    p.busy = false;
+                    p.note = String::new();
+                    p.cards = cards
+                        .into_iter()
+                        .map(|(name, pic)| {
+                            let tex = pic.map(|img| ctx.load_texture(format!("preview:{name}"), img, Default::default()));
+                            (name, tex)
+                        })
+                        .collect();
+                    p.file = Some(file);
+                }
+            }
         }
     }
 
@@ -3799,7 +3961,13 @@ impl eframe::App for App {
                     });
                     ui.separator();
                     match self.right {
-                        Right::Compose => self.compose_panel(ui),
+                        // the whole panel scrolls: preview cards can be taller than the window
+                        Right::Compose => {
+                            egui::ScrollArea::vertical()
+                                .id_salt("compose_panel_scroll")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| self.compose_panel(ui));
+                        }
                         Right::PullRequest => {
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
@@ -3809,6 +3977,15 @@ impl eframe::App for App {
                 });
             if !open && !hidden {
                 self.show_right = false;
+            }
+        });
+        watch.stage("diff panel", || {
+            // docked beside the editor, like Android Studio's diff (it was a floating window)
+            if self.has_diff() && !hidden {
+                egui::Panel::right("diff")
+                    .resizable(true)
+                    .default_size(620.0)
+                    .show(ui, |ui| self.diff_panel(ui));
             }
         });
         let editor_frame = egui::Frame::central_panel(ui.style()).fill(theme::t().editor_bg);
@@ -3825,7 +4002,6 @@ impl eframe::App for App {
             self.translations_window(&ctx);
             self.deep_link_window(&ctx);
             self.refactor_window(&ctx);
-            self.commit_window(&ctx);
             self.shortcuts_window(&ctx);
             self.settings_window(&ctx);
             self.capture_window(&ctx);
@@ -4192,6 +4368,74 @@ fn texture(
     Some(h)
 }
 
+/// The size a preview picture is shown at (half its pixels, at most the panel's width).
+fn shown_size(ui: &Ui, tex: &egui::TextureHandle) -> egui::Vec2 {
+    let size = tex.size_vec2();
+    let w = ui.available_width().min(size.x / 2.0);
+    egui::vec2(w, size.y * w / size.x)
+}
+
+/// A loading preview card: the last picture dimmed, or a soft frame, with a slow, faint shimmer
+/// sweeping across it. Repaints at most ~30 times a second, only while a card loads; with macOS
+/// Reduce motion the card stays still.
+fn loading_card(ui: &mut Ui, old: Option<&egui::TextureHandle>) {
+    let size = old.map_or_else(|| egui::vec2(ui.available_width().min(240.0), 160.0), |t| shown_size(ui, t));
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let t = theme::t();
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, egui::CornerRadius::same(8), t.raised);
+    if let Some(tex) = old {
+        p.image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::from_white_alpha(70));
+    }
+    if theme::reduce_motion() {
+        return;
+    }
+    // a soft band, 40% of the width, crossing every 1.6 s
+    let now = ui.input(|i| i.time) as f32;
+    let band = rect.width() * 0.4;
+    let x = rect.left() - band + (now / 1.6).fract() * (rect.width() + band * 2.0);
+    let steps = 12;
+    for i in 0..steps {
+        let f = i as f32 / steps as f32;
+        let a = (1.0 - (f * 2.0 - 1.0).abs()) * 22.0; // brightest in the middle
+        let x0 = x + f * band;
+        let slice = egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x0 + band / steps as f32 + 0.5, rect.bottom()));
+        p.rect_filled(slice.intersect(rect), 0.0, egui::Color32::from_white_alpha(a as u8));
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+}
+
+/// The real step under the loading cards, and a thin bar: filling when the count is known, else a
+/// short segment moving back and forth (still with Reduce motion).
+fn loading_step(ui: &mut Ui, step: &str, progress: Option<(u64, u64)>) {
+    ui.add_space(6.0);
+    let text = match progress {
+        Some((done, total)) if total > 0 => format!("{step} ({done} of {total})"),
+        _ => step.to_string(),
+    };
+    ui.label(RichText::new(text).weak());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(240.0), 3.0), egui::Sense::hover());
+    let t = theme::t();
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, egui::CornerRadius::same(2), t.raised);
+    let fill = match progress {
+        Some((done, total)) if total > 0 => {
+            let w = rect.width() * (done as f32 / total as f32).clamp(0.0, 1.0);
+            egui::Rect::from_min_size(rect.min, egui::vec2(w, rect.height()))
+        }
+        _ if theme::reduce_motion() => egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * 0.3, rect.height())),
+        _ => {
+            let now = ui.input(|i| i.time) as f32;
+            let w = rect.width() * 0.3;
+            let phase = (now / 1.2).fract();
+            let x = rect.left() + (1.0 - (phase * 2.0 - 1.0).abs()) * (rect.width() - w);
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+            egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, rect.height()))
+        }
+    };
+    p.rect_filled(fill, egui::CornerRadius::same(2), t.accent);
+}
+
 /// One UI tree row, in the UI font. A leaf leaves the room of the ▸ arrow empty, so it lines up with
 /// the names of headers at the same level instead of with their arrows.
 fn node_ui(ui: &mut Ui, n: &compose::Node, jump: &mut Option<usize>) {
@@ -4269,6 +4513,7 @@ fn tab_widget(ui: &mut Ui, t: &Tab, active: bool) -> (bool, bool) {
         Color32::TRANSPARENT
     };
     let mut close = false;
+    let mut close_rect = egui::Rect::NOTHING;
     let inner = egui::Frame::new()
         .fill(fill)
         .corner_radius(egui::CornerRadius {
@@ -4295,7 +4540,7 @@ fn tab_widget(ui: &mut Ui, t: &Tab, active: bool) -> (bool, bool) {
                     })
                     .color(color),
                 );
-                close = ui
+                let x = ui
                     .add(
                         egui::Button::new(
                             RichText::new(ic::X)
@@ -4304,8 +4549,9 @@ fn tab_widget(ui: &mut Ui, t: &Tab, active: bool) -> (bool, bool) {
                         )
                         .frame(false),
                     )
-                    .on_hover_text("Close  ⌘W")
-                    .clicked();
+                    .on_hover_text("Close  ⌘W");
+                close = x.clicked();
+                close_rect = x.rect;
             });
         });
     let r = inner
@@ -4320,6 +4566,10 @@ fn tab_widget(ui: &mut Ui, t: &Tab, active: bool) -> (bool, bool) {
             egui::Stroke::new(2.0, crate::theme::t().accent),
         );
     }
+    // the tab's own click area is added after the × and sits on top of it, so a click on the × arrives
+    // as a tab click: where the pointer was decides
+    let on_x = r.clicked() && r.interact_pointer_pos().is_some_and(|p| close_rect.expand(2.0).contains(p));
+    let close = close || on_x;
     (r.clicked() && !close, close || r.middle_clicked())
 }
 

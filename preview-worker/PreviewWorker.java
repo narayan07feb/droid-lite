@@ -4,7 +4,7 @@
 //
 // Run: java -cp <base jars> PreviewWorker.java <socket path> <work dir>
 //   system properties: paparazzi.layoutlib.runtime.root, paparazzi.layoutlib.resources.root,
-//   droidlite.compose.plugin (the Kotlin Compose compiler plugin jar),
+//   droidlite.plugins (the Kotlin compiler plugin jars: Compose, parcelize; ":"-separated),
 //   droidlite.compile.cp (the classpath the open file compiles against), droidlite.idle.minutes (10).
 //
 // Protocol, one JSON object per line each way (a tiny reader below, no JSON library):
@@ -33,7 +33,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import javax.imageio.ImageIO;
 
 public class PreviewWorker {
-    record Request(long id, String file, List<String> sources, String cls, List<String> previews, SocketChannel out) {}
+    record Request(long id, String file, List<String> sources, String cls, List<Map<String, Object>> previews, List<String> cp,
+        List<String> rjava, String key, SocketChannel out) {}
 
     static final AtomicReference<Request> next = new AtomicReference<>();
     static final Object wake = new Object();
@@ -82,7 +83,8 @@ public class PreviewWorker {
             while ((line = in.readLine()) != null) {
                 Map<String, Object> m = Json.parse(line);
                 Request r = new Request(((Number) m.get("id")).longValue(), (String) m.get("file"),
-                    strings(m.get("sources")), (String) m.get("class"), strings(m.get("previews")), out);
+                    strings(m.get("sources")), (String) m.get("class"), specs(m.get("previews")), strings(m.get("cp")),
+                    strings(m.get("rjava")), m.get("key") == null ? "" : (String) m.get("key"), out);
                 Request old = next.getAndSet(r);
                 if (old != null) reply(old.out, "{\"id\":" + old.id + ",\"ok\":false,\"skipped\":true}");
                 synchronized (wake) { wake.notifyAll(); }
@@ -104,9 +106,20 @@ public class PreviewWorker {
             lastWork = System.currentTimeMillis();
             try {
                 if (sdk == null) {
-                    Environment env = new Environment(work.toString(), "droidlite.preview", 35,
-                        List.of(), List.of(), List.of(), List.of(), List.of(), List.of());
-                    sdk = new PaparazziSdk(env, DeviceConfig.PIXEL_5, img -> { frame = img; return kotlin.Unit.INSTANCE; });
+                    status(r, "Starting the renderer", 0, 0);
+                    // the libraries' assets folders (fonts and Compose resources load from them)
+                    List<String> assets = list("droidlite.assets");
+                    // the R packages (their R classes are on this classpath) and resource folders, so
+                    // R.string.x and painterResource(R.drawable.y) resolve; the first package is the "app"
+                    List<String> packages = list("droidlite.res.packages");
+                    Environment env = new Environment(work.toString(), packages.isEmpty() ? "droidlite.preview" : packages.get(0),
+                        34, // layoutlib 14 is Android 14 (API 34): Compose must not take its API 35 paths
+                        packages.size() > 1 ? packages.subList(1, packages.size()) : List.of(), List.of(),
+                        list("droidlite.res.modules"), list("droidlite.aar.dirs"), List.of(), assets);
+                    // SHRINK: the picture is as big as the content (like Android Studio's preview), not a whole phone
+                    sdk = new PaparazziSdk(env, DeviceConfig.PIXEL_5, "android:Theme.Material.NoActionBar.Fullscreen",
+                        com.android.ide.common.rendering.api.SessionParams.RenderingMode.SHRINK,
+                        img -> { frame = img; return kotlin.Unit.INSTANCE; });
                     sdk.setup();
                 }
                 reply(r.out, handle(r, work, sdk));
@@ -117,15 +130,180 @@ public class PreviewWorker {
         }
     }
 
+    /** The project's own code a preview needs (its R classes, then its source files), compiled once per
+     *  key into work/lib-KEY and reused until a file changes; older lib dirs are deleted. Null when none. */
+    static Path ownCode(Request r, Path work, String cp) throws Exception {
+        if (r.key.isEmpty() || (r.sources.isEmpty() && r.rjava.isEmpty())) return null;
+        Path lib = work.resolve("lib-" + r.key);
+        if (Files.exists(lib.resolve(".ok"))) return lib;
+        status(r, "Compiling the project code this preview needs (" + r.sources.size() + " files)", 0, 0);
+        deleteTree(lib);
+        Files.createDirectories(lib);
+        if (!r.rjava.isEmpty()) javac(r.rjava, System.getProperty("droidlite.compile.cp"), lib);
+        List<String> kt = r.sources.stream().filter(s -> s.endsWith(".kt")).toList();
+        List<String> java = r.sources.stream().filter(s -> s.endsWith(".java")).toList();
+        if (!kt.isEmpty()) {
+            List<String> args = new ArrayList<>(r.sources); // .java files too: Kotlin code may use them
+            args.addAll(List.of("-d", lib.toString(), "-classpath", cp + ":" + lib, "-no-stdlib", "-no-reflect",
+                "-jvm-target", "17", "-nowarn", "-module-name", "project", "-Xskip-metadata-version-check",
+                "-Xskip-prerelease-check"));
+            args.addAll(plugins());
+            ByteArrayOutputStream log = new ByteArrayOutputStream();
+            var code = new org.jetbrains.kotlin.cli.jvm.K2JVMCompiler().exec(new PrintStream(log, true, StandardCharsets.UTF_8), args.toArray(String[]::new));
+            if (code != org.jetbrains.kotlin.cli.common.ExitCode.OK) {
+                throw new IllegalStateException(log.toString(StandardCharsets.UTF_8).strip());
+            }
+        }
+        if (!java.isEmpty()) javac(java, cp + ":" + lib, lib);
+        Files.writeString(lib.resolve(".ok"), r.key);
+        try (var dirs = Files.list(work)) { // keep only the current project code
+            dirs.filter(d -> d.getFileName().toString().startsWith("lib-") && !d.equals(lib)).forEach(PreviewWorker::deleteTree);
+        }
+        return lib;
+    }
+
+    /** -Xplugin=… for each compiler plugin of the project's Kotlin (Compose, parcelize). */
+    static List<String> plugins() {
+        List<String> out = new ArrayList<>();
+        for (String p : System.getProperty("droidlite.plugins", "").split(":")) if (!p.isEmpty()) out.add("-Xplugin=" + p);
+        return out;
+    }
+
+    static void javac(List<String> files, String cp, Path out) {
+        var javac = javax.tools.ToolProvider.getSystemJavaCompiler();
+        ByteArrayOutputStream log = new ByteArrayOutputStream();
+        List<String> args = new ArrayList<>(List.of("-d", out.toString(), "-cp", cp, "-nowarn", "-proc:none", "--release", "17"));
+        args.addAll(files);
+        if (javac.run(null, log, log, args.toArray(String[]::new)) != 0) {
+            throw new IllegalStateException(log.toString(StandardCharsets.UTF_8).strip());
+        }
+    }
+
+    /** What Android Studio's preview gives every preview (its ComposeViewAdapter does the same):
+     *  owners for activity results and the back button, so rememberLauncherForActivityResult and
+     *  BackHandler work. Compiled once per worker against the project's libraries; null when the
+     *  project has no activity-compose (then previews run without it). */
+    static final String HOST = """
+        package droidlite.host
+
+        import androidx.activity.OnBackPressedDispatcher
+        import androidx.activity.OnBackPressedDispatcherOwner
+        import androidx.activity.compose.LocalActivityResultRegistryOwner
+        import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
+        import androidx.activity.result.ActivityResultRegistry
+        import androidx.activity.result.ActivityResultRegistryOwner
+        import androidx.activity.result.contract.ActivityResultContract
+        import androidx.compose.runtime.Composable
+        import androidx.compose.runtime.CompositionLocalProvider
+        import androidx.compose.foundation.background
+        import androidx.compose.foundation.layout.Box
+        import androidx.compose.foundation.layout.height
+        import androidx.compose.foundation.layout.width
+        import androidx.compose.ui.Modifier
+        import androidx.compose.ui.graphics.Color
+        import androidx.compose.ui.unit.dp
+        import androidx.compose.ui.platform.LocalInspectionMode
+        import androidx.compose.ui.platform.LocalLifecycleOwner
+        import androidx.core.app.ActivityOptionsCompat
+
+        /** widthDp / heightDp and showBackground / backgroundColor of @Preview, like Android Studio. */
+        @Composable
+        fun PreviewFrame(widthDp: Int, heightDp: Int, background: Long, content: @Composable () -> Unit) {
+            var m: Modifier = Modifier
+            if (widthDp > 0) m = m.width(widthDp.dp)
+            if (heightDp > 0) m = m.height(heightDp.dp)
+            if (background != 0L) m = m.background(Color(background.toInt()))
+            Box(m) { content() }
+        }
+
+        @Composable
+        fun PreviewHost(content: @Composable () -> Unit) {
+            val lifecycle = LocalLifecycleOwner.current.lifecycle
+            val results = object : ActivityResultRegistryOwner {
+                override val activityResultRegistry = object : ActivityResultRegistry() {
+                    override fun <I, O> onLaunch(requestCode: Int, contract: ActivityResultContract<I, O>, input: I, options: ActivityOptionsCompat?) {}
+                }
+            }
+            val back = object : OnBackPressedDispatcherOwner {
+                override val lifecycle = lifecycle
+                override val onBackPressedDispatcher = OnBackPressedDispatcher()
+            }
+            CompositionLocalProvider(
+                LocalActivityResultRegistryOwner provides results,
+                LocalOnBackPressedDispatcherOwner provides back,
+                LocalInspectionMode provides true,
+                VM_OWNER
+            ) {
+                CMP_CONTEXT
+                content()
+            }
+        }
+        """;
+    /** Compose Multiplatform resources read images and strings through an Android context that only an
+     *  app start sets; previews set it with this effect (as Android Studio's preview does). */
+    static final String CMP_CONTEXT = "@OptIn(org.jetbrains.compose.resources.ExperimentalResourceApi::class) org.jetbrains.compose.resources.PreviewContextConfigurationEffect()";
+    /** A ViewModel store, as Android Studio's preview gives one: composables that take a viewModel()
+     *  draw (one that needs Hilt's still cannot, as in Android Studio). */
+    static final String VM_OWNER = "androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner provides object : androidx.lifecycle.ViewModelStoreOwner { override val viewModelStore = androidx.lifecycle.ViewModelStore() },";
+    static Path host;
+    static boolean hostTried;
+
+    static Path host(Path work, String cp) {
+        if (hostTried) return host;
+        hostTried = true;
+        try {
+            Path src = work.resolve("host/PreviewHost.kt");
+            Path out = work.resolve("host/classes");
+            Files.createDirectories(src.getParent());
+            // with the Compose Multiplatform context first; a project without compose-resources gets
+            // the plain host
+            // the richest host the project's libraries allow: Compose Multiplatform context and a
+            // ViewModel store, then without one of them, then plain
+            List<String> variants = new ArrayList<>();
+            for (String cmp : List.of(CMP_CONTEXT, ""))
+                for (String vm : List.of(VM_OWNER, "")) variants.add(HOST.replace("CMP_CONTEXT", cmp).replace("VM_OWNER", vm));
+            for (String hostSource : variants) {
+                Files.writeString(src, hostSource);
+                deleteTree(out);
+                List<String> args = new ArrayList<>(List.of(src.toString(), "-d", out.toString(), "-classpath", cp, "-no-stdlib",
+                    "-no-reflect", "-jvm-target", "17", "-nowarn", "-Xskip-metadata-version-check", "-Xskip-prerelease-check"));
+                args.addAll(plugins());
+                ByteArrayOutputStream log = new ByteArrayOutputStream();
+                var code = new org.jetbrains.kotlin.cli.jvm.K2JVMCompiler().exec(new PrintStream(log, true, StandardCharsets.UTF_8), args.toArray(String[]::new));
+                if (code == org.jetbrains.kotlin.cli.common.ExitCode.OK) {
+                    host = out;
+                    break;
+                }
+                System.err.println("preview host variant not built: " + log.toString(StandardCharsets.UTF_8).lines().limit(3).toList());
+            }
+        } catch (Exception e) {
+            System.err.println("preview host: " + e);
+        }
+        return host;
+    }
+
     static String handle(Request r, Path work, PaparazziSdk sdk) throws Exception {
         Path out = work.resolve("classes-" + r.id);
         long t0 = System.nanoTime();
+        // the project's own libraries first (the worker runs with them too), then the base pack
+        String cp = (r.cp.isEmpty() ? "" : String.join(":", r.cp) + ":") + System.getProperty("droidlite.compile.cp");
+        Path lib;
+        try {
+            lib = ownCode(r, work, cp);
+        } catch (IllegalStateException e) {
+            return "{\"id\":" + r.id + ",\"ok\":false,\"error\":" + Json.str("In the project code this preview needs:\n" + e.getMessage()) + "}";
+        }
+        if (lib != null) cp = cp + ":" + lib;
+        status(r, "Compiling " + Path.of(r.file).getFileName(), 0, 0);
         List<String> args = new ArrayList<>();
         args.add(r.file);
-        args.addAll(r.sources);
-        args.addAll(List.of("-d", out.toString(), "-classpath", System.getProperty("droidlite.compile.cp"),
-            "-no-stdlib", "-no-reflect", "-jvm-target", "17", "-nowarn", "-module-name", "preview",
-            "-Xplugin=" + System.getProperty("droidlite.compose.plugin")));
+        args.addAll(List.of("-d", out.toString(), "-classpath", cp,
+            // the same module as the project code, so the open file sees its `internal` declarations
+            "-no-stdlib", "-no-reflect", "-jvm-target", "17", "-nowarn", "-module-name", "project",
+            // the project's libraries may be built by a newer Kotlin than the base pack's compiler
+            "-Xskip-metadata-version-check", "-Xskip-prerelease-check"));
+        args.addAll(plugins());
+        if (lib != null) args.add("-Xfriend-paths=" + lib);
         ByteArrayOutputStream log = new ByteArrayOutputStream();
         var code = new org.jetbrains.kotlin.cli.jvm.K2JVMCompiler().exec(new PrintStream(log, true, StandardCharsets.UTF_8), args.toArray(String[]::new));
         long compileMs = (System.nanoTime() - t0) / 1_000_000;
@@ -133,28 +311,69 @@ public class PreviewWorker {
             return "{\"id\":" + r.id + ",\"ok\":false,\"error\":" + Json.str(log.toString(StandardCharsets.UTF_8).strip()) + ",\"compile_ms\":" + compileMs + "}";
         }
         // a fresh loader per request: the edited classes replace the old ones; Compose and Paparazzi stay shared
-        try (URLClassLoader loader = new URLClassLoader(new URL[] {out.toUri().toURL()}, PreviewWorker.class.getClassLoader())) {
+        List<URL> urls = new ArrayList<>(List.of(out.toUri().toURL()));
+        if (lib != null) urls.add(lib.toUri().toURL());
+        Path hostDir = host(work, cp);
+        if (hostDir != null) urls.add(hostDir.toUri().toURL());
+        // the libraries are on the worker's own classpath already (parent first): only the project's
+        // code and the open file live in this loader
+        try (URLClassLoader loader = new URLClassLoader(urls.toArray(URL[]::new), PreviewWorker.class.getClassLoader())) {
             Class<?> c = loader.loadClass(r.cls);
             StringBuilder images = new StringBuilder();
-            for (String p : r.previews) {
+            int drawn = 0;
+            for (Map<String, Object> spec : r.previews) {
+                status(r, "Drawing " + (drawn + 1) + " of " + r.previews.size() + " previews", drawn, r.previews.size());
+                drawn++;
+                String fn = (String) spec.get("function");
+                String title = spec.get("title") instanceof String s ? s : fn;
                 long t = System.nanoTime();
-                ComposableMethod m = ComposableMethodKt.getDeclaredComposableMethod(c, p);
-                m.asMethod().setAccessible(true);
-                Thread.currentThread().setContextClassLoader(loader);
-                sdk.prepare();
-                try {
-                    sdk.snapshot((composer, changed) -> { m.invoke(composer, null); return kotlin.Unit.INSTANCE; });
-                } finally {
-                    sdk.teardown();
-                }
-                Path png = work.resolve(r.id + "-" + p + ".png");
-                ImageIO.write(frame, "png", png.toFile());
                 if (images.length() > 0) images.append(',');
-                images.append("{\"name\":").append(Json.str(p)).append(",\"png\":").append(Json.str(png.toString()))
-                    .append(",\"ms\":").append((System.nanoTime() - t) / 1_000_000).append('}');
+                try {
+                    ComposableMethod m = ComposableMethodKt.getDeclaredComposableMethod(c, fn);
+                    m.asMethod().setAccessible(true);
+                    Class<?> hostClass = hostDir == null ? null : loader.loadClass("droidlite.host.PreviewHostKt");
+                    ComposableMethod hostMethod = hostClass == null ? null
+                        : ComposableMethodKt.getDeclaredComposableMethod(hostClass, "PreviewHost", kotlin.jvm.functions.Function2.class);
+                    ComposableMethod frameMethod = hostClass == null ? null
+                        : ComposableMethodKt.getDeclaredComposableMethod(hostClass, "PreviewFrame", int.class, int.class, long.class, kotlin.jvm.functions.Function2.class);
+                    int w = intOf(spec.get("widthDp")), h = intOf(spec.get("heightDp"));
+                    long bg = spec.get("background") instanceof Number b ? b.longValue()
+                        : Boolean.TRUE.equals(spec.get("showBackground")) ? (Boolean.TRUE.equals(spec.get("night")) ? 0xFF000000L : 0xFFFFFFFFL) : 0L;
+                    Thread.currentThread().setContextClassLoader(loader);
+                    sdk.prepare();
+                    try {
+                        // this picture's device (night mode, font scale, locale, screen size): it needs the
+                        // session prepare() just opened
+                        sdk.unsafeUpdateConfig(deviceFor(spec), "android:Theme.Material.NoActionBar.Fullscreen",
+                            com.android.ide.common.rendering.api.SessionParams.RenderingMode.SHRINK);
+                        kotlin.jvm.functions.Function2<androidx.compose.runtime.Composer, Integer, kotlin.Unit> preview =
+                            (composer, changed) -> { m.invoke(composer, null); return kotlin.Unit.INSTANCE; };
+                        kotlin.jvm.functions.Function2<androidx.compose.runtime.Composer, Integer, kotlin.Unit> framed = frameMethod == null ? preview
+                            : (composer, changed) -> { frameMethod.invoke(composer, null, w, h, bg, preview); return kotlin.Unit.INSTANCE; };
+                        sdk.snapshot(hostMethod == null ? framed
+                            : (composer, changed) -> { hostMethod.invoke(composer, null, framed); return kotlin.Unit.INSTANCE; });
+                    } finally {
+                        sdk.teardown();
+                    }
+                    Path png = work.resolve(r.id + "-" + drawn + ".png");
+                    ImageIO.write(frame, "png", png.toFile());
+                    images.append("{\"name\":").append(Json.str(title)).append(",\"png\":").append(Json.str(png.toString()))
+                        .append(",\"ms\":").append((System.nanoTime() - t) / 1_000_000).append('}');
+                } catch (Throwable e) {
+                    // one picture failing (e.g. a font scale the screen does not take) leaves the others
+                    images.append("{\"name\":").append(Json.str(title)).append(",\"error\":").append(Json.str(trace(e))).append('}');
+                }
             }
             return "{\"id\":" + r.id + ",\"ok\":true,\"images\":[" + images + "],\"compile_ms\":" + compileMs + "}";
+        } finally {
+            deleteTree(out); // the classes of one request are not needed after it
         }
+    }
+
+    static void deleteTree(Path p) {
+        try (var walk = Files.walk(p)) {
+            walk.sorted(Comparator.reverseOrder()).forEach(f -> f.toFile().delete());
+        } catch (IOException ignored) {}
     }
 
     /** The SDK's android.jar stub leaves Build.FINGERPRINT null; Compose reads it ("robolectric" = a host JVM). */
@@ -184,7 +403,62 @@ public class PreviewWorker {
         }
     }
 
+    /** The real step, sent while a request runs: Droid Lite shows it under the loading card. */
+    static void status(Request r, String text, int done, int total) {
+        reply(r.out, "{\"id\":" + r.id + ",\"status\":" + Json.str(text) + ",\"done\":" + done + ",\"total\":" + total + "}");
+    }
+
+    static List<String> list(String property) {
+        return Arrays.stream(System.getProperty(property, "").split(":")).filter(s -> !s.isEmpty()).toList();
+    }
+
     static void sleep(long ms) { try { Thread.sleep(ms); } catch (InterruptedException ignored) {} }
+
+    @SuppressWarnings("unchecked")
+    static List<Map<String, Object>> specs(Object o) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Object x : o == null ? List.of() : (List<Object>) o) {
+            if (x instanceof Map) out.add((Map<String, Object>) x);
+            else out.add(Map.of("function", x, "title", x)); // an older client: names only
+        }
+        return out;
+    }
+
+    /** The device for one picture: Paparazzi's PIXEL_5 with this preview's night mode, font scale,
+     *  locale and screen size (`device = "spec:width=…dp,height=…dp"`), through the data class's copy
+     *  with named parameters (kotlin-reflect). */
+    static DeviceConfig deviceFor(Map<String, Object> spec) {
+        DeviceConfig base = DeviceConfig.PIXEL_5;
+        var copy = kotlin.reflect.full.KClasses.getMemberFunctions(kotlin.jvm.JvmClassMappingKt.getKotlinClass(DeviceConfig.class))
+            .stream().filter(f -> f.getName().equals("copy")).findFirst().orElseThrow();
+        Map<kotlin.reflect.KParameter, Object> args = new HashMap<>();
+        double dpi = base.getDensity().getDpiValue();
+        String device = spec.get("device") instanceof String d ? d : "";
+        Integer wDp = specDp(device, "width"), hDp = specDp(device, "height");
+        for (var p : copy.getParameters()) {
+            if (p.getKind() == kotlin.reflect.KParameter.Kind.INSTANCE) { args.put(p, base); continue; }
+            String n = p.getName();
+            if ("nightMode".equals(n) && Boolean.TRUE.equals(spec.get("night"))) args.put(p, com.android.resources.NightMode.NIGHT);
+            if ("fontScale".equals(n) && spec.get("fontScale") instanceof Number f) args.put(p, f.floatValue());
+            if ("locale".equals(n) && spec.get("locale") instanceof String l) args.put(p, l);
+            if ("screenWidth".equals(n) && wDp != null) args.put(p, (int) Math.round(wDp * dpi / 160));
+            if ("screenHeight".equals(n) && hDp != null) args.put(p, (int) Math.round(hDp * dpi / 160));
+        }
+        return (DeviceConfig) copy.callBy(args);
+    }
+
+    /** `spec:width=411dp,height=891dp` -> 411 for "width". */
+    static Integer specDp(String device, String key) {
+        for (String part : device.replace("spec:", "").split(",")) {
+            String[] kv = part.trim().split("=");
+            if (kv.length == 2 && kv[0].trim().equals(key)) {
+                try { return (int) Double.parseDouble(kv[1].trim().replace("dp", "")); } catch (NumberFormatException e) { return null; }
+            }
+        }
+        return null;
+    }
+
+    static int intOf(Object o) { return o instanceof Number n ? n.intValue() : 0; }
 
     @SuppressWarnings("unchecked")
     static List<String> strings(Object o) { return o == null ? List.of() : (List<String>) (List<?>) o; }
