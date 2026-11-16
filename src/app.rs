@@ -304,7 +304,7 @@ struct Previews {
 
 /// What the worker needs to draw a tab's previews: its top-level `@Preview` functions (their class is
 /// the file's `…Kt` class); None when it has none.
-fn preview_request(tab: &Tab) -> Option<crate::preview::Request> {
+fn preview_request(tab: &Tab, project: Option<&crate::project::Project>) -> Option<crate::preview::Request> {
     let previews: Vec<String> = tab
         .syms
         .decls
@@ -318,6 +318,16 @@ fn preview_request(tab: &Tab) -> Option<crate::preview::Request> {
             .trim_end_matches(".x")
             .to_string(),
         previews,
+        project: project.map(|p| crate::preview::ProjectRef {
+            root: p.root.clone(),
+            scripts: p
+                .files
+                .iter()
+                .filter(|f| f.extension().is_some_and(|e| e == "kts" || e == "gradle"))
+                .cloned()
+                .collect(),
+            files: std::sync::Arc::new(p.files.clone()),
+        }),
     })
 }
 
@@ -3387,7 +3397,7 @@ impl App {
                             .map(|d| d.offset);
                     }
                 }
-                render_req = preview_request(tab);
+                render_req = preview_request(tab, self.project.as_ref());
                 if render_req.is_some() {
                     render = ui
                         .add_enabled(!self.previews.busy, egui::Button::new(format!("{}  Render again", ic::IMAGE)))
@@ -3465,7 +3475,7 @@ impl App {
         // by itself: a file with previews that was just opened or saved (no unsaved edits) is drawn
         if let Some(tab) = self.tabs.get(self.active)
             && tab.text == tab.saved
-            && let Some(r) = preview_request(tab)
+            && let Some(r) = preview_request(tab, self.project.as_ref())
         {
             let key = (tab.path.clone(), hash(&tab.saved));
             if self.previews.sent.as_ref() != Some(&key) {

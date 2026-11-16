@@ -186,23 +186,36 @@ fn version_files(
         .filter_map(|e| e.file_name().into_string().ok())
         .collect();
     versions.sort_by_key(|v| version_key(v));
+    let files_of = |v: &str| -> Vec<PathBuf> {
+        std::fs::read_dir(dir.join(v))
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .flat_map(|h| {
+                std::fs::read_dir(h.path())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .map(|f| f.path())
+            })
+            .collect()
+    };
     let chosen = version
         .filter(|v| versions.iter().any(|x| x == v))
         .map(String::from)
         .or_else(|| versions.last().cloned())?;
-    let files = std::fs::read_dir(dir.join(&chosen))
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .flat_map(|h| {
-            std::fs::read_dir(h.path())
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-                .map(|f| f.path())
-        })
-        .collect();
-    Some((format!("{group}:{name}:{chosen}"), files))
+    Some((format!("{group}:{name}:{chosen}"), files_of(&chosen)))
+}
+
+/// The newest cached version of `group:name` that has code (a jar or an aar).
+fn newest_with_code(cache: &Path, group: &str, name: &str) -> Option<(String, Vec<PathBuf>)> {
+    let dir = cache.join(group).join(name);
+    let mut versions: Vec<String> = std::fs::read_dir(&dir).ok()?.filter_map(Result::ok).filter_map(|e| e.file_name().into_string().ok()).collect();
+    versions.sort_by_key(|v| version_key(v));
+    versions.iter().rev().find_map(|v| {
+        let files = version_files(cache, group, name, Some(v))?.1;
+        has_code(&files).then(|| (format!("{group}:{name}:{v}"), files))
+    })
 }
 
 fn has_code(files: &[PathBuf]) -> bool {
@@ -231,7 +244,13 @@ fn find_artifact(cache: &Path, group: &str, name: &str, version: Option<&str>) -
             files.extend(code);
             Some(Artifact { id, files })
         }
-        (None, Some((id, files))) | (Some((id, files)), None) => Some(Artifact { id, files }),
+        (None, Some((id, files))) => Some(Artifact { id, files }),
+        // no code in the wanted version nor a -android/-jvm variant (Gradle resolved this version but
+        // used another one): the newest cached version with code, so the library is not lost
+        (Some((id, files)), None) => match newest_with_code(cache, group, name) {
+            Some((id, code)) => Some(Artifact { id, files: code }),
+            None => Some(Artifact { id, files }),
+        },
         (None, None) => None,
     }
 }
@@ -262,7 +281,7 @@ fn pom_deps(pom: &str) -> Vec<(String, String, Option<String>)> {
 
 /// Follows the dependencies breadth first and reads every artifact's symbols.
 pub fn index(root: &Path, scripts: &[PathBuf]) -> Libraries {
-    let arts = resolve(root, scripts);
+    let arts = resolve(root, scripts, 800);
     let rows = read_all(&arts, cache_dir().as_deref());
     // strings repeat a lot (packages, names, archives): keep one copy of each
     let mut pool: HashSet<Arc<str>> = HashSet::new();
@@ -309,14 +328,81 @@ pub fn index(root: &Path, scripts: &[PathBuf]) -> Libraries {
     libs
 }
 
-/// The project's dependencies and theirs (from the `.pom` files), at most 800.
-fn resolve(root: &Path, scripts: &[PathBuf]) -> Vec<Artifact> {
-    let cache = gradle_home().join("caches/modules-2/files-2.1");
-    let mut queue: VecDeque<(String, String, Option<String>)> = direct_deps(root, scripts).into();
+/// The class files (jars and aars, no sources) of the project's dependencies and theirs, from the
+/// Gradle cache (read only): what a preview compiles and runs against.
+pub fn class_archives(root: &Path, scripts: &[PathBuf]) -> Vec<PathBuf> {
+    let files: Vec<PathBuf> = resolve(root, scripts, 5000)
+        .into_iter()
+        .flat_map(|a| a.files)
+        .filter(|f| {
+            let name = f.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+            (name.ends_with(".jar") || name.ends_with(".aar"))
+                && !name.ends_with("-sources.jar")
+                && !name.ends_with("-javadoc.jar")
+        })
+        .collect();
+    one_version_each(files)
+}
+
+/// One version of each `group/name` (the highest): an artifact can come twice, directly and through
+/// a multiplatform root, and two versions of one class on a classpath break at run time.
+fn one_version_each(files: Vec<PathBuf>) -> Vec<PathBuf> {
+    // …/files-2.1/<group>/<name>/<version>/<hash>/<file>
+    let parts = |f: &Path| -> Option<(String, String)> {
+        let version = f.parent()?.parent()?;
+        let name = version.parent()?;
+        Some((name.to_string_lossy().into_owned(), version.file_name()?.to_string_lossy().into_owned()))
+    };
+    let mut best: HashMap<String, String> = HashMap::new();
+    for f in &files {
+        if let Some((ga, v)) = parts(f)
+            && best.get(&ga).is_none_or(|b| version_key(&v) > version_key(b))
+        {
+            best.insert(ga, v);
+        }
+    }
     let mut seen = HashSet::new();
-    let mut arts = Vec::new();
+    files
+        .into_iter()
+        .filter(|f| parts(f).is_none_or(|(ga, v)| best.get(&ga) == Some(&v)))
+        .filter(|f| seen.insert(f.clone()))
+        .collect()
+}
+
+/// The project's dependencies and theirs (from the `.pom` files), at most `limit` (the symbol index
+/// keeps 800 for its memory; a preview needs them all to compile).
+fn resolve(root: &Path, scripts: &[PathBuf], limit: usize) -> Vec<Artifact> {
+    resolve_from(direct_deps(root, scripts), limit)
+}
+
+/// The class files of these coordinates and their pom dependencies, from the Gradle cache (read only).
+pub fn closure_archives(coords: Vec<(String, String, Option<String>)>) -> Vec<PathBuf> {
+    resolve_from(coords, 200)
+        .into_iter()
+        .flat_map(|a| a.files)
+        .filter(|f| {
+            let n = f.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+            n.ends_with(".jar") && !n.ends_with("-sources.jar") && !n.ends_with("-javadoc.jar")
+        })
+        .collect()
+}
+
+fn resolve_from(start: Vec<(String, String, Option<String>)>, limit: usize) -> Vec<Artifact> {
+    let cache = gradle_home().join("caches/modules-2/files-2.1");
+    let mut queue: VecDeque<(String, String, Option<String>)> = start.into();
+    let mut seen = HashSet::new();
+    let mut arts: Vec<(String, String, Artifact)> = Vec::new();
+    // every version asked for, per group:name: Gradle keeps the highest, and so do we (the first one
+    // met could be older than what another library needs, e.g. androidx.collection for Compose)
+    let mut wanted: HashMap<String, String> = HashMap::new();
     while let Some((g, a, v)) = queue.pop_front() {
-        if arts.len() >= 800 || !seen.insert(format!("{g}:{a}")) {
+        let ga = format!("{g}:{a}");
+        if let Some(v) = &v
+            && wanted.get(&ga).is_none_or(|w| version_key(v) > version_key(w))
+        {
+            wanted.insert(ga.clone(), v.clone());
+        }
+        if arts.len() >= limit || !seen.insert(ga) {
             continue;
         }
         let Some(art) = find_artifact(&cache, &g, &a, v.as_deref()) else {
@@ -329,9 +415,20 @@ fn resolve(root: &Path, scripts: &[PathBuf]) -> Vec<Artifact> {
                 queue.extend(pom_deps(&p));
             }
         }
-        arts.push(art);
+        arts.push((g, a, art));
     }
-    arts
+    arts.into_iter()
+        .map(|(g, a, art)| {
+            let best = wanted.get(&format!("{g}:{a}"));
+            let first = art.id.rsplit(':').next().unwrap_or("").to_string();
+            match best {
+                Some(b) if version_key(b) > version_key(&first) => {
+                    find_artifact(&cache, &g, &a, Some(b)).unwrap_or(art)
+                }
+                _ => art,
+            }
+        })
+        .collect()
 }
 
 /// Reads every artifact on all cores, each from the disk cache when it has one.

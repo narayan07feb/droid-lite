@@ -3792,6 +3792,7 @@ fn e2e_real_preview_shot() {
         std::env::remove_var("DROID_LITE_PREVIEW_WORKER");
         std::env::remove_var("DROID_LITE_PREVIEW_DIR");
         std::env::remove_var("DROID_LITE_MAC_GUARD");
+        std::env::remove_var("DROID_LITE_GRADLE_HOME"); // the real Gradle cache, read only
     }
     let root = PathBuf::from(project);
     let mut h = Harness::builder()

@@ -4,7 +4,7 @@
 //
 // Run: java -cp <base jars> PreviewWorker.java <socket path> <work dir>
 //   system properties: paparazzi.layoutlib.runtime.root, paparazzi.layoutlib.resources.root,
-//   droidlite.compose.plugin (the Kotlin Compose compiler plugin jar),
+//   droidlite.plugins (the Kotlin compiler plugin jars: Compose, parcelize; ":"-separated),
 //   droidlite.compile.cp (the classpath the open file compiles against), droidlite.idle.minutes (10).
 //
 // Protocol, one JSON object per line each way (a tiny reader below, no JSON library):
@@ -33,7 +33,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import javax.imageio.ImageIO;
 
 public class PreviewWorker {
-    record Request(long id, String file, List<String> sources, String cls, List<String> previews, SocketChannel out) {}
+    record Request(long id, String file, List<String> sources, String cls, List<String> previews, List<String> cp,
+        List<String> rjava, String key, SocketChannel out) {}
 
     static final AtomicReference<Request> next = new AtomicReference<>();
     static final Object wake = new Object();
@@ -82,7 +83,8 @@ public class PreviewWorker {
             while ((line = in.readLine()) != null) {
                 Map<String, Object> m = Json.parse(line);
                 Request r = new Request(((Number) m.get("id")).longValue(), (String) m.get("file"),
-                    strings(m.get("sources")), (String) m.get("class"), strings(m.get("previews")), out);
+                    strings(m.get("sources")), (String) m.get("class"), strings(m.get("previews")), strings(m.get("cp")),
+                    strings(m.get("rjava")), m.get("key") == null ? "" : (String) m.get("key"), out);
                 Request old = next.getAndSet(r);
                 if (old != null) reply(old.out, "{\"id\":" + old.id + ",\"ok\":false,\"skipped\":true}");
                 synchronized (wake) { wake.notifyAll(); }
@@ -104,8 +106,15 @@ public class PreviewWorker {
             lastWork = System.currentTimeMillis();
             try {
                 if (sdk == null) {
-                    Environment env = new Environment(work.toString(), "droidlite.preview", 35,
-                        List.of(), List.of(), List.of(), List.of(), List.of(), List.of());
+                    // the libraries' assets folders (fonts and Compose resources load from them)
+                    List<String> assets = list("droidlite.assets");
+                    // the R packages (their R classes are on this classpath) and resource folders, so
+                    // R.string.x and painterResource(R.drawable.y) resolve; the first package is the "app"
+                    List<String> packages = list("droidlite.res.packages");
+                    Environment env = new Environment(work.toString(), packages.isEmpty() ? "droidlite.preview" : packages.get(0),
+                        34, // layoutlib 14 is Android 14 (API 34): Compose must not take its API 35 paths
+                        packages.size() > 1 ? packages.subList(1, packages.size()) : List.of(), List.of(),
+                        list("droidlite.res.modules"), list("droidlite.aar.dirs"), List.of(), assets);
                     // SHRINK: the picture is as big as the content (like Android Studio's preview), not a whole phone
                     sdk = new PaparazziSdk(env, DeviceConfig.PIXEL_5, "android:Theme.Material.NoActionBar.Fullscreen",
                         com.android.ide.common.rendering.api.SessionParams.RenderingMode.SHRINK,
@@ -120,15 +129,152 @@ public class PreviewWorker {
         }
     }
 
+    /** The project's own code a preview needs (its R classes, then its source files), compiled once per
+     *  key into work/lib-KEY and reused until a file changes; older lib dirs are deleted. Null when none. */
+    static Path ownCode(Request r, Path work, String cp) throws Exception {
+        if (r.key.isEmpty() || (r.sources.isEmpty() && r.rjava.isEmpty())) return null;
+        Path lib = work.resolve("lib-" + r.key);
+        if (Files.exists(lib.resolve(".ok"))) return lib;
+        deleteTree(lib);
+        Files.createDirectories(lib);
+        if (!r.rjava.isEmpty()) javac(r.rjava, System.getProperty("droidlite.compile.cp"), lib);
+        List<String> kt = r.sources.stream().filter(s -> s.endsWith(".kt")).toList();
+        List<String> java = r.sources.stream().filter(s -> s.endsWith(".java")).toList();
+        if (!kt.isEmpty()) {
+            List<String> args = new ArrayList<>(r.sources); // .java files too: Kotlin code may use them
+            args.addAll(List.of("-d", lib.toString(), "-classpath", cp + ":" + lib, "-no-stdlib", "-no-reflect",
+                "-jvm-target", "17", "-nowarn", "-module-name", "project", "-Xskip-metadata-version-check",
+                "-Xskip-prerelease-check"));
+            args.addAll(plugins());
+            ByteArrayOutputStream log = new ByteArrayOutputStream();
+            var code = new org.jetbrains.kotlin.cli.jvm.K2JVMCompiler().exec(new PrintStream(log, true, StandardCharsets.UTF_8), args.toArray(String[]::new));
+            if (code != org.jetbrains.kotlin.cli.common.ExitCode.OK) {
+                throw new IllegalStateException(log.toString(StandardCharsets.UTF_8).strip());
+            }
+        }
+        if (!java.isEmpty()) javac(java, cp + ":" + lib, lib);
+        Files.writeString(lib.resolve(".ok"), r.key);
+        try (var dirs = Files.list(work)) { // keep only the current project code
+            dirs.filter(d -> d.getFileName().toString().startsWith("lib-") && !d.equals(lib)).forEach(PreviewWorker::deleteTree);
+        }
+        return lib;
+    }
+
+    /** -Xplugin=… for each compiler plugin of the project's Kotlin (Compose, parcelize). */
+    static List<String> plugins() {
+        List<String> out = new ArrayList<>();
+        for (String p : System.getProperty("droidlite.plugins", "").split(":")) if (!p.isEmpty()) out.add("-Xplugin=" + p);
+        return out;
+    }
+
+    static void javac(List<String> files, String cp, Path out) {
+        var javac = javax.tools.ToolProvider.getSystemJavaCompiler();
+        ByteArrayOutputStream log = new ByteArrayOutputStream();
+        List<String> args = new ArrayList<>(List.of("-d", out.toString(), "-cp", cp, "-nowarn", "-proc:none", "--release", "17"));
+        args.addAll(files);
+        if (javac.run(null, log, log, args.toArray(String[]::new)) != 0) {
+            throw new IllegalStateException(log.toString(StandardCharsets.UTF_8).strip());
+        }
+    }
+
+    /** What Android Studio's preview gives every preview (its ComposeViewAdapter does the same):
+     *  owners for activity results and the back button, so rememberLauncherForActivityResult and
+     *  BackHandler work. Compiled once per worker against the project's libraries; null when the
+     *  project has no activity-compose (then previews run without it). */
+    static final String HOST = """
+        package droidlite.host
+
+        import androidx.activity.OnBackPressedDispatcher
+        import androidx.activity.OnBackPressedDispatcherOwner
+        import androidx.activity.compose.LocalActivityResultRegistryOwner
+        import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
+        import androidx.activity.result.ActivityResultRegistry
+        import androidx.activity.result.ActivityResultRegistryOwner
+        import androidx.activity.result.contract.ActivityResultContract
+        import androidx.compose.runtime.Composable
+        import androidx.compose.runtime.CompositionLocalProvider
+        import androidx.compose.ui.platform.LocalInspectionMode
+        import androidx.compose.ui.platform.LocalLifecycleOwner
+        import androidx.core.app.ActivityOptionsCompat
+
+        @Composable
+        fun PreviewHost(content: @Composable () -> Unit) {
+            val lifecycle = LocalLifecycleOwner.current.lifecycle
+            val results = object : ActivityResultRegistryOwner {
+                override val activityResultRegistry = object : ActivityResultRegistry() {
+                    override fun <I, O> onLaunch(requestCode: Int, contract: ActivityResultContract<I, O>, input: I, options: ActivityOptionsCompat?) {}
+                }
+            }
+            val back = object : OnBackPressedDispatcherOwner {
+                override val lifecycle = lifecycle
+                override val onBackPressedDispatcher = OnBackPressedDispatcher()
+            }
+            CompositionLocalProvider(
+                LocalActivityResultRegistryOwner provides results,
+                LocalOnBackPressedDispatcherOwner provides back,
+                LocalInspectionMode provides true,
+            ) {
+                CMP_CONTEXT
+                content()
+            }
+        }
+        """;
+    /** Compose Multiplatform resources read images and strings through an Android context that only an
+     *  app start sets; previews set it with this effect (as Android Studio's preview does). */
+    static final String CMP_CONTEXT = "@OptIn(org.jetbrains.compose.resources.ExperimentalResourceApi::class) org.jetbrains.compose.resources.PreviewContextConfigurationEffect()";
+    static Path host;
+    static boolean hostTried;
+
+    static Path host(Path work, String cp) {
+        if (hostTried) return host;
+        hostTried = true;
+        try {
+            Path src = work.resolve("host/PreviewHost.kt");
+            Path out = work.resolve("host/classes");
+            Files.createDirectories(src.getParent());
+            // with the Compose Multiplatform context first; a project without compose-resources gets
+            // the plain host
+            for (String hostSource : List.of(HOST.replace("CMP_CONTEXT", CMP_CONTEXT), HOST.replace("CMP_CONTEXT", ""))) {
+                Files.writeString(src, hostSource);
+                deleteTree(out);
+                List<String> args = new ArrayList<>(List.of(src.toString(), "-d", out.toString(), "-classpath", cp, "-no-stdlib",
+                    "-no-reflect", "-jvm-target", "17", "-nowarn", "-Xskip-metadata-version-check", "-Xskip-prerelease-check"));
+                args.addAll(plugins());
+                ByteArrayOutputStream log = new ByteArrayOutputStream();
+                var code = new org.jetbrains.kotlin.cli.jvm.K2JVMCompiler().exec(new PrintStream(log, true, StandardCharsets.UTF_8), args.toArray(String[]::new));
+                if (code == org.jetbrains.kotlin.cli.common.ExitCode.OK) {
+                    host = out;
+                    break;
+                }
+                System.err.println("preview host variant not built: " + log.toString(StandardCharsets.UTF_8).lines().limit(3).toList());
+            }
+        } catch (Exception e) {
+            System.err.println("preview host: " + e);
+        }
+        return host;
+    }
+
     static String handle(Request r, Path work, PaparazziSdk sdk) throws Exception {
         Path out = work.resolve("classes-" + r.id);
         long t0 = System.nanoTime();
+        // the project's own libraries first (the worker runs with them too), then the base pack
+        String cp = (r.cp.isEmpty() ? "" : String.join(":", r.cp) + ":") + System.getProperty("droidlite.compile.cp");
+        Path lib;
+        try {
+            lib = ownCode(r, work, cp);
+        } catch (IllegalStateException e) {
+            return "{\"id\":" + r.id + ",\"ok\":false,\"error\":" + Json.str("In the project code this preview needs:\n" + e.getMessage()) + "}";
+        }
+        if (lib != null) cp = cp + ":" + lib;
         List<String> args = new ArrayList<>();
         args.add(r.file);
-        args.addAll(r.sources);
-        args.addAll(List.of("-d", out.toString(), "-classpath", System.getProperty("droidlite.compile.cp"),
-            "-no-stdlib", "-no-reflect", "-jvm-target", "17", "-nowarn", "-module-name", "preview",
-            "-Xplugin=" + System.getProperty("droidlite.compose.plugin")));
+        args.addAll(List.of("-d", out.toString(), "-classpath", cp,
+            // the same module as the project code, so the open file sees its `internal` declarations
+            "-no-stdlib", "-no-reflect", "-jvm-target", "17", "-nowarn", "-module-name", "project",
+            // the project's libraries may be built by a newer Kotlin than the base pack's compiler
+            "-Xskip-metadata-version-check", "-Xskip-prerelease-check"));
+        args.addAll(plugins());
+        if (lib != null) args.add("-Xfriend-paths=" + lib);
         ByteArrayOutputStream log = new ByteArrayOutputStream();
         var code = new org.jetbrains.kotlin.cli.jvm.K2JVMCompiler().exec(new PrintStream(log, true, StandardCharsets.UTF_8), args.toArray(String[]::new));
         long compileMs = (System.nanoTime() - t0) / 1_000_000;
@@ -136,17 +282,28 @@ public class PreviewWorker {
             return "{\"id\":" + r.id + ",\"ok\":false,\"error\":" + Json.str(log.toString(StandardCharsets.UTF_8).strip()) + ",\"compile_ms\":" + compileMs + "}";
         }
         // a fresh loader per request: the edited classes replace the old ones; Compose and Paparazzi stay shared
-        try (URLClassLoader loader = new URLClassLoader(new URL[] {out.toUri().toURL()}, PreviewWorker.class.getClassLoader())) {
+        List<URL> urls = new ArrayList<>(List.of(out.toUri().toURL()));
+        if (lib != null) urls.add(lib.toUri().toURL());
+        Path hostDir = host(work, cp);
+        if (hostDir != null) urls.add(hostDir.toUri().toURL());
+        // the libraries are on the worker's own classpath already (parent first): only the project's
+        // code and the open file live in this loader
+        try (URLClassLoader loader = new URLClassLoader(urls.toArray(URL[]::new), PreviewWorker.class.getClassLoader())) {
             Class<?> c = loader.loadClass(r.cls);
             StringBuilder images = new StringBuilder();
             for (String p : r.previews) {
                 long t = System.nanoTime();
                 ComposableMethod m = ComposableMethodKt.getDeclaredComposableMethod(c, p);
                 m.asMethod().setAccessible(true);
+                ComposableMethod hostMethod = hostDir == null ? null
+                    : ComposableMethodKt.getDeclaredComposableMethod(loader.loadClass("droidlite.host.PreviewHostKt"), "PreviewHost", kotlin.jvm.functions.Function2.class);
                 Thread.currentThread().setContextClassLoader(loader);
                 sdk.prepare();
                 try {
-                    sdk.snapshot((composer, changed) -> { m.invoke(composer, null); return kotlin.Unit.INSTANCE; });
+                    kotlin.jvm.functions.Function2<androidx.compose.runtime.Composer, Integer, kotlin.Unit> preview =
+                        (composer, changed) -> { m.invoke(composer, null); return kotlin.Unit.INSTANCE; };
+                    sdk.snapshot(hostMethod == null ? preview
+                        : (composer, changed) -> { hostMethod.invoke(composer, null, preview); return kotlin.Unit.INSTANCE; });
                 } finally {
                     sdk.teardown();
                 }
@@ -193,6 +350,10 @@ public class PreviewWorker {
         } catch (IOException e) {
             System.err.println("reply: " + e); // Droid Lite went away: nothing to answer
         }
+    }
+
+    static List<String> list(String property) {
+        return Arrays.stream(System.getProperty(property, "").split(":")).filter(s -> !s.isEmpty()).toList();
     }
 
     static void sleep(long ms) { try { Thread.sleep(ms); } catch (InterruptedException ignored) {} }

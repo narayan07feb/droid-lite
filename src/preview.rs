@@ -24,6 +24,94 @@ pub struct Request {
     /// The JVM class of the file's top-level functions (`com.app.ui.CardKt`).
     pub class: String,
     pub previews: Vec<String>,
+    /// The project: its libraries come from the Gradle cache (read only), its own code the preview
+    /// needs from its files.
+    pub project: Option<ProjectRef>,
+}
+
+/// The Kotlin compiler a worker runs: the project's own version (its version catalog's `kotlin`),
+/// so its libraries' metadata and compiler plugins (Compose, parcelize) match; jars from the Gradle
+/// cache, read only.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Kotlin {
+    pub version: String,
+    /// The compiler and what it needs, for the worker's classpath.
+    pub compiler: Vec<PathBuf>,
+    pub compose_plugin: Option<PathBuf>,
+    pub parcelize_plugin: Option<PathBuf>,
+    pub serialization_plugin: Option<PathBuf>,
+    /// What compiled code needs besides the libraries (the parcelize runtime).
+    pub runtime: Vec<PathBuf>,
+}
+
+const DEFAULT_KOTLIN: &str = "2.2.20";
+
+/// The version catalog's `kotlin = "…"`, else the base pack's version.
+pub fn kotlin_version(root: Option<&Path>) -> String {
+    root.and_then(|r| std::fs::read_to_string(r.join("gradle/libs.versions.toml")).ok())
+        .and_then(|t| {
+            t.lines().map(str::trim).find_map(|l| {
+                let v = l.strip_prefix("kotlin")?.trim_start().strip_prefix('=')?.trim();
+                v.strip_prefix('"')?.split('"').next().map(String::from)
+            })
+        })
+        .unwrap_or_else(|| DEFAULT_KOTLIN.into())
+}
+
+pub fn kotlin(version: &str) -> Result<Kotlin, String> {
+    let k = |a: &str| ("org.jetbrains.kotlin".to_string(), a.to_string(), Some(version.to_string()));
+    let compiler = crate::libs::closure_archives(vec![k("kotlin-compiler-embeddable"), k("kotlin-stdlib")]);
+    if !compiler.iter().any(|f| f.to_string_lossy().contains(&format!("kotlin-compiler-embeddable-{version}.jar"))) {
+        return Err(format!("The Kotlin {version} compiler is not on this Mac yet (it comes with the project's first Gradle build, or the preview download)."));
+    }
+    let one = |a: &str| {
+        crate::libs::closure_archives(vec![k(a)])
+            .into_iter()
+            .find(|f| f.to_string_lossy().contains(&format!("{a}-{version}.jar")))
+    };
+    Ok(Kotlin {
+        version: version.into(),
+        compiler,
+        compose_plugin: one("kotlin-compose-compiler-plugin-embeddable"),
+        parcelize_plugin: one("kotlin-parcelize-compiler"),
+        serialization_plugin: one("kotlin-serialization-compiler-plugin-embeddable"),
+        runtime: one("kotlin-parcelize-runtime").into_iter().collect(),
+    })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectRef {
+    pub root: PathBuf,
+    pub scripts: Vec<PathBuf>,
+    pub files: std::sync::Arc<Vec<PathBuf>>,
+}
+
+/// The project's own code a preview needs: the files (compiled once, cached by `key`) and the R sources.
+struct Own {
+    sources: Vec<String>,
+    rjava: Vec<String>,
+    key: String,
+}
+
+/// Follows the open file's imports through the project (main sources only), writes the R classes of
+/// the modules it uses, and hashes it all, so the worker compiles this code once per change.
+fn own_code(pk: &crate::preview_src::Packages, open: &Path) -> Result<Own, String> {
+    let text = std::fs::read_to_string(open).map_err(|e| e.to_string())?;
+    let (files, rs) = pk.closure(open, &text, 1500)?;
+    let mut h = fnv("own");
+    for f in &files {
+        let m = std::fs::metadata(f).ok();
+        let stamp = m.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+        h ^= fnv(&format!("{}|{:?}|{:?}", f.display(), stamp, m.map(|m| m.len())));
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let _ = rs; // the modules' R classes are built once per project (project_r), on the classpath
+    let rjava: Vec<String> = Vec::new();
+    Ok(Own {
+        sources: files.iter().map(|f| f.to_string_lossy().into_owned()).collect(),
+        rjava,
+        key: format!("{h:016x}"),
+    })
 }
 
 /// What comes back, by message only.
@@ -76,16 +164,17 @@ pub fn dir() -> PathBuf {
     )
 }
 
-/// The base pack: what every preview needs (Compose, layoutlib, the Kotlin compiler, the renderer).
-///   runtime/*.jar     the worker's classpath (renderer, compiler, Compose, android.jar last)
-///   compile/*.jar     what the open file compiles against (Compose + android.jar)
-///   compose-plugin.jar, layoutlib/runtime, layoutlib/resources
+/// The base pack: what every preview needs.
+///   runtime/*.jar     the renderer (Paparazzi and what it needs)
+///   compose/*.jar     Compose and AndroidX for a project that has none in the Gradle cache
+///   compile/*.jar     what such a project's file compiles against
+///   android.jar, compose-plugin.jar, layoutlib/runtime, layoutlib/resources
 pub fn base_dir() -> PathBuf {
     dir().join("base")
 }
 
 pub fn base_ready(base: &Path) -> bool {
-    ["runtime", "compile", "layoutlib/runtime", "layoutlib/resources", "compose-plugin.jar"]
+    ["runtime", "compose", "compile", "android.jar", "layoutlib/runtime", "layoutlib/resources", "compose-plugin.jar"]
         .iter()
         .all(|p| base.join(p).exists())
 }
@@ -123,6 +212,13 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
     };
     let mut conn: Option<(UnixStream, BufReader<UnixStream>)> = None;
     let mut id = 0u64;
+    // the project's libraries, read once per project root (the Gradle cache does not change under us)
+    let mut libs: Option<(PathBuf, LibraryCode)> = None;
+    let mut packages: Option<(PathBuf, crate::preview_src::Packages)> = None;
+    let mut assets: Vec<String> = Vec::new();
+    let (mut res_packages, mut module_res, mut exploded): (Vec<String>, Vec<String>, Vec<String>) = Default::default();
+    let mut kotlins: std::collections::HashMap<String, Result<Kotlin, String>> = std::collections::HashMap::new();
+    let mut conn_version = String::new();
     while let Ok(mut r) = jobs.recv() {
         while let Ok(newer) = jobs.try_recv() {
             r = newer; // the newest request wins
@@ -132,6 +228,68 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
             send(Event::Status(why));
             continue;
         }
+        let (cp, own) = match &r.project {
+            Some(p) => {
+                if libs.as_ref().is_none_or(|(r0, _)| *r0 != p.root) {
+                    send(Event::Status("Reading the project's libraries…".into()));
+                    libs = Some((p.root.clone(), library_classpath(&p.root, &p.scripts)));
+                    packages = Some((p.root.clone(), crate::preview_src::Packages::read(&p.files)));
+                }
+                let lc = libs.as_ref().map(|(_, l)| l.clone()).unwrap_or_default();
+                let (mut cp, lib_r) = (lc.jars, lc.rjava);
+                assets = lc.assets;
+                // the project's own Compose runs the preview when the Gradle cache has it
+                if cp.iter().any(|j| j.contains("/androidx.compose.runtime/")) {
+                    match project_r(&packages.as_ref().unwrap().1, &lib_r) {
+                        Ok((rs, pkgs, res)) => {
+                            cp.push(rs.to_string_lossy().into_owned());
+                            res_packages = pkgs;
+                            module_res = res;
+                            exploded = lc.exploded.clone();
+                        }
+                        Err(e) => {
+                            send(Event::Failed { file: r.file.clone(), error: e });
+                            continue;
+                        }
+                    }
+                } else {
+                    cp.clear(); // not usable on its own: the base pack's Compose instead
+                }
+                match own_code(&packages.as_ref().unwrap().1, &r.file) {
+                    Ok(o) => (cp, Some(o)),
+                    Err(e) => {
+                        send(Event::Failed { file: r.file.clone(), error: e });
+                        continue;
+                    }
+                }
+            }
+            None => (Vec::new(), None),
+        };
+        let version = kotlin_version(r.project.as_ref().map(|p| p.root.as_path()));
+        let stand_in = std::env::var_os("DROID_LITE_PREVIEW_WORKER").is_some(); // tests: no compiler needed
+        let kt = match kotlins.entry(version.clone()).or_insert_with(|| {
+            if stand_in { Ok(Kotlin { version: version.clone(), ..Default::default() }) } else { kotlin(&version) }
+        }) {
+            Ok(k) => k.clone(),
+            Err(e) => {
+                send(Event::Failed { file: r.file.clone(), error: e.clone() });
+                continue;
+            }
+        };
+        // never Kotlin's own compiler-side jars on the worker's classpath: the worker's compiler would
+        // load them as plugins (a scripting plugin of another version crashed it); it brings its stdlib
+        let rt = ProjectRuntime {
+            jars: cp.iter().filter(|j| !j.contains("/org.jetbrains.kotlin/")).cloned().collect(),
+            assets: if cp.is_empty() { Vec::new() } else { assets.clone() },
+            res_packages: if cp.is_empty() { Vec::new() } else { res_packages.clone() },
+            module_res: if cp.is_empty() { Vec::new() } else { module_res.clone() },
+            exploded: if cp.is_empty() { Vec::new() } else { exploded.clone() },
+        };
+        let worker_id = format!("{version}-{:08x}", rt.key());
+        if conn_version != worker_id {
+            conn = None; // another project's Kotlin or libraries: its own worker
+            conn_version = worker_id;
+        }
         // the worker may have ended (idle exit, a crash) or never started: start it and connect by
         // itself, up to 3 tries with a short back-off, then the error goes on the card
         let mut last_error = String::new();
@@ -140,7 +298,7 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
                 std::thread::sleep(Duration::from_millis(500 << attempt));
             }
             if conn.is_none() {
-                match connect_or_start(&send) {
+                match connect_or_start(&send, &kt, &rt) {
                     Ok(c) => conn = Some(c),
                     Err(e) => {
                         last_error = e;
@@ -151,7 +309,7 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
             send(Event::Status(format!("Rendering {} preview(s)…", r.previews.len())));
             id += 1;
             let (w, rd) = conn.as_mut().unwrap();
-            match ask(w, rd, id, &r) {
+            match ask(w, rd, id, &r, &cp, own.as_ref()) {
                 Ok(e) => {
                     send(e);
                     last_error.clear();
@@ -171,8 +329,13 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
 
 fn connect_or_start(
     send: &dyn Fn(Event),
+    kt: &Kotlin,
+    rt: &ProjectRuntime,
 ) -> Result<(UnixStream, BufReader<UnixStream>), String> {
-    let sock = dir().join("w.sock");
+    // one socket per worker source and Kotlin version: after an update, or for a project on another
+    // Kotlin, a new worker starts; an old one exits when idle
+    let plugins = format!("{:?}{:?}{:?}", kt.compose_plugin, kt.parcelize_plugin, kt.serialization_plugin);
+    let sock = dir().join(format!("w-{:08x}-{}-{:08x}.sock", (fnv(WORKER_SOURCE) ^ fnv(&plugins)) as u32, kt.version, rt.key()));
     if let Ok(s) = UnixStream::connect(&sock) {
         let rd = BufReader::new(s.try_clone().map_err(|e| e.to_string())?);
         return Ok((s, rd));
@@ -182,15 +345,26 @@ fn connect_or_start(
         return Err("The preview pack is not downloaded yet.".into());
     }
     send(Event::Status("Starting the preview worker…".into()));
-    start_worker(&base, &sock)?;
+    let mut child = start_worker(&base, &sock, kt, rt)?;
     let until = Instant::now() + Duration::from_secs(60);
     while Instant::now() < until {
         if let Ok(s) = UnixStream::connect(&sock) {
+            std::thread::spawn(move || child.wait()); // reap it when it ends (idle exit)
             let rd = BufReader::new(s.try_clone().map_err(|e| e.to_string())?);
             return Ok((s, rd));
         }
+        // it ended before it listened: say why now (the end of its log), do not wait the full minute
+        if let Ok(Some(status)) = child.try_wait() {
+            let log = std::fs::read_to_string(dir().join("worker.log")).unwrap_or_default();
+            let tail: Vec<&str> = log.lines().rev().take(8).collect();
+            return Err(format!(
+                "The preview worker stopped at start ({status}):\n{}",
+                tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+            ));
+        }
         std::thread::sleep(Duration::from_millis(200));
     }
+    let _ = child.kill();
     Err(format!(
         "The preview worker did not start in 60 s. Its log: {}",
         dir().join("worker.log").display()
@@ -199,7 +373,7 @@ fn connect_or_start(
 
 /// Starts the worker detached (its own process group, output to worker.log), so it outlives nothing
 /// it should not and a restart of Droid Lite finds it still warm.
-fn start_worker(base: &Path, sock: &Path) -> Result<(), String> {
+fn start_worker(base: &Path, sock: &Path, kt: &Kotlin, rt: &ProjectRuntime) -> Result<std::process::Child, String> {
     let d = dir();
     std::fs::create_dir_all(d.join("work")).map_err(|e| e.to_string())?;
     let log = std::fs::File::create(d.join("worker.log")).map_err(|e| e.to_string())?;
@@ -223,15 +397,37 @@ fn start_worker(base: &Path, sock: &Path) -> Result<(), String> {
                 v.sort(); // android.jar is named zz-android.jar so it comes last, after layoutlib
                 v.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join(":")
             };
+            let paths = |v: &[PathBuf]| v.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join(":");
+            let compose = kt.compose_plugin.clone().unwrap_or_else(|| base.join("compose-plugin.jar"));
+            let plugins: Vec<PathBuf> = std::iter::once(compose)
+                .chain(kt.parcelize_plugin.clone())
+                .chain(kt.serialization_plugin.clone())
+                .collect();
+            let mut compile = jars("compile");
+            if !kt.runtime.is_empty() {
+                compile = format!("{compile}:{}", paths(&kt.runtime));
+            }
             let mut cmd = Command::new(java());
-            cmd.arg("-Xmx1500m")
+            cmd.arg("-Xmx2g")
                 .arg("-XX:+UseSerialGC")
                 .arg(format!("-Dpaparazzi.layoutlib.runtime.root={}", base.join("layoutlib/runtime").display()))
                 .arg(format!("-Dpaparazzi.layoutlib.resources.root={}", base.join("layoutlib/resources").display()))
-                .arg(format!("-Ddroidlite.compose.plugin={}", base.join("compose-plugin.jar").display()))
-                .arg(format!("-Ddroidlite.compile.cp={}", jars("compile")))
+                .arg(format!("-Ddroidlite.plugins={}", paths(&plugins)))
+                .arg(format!("-Ddroidlite.compile.cp={compile}"))
+                .arg(format!("-Ddroidlite.assets={}", rt.assets.join(":")))
+                .arg(format!("-Ddroidlite.res.packages={}", rt.res_packages.join(":")))
+                .arg(format!("-Ddroidlite.res.modules={}", rt.module_res.join(":")))
+                .arg(format!("-Ddroidlite.aar.dirs={}", rt.exploded.join(":")))
                 .arg("-cp")
-                .arg(jars("runtime"))
+                // the project's Kotlin compiler (and its stdlib) first, then the renderer, then the
+                // project's libraries (or the base pack's Compose), android.jar last (after layoutlib)
+                .arg(format!(
+                    "{}:{}:{}:{}",
+                    paths(&kt.compiler),
+                    jars("runtime"),
+                    if rt.jars.is_empty() { jars("compose") } else { rt.jars.join(":") },
+                    base.join("android.jar").display()
+                ))
                 .arg(&src);
             cmd
         }
@@ -243,9 +439,7 @@ fn start_worker(base: &Path, sock: &Path) -> Result<(), String> {
         .stderr(log)
         .process_group(0);
     let _ = std::fs::remove_file(sock);
-    let mut child = cmd.spawn().map_err(|e| format!("Could not start the preview worker: {e}"))?;
-    std::thread::spawn(move || child.wait()); // reap it when it ends (idle exit)
-    Ok(())
+    cmd.spawn().map_err(|e| format!("Could not start the preview worker: {e}"))
 }
 
 /// The JVM for the worker: `DROID_LITE_JAVA`, else `$JAVA_HOME/bin/java`, else a JDK 17 (what layoutlib
@@ -277,9 +471,203 @@ fn java() -> PathBuf {
         .unwrap_or_else(|| "java".into())
 }
 
-fn ask(w: &mut UnixStream, rd: &mut BufReader<UnixStream>, id: u64, r: &Request) -> Result<Event, String> {
+/// Libraries the build scripts name that never run in an app, so never in a preview: test libraries,
+/// and build tools (KSP, Lint, detekt, annotation processors, Gradle plugins). Several of them bundle a
+/// whole Kotlin compiler, which the worker's compiler then loads as a plugin and crashes on.
+fn build_or_test_only(f: &Path) -> bool {
+    const PARTS: [&str; 19] = [
+        "/kotlin-test", "/junit", "/mockk", "/robolectric", "/espresso", "/truth/", "/turbine/", "/kotest",
+        "/com.google.devtools.ksp/", "/com.android.tools.lint/", "/com.android.tools.build/",
+        "/io.gitlab.arturbosch.detekt/", "/com.pinterest", "gradle-plugin", "/org.jetbrains.kotlin/kotlin-scripting",
+        "/org.jetbrains.kotlin/kotlin-compiler", "/org.jetbrains.kotlin/kotlin-annotation-processing",
+        "/com.squareup/kotlinpoet", "/com.google.auto",
+    ];
+    let s = f.to_string_lossy();
+    let artifact = f.parent().and_then(Path::parent).and_then(Path::parent).and_then(|d| d.file_name()).map_or(String::new(), |n| n.to_string_lossy().into_owned());
+    PARTS.iter().any(|p| s.contains(p))
+        || artifact.ends_with("-compiler")
+        || artifact.ends_with("-processor")
+        || artifact.ends_with("-compiler-embeddable")
+}
+
+/// The project's dependencies as class jars: jars as they are, an aar's classes.jar copied once into
+/// the preview cache (the Gradle cache is never written).
+/// The libraries' class jars, their R sources, and their assets folders.
+#[derive(Clone, Default)]
+struct LibraryCode {
+    jars: Vec<String>,
+    rjava: Vec<String>,
+    assets: Vec<String>,
+    /// Unpacked aars that have resources (res/ + AndroidManifest.xml), for the renderer.
+    exploded: Vec<String>,
+}
+
+/// What a project's worker runs with besides the renderer: the project's own libraries (its Compose,
+/// AndroidX, …) and their R classes, compiled once. Empty when the project has no Compose in the
+/// Gradle cache: then the base pack's Compose is used.
+#[derive(Clone, Debug, Default)]
+struct ProjectRuntime {
+    jars: Vec<String>,
+    assets: Vec<String>,
+    /// Every R package (modules and libraries) the renderer maps ids for, its first one the "app".
+    res_packages: Vec<String>,
+    module_res: Vec<String>,
+    exploded: Vec<String>,
+}
+
+impl ProjectRuntime {
+    fn key(&self) -> u32 {
+        if self.jars.is_empty() { 0 } else { fnv(&format!("{:?}{:?}{:?}", self.jars, self.module_res, self.res_packages)) as u32 }
+    }
+}
+
+/// The R classes of every module of the project (made from its res folders, ids unique across all) and
+/// of every library (from their R.txt), compiled once with javac into one folder: the renderer loads
+/// them from the worker's main class loader to map ids back to resources. Also the R package names.
+fn project_r(pk: &crate::preview_src::Packages, lib_r: &[String]) -> Result<(PathBuf, Vec<String>, Vec<String>), String> {
+    let mut modules: Vec<(&String, &PathBuf)> = pk.modules().collect();
+    modules.sort();
+    let mut next = 0x7f00_0000u32;
+    let mut sources = Vec::new();
+    let mut packages = Vec::new();
+    let mut res = Vec::new();
+    for (ns, dir) in modules {
+        let java = crate::preview_src::r_java(ns, dir, &mut next);
+        let path = self::dir().join("r").join(ns).join("R.java");
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(java.as_str()) {
+            std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+            std::fs::write(&path, &java).map_err(|e| e.to_string())?;
+        }
+        sources.push(path.to_string_lossy().into_owned());
+        packages.push(ns.clone());
+        res.push(dir.to_string_lossy().into_owned());
+    }
+    for r in lib_r {
+        if let Some(pkg) = std::fs::read_to_string(r).ok().and_then(|s| s.lines().next().map(|l| l.trim_start_matches("package ").trim_end_matches(';').to_string())) {
+            packages.push(pkg);
+        }
+        sources.push(r.clone());
+    }
+    let out = library_r_classes(&sources)?.ok_or("no R classes")?;
+    Ok((out, packages, res))
+}
+
+/// The libraries' R classes as one folder of classes, compiled with javac once per set of libraries
+/// (they must sit next to the libraries' own code, in the worker's base class loader).
+fn library_r_classes(rjava: &[String]) -> Result<Option<PathBuf>, String> {
+    if rjava.is_empty() {
+        return Ok(None);
+    }
+    // keyed on the contents (ids change when the R sources are made again), not only the paths
+    let all: String = rjava.iter().map(|f| std::fs::read_to_string(f).unwrap_or_default()).collect();
+    let out = dir().join(format!("librs-{:016x}", fnv(&all)));
+    if out.join(".ok").exists() {
+        return Ok(Some(out));
+    }
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+    let args = out.join("sources.txt");
+    std::fs::write(&args, rjava.join("\n")).map_err(|e| e.to_string())?;
+    let javac = java().with_file_name("javac");
+    let o = Command::new(&javac)
+        .args(["-nowarn", "-proc:none", "--release", "17", "-d"])
+        .arg(&out)
+        .arg(format!("@{}", args.display()))
+        .output()
+        .map_err(|e| format!("Could not run {}: {e}", javac.display()))?;
+    if !o.status.success() {
+        return Err(format!("The libraries' R classes did not compile:\n{}", String::from_utf8_lossy(&o.stderr)));
+    }
+    let _ = std::fs::write(out.join(".ok"), "");
+    Ok(Some(out))
+}
+
+fn library_classpath(root: &Path, scripts: &[PathBuf]) -> LibraryCode {
+    let aars = dir().join("aar");
+    let _ = std::fs::create_dir_all(&aars);
+    let mut rjava = Vec::new();
+    let mut assets = Vec::new();
+    let mut exploded = Vec::new();
+    let mut r_packages = std::collections::HashSet::new();
+    // ids unique across all libraries (a library's own R.txt has placeholders); kept apart from the
+    // ids of the project's modules (0x7f000001 up) by starting high
+    let mut next_id = 0x7f80_0000u32;
+    let cp = crate::libs::class_archives(root, scripts)
+        .into_iter()
+        .filter(|f| !build_or_test_only(f))
+        .filter_map(|f| {
+            if f.extension().is_some_and(|e| e == "jar") {
+                return Some(f);
+            }
+            let key = format!("{:016x}", fnv(&f.to_string_lossy()));
+            let out = aars.join(format!("{key}.jar"));
+            let r = aars.join(&key).join("R.java");
+            if !out.exists() {
+                let file = std::fs::File::open(&f).ok()?;
+                let mut zip = zip::ZipArchive::new(file).ok()?;
+                // the library's R class: AGP makes it from R.txt in the app's build; we do the same
+                let text = |zip: &mut zip::ZipArchive<std::fs::File>, name: &str| {
+                    let mut s = String::new();
+                    zip.by_name(name).ok().map(|mut e| std::io::Read::read_to_string(&mut e, &mut s)).and(Some(s))
+                };
+                if let (Some(rtxt), Some(manifest)) = (text(&mut zip, "R.txt"), text(&mut zip, "AndroidManifest.xml"))
+                    && !rtxt.trim().is_empty()
+                    && let Some(pkg) = manifest.split("package=\"").nth(1).and_then(|s| s.split('"').next())
+                {
+                    let _ = std::fs::create_dir_all(r.parent().unwrap());
+                    let _ = std::fs::write(&r, crate::preview_src::r_txt_java(pkg, &rtxt, &mut next_id));
+                }
+                // its assets (Compose resources and fonts load from there) and resources (strings,
+                // drawables the renderer resolves), once, next to its classes
+                let assets = aars.join(&key).join("assets");
+                for i in 0..zip.len() {
+                    let Ok(mut e) = zip.by_index(i) else { continue };
+                    let Some(rel) = e.enclosed_name().filter(|n| {
+                        (n.starts_with("assets/") || n.starts_with("res/") || n.as_os_str() == "AndroidManifest.xml") && !e.is_dir()
+                    }) else { continue };
+                    let to = aars.join(&key).join(rel);
+                    let _ = std::fs::create_dir_all(to.parent().unwrap());
+                    if let Ok(mut w) = std::fs::File::create(&to) {
+                        let _ = std::io::copy(&mut e, &mut w);
+                    }
+                }
+                let _ = assets;
+                let mut entry = zip.by_name("classes.jar").ok()?;
+                let tmp = out.with_extension("part");
+                let mut w = std::fs::File::create(&tmp).ok()?;
+                std::io::copy(&mut entry, &mut w).ok()?;
+                std::fs::rename(&tmp, &out).ok()?;
+            }
+            let a = aars.join(&key).join("assets");
+            if a.is_dir() {
+                assets.push(a.to_string_lossy().into_owned());
+            }
+            if aars.join(&key).join("res").is_dir() {
+                exploded.push(aars.join(&key).to_string_lossy().into_owned());
+            }
+            // one R per package: two versions of one library (both cached) would declare it twice
+            if let Some(first) = std::fs::read_to_string(&r).ok().and_then(|s| s.lines().next().map(String::from))
+                && r_packages.insert(first)
+            {
+                rjava.push(r.to_string_lossy().into_owned());
+            }
+            Some(out)
+        })
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    LibraryCode { jars: cp, rjava, assets, exploded }
+}
+
+fn fnv(s: &str) -> u64 {
+    s.bytes().fold(0xcbf29ce484222325, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+}
+
+fn ask(w: &mut UnixStream, rd: &mut BufReader<UnixStream>, id: u64, r: &Request, cp: &[String], own: Option<&Own>) -> Result<Event, String> {
     let line = serde_json::json!({
-        "id": id, "file": r.file, "sources": [], "class": r.class, "previews": r.previews,
+        "id": id, "file": r.file, "class": r.class, "previews": r.previews, "cp": cp,
+        "sources": own.map_or(&[][..], |o| &o.sources[..]),
+        "rjava": own.map_or(&[][..], |o| &o.rjava[..]),
+        "key": own.map_or("", |o| o.key.as_str()),
     });
     writeln!(w, "{line}").map_err(|e| e.to_string())?;
     loop {
@@ -385,6 +773,20 @@ fn file_names_only(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_tools_and_tests_stay_out_of_previews() {
+        let c = "/Users/n/.gradle/caches/modules-2/files-2.1";
+        for no in ["com.google.devtools.ksp/symbol-processing-aa-embeddable/2.3.0/h/x.jar", "com.google.dagger/hilt-compiler/2.60/h/x.jar",
+            "androidx.room/room-compiler/2.7/h/x.jar", "io.mockk/mockk/1.13/h/mockk-1.13.jar", "junit/junit/4.13/h/junit-4.13.jar",
+            "org.jetbrains.kotlin/kotlin-scripting-compiler-embeddable/2.4.21/h/x.jar", "com.android.tools.lint/lint-api/31/h/x.jar"] {
+            assert!(build_or_test_only(Path::new(&format!("{c}/{no}"))), "{no}");
+        }
+        for yes in ["androidx.compose.runtime/runtime-android/1.9/h/x.aar", "com.google.dagger/dagger/2.60.1/h/dagger-2.60.1.jar",
+            "org.jetbrains.kotlinx/kotlinx-serialization-core-jvm/1.8/h/x.jar"] {
+            assert!(!build_or_test_only(Path::new(&format!("{c}/{yes}"))), "{yes}");
+        }
+    }
 
     #[test]
     fn compiler_errors_are_grouped_by_what_is_missing_and_paths_cut_to_the_file() {
