@@ -50,7 +50,7 @@ function start(ctx) {
 // longest wait for an answer (ms), so no waiting call outlives a stuck engine; others wait 15 s
 const limits = {
   initialize: 60000, ping: 15000, update: 15000, remove: 15000, lenses: 15000, stability: 15000, implementations: 15000,
-  previews: 180000, devices: 60000, adb: 60000, screenshot: 60000, record_start: 60000, record_stop: 900000,
+  previews: 180000, devices: 60000, adb: 60000, screenshot: 60000, record_start: 60000, record_stop: 1080000, // engine worst case ~976 s (pull capped at 15 min)
 };
 // a previews call starts its limit again on each progress line for its file (a first run downloads
 // and compiles), up to this cap (ms)

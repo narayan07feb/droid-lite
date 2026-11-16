@@ -331,7 +331,7 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   check('every engine method has a limit', ['initialize', 'ping', 'update', 'remove', 'lenses', 'stability',
     'implementations', 'previews', 'devices', 'adb', 'screenshot', 'record_start', 'record_stop']
     .every((m) => ext.limits[m] > 0) && ext.limits.initialize === 60000 && ext.limits.update === 15000
-    && ext.limits.lenses === 15000 && ext.limits.record_stop === 900000);
+    && ext.limits.lenses === 15000 && ext.limits.record_stop === 1080000);
   fs.writeFileSync(silent, '["lenses"]');
   ext.limits.lenses = 100;
   const lensResult = await Promise.race([provider.provideCodeLenses(doc('Api.kt')), sleep(2000).then(() => 'stuck')]);
