@@ -392,22 +392,39 @@ fn e2e_compose_panel_tree_stability_lints_preview_render() {
         rules.contains(&"remember-state") && rules.contains(&"modifier-default"),
         "{rules:?}"
     );
-    // Render previews runs the module's Paparazzi task and shows the image
-    h.get_by_label(&format!("{}  Render previews", ic::IMAGE))
-        .click();
+    // Render previews draws them in the panel through the preview worker (a stand-in here), no Gradle
+    let pv = std::env::temp_dir().join(format!("dlpv-{}", std::process::id()));
+    let worker = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_preview_worker.py");
+    let png = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icon-256.png");
+    // SAFETY: the SERIAL lock (held by the fixture) keeps other tests from reading the environment
+    unsafe {
+        std::env::set_var("DROID_LITE_PREVIEW_DIR", &pv);
+        std::env::set_var("DROID_LITE_PREVIEW_WORKER", format!("python3 {}", worker.display()));
+        std::env::set_var("FAKE_PREVIEW_PNG", &png);
+        std::env::set_var("DROID_LITE_MAC_GUARD", "/nonexistent/mac-guard");
+    }
+    h.get_by_label(&format!("{}  Render previews", ic::IMAGE)).click();
     steps(&mut h, 2);
-    wait(&mut h, "preview build", |a| {
-        a.gradle.is_none() && a.console.iter().any(|l| l == "BUILD SUCCESSFUL")
+    wait(&mut h, "preview picture", |a| {
+        matches!(a.previews.cards.as_slice(), [(name, Ok(_))] if name == "UserCardPreview")
     });
-    assert!(
-        h.state()
-            .console
-            .iter()
-            .any(|l| l == "> Task :app:recordPaparazziDebug")
-    );
-    wait(&mut h, "preview image", |a| {
-        a.compose_view.as_ref().is_some_and(|v| v.images.len() == 1) && a.textures.len() == 1
+    assert!(h.state().gradle.is_none(), "no Gradle run for a preview");
+    assert!(h.query_all_by_label("UserCardPreview").count() >= 2, "the card title beside the list link");
+    // a file that does not compile shows the compiler's text on the card
+    let broken = f.path("app/src/main/java/com/demo/ui/BrokenPreview.kt");
+    std::fs::write(
+        &broken,
+        "package com.demo.ui\n\nimport androidx.compose.ui.tooling.preview.Preview\n\n@Preview\n@Composable\nfun BrokenCardPreview() { Oops() }\n",
+    )
+    .unwrap();
+    open(&mut h, &broken);
+    steps(&mut h, 3);
+    h.get_by_label(&format!("{}  Render previews", ic::IMAGE)).click();
+    wait(&mut h, "error card", |a| {
+        a.previews.file.as_deref() == Some(broken.as_path())
+            && matches!(a.previews.cards.as_slice(), [(_, Err(e))] if e.contains("unresolved reference 'Oops'"))
     });
+    let _ = std::fs::remove_dir_all(&pv);
 }
 
 #[test]

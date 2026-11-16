@@ -154,7 +154,15 @@ public class PreviewWorker {
                     .append(",\"ms\":").append((System.nanoTime() - t) / 1_000_000).append('}');
             }
             return "{\"id\":" + r.id + ",\"ok\":true,\"images\":[" + images + "],\"compile_ms\":" + compileMs + "}";
+        } finally {
+            deleteTree(out); // the classes of one request are not needed after it
         }
+    }
+
+    static void deleteTree(Path p) {
+        try (var walk = Files.walk(p)) {
+            walk.sorted(Comparator.reverseOrder()).forEach(f -> f.toFile().delete());
+        } catch (IOException ignored) {}
     }
 
     /** The SDK's android.jar stub leaves Build.FINGERPRINT null; Compose reads it ("robolectric" = a host JVM). */

@@ -20,6 +20,7 @@ mod libs;
 mod logcat;
 mod lsp;
 mod plugins;
+mod preview;
 mod project;
 mod refactor;
 mod reports;

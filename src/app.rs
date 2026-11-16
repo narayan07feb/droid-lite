@@ -24,7 +24,7 @@ mod usage_filter;
 
 use crate::compose::{self, Lint, Severity, Stability};
 use crate::edit;
-use crate::gradle::{self, PreviewTool};
+use crate::gradle;
 use crate::highlight::{self, ERROR, INFO, WARN};
 use crate::icons as ic;
 use crate::index::{self, Hit, Index};
@@ -286,8 +286,18 @@ enum Right {
 struct ComposeView {
     key: (PathBuf, u64, u64, u64, String),
     tree: Vec<compose::Node>,
-    tool: Option<(crate::project::Module, PreviewTool)>,
-    images: Vec<(String, PathBuf)>,
+}
+
+/// The Compose panel's preview cards, drawn by the preview worker (`preview.rs`).
+#[derive(Default)]
+struct Previews {
+    client: Option<crate::preview::Client>,
+    /// The file the cards belong to; cards of another file are not shown.
+    file: Option<PathBuf>,
+    cards: Vec<(String, Result<egui::TextureHandle, String>)>,
+    /// The latest status or skip reason, and whether a render is under way.
+    note: String,
+    busy: bool,
 }
 
 /// The ⌘-hovered name, a resource reference it may be (kind, name), and its response.
@@ -371,6 +381,7 @@ pub struct App {
     libs: crate::libs::Libraries,
     libs_rx: Option<Receiver<crate::libs::Libraries>>,
     compose_view: Option<ComposeView>,
+    previews: Previews,
     ctx: Option<egui::Context>,
     keymap: Keymap,
     show_shortcuts: bool,
@@ -483,6 +494,7 @@ impl App {
             libs: Default::default(),
             libs_rx: None,
             compose_view: None,
+            previews: Previews::default(),
             ctx: Some(cc.egui_ctx.clone()),
             keymap: load_setting("keymap").map_or(Keymap::Eclipse, |s| Keymap::from_name(&s)),
             show_shortcuts: false,
@@ -1116,6 +1128,7 @@ impl App {
     // ---------- per-frame background work ----------
 
     fn poll(&mut self, ctx: &egui::Context) {
+        self.poll_previews(ctx);
         if let Some(rx) = &self.indexing
             && let Ok((project, index, branch, tree, res)) = rx.try_recv()
         {
@@ -3268,6 +3281,7 @@ impl App {
         let mut jump: Option<usize> = None;
         let mut pick = None;
         let mut render = false;
+        let mut render_req: Option<crate::preview::Request> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -3311,27 +3325,9 @@ impl App {
                 );
                 if self.compose_view.as_ref().is_none_or(|v| v.key != key) {
                     let is_ui = |n: &str| compose::is_ui_call(n, &self.index, &self.libs);
-                    let previews: Vec<String> = tab
-                        .syms
-                        .decls
-                        .iter()
-                        .filter(|d| d.is_preview())
-                        .map(|d| d.name.clone())
-                        .collect();
-                    let tool = self
-                        .project
-                        .as_ref()
-                        .and_then(|pr| pr.module_of(&tab.path))
-                        .and_then(|m| PreviewTool::detect(m).map(|t| (m.clone(), t)));
-                    let images = tool
-                        .as_ref()
-                        .map(|(m, t)| t.images(m, &previews))
-                        .unwrap_or_default();
                     self.compose_view = Some(ComposeView {
                         key,
                         tree: compose::tree(&tab.text, d, &is_ui),
-                        tool,
-                        images,
                     });
                 }
                 let Some(view) = &self.compose_view else {
@@ -3370,39 +3366,56 @@ impl App {
                             .map(|d| d.offset);
                     }
                 }
-                match &view.tool {
-                    Some((m, tool)) => {
-                        ui.horizontal(|ui| {
-                            render = ui
-                                .add_enabled(
-                                    self.gradle.is_none(),
-                                    egui::Button::new(format!("{}  Render previews", ic::IMAGE)),
-                                )
-                                .on_hover_text(tool.task(m))
-                                .clicked();
-                            ui.label(RichText::new(format!("{tool:?}")).weak());
-                        });
-                        // drop textures of images no longer shown, so memory stays flat
-                        self.textures
-                            .retain(|p, _| view.images.iter().any(|(_, q)| q == p));
-                        for (name, path) in &view.images {
-                            ui.label(RichText::new(name).small());
-                            if let Some(tex) = texture(ui.ctx(), &mut self.textures, path) {
+                // only top-level previews for now: their class is the file's `…Kt` class
+                let top: Vec<String> = tab
+                    .syms
+                    .decls
+                    .iter()
+                    .filter(|d| d.is_preview() && d.container.is_none())
+                    .map(|d| d.name.clone())
+                    .collect();
+                if !top.is_empty() {
+                    render = ui
+                        .add_enabled(
+                            !self.previews.busy,
+                            egui::Button::new(format!("{}  Render previews", ic::IMAGE)),
+                        )
+                        .on_hover_text("Draw these previews here (no Gradle; the first one takes a few seconds)")
+                        .clicked();
+                    render_req = Some(crate::preview::Request {
+                        file: tab.path.clone(),
+                        class: crate::device::preview_name(&tab.syms.package, &tab.path, None, "x")
+                            .trim_end_matches(".x")
+                            .to_string(),
+                        previews: top,
+                    });
+                }
+                if previews.len() > render_req.as_ref().map_or(0, |r| r.previews.len()) {
+                    ui.label(RichText::new("Previews inside a class or object are not drawn yet.").weak());
+                }
+                if !self.previews.note.is_empty() {
+                    ui.horizontal(|ui| {
+                        if self.previews.busy {
+                            ui.spinner();
+                        }
+                        ui.label(RichText::new(&self.previews.note).weak());
+                    });
+                }
+                if self.previews.file.as_deref() == Some(tab.path.as_path()) {
+                    for (name, card) in &self.previews.cards {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(name).strong()).on_hover_text(name);
+                        match card {
+                            Ok(tex) => {
                                 let size = tex.size_vec2();
-                                let w = ui.available_width().min(size.x);
+                                let w = ui.available_width().min(size.x / 2.0);
                                 ui.image((tex.id(), egui::vec2(w, size.y * w / size.x)));
+                            }
+                            Err(e) => {
+                                ui.label(RichText::new(e).monospace().color(ERROR));
                             }
                         }
                     }
-                    None if !previews.is_empty() => {
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(gradle::SETUP_HELP).weak());
-                        ui.hyperlink_to(
-                            "Setup and newest version",
-                            "https://developer.android.com/studio/preview/compose-screenshot-testing",
-                        );
-                    }
-                    _ => {}
                 }
 
                 ui.separator();
@@ -3434,17 +3447,43 @@ impl App {
         if let Some(o) = jump {
             self.open_file(&path, Some(o));
         }
-        let task_module = self
-            .project
-            .as_ref()
-            .and_then(|p| p.module_of(&path))
-            .cloned();
-        if render
-            && let Some(m) = &task_module
-            && let Some(tool) = PreviewTool::detect(m)
-        {
+        if render && let Some(r) = render_req {
             let ctx = ui.ctx().clone();
-            self.run_gradle(tool.task(m), &ctx);
+            self.previews.busy = true;
+            self.previews.note = "Waiting for the preview worker…".into();
+            self.previews.client.get_or_insert_with(|| crate::preview::Client::new(&ctx)).request(r);
+        }
+    }
+
+    /// Preview worker messages: status lines, pictures (decoded off the UI thread; only the texture
+    /// upload happens here) and error texts for the cards.
+    fn poll_previews(&mut self, ctx: &egui::Context) {
+        let p = &mut self.previews;
+        while let Some(e) = p.client.as_ref().and_then(crate::preview::Client::poll) {
+            match e {
+                crate::preview::Event::Status(s) => {
+                    p.busy = !s.starts_with("Skipped");
+                    p.note = s;
+                }
+                crate::preview::Event::Failed { file, error } => {
+                    p.busy = false;
+                    p.note = String::new();
+                    p.cards = vec![("Could not draw the previews".into(), Err(error))];
+                    p.file = Some(file);
+                }
+                crate::preview::Event::Done { file, cards } => {
+                    p.busy = false;
+                    p.note = String::new();
+                    p.cards = cards
+                        .into_iter()
+                        .map(|(name, pic)| {
+                            let tex = pic.map(|img| ctx.load_texture(format!("preview:{name}"), img, Default::default()));
+                            (name, tex)
+                        })
+                        .collect();
+                    p.file = Some(file);
+                }
+            }
         }
     }
 
