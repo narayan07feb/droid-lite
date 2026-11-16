@@ -325,6 +325,7 @@ fn preview_request(tab: &Tab, project: Option<&crate::project::Project>) -> Opti
             .trim_end_matches(".x")
             .to_string(),
         previews,
+        seq: 0,
         project: project.map(|p| crate::preview::ProjectRef {
             root: p.root.clone(),
             scripts: p
@@ -3588,13 +3589,15 @@ impl App {
                     p.note = s;
                     p.progress = progress;
                 }
-                crate::preview::Event::Failed { file, error } => {
+                // a request this window replaced: the newer one answers
+                crate::preview::Event::Skipped { .. } => {}
+                crate::preview::Event::Failed { file, error, .. } => {
                     p.busy = false;
                     p.note = String::new();
                     p.cards = vec![("Could not draw the previews".into(), Err(error))];
                     p.file = Some(file);
                 }
-                crate::preview::Event::Done { file, cards } => {
+                crate::preview::Event::Done { file, cards, .. } => {
                     p.busy = false;
                     p.note = String::new();
                     p.cards = cards

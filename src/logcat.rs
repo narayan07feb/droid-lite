@@ -153,7 +153,10 @@ pub struct Device {
 
 /// Connected devices from `adb devices -l`.
 pub fn devices(adb: &Path) -> Vec<Device> {
-    let Ok(out) = Command::new(adb).args(["devices", "-l"]).output() else {
+    let Ok(out) = crate::capture::output_within(
+        Command::new(adb).args(["devices", "-l"]),
+        crate::capture::ADB_TIMEOUT,
+    ) else {
         return Vec::new();
     };
     String::from_utf8_lossy(&out.stdout)

@@ -65,8 +65,12 @@ pub fn lookup(root: &Path, key: &str, now: u64) -> Option<Cards> {
 }
 
 /// Stores the pictures of `file` under `key`, replaces that file's older entry, then keeps the
-/// newest entries younger than the TTL up to MAX_IMAGES pictures.
+/// newest entries younger than the TTL up to MAX_IMAGES pictures. Cards with an error are not
+/// stored: the next request draws them again (a render error may not come back).
 pub fn store(root: &Path, key: &str, file: &Path, cards: &Cards, now: u64) {
+    if cards.iter().any(|c| c.1.is_err()) {
+        return;
+    }
     let dir = root.join(key);
     let _ = std::fs::remove_dir_all(&dir);
     if std::fs::create_dir_all(&dir).is_err() {
@@ -107,7 +111,7 @@ fn evict(root: &Path, keep_key: &str, file: &Path, now: u64) {
     let Ok(rd) = std::fs::read_dir(root) else {
         return;
     };
-    let mut live: Vec<(u64, usize, PathBuf)> = Vec::new();
+    let mut live: Vec<(u64, bool, usize, PathBuf)> = Vec::new();
     for e in rd.flatten() {
         let k = e.file_name().to_string_lossy().into_owned();
         let m = meta(root, &k);
@@ -121,16 +125,17 @@ fn evict(root: &Path, keep_key: &str, file: &Path, now: u64) {
             .map_or(0, |c| c.iter().filter(|c| c["error"].is_null()).count());
         match at {
             Some(at) if now.saturating_sub(at) < TTL_SECS && (k == keep_key || !same_file) => {
-                live.push((at, pictures, e.path()))
+                live.push((at, k == keep_key, pictures, e.path()))
             }
             _ => {
                 let _ = std::fs::remove_dir_all(e.path());
             }
         }
     }
-    live.sort_by_key(|e| std::cmp::Reverse(e.0));
+    // newest first; the entry just stored first among those of the same second
+    live.sort_by_key(|e| std::cmp::Reverse((e.0, e.1)));
     let mut total = 0;
-    for (i, (_, n, p)) in live.into_iter().enumerate() {
+    for (i, (_, _, n, p)) in live.into_iter().enumerate() {
         total += n;
         if i > 0 && total > MAX_IMAGES {
             let _ = std::fs::remove_dir_all(p);
@@ -151,10 +156,7 @@ mod tests {
 
     fn cards() -> Cards {
         let img = ColorImage::new([2, 3], vec![egui::Color32::from_rgb(10, 20, 30); 6]);
-        vec![
-            ("Card - Light".into(), Ok(img)),
-            ("Card - Dark".into(), Err("boom".into())),
-        ]
+        vec![("Card - Light".into(), Ok(img))]
     }
 
     fn entries(root: &Path) -> usize {
@@ -167,12 +169,11 @@ mod tests {
         let k = key(&["text", "own"]);
         store(&root, &k, Path::new("/p/Card.kt"), &cards(), 1000);
         let got = lookup(&root, &k, 1000 + TTL_SECS - 1).expect("hit before the TTL");
-        assert_eq!(got.len(), 2);
+        assert_eq!(got.len(), 1);
         assert_eq!(got[0].0, "Card - Light");
         let img = got[0].1.as_ref().unwrap();
         assert_eq!(img.size, [2, 3]);
         assert_eq!(img.pixels[0], egui::Color32::from_rgb(10, 20, 30));
-        assert_eq!(got[1].1, Err("boom".to_string()));
         assert!(
             lookup(&root, &k, 1000 + TTL_SECS).is_none(),
             "expired at 30 minutes"
@@ -201,7 +202,7 @@ mod tests {
     #[test]
     fn at_most_twenty_pictures_newest_first_and_no_expired_ones() {
         let root = tmp("keep");
-        // one picture each (cards() has one picture and one error card)
+        // one picture each
         for i in 0..22u64 {
             let f = PathBuf::from(format!("/p/F{i}.kt"));
             store(&root, &key(&[&i.to_string()]), &f, &cards(), 1000 + i);
@@ -230,6 +231,44 @@ mod tests {
         );
         assert_eq!(entries(&root), 1);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cards_with_an_error_are_not_stored() {
+        let root = tmp("errors");
+        let k = key(&["e"]);
+        let mut c = cards();
+        c.push(("Card - Dark".into(), Err("boom".into())));
+        store(&root, &k, Path::new("/p/E.kt"), &c, 1000);
+        assert!(lookup(&root, &k, 1001).is_none(), "drawn again next time");
+        assert_eq!(entries(&root), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_entry_just_stored_stays_when_another_has_the_same_time() {
+        let img = ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
+        let many =
+            |n: usize| -> Cards { (0..n).map(|i| (format!("P{i}"), Ok(img.clone()))).collect() };
+        // several names, so the folder order puts the new entry both before and after the other
+        for i in 0..8 {
+            let root = tmp(&format!("tie{i}"));
+            store(
+                &root,
+                &key(&["other", &i.to_string()]),
+                Path::new("/p/A.kt"),
+                &many(15),
+                1000,
+            );
+            let new = key(&["new", &i.to_string()]);
+            store(&root, &new, Path::new("/p/B.kt"), &many(10), 1000);
+            assert!(
+                lookup(&root, &new, 1001).is_some(),
+                "round {i}: the entry just stored was evicted"
+            );
+            assert_eq!(entries(&root), 1, "round {i}");
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]

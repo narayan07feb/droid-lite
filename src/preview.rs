@@ -24,6 +24,8 @@ pub struct Request {
     /// The JVM class of the file's top-level functions (`com.app.ui.CardKt`).
     pub class: String,
     pub previews: Vec<String>,
+    /// The caller's number for this request, given back in its answer (Done, Failed or Skipped).
+    pub seq: u64,
     /// The project: its libraries come from the Gradle cache (read only), its own code the preview
     /// needs from its files.
     pub project: Option<ProjectRef>,
@@ -133,9 +135,11 @@ pub enum Event {
     /// with (done, total) when the count is known; or a reason it cannot run ("Skipped: …").
     Status(String, Option<(u64, u64)>),
     /// One picture or one error text per preview, in request order.
-    Done { file: PathBuf, cards: Vec<(String, Result<egui::ColorImage, String>)> },
+    Done { file: PathBuf, seq: u64, cards: Vec<(String, Result<egui::ColorImage, String>)> },
     /// The whole request failed (compile error, missing class): the text for the cards.
-    Failed { file: PathBuf, error: String },
+    Failed { file: PathBuf, seq: u64, error: String },
+    /// The request was not drawn: a newer one replaced it, or there is no room now (the reason).
+    Skipped { file: PathBuf, seq: u64, reason: String },
 }
 
 pub struct Client {
@@ -143,15 +147,21 @@ pub struct Client {
     rx: Receiver<Event>,
 }
 
+/// Starts the client's thread: requests go in, events come out (a caller may block on them).
+pub fn spawn(ctx: &egui::Context) -> (Sender<Request>, Receiver<Event>) {
+    let (tx, jobs) = channel::<Request>();
+    let (events, rx) = channel();
+    let ctx = ctx.clone();
+    std::thread::Builder::new()
+        .name("preview-client".into())
+        .spawn(move || run(jobs, events, ctx))
+        .expect("preview thread");
+    (tx, rx)
+}
+
 impl Client {
     pub fn new(ctx: &egui::Context) -> Client {
-        let (tx, jobs) = channel::<Request>();
-        let (events, rx) = channel();
-        let ctx = ctx.clone();
-        std::thread::Builder::new()
-            .name("preview-client".into())
-            .spawn(move || run(jobs, events, ctx))
-            .expect("preview thread");
+        let (tx, rx) = spawn(ctx);
         Client { tx, rx }
     }
 
@@ -225,43 +235,86 @@ fn room_from_status(status: &str) -> String {
     }
 }
 
+/// The next request to draw: the newest one waiting. Every older one, and one there is no room
+/// for now, is answered Skipped, so no caller waits for an answer that never comes.
+fn next_job(jobs: &Receiver<Request>, send: &dyn Fn(Event), room: &dyn Fn() -> String) -> Option<Request> {
+    loop {
+        let mut r = jobs.recv().ok()?;
+        while let Ok(newer) = jobs.try_recv() {
+            send(Event::Skipped { file: r.file, seq: r.seq, reason: "replaced by a newer request".into() });
+            r = newer;
+        }
+        let why = room();
+        if why.is_empty() {
+            return Some(r);
+        }
+        send(Event::Status(why.clone(), None));
+        send(Event::Skipped { file: r.file, seq: r.seq, reason: why });
+    }
+}
+
+/// The preview cache key: what is drawn (file, text, project code, specs, Kotlin version), the
+/// libraries, the worker's source, the renderer and every resource and assets file.
+fn cache_key(draw: &[&str], rt: &ProjectRuntime, worker: &str, renderer: &str) -> String {
+    let mut parts = draw.to_vec();
+    let (libs, worker, files) = (format!("{:08x}", rt.key()), format!("{:016x}", fnv(worker)), format!("{:016x}", rt.files_key()));
+    parts.extend([libs.as_str(), &worker, renderer, &files]);
+    crate::preview_cache::key(&parts)
+}
+
+/// What the run loop reads once per project (the libraries, the packages) and the compilers it found.
+#[derive(Default)]
+struct Reads {
+    libs: Option<(PathBuf, LibraryCode)>,
+    packages: Option<(PathBuf, crate::preview_src::Packages)>,
+    kotlins: std::collections::HashMap<String, Result<Kotlin, String>>,
+}
+
+impl Reads {
+    /// After a failed request (no Compose in the Gradle cache yet, no compiler, unresolved code) the
+    /// next one reads again, so "build once with Gradle, then open the preview again" works.
+    fn forget_errors(&mut self) {
+        self.libs = None;
+        self.packages = None;
+        self.kotlins.retain(|_, k| k.is_ok());
+    }
+}
+
 fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
+    let failed = std::cell::Cell::new(false);
     let send = |e: Event| {
+        if matches!(e, Event::Failed { .. }) {
+            failed.set(true);
+        }
         let _ = events.send(e);
         ctx.request_repaint();
     };
     let mut conn: Option<(UnixStream, BufReader<UnixStream>)> = None;
     let mut id = 0u64;
-    // the project's libraries, read once per project root (the Gradle cache does not change under us)
-    let mut libs: Option<(PathBuf, LibraryCode)> = None;
-    let mut packages: Option<(PathBuf, crate::preview_src::Packages)> = None;
+    // the project's libraries, read once per project root (again after a failed request)
+    let mut reads = Reads::default();
     let mut assets: Vec<String> = Vec::new();
     let (mut res_packages, mut module_res, mut exploded): (Vec<String>, Vec<String>, Vec<String>) = Default::default();
-    let mut kotlins: std::collections::HashMap<String, Result<Kotlin, String>> = std::collections::HashMap::new();
     let mut conn_version = String::new();
-    while let Ok(mut r) = jobs.recv() {
-        while let Ok(newer) = jobs.try_recv() {
-            r = newer; // the newest request wins
+    while let Some(r) = next_job(&jobs, &send, &room) {
+        if failed.take() {
+            reads.forget_errors();
         }
-        let why = room();
-        if !why.is_empty() {
-            send(Event::Status(why, None));
-            continue;
-        }
+        let fail = |error: String| Event::Failed { file: r.file.clone(), seq: r.seq, error };
         let (cp, own) = match &r.project {
             Some(p) => {
-                if libs.as_ref().is_none_or(|(r0, _)| *r0 != p.root) {
+                if reads.libs.as_ref().is_none_or(|(r0, _)| *r0 != p.root) {
                     send(Event::Status("Reading the project's libraries".into(), None));
                     let progress = |i: usize, n: usize| send(Event::Status("Unpacking the project's libraries".into(), Some((i as u64, n as u64))));
-                    libs = Some((p.root.clone(), library_classpath(&p.root, &p.scripts, &progress)));
-                    packages = Some((p.root.clone(), crate::preview_src::Packages::read(&p.files)));
+                    reads.libs = Some((p.root.clone(), library_classpath(&p.root, &p.scripts, &progress)));
+                    reads.packages = Some((p.root.clone(), crate::preview_src::Packages::read(&p.files)));
                 }
-                let lc = libs.as_ref().map(|(_, l)| l.clone()).unwrap_or_default();
+                let lc = reads.libs.as_ref().map(|(_, l)| l.clone()).unwrap_or_default();
                 let (mut cp, lib_r) = (lc.jars, lc.rjava);
                 assets = lc.assets;
                 // the project's own Compose runs the preview when the Gradle cache has it
                 if cp.iter().any(|j| j.contains("/androidx.compose.runtime/")) {
-                    match project_r(&packages.as_ref().unwrap().1, &lib_r) {
+                    match project_r(&reads.packages.as_ref().unwrap().1, &lib_r) {
                         Ok((rs, pkgs, res)) => {
                             cp.push(rs.to_string_lossy().into_owned());
                             res_packages = pkgs;
@@ -269,17 +322,17 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
                             exploded = lc.exploded.clone();
                         }
                         Err(e) => {
-                            send(Event::Failed { file: r.file.clone(), error: e });
+                            send(fail(e));
                             continue;
                         }
                     }
                 } else {
                     cp.clear(); // not usable on its own: the base pack's Compose instead
                 }
-                match own_code(&packages.as_ref().unwrap().1, &r.file) {
+                match own_code(&reads.packages.as_ref().unwrap().1, &r.file) {
                     Ok(o) => (cp, Some(o)),
                     Err(e) => {
-                        send(Event::Failed { file: r.file.clone(), error: e });
+                        send(fail(e));
                         continue;
                     }
                 }
@@ -289,15 +342,15 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
         let version = kotlin_version(r.project.as_ref().map(|p| p.root.as_path()));
         let stand_in = std::env::var_os("DROID_LITE_PREVIEW_WORKER").is_some(); // tests: no compiler needed
         if cp.is_empty() && !stand_in && base_jars("compose").is_empty() {
-            send(Event::Failed { file: r.file.clone(), error: NO_COMPOSE.into() });
+            send(fail(NO_COMPOSE.into()));
             continue;
         }
-        let kt = match kotlins.entry(version.clone()).or_insert_with(|| {
+        let kt = match reads.kotlins.entry(version.clone()).or_insert_with(|| {
             if stand_in { Ok(Kotlin { version: version.clone(), ..Default::default() }) } else { kotlin(&version) }
         }) {
             Ok(k) => k.clone(),
             Err(e) => {
-                send(Event::Failed { file: r.file.clone(), error: e.clone() });
+                send(fail(e.clone()));
                 continue;
             }
         };
@@ -306,7 +359,7 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
         let text = std::fs::read_to_string(&r.file).unwrap_or_default();
         let specs = {
             let empty = std::collections::HashMap::new();
-            let classes = packages.as_ref().map_or(&empty, |(_, p)| &p.annotation_classes);
+            let classes = reads.packages.as_ref().map_or(&empty, |(_, p)| &p.annotation_classes);
             specs_for(&text, &r.previews, classes)
         };
         let rt = ProjectRuntime {
@@ -316,18 +369,14 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
             module_res: if cp.is_empty() { Vec::new() } else { module_res.clone() },
             exploded: if cp.is_empty() { Vec::new() } else { exploded.clone() },
         };
-        // the same file, project code, previews and libraries as a recent draw: its pictures at once
+        // the same file, project code, previews, libraries, worker, renderer and resources as a recent
+        // draw: its pictures at once
         let cache_dir = dir().join("cache");
-        let cache_key = crate::preview_cache::key(&[
-            &r.file.to_string_lossy(),
-            &text,
-            own.as_ref().map_or("", |o| o.key.as_str()),
-            &format!("{specs:?}"),
-            &version,
-            &format!("{:08x}", rt.key()),
-        ]);
+        let (file, specs_text) = (r.file.to_string_lossy(), format!("{specs:?}"));
+        let draw = [file.as_ref(), &text, own.as_ref().map_or("", |o| o.key.as_str()), &specs_text, &version];
+        let cache_key = cache_key(&draw, &rt, WORKER_SOURCE, &crate::preview_base::fingerprint());
         if !stand_in && let Some(cards) = crate::preview_cache::lookup(&cache_dir, &cache_key, crate::preview_cache::now_secs()) {
-            send(Event::Done { file: r.file.clone(), cards });
+            send(Event::Done { file: r.file.clone(), seq: r.seq, cards });
             continue;
         }
         let worker_id = format!("{version}-{:08x}", rt.key());
@@ -360,7 +409,7 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
             let (w, rd) = conn.as_mut().unwrap();
             match ask(w, rd, id, &r, &specs, &cp, own.as_ref(), &send) {
                 Ok(e) => {
-                    if let Event::Done { file, cards } = &e
+                    if let Event::Done { file, cards, .. } = &e
                         && !stand_in
                     {
                         crate::preview_cache::store(&cache_dir, &cache_key, file, cards, crate::preview_cache::now_secs());
@@ -376,7 +425,7 @@ fn run(jobs: Receiver<Request>, events: Sender<Event>, ctx: egui::Context) {
             }
         }
         if !last_error.is_empty() {
-            send(Event::Failed { file: r.file.clone(), error: last_error });
+            send(fail(last_error));
         }
     }
 }
@@ -430,23 +479,31 @@ fn connect_or_start(
     ))
 }
 
-/// Only one worker at a time: before a new one starts, any other preview worker of this preview folder
-/// (an older build's, another project's or Kotlin version's) is asked to stop (SIGTERM); a worker
-/// holds about a gigabyte. Found by its command line (worker source and socket), so older builds
-/// that wrote no pidfile are found too.
+/// Workers that may run at once (about 2 GB each): the one starting and one other, so two windows
+/// on different projects (the app and VS Code) do not stop each other's worker mid-draw.
+const MAX_WORKERS: usize = 2;
+
+/// Before a new worker starts, the other preview workers of this preview folder (an older build's,
+/// another project's or Kotlin version's) past [`MAX_WORKERS`] are asked to stop (SIGTERM), the
+/// oldest first: the youngest is the one most likely still in use, and an unused one exits by
+/// itself when idle. Found by their command line (worker source and socket), so older builds that
+/// wrote no pidfile are found too.
 fn stop_other_workers(keep: &Path) {
-    let Ok(out) = Command::new("ps").args(["-axo", "pid=,command="]).output() else { return };
+    let Ok(out) = Command::new("ps").args(["-axo", "pid=,etime=,command="]).output() else { return };
     let src = base_dir().join("PreviewWorker.java");
     let (src, keep, me) = (src.to_string_lossy().into_owned(), keep.to_string_lossy().into_owned(), std::process::id());
-    let mut stopped = Vec::new();
+    let mut others = Vec::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let line = line.trim_start();
-        let Some((pid, cmd)) = line.split_once(' ') else { continue };
-        let Ok(pid) = pid.parse::<i32>() else { continue };
+        let mut it = line.split_whitespace();
+        let (Some(pid), Some(age)) = (it.next().and_then(|p| p.parse::<i32>().ok()), it.next().and_then(etime_secs)) else { continue };
+        let cmd = it.collect::<Vec<_>>().join(" ");
         if pid as u32 != me && cmd.contains(&src) && !cmd.contains(&keep) {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-            stopped.push(pid);
+            others.push((pid, age));
         }
+    }
+    let mut stopped = workers_to_stop(others);
+    for p in &stopped {
+        unsafe { libc::kill(*p, libc::SIGTERM) };
     }
     // give them a moment to go before the new one starts (memory)
     let until = Instant::now() + Duration::from_secs(5);
@@ -454,6 +511,20 @@ fn stop_other_workers(keep: &Path) {
         stopped.retain(|p| unsafe { libc::kill(*p, 0) } == 0);
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Of the other workers (pid, age in seconds), the ones to stop so that with the new one at most
+/// [`MAX_WORKERS`] run: all but the youngest.
+fn workers_to_stop(mut others: Vec<(i32, u64)>) -> Vec<i32> {
+    others.sort_by_key(|w| w.1);
+    others.into_iter().skip(MAX_WORKERS - 1).map(|w| w.0).collect()
+}
+
+/// `ps` elapsed time (`[[dd-]hh:]mm:ss`) in seconds.
+fn etime_secs(s: &str) -> Option<u64> {
+    let (days, rest) = s.split_once('-').map_or(Some((0, s)), |(d, r)| d.parse().ok().map(|d: u64| (d, r)))?;
+    let secs = rest.split(':').try_fold(0u64, |acc, p| p.parse::<u64>().ok().map(|n| acc * 60 + n))?;
+    Some(days * 86_400 + secs)
 }
 
 /// Starts the worker detached (its own process group, output to worker.log), so it outlives nothing
@@ -618,6 +689,30 @@ impl ProjectRuntime {
     fn key(&self) -> u32 {
         if self.jars.is_empty() { 0 } else { fnv(&format!("{:?}{:?}{:?}", self.jars, self.module_res, self.res_packages)) as u32 }
     }
+
+    /// Every file of the resource and assets folders the renderer reads (path, time, size), so an
+    /// edited string or drawable draws the pictures again.
+    fn files_key(&self) -> u64 {
+        fn walk(d: &Path, h: &mut u64) {
+            let Ok(rd) = std::fs::read_dir(d) else { return };
+            let mut entries: Vec<_> = rd.flatten().collect();
+            entries.sort_by_key(|e| e.file_name());
+            for e in entries {
+                let Ok(m) = e.metadata() else { continue };
+                if m.is_dir() {
+                    walk(&e.path(), h);
+                } else {
+                    let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+                    *h = (*h ^ fnv(&format!("{}|{t:?}|{}", e.path().display(), m.len()))).wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+        let mut h = fnv("files");
+        for d in self.module_res.iter().chain(&self.assets) {
+            walk(Path::new(d), &mut h);
+        }
+        h
+    }
 }
 
 /// The R classes of every module of the project (made from its res folders, ids unique across all) and
@@ -766,6 +861,9 @@ fn fnv(s: &str) -> u64 {
     s.bytes().fold(0xcbf29ce484222325, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
 }
 
+/// How long the worker may be silent before it counts as stopped.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 120 });
+
 #[allow(clippy::too_many_arguments)]
 fn ask(
     w: &mut UnixStream,
@@ -784,6 +882,8 @@ fn ask(
         "rjava": own.map_or(&[][..], |o| &o.rjava[..]),
         "key": own.map_or("", |o| o.key.as_str()),
     });
+    // a worker that hangs is given up (a cold compile takes about 25 s between lines)
+    rd.get_ref().set_read_timeout(Some(REPLY_TIMEOUT)).map_err(|e| e.to_string())?;
     writeln!(w, "{line}").map_err(|e| e.to_string())?;
     loop {
         let mut reply = String::new();
@@ -791,8 +891,12 @@ fn ask(
             return Err("no answer".into());
         }
         let v: serde_json::Value = serde_json::from_str(&reply).map_err(|e| e.to_string())?;
-        if v["id"].as_u64() != Some(id) || v["skipped"].as_bool() == Some(true) {
+        if v["id"].as_u64() != Some(id) {
             continue; // an older answer
+        }
+        if v["skipped"].as_bool() == Some(true) {
+            // another client's request took the worker's one waiting place: ask again
+            return Err("another window's request replaced this one".into());
         }
         if let Some(step) = v["status"].as_str() {
             // the worker's real step, while it works
@@ -802,7 +906,7 @@ fn ask(
         }
         if v["ok"].as_bool() != Some(true) {
             let error = short_error(v["error"].as_str().unwrap_or("The preview failed."), &r.file);
-            return Ok(Event::Failed { file: r.file.clone(), error });
+            return Ok(Event::Failed { file: r.file.clone(), seq: r.seq, error });
         }
         let cards = v["images"]
             .as_array()
@@ -826,7 +930,7 @@ fn ask(
                 (name, pic)
             })
             .collect();
-        return Ok(Event::Done { file: r.file.clone(), cards });
+        return Ok(Event::Done { file: r.file.clone(), seq: r.seq, cards });
     }
 }
 
@@ -932,6 +1036,128 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         assert!(s.contains("\nScreen.kt:5:30: error: unresolved reference 'compose'."), "{s}");
         assert!(!s.contains("Users/n"), "paths cut to the file name, with or without the leading /: {s}");
         assert!(s.ends_with("… 1 more errors"), "{s}");
+    }
+
+    fn request(seq: u64) -> Request {
+        Request { file: PathBuf::from(format!("/p/F{seq}.kt")), class: "FKt".into(), previews: vec!["P".into()], seq, project: None }
+    }
+
+    /// The events `next_job` sent, as (kind, seq, text).
+    type Log = std::rc::Rc<std::cell::RefCell<Vec<(String, u64, String)>>>;
+
+    fn record() -> (Log, impl Fn(Event)) {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let l = log.clone();
+        (log, move |e: Event| {
+            let row = match e {
+                Event::Skipped { seq, reason, .. } => ("skipped".into(), seq, reason),
+                Event::Status(t, _) => ("status".into(), 0, t),
+                Event::Done { seq, .. } => ("done".into(), seq, String::new()),
+                Event::Failed { seq, error, .. } => ("failed".into(), seq, error),
+            };
+            l.borrow_mut().push(row);
+        })
+    }
+
+    #[test]
+    fn every_request_the_loop_drops_or_skips_is_answered() {
+        let (tx, jobs) = channel();
+        for seq in 1..=3 {
+            tx.send(request(seq)).unwrap();
+        }
+        let (log, send) = record();
+        let go = || String::new();
+        assert_eq!(next_job(&jobs, &send, &go).map(|r| r.seq), Some(3), "the newest wins");
+        let replaced = |seq| ("skipped".to_string(), seq, "replaced by a newer request".to_string());
+        assert_eq!(*log.borrow(), vec![replaced(1), replaced(2)]);
+        // no room now: the request is answered with the reason, then the loop waits for the next
+        log.borrow_mut().clear();
+        tx.send(request(4)).unwrap();
+        drop(tx);
+        let busy = || "Skipped: mac-guard says memory is critical.".to_string();
+        assert!(next_job(&jobs, &send, &busy).is_none());
+        let why = busy();
+        assert_eq!(*log.borrow(), vec![("status".to_string(), 0, why.clone()), ("skipped".to_string(), 4, why)]);
+    }
+
+    #[test]
+    fn a_skipped_reply_for_this_request_is_an_error_not_an_endless_wait() {
+        let (mut w, peer) = UnixStream::pair().unwrap();
+        let mut rd = BufReader::new(w.try_clone().unwrap());
+        let worker = std::thread::spawn(move || {
+            let mut line = String::new();
+            let mut r = BufReader::new(peer.try_clone().unwrap());
+            r.read_line(&mut line).unwrap();
+            let mut p = peer;
+            writeln!(p, r#"{{"id":7,"ok":false,"skipped":true}}"#).unwrap();
+            p // kept open: the answer must not depend on the socket closing
+        });
+        let (done, got) = channel();
+        std::thread::spawn(move || {
+            let _ = done.send(ask(&mut w, &mut rd, 7, &request(1), &[], &[], None, &|_| {}).err());
+        });
+        let err = got.recv_timeout(Duration::from_secs(10)).expect("an answer, not a hang");
+        assert!(err.as_deref().is_some_and(|e| e.contains("replaced")), "{err:?}");
+        drop(worker.join());
+    }
+
+    #[test]
+    fn a_silent_worker_is_given_up_after_the_reply_timeout() {
+        let (mut w, peer) = UnixStream::pair().unwrap();
+        let mut rd = BufReader::new(w.try_clone().unwrap());
+        let (done, got) = channel();
+        std::thread::spawn(move || {
+            let _ = done.send(ask(&mut w, &mut rd, 1, &request(1), &[], &[], None, &|_| {}).is_err());
+        });
+        assert_eq!(got.recv_timeout(Duration::from_secs(10)), Ok(true), "no endless wait");
+        drop(peer);
+    }
+
+    #[test]
+    fn after_a_failed_request_libraries_packages_and_compiler_errors_are_read_again() {
+        let mut reads = Reads { libs: Some((PathBuf::from("/p"), LibraryCode::default())), ..Default::default() };
+        reads.kotlins.insert("2.2.20".into(), Ok(Kotlin::default()));
+        reads.kotlins.insert("2.3.0".into(), Err("not on this Mac yet".into()));
+        reads.forget_errors();
+        assert!(reads.libs.is_none() && reads.packages.is_none());
+        assert_eq!(reads.kotlins.keys().collect::<Vec<_>>(), ["2.2.20"], "the found compiler stays");
+    }
+
+    #[test]
+    fn the_cache_key_covers_the_worker_the_renderer_and_resource_files() {
+        let d = std::env::temp_dir().join(format!("dl-preview-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("res/values")).unwrap();
+        std::fs::create_dir_all(d.join("assets")).unwrap();
+        std::fs::write(d.join("res/values/strings.xml"), "<a/>").unwrap();
+        let rt = ProjectRuntime {
+            jars: vec!["/x.jar".into()],
+            module_res: vec![d.join("res").to_string_lossy().into_owned()],
+            assets: vec![d.join("assets").to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let k = || cache_key(&["/p/A.kt", "text"], &rt, "worker v1", "renderer v1");
+        let first = k();
+        assert_eq!(first, k(), "nothing changed");
+        assert_ne!(first, cache_key(&["/p/A.kt", "text"], &rt, "worker v2", "renderer v1"));
+        assert_ne!(first, cache_key(&["/p/A.kt", "text"], &rt, "worker v1", "renderer v2"));
+        std::fs::write(d.join("res/values/strings.xml"), "<a>b</a>").unwrap();
+        let second = k();
+        assert_ne!(first, second, "an edited string");
+        std::fs::write(d.join("assets/font.ttf"), "f").unwrap();
+        assert_ne!(second, k(), "a new asset");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn at_most_two_workers_run_the_youngest_other_one_stays() {
+        assert_eq!(workers_to_stop(vec![]), Vec::<i32>::new());
+        assert_eq!(workers_to_stop(vec![(10, 900)]), Vec::<i32>::new(), "another window's worker stays");
+        assert_eq!(workers_to_stop(vec![(10, 900), (11, 30), (12, 4000)]), vec![10, 12], "oldest go");
+        assert_eq!(etime_secs("05:07"), Some(307));
+        assert_eq!(etime_secs("01:00:01"), Some(3601));
+        assert_eq!(etime_secs("2-00:00:10"), Some(172_810));
+        assert_eq!(etime_secs("x"), None);
     }
 
     #[test]

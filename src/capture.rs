@@ -10,6 +10,54 @@ use std::time::{Duration, Instant};
 /// Android stops `screenrecord` after 3 minutes.
 pub const MAX_RECORDING: Duration = Duration::from_secs(180);
 
+/// How long one adb call may take before it is stopped (a device that hangs, a stuck adb server);
+/// copying a finished recording may take longer.
+pub const ADB_TIMEOUT: Duration = Duration::from_secs(20);
+const PULL_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn read_all(r: Option<impl std::io::Read + Send + 'static>) -> Receiver<Vec<u8>> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(mut r) = r {
+            let _ = r.read_to_end(&mut b);
+        }
+        let _ = tx.send(b);
+    });
+    rx
+}
+
+/// `cmd.output()`, but the process is killed when it runs longer than `limit`.
+pub fn output_within(cmd: &mut Command, limit: Duration) -> Result<std::process::Output, String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let (out, err) = (read_all(child.stdout.take()), read_all(child.stderr.take()));
+    let until = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            // a helper it started (the adb server) may hold the pipes open: wait only a moment
+            let left = until
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_secs(1));
+            return Ok(std::process::Output {
+                status,
+                stdout: out.recv_timeout(left).unwrap_or_default(),
+                stderr: err.recv_timeout(left).unwrap_or_default(),
+            });
+        }
+        if Instant::now() >= until {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("no answer in {} s", limit.as_secs()));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Where captures go: `DROID_LITE_CAPTURE_DIR`, else `~/Desktop`, else the home folder.
 pub fn out_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("DROID_LITE_CAPTURE_DIR") {
@@ -53,10 +101,11 @@ pub fn file_name(kind: &str, serial: &str, stamp: &str, ext: &str) -> String {
 
 /// Saves the screen of `serial` as a PNG in `dir`.
 pub fn screenshot(adb: &Path, serial: &str, dir: &Path) -> Result<PathBuf, String> {
-    let out = Command::new(adb)
-        .args(["-s", serial, "exec-out", "screencap", "-p"])
-        .output()
-        .map_err(|e| format!("adb: {e}"))?;
+    let out = output_within(
+        Command::new(adb).args(["-s", serial, "exec-out", "screencap", "-p"]),
+        ADB_TIMEOUT,
+    )
+    .map_err(|e| format!("adb: {e}"))?;
     if !out.stdout.starts_with(b"\x89PNG") {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(if err.is_empty() {
@@ -121,12 +170,18 @@ impl Recording {
     }
 
     fn adb(&self, args: &[&str]) -> Result<std::process::Output, String> {
-        Command::new(&self.adb)
-            .args(["-s", &self.serial])
-            .args(args)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| format!("adb: {e}"))
+        let limit = if args.first() == Some(&"pull") {
+            PULL_TIMEOUT
+        } else {
+            ADB_TIMEOUT
+        };
+        output_within(
+            Command::new(&self.adb)
+                .args(["-s", &self.serial])
+                .args(args),
+            limit,
+        )
+        .map_err(|e| format!("adb: {e}"))
     }
 
     /// Stops screenrecord with SIGINT (so it finishes the mp4) by its own pid, never by name.
@@ -194,6 +249,23 @@ impl Drop for Recording {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_call_that_hangs_is_stopped_at_its_limit() {
+        let t = Instant::now();
+        let r = output_within(Command::new("sleep").arg("10"), Duration::from_millis(300));
+        assert!(r.is_err(), "{r:?}");
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        let ok = output_within(
+            Command::new("sh").args(["-c", "echo out; echo err >&2"]),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(
+            (&ok.stdout[..], &ok.stderr[..]),
+            (&b"out\n"[..], &b"err\n"[..])
+        );
+    }
 
     #[test]
     fn file_names_are_safe_for_wifi_serials() {

@@ -172,20 +172,28 @@ trait Fetch {
 /// the file's size while it runs.
 struct Curl;
 
+/// curl's options: a connection that stalls (under 1 KB/s for 30 s) fails instead of hanging; the
+/// `.part` file resumes at the next try.
+const CURL_ARGS: [&str; 13] = [
+    "-fsSL",
+    "-C",
+    "-",
+    "--retry",
+    "3",
+    "--retry-delay",
+    "2",
+    "--connect-timeout",
+    "20",
+    "--speed-limit",
+    "1024",
+    "--speed-time",
+    "30",
+];
+
 impl Fetch for Curl {
     fn fetch(&self, url: &str, to: &Path, progress: &dyn Fn(u64)) -> Result<(), String> {
         let mut child = Command::new("curl")
-            .args([
-                "-fsSL",
-                "-C",
-                "-",
-                "--retry",
-                "3",
-                "--retry-delay",
-                "2",
-                "--connect-timeout",
-                "20",
-            ])
+            .args(CURL_ARGS)
             .arg("-o")
             .arg(to)
             .arg(url)
@@ -341,6 +349,7 @@ fn unpacked(jar: &Path, sha1: &str, to: &Path) -> Result<(), String> {
         return Ok(());
     }
     std::fs::create_dir_all(to.parent().unwrap()).map_err(|e| e.to_string())?;
+    sweep_unpack_leftovers(to);
     let tmp = to.with_extension(format!("new-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let file = std::fs::File::open(jar).map_err(|e| e.to_string())?;
@@ -350,6 +359,31 @@ fn unpacked(jar: &Path, sha1: &str, to: &Path) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(to);
     std::fs::rename(&tmp, to).map_err(|e| e.to_string())?;
     std::fs::write(to.with_extension("sha1"), sha1).map_err(|e| e.to_string())
+}
+
+/// Deletes `<to>.new-<pid>` folders that a killed or failed unpack left behind (this process's,
+/// or one whose process has ended); one being written by a live process stays.
+fn sweep_unpack_leftovers(to: &Path) {
+    let prefix = to.with_extension("new-");
+    let (Some(dir), Some(prefix)) = (to.parent(), prefix.file_name()) else {
+        return;
+    };
+    let prefix = prefix.to_string_lossy().into_owned();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let live = pid
+            .parse::<i32>()
+            .is_ok_and(|p| p as u32 != std::process::id() && unsafe { libc::kill(p, 0) } == 0);
+        if !live {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
 }
 
 fn is_unpacked(to: &Path, sha1: &str) -> bool {
@@ -393,6 +427,22 @@ fn newest_android_jar(platforms: &Path) -> Option<PathBuf> {
         .filter(|(_, j)| j.is_file())
         .max_by_key(|(l, _)| *l)
         .map(|(_, j)| j)
+}
+
+/// What the renderer is, for the preview cache key: every piece's checksum and the SDK's
+/// android.jar (path, time, size). Cheap: nothing is downloaded or read.
+pub fn fingerprint() -> String {
+    let mut s: String = pieces()
+        .iter()
+        .map(|p| p.sha1)
+        .collect::<Vec<_>>()
+        .join(",");
+    if let Some(j) = android_jar() {
+        let m = std::fs::metadata(&j).ok();
+        let t = m.as_ref().and_then(|m| m.modified().ok());
+        s.push_str(&format!("|{}|{t:?}|{:?}", j.display(), m.map(|m| m.len())));
+    }
+    s
 }
 
 /// The base for a worker start: every piece found or downloaded, the data jars unpacked under
@@ -854,6 +904,56 @@ mod tests {
             1,
             "unpacked once: not downloaded again"
         );
+    }
+
+    #[test]
+    fn a_stalled_download_fails_instead_of_hanging() {
+        let args = CURL_ARGS.join(" ");
+        assert!(
+            args.contains("--speed-limit 1024 --speed-time 30"),
+            "{args}"
+        );
+        assert!(args.contains("--connect-timeout 20"), "{args}");
+    }
+
+    #[test]
+    fn the_fingerprint_names_every_piece_of_the_renderer() {
+        let f = fingerprint();
+        assert!(pieces().iter().all(|p| f.contains(p.sha1)), "{f}");
+    }
+
+    #[test]
+    fn leftover_unpack_folders_of_ended_runs_are_swept() {
+        let d = temp("sweep");
+        let to = d.join("layoutlib/runtime");
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        // a process that has ended, and one that is still running
+        let mut ended = Command::new("true").spawn().unwrap();
+        let ended_pid = ended.id();
+        ended.wait().unwrap();
+        let mut running = Command::new("sleep").arg("30").spawn().unwrap();
+        let (gone, kept) = (
+            to.with_extension(format!("new-{ended_pid}")),
+            to.with_extension(format!("new-{}", running.id())),
+        );
+        let junk = to.with_extension("new-x");
+        for p in [&gone, &kept, &junk] {
+            std::fs::create_dir_all(p.join("data")).unwrap();
+        }
+        let jar = d.join("data.jar");
+        {
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&jar).unwrap());
+            z.start_file("data/a.txt", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut z, b"a").unwrap();
+            z.finish().unwrap();
+        }
+        unpacked(&jar, "s1", &to).unwrap();
+        assert!(!gone.exists(), "a killed run's folder");
+        assert!(!junk.exists());
+        assert!(kept.exists(), "a live run's folder stays");
+        let _ = running.kill();
+        let _ = running.wait();
     }
 
     #[test]
