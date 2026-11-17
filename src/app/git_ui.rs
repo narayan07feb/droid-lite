@@ -255,8 +255,10 @@ impl App {
             };
             let what = format!("Git revert {}", super::short_name(path));
             let key = format!("git revert {kind} {}", path.display());
-            let at = root.to_path_buf();
-            self.settle_git_saves(&key, &what, root, move |a| a.revert_file(&at, r));
+            let (at, writes) = (root.to_path_buf(), vec![path.clone()]);
+            self.settle_saves_of(&key, &what, Some(root), writes, move |a| {
+                a.revert_file(&at, r)
+            });
             return;
         }
         let (path, res) = match r {

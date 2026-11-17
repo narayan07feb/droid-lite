@@ -293,7 +293,9 @@ impl App {
                 .map(|f| format!("{}", f.path.display()))
                 .collect();
             let key = format!("rename {} → {} in {}", p.old, p.new, places.join(", "));
-            self.settle_saves_keyed(&key, &what, move |a| a.apply_preview(p));
+            let mut writes: Vec<PathBuf> = p.files.iter().map(|f| f.path.clone()).collect();
+            writes.extend(p.rename_file.iter().map(|(_, to, _)| to.clone()));
+            self.settle_saves_of(&key, &what, None, writes, move |a| a.apply_preview(p));
             return;
         }
         let mut undo = Undo {
@@ -346,13 +348,15 @@ impl App {
     /// at its old name. The window never waits for them: with one on its way this returns false
     /// (the caller changes nothing now) and `again` runs once they all landed, unless an open
     /// tab's text changed meanwhile ([`App::poll_saves`]). It waits in the status bar, where it
-    /// can be cancelled; asking again for the same `what` replaces it.
+    /// can be cancelled; asking again for the same `what` replaces it. The app's actions use
+    /// [`App::settle_saves_keyed`] and [`App::settle_saves_of`]; tests use this one.
+    #[cfg(test)]
     pub(super) fn settle_saves(
         &mut self,
         what: &str,
         again: impl FnOnce(&mut App) + 'static,
     ) -> bool {
-        self.settle_saves_of(what, what, None, again)
+        self.settle_saves_of(what, what, None, Vec::new(), again)
     }
 
     /// [`App::settle_saves`] for an action on one file: `key` (its kind and the file's full
@@ -363,7 +367,7 @@ impl App {
         what: &str,
         again: impl FnOnce(&mut App) + 'static,
     ) -> bool {
-        self.settle_saves_of(key, what, None, again)
+        self.settle_saves_of(key, what, None, Vec::new(), again)
     }
 
     /// [`App::settle_saves_keyed`] for a git action in the repository at `root`: it is dropped
@@ -375,14 +379,18 @@ impl App {
         root: &Path,
         again: impl FnOnce(&mut App) + 'static,
     ) -> bool {
-        self.settle_saves_of(key, what, Some(root), again)
+        self.settle_saves_of(key, what, Some(root), Vec::new(), again)
     }
 
-    fn settle_saves_of(
+    /// [`App::settle_saves_keyed`] (a git action with `git`) for an action that writes the
+    /// files `writes`: one not open now and opened with unsaved typing before it runs stops it
+    /// too.
+    pub(super) fn settle_saves_of(
         &mut self,
         key: &str,
         what: &str,
         git: Option<&Path>,
+        writes: Vec<PathBuf>,
         again: impl FnOnce(&mut App) + 'static,
     ) -> bool {
         if !self.waits_for_saves() {
@@ -401,10 +409,20 @@ impl App {
             asked: super::Stamp::start(r, self.ctx.clone(), self.stamp),
             now: None,
         });
+        let mut revs: Vec<(PathBuf, Option<u64>)> = self
+            .tab_revs()
+            .into_iter()
+            .map(|(p, r, _)| (p, Some(r)))
+            .collect();
+        for w in writes {
+            if !revs.iter().any(|(p, _)| *p == w) {
+                revs.push((w, None));
+            }
+        }
         let a = AfterSaves {
             what: what.to_string(),
             key: key.to_string(),
-            revs: self.tab_revs(),
+            revs,
             git,
             run: Box::new(again),
         };
@@ -504,7 +522,11 @@ impl App {
         if self.refuse_during_checkout() {
             return;
         }
-        if !self.settle_saves("Undo", |a| a.undo_refactor()) {
+        let writes = self.undo.as_ref().map_or_else(Vec::new, |u| {
+            let back = u.moved.iter().flat_map(|(from, to)| [from.clone(), to.clone()]);
+            u.files.iter().map(|(p, _)| p.clone()).chain(back).collect()
+        });
+        if !self.settle_saves_of("Undo", "Undo", None, writes, |a| a.undo_refactor()) {
             return;
         }
         let Some(u) = self.undo.take() else { return };

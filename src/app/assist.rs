@@ -244,6 +244,14 @@ impl App {
                 return;
             };
             let strings = module.dir.join("src/main/res/values/strings.xml");
+            // a tab with typing not saved would lose the string on its next save
+            if self.unsaved_tab([strings.as_path()]).is_some() {
+                self.status = format!(
+                    "{} has unsaved changes: save (⌘S) or revert first",
+                    strings.display()
+                );
+                return;
+            }
             let old = std::fs::read_to_string(&strings).ok();
             let _ = std::fs::create_dir_all(strings.parent().unwrap_or(Path::new(".")));
             if let Err(e) = std::fs::write(
@@ -500,8 +508,12 @@ impl App {
         } else {
             format!("{package}.{class}")
         };
-        let added = std::fs::read_to_string(&manifest)
-            .ok()
+        // a tab with typing not saved would lose the entry on its next save
+        let added = self
+            .unsaved_tab([manifest.as_path()])
+            .is_none()
+            .then(|| std::fs::read_to_string(&manifest).ok())
+            .flatten()
             .and_then(|t| android_kit::add_activity(&t, &fq));
         match added.map(|t| std::fs::write(&manifest, t)) {
             Some(Ok(())) => {

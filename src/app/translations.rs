@@ -255,6 +255,25 @@ impl App {
         commit
     }
 
+    /// The file a cell is written to: where the folder has the string, else that folder's
+    /// `strings.xml` next to the default one.
+    fn translation_file(&self, key: &str, col: usize) -> Option<PathBuf> {
+        let (_, table) = self.translations.table.as_ref()?;
+        let row = table.rows.iter().find(|r| r.key == key)?;
+        match &row.cells[col] {
+            Some(c) => Some(c.path.clone()),
+            // the res folder of any existing version of this string
+            None => {
+                let res = row
+                    .cells
+                    .iter()
+                    .flatten()
+                    .find_map(|c| c.path.parent()?.parent())?;
+                Some(res.join(&table.folders[col]).join("strings.xml"))
+            }
+        }
+    }
+
     /// Writes one cell: in place when the folder has the string, else added to that folder's
     /// `strings.xml` next to the default one.
     pub(super) fn write_translation(&mut self, key: String, col: usize, text: &str) {
@@ -273,7 +292,10 @@ impl App {
             // the same key and folder in another project is another action
             let root = self.project.as_ref().map(|p| p.root.clone()).unwrap_or_default();
             let id = format!("translation {key} in {folder} of {}", root.display());
-            self.settle_saves_keyed(&id, &what, move |a| a.write_translation(key, col, &text));
+            let writes = self.translation_file(&key, col).into_iter().collect();
+            self.settle_saves_of(&id, &what, None, writes, move |a| {
+                a.write_translation(key, col, &text)
+            });
             return;
         }
         let Some((_, table)) = &self.translations.table else {
@@ -282,28 +304,28 @@ impl App {
         let Some(row) = table.rows.iter().find(|r| r.key == key) else {
             return;
         };
-        let value = android_kit::xml_value(text);
-        let result = match &row.cells[col] {
-            Some(c) if c.value == text => return,
-            Some(c) => std::fs::read_to_string(&c.path)
-                .ok()
-                .and_then(|x| android_kit::set_string(&x, c.offset, &value))
-                .map(|x| (c.path.clone(), x)),
-            None => {
-                // the res folder of any existing version of this string
-                let res = row
-                    .cells
-                    .iter()
-                    .flatten()
-                    .find_map(|c| c.path.parent()?.parent().map(PathBuf::from));
-                res.map(|res| {
-                    let file = res.join(&table.folders[col]).join("strings.xml");
-                    let old = std::fs::read_to_string(&file).ok();
-                    (file, android_kit::add_string(old.as_deref(), &key, &value))
-                })
-            }
+        if row.cells[col].as_ref().is_some_and(|c| c.value == text) {
+            return;
+        }
+        let Some(file) = self.translation_file(&key, col) else {
+            self.status = format!("Could not change `{key}`");
+            return;
         };
-        let Some((file, xml)) = result else {
+        // a tab with typing not saved would lose this on its next save
+        if self.unsaved_tab([file.as_path()]).is_some() {
+            self.status = format!(
+                "`{key}` was not saved: {} has unsaved changes: save (⌘S) or revert first",
+                file.display()
+            );
+            return;
+        }
+        let value = android_kit::xml_value(text);
+        let old = std::fs::read_to_string(&file).ok();
+        let xml = match &row.cells[col] {
+            Some(c) => old.and_then(|x| android_kit::set_string(&x, c.offset, &value)),
+            None => Some(android_kit::add_string(old.as_deref(), &key, &value)),
+        };
+        let Some(xml) = xml else {
             self.status = format!("Could not change `{key}`");
             return;
         };

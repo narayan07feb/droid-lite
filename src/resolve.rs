@@ -147,6 +147,10 @@ impl FileInfo {
     fn t(&self, i: usize) -> &str {
         self.toks.get(i).map_or("", |t| &self.text[t.range.clone()])
     }
+    /// Whether tokens `i` and `i + 1` are the arrow `->`: the lexer makes each its own token.
+    fn arrow(&self, i: usize) -> bool {
+        self.t(i) == "-" && self.t(i + 1) == ">" && self.end(i) == self.start(i + 1)
+    }
     fn kind(&self, i: usize) -> Option<Tok> {
         self.toks.get(i).map(|t| t.kind)
     }
@@ -299,10 +303,8 @@ impl FileInfo {
                     self.t(j),
                     "." | "?" | ":" | "+" | "-" | "*" | "/" | "&" | "|" | "=" | "as"
                 )
-                && !matches!(
-                    self.t(j - 1),
-                    "." | "=" | "(" | "," | "+" | "-" | "&" | "|" | "->"
-                )
+                && !matches!(self.t(j - 1), "." | "=" | "(" | "," | "+" | "-" | "&" | "|")
+                && !(j > 1 && self.arrow(j - 2))
             {
                 return j;
             }
@@ -610,7 +612,7 @@ impl FileInfo {
                         let mut ok = false;
                         while k < close {
                             match self.t(k) {
-                                "-" if self.t(k + 1) == ">" => {
+                                "-" if self.arrow(k) => {
                                     ok = true;
                                     break;
                                 }
@@ -620,15 +622,20 @@ impl FileInfo {
                                 },
                                 "(" => part = Some(0),
                                 ")" => part = None,
-                                "." | "<" | ">" | "?" => {}
                                 ":" => {
-                                    // a typed parameter: skip its type
+                                    // a typed parameter: skip its type (`Map<K, V>`, `(A) -> B`)
                                     k += 1;
-                                    while k < close
-                                        && self.t(k) != ","
-                                        && !(part.is_some() && self.t(k) == ")")
-                                        && !(self.t(k) == "-" && self.t(k + 1) == ">")
-                                    {
+                                    let mut depth = 0;
+                                    while k < close {
+                                        match self.t(k) {
+                                            "<" | "(" => depth += 1,
+                                            ">" if self.arrow(k - 1) => {}
+                                            ">" | ")" if depth > 0 => depth -= 1,
+                                            ")" if part.is_some() => break,
+                                            "," if depth == 0 => break,
+                                            "-" if depth == 0 && self.arrow(k) => break,
+                                            _ => {}
+                                        }
                                         k += 1;
                                     }
                                     continue;
@@ -810,15 +817,16 @@ impl FileInfo {
         let mut last = first;
         let mut j = first;
         while j < self.toks.len() {
-            let joined = matches!(
-                self.t(j - 1),
-                "->" | "." | "," | "(" | "<" | "=" | ":" | "@"
-            ) || matches!(self.t(j), "->" | "." | "?" | ")" | ">" | ",");
+            let joined = matches!(self.t(j - 1), "." | "," | "(" | "<" | "=" | ":" | "@")
+                || j > 1 && self.arrow(j - 2)
+                || matches!(self.t(j), "." | "?" | ")" | ">" | ",")
+                || self.arrow(j);
             if j > first && depth == 0 && self.newline_before(j) && !joined {
                 break;
             }
             match self.t(j) {
                 "(" | "<" => depth += 1,
+                ">" if self.arrow(j - 1) => {}
                 ")" | ">" => depth -= 1,
                 _ => {}
             }
@@ -2812,10 +2820,14 @@ impl<'a> Resolver<'a> {
         // A type in a type position (`x: T`, `as T`, `List<T>`) is never a member.
         let class_calls = unknown.is_none() || type_position(f, i);
         for (k, t) in receivers.iter().enumerate() {
-            // a member of a library receiver (`append` in `buildString { }`)
+            // a member of a library receiver (`append` in `buildString { }`); one on `Modifier`
+            // (`weight` in `Row { }`) needs a `Modifier` before it: a bare call is not it
             if let Ty::Lib(n, _) = t
                 && match args {
-                    Some(_) => known_members(n).is_some_and(|m| m.contains(&name)),
+                    Some(_) => {
+                        !MODIFIER_SCOPES.contains(&n.as_str())
+                            && known_members(n).is_some_and(|m| m.contains(&name))
+                    }
                     None => known_properties(n).contains(&name),
                 }
             {
@@ -2941,6 +2953,16 @@ impl<'a> Resolver<'a> {
         Res::None
     }
 
+    /// Whether `name` is a member extension on `Modifier` of a library lambda's receiver
+    /// around token `i` ([`MODIFIER_SCOPES`]).
+    fn in_modifier_scope(&self, f: &FileInfo, i: usize, name: &str) -> bool {
+        let of = |n: &str| {
+            MODIFIER_SCOPES.contains(&n) && known_members(n).is_some_and(|m| m.contains(&name))
+        };
+        MODIFIER_SCOPES.iter().any(|n| of(n))
+            && self.receivers_at(f, i).0.iter().any(|t| t.lib().is_some_and(of))
+    }
+
     fn qualified(
         &self,
         f: &FileInfo,
@@ -3021,6 +3043,13 @@ impl<'a> Resolver<'a> {
         }
         // `value.name`
         let t = self.type_of_expr(f, start, dot);
+        // `Modifier.weight(1f)` in a `Row { }`: the scope's extension on `Modifier`, which
+        // kotlinc picks before a project's `Modifier.weight`
+        if t.as_ref().is_none_or(|t| t.lib() == Some("Modifier"))
+            && self.in_modifier_scope(f, i, name)
+        {
+            return Res::None;
+        }
         if let Some(t) = &t {
             let v = self.member_of(t, name, args);
             if !v.is_empty() {
@@ -3830,28 +3859,40 @@ fn type_position(f: &FileInfo, i: usize) -> bool {
         ":" => !(i > 1 && f.t(i - 2) == ":"),
         "as" | "is" | "@" => true,
         "?" => i > 1 && f.t(i - 2) == "as",
-        "<" | "," => {
-            // inside type arguments: back to an unmatched `<` after a name, which a `>` closes
-            // (else it is a comparison: `foo(a < b, Item.CONST)`)
-            let mut depth = 0;
-            let mut k = i;
-            while k > 0 && i - k < TYPE_ARGS_SCAN {
-                k -= 1;
-                #[cfg(test)]
-                TYPE_SCAN_STEPS.set(TYPE_SCAN_STEPS.get() + 1);
-                match f.t(k) {
-                    ">" => depth += 1,
-                    "<" if depth == 0 => return k > 0 && f.ident(k - 1) && closes_type_args(f, k),
-                    "<" => depth -= 1,
-                    "," | "." | "?" | "*" | "out" | "in" => {}
-                    _ if f.ident(k) => {}
-                    _ => return false,
-                }
-            }
-            false
-        }
+        "<" | "," | "(" => type_args_around(f, i),
+        // the result of a function type: `Map<K, (A) -> B>`
+        ">" => i > 1 && f.arrow(i - 2) && type_args_around(f, i),
         _ => false,
     }
+}
+
+/// Whether token `i` is inside type arguments: back to an unmatched `<` after a name, which a
+/// `>` closes (else it is a comparison: `foo(a < b, Item.CONST)`). Function types in them
+/// (`(A) -> B`, `@Composable () -> Unit`, `suspend (A) -> B`) are types too.
+fn type_args_around(f: &FileInfo, i: usize) -> bool {
+    let mut depth = 0;
+    let mut k = i;
+    while k > 0 && i - k < TYPE_ARGS_SCAN {
+        k -= 1;
+        #[cfg(test)]
+        TYPE_SCAN_STEPS.set(TYPE_SCAN_STEPS.get() + 1);
+        match f.t(k) {
+            ">" if k > 0 && f.arrow(k - 1) => k -= 1,
+            ">" => depth += 1,
+            "<" if depth == 0 => return k > 0 && f.ident(k - 1) && closes_type_args(f, k),
+            "<" => depth -= 1,
+            // a function type's parameters, before or around the name
+            ")" => match f.pair(k) {
+                Some(o) if f.arrow(k + 1) => k = o,
+                _ => return false,
+            },
+            "(" if f.pair(k).is_some_and(|c| f.arrow(c + 1)) => {}
+            "," | "." | "?" | "*" | "out" | "in" | "suspend" => {}
+            _ if f.ident(k) || f.kind(k) == Some(Tok::Annotation) => {}
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// How many tokens [`type_position`] reads back to the `<` of type arguments, and forward to
@@ -3886,13 +3927,13 @@ fn closes_type_args(f: &FileInfo, open: usize) -> bool {
             "<" => depth += 1,
             ">" if depth == 0 => return true,
             ">" => depth -= 1,
-            // a function type: `Map<K, (A) -> B>`
+            // a function type: `Map<K, (A) -> B>`, `@Composable () -> Unit`, `suspend (A) -> B`
             "(" => match f.pair(k) {
-                Some(c) if c + 1 < f.toks.len() && f.t(c + 1) == "->" => k = c,
+                Some(c) if f.arrow(c + 1) => k = c + 2,
                 _ => return false,
             },
-            "," | "." | "?" | "*" | "out" | "in" | "->" | "@" => {}
-            _ if f.ident(k) => {}
+            "," | "." | "?" | "*" | "out" | "in" | "@" | "suspend" => {}
+            _ if f.ident(k) || f.kind(k) == Some(Tok::Annotation) => {}
             _ => return false,
         }
         k += 1;
@@ -3908,6 +3949,20 @@ fn any_receiver_scope_fn(name: &str) -> bool {
         "run" | "apply" | "let" | "also" | "takeIf" | "takeUnless" | "runCatching"
     )
 }
+
+/// The receivers in [`known_members`] whose members there are all extensions on `Modifier`
+/// (javap on the jars at [`known_lambda_call`]: each takes a `Modifier` first, e.g. RowScope
+/// `Modifier weight(Modifier, float, boolean)`, AnimatedVisibilityScope `Modifier
+/// animateEnterExit(Modifier, EnterTransition, ExitTransition, String)`).
+const MODIFIER_SCOPES: &[&str] = &[
+    "ColumnScope",
+    "RowScope",
+    "BoxScope",
+    "BoxWithConstraintsScope",
+    "AnimatedVisibilityScope",
+    "AnimatedContentScope",
+    "LazyItemScope",
+];
 
 /// The members of a library receiver from [`known_lambda_call`] that a call in its lambda can
 /// mean.
@@ -6205,17 +6260,44 @@ fun f(state: State, other: State) {
     /// `items: a, top.Header, Lib.LazyItemScope.fillParentMaxWidth, top.limit, top.Dimens.x,
     /// top.Item.CONST`: in a container's lambda the project's composables, objects, classes and
     /// top-level vals stay the project's; only the receiver's own members win (unresolved here).
+    ///
+    /// Those stand-ins made `weight` a plain member. In the jars it is an extension on
+    /// `Modifier` (javap, foundation-layout-android 1.9.3: RowScope `Modifier weight(Modifier,
+    /// float, boolean)`, ColumnScope the same; foundation-android 1.9.3 LazyItemScope `Modifier
+    /// fillParentMaxWidth(Modifier, float)`; animation-android 1.9.3 AnimatedVisibilityScope
+    /// `Transition<EnterExitState> getTransition()`, `Modifier animateEnterExit(Modifier,
+    /// EnterTransition, ExitTransition, String)`; navigation-common-android 2.9.7
+    /// NavDestinationBuilder `String getRoute()`, `int getId()`; navigation-compose-android
+    /// 2.9.7 NavGraphBuilderKt `navigation(NavGraphBuilder, String, String, List, List,
+    /// Function1)`). kotlinc 2.1.20 against those jars, with `class Top` and top-level
+    /// `val transition: Top`, `val route: Top`, `val id: Top`, `fun weight(f: Float): Top`,
+    /// `fun Modifier.weight(f: Float): Top`, the same two for `animateEnterExit` and
+    /// `fillParentMaxWidth`, and `fun navigation(startDestination: String, route: String,
+    /// builder: NavGraphBuilder.() -> Unit): Top`, compiles
+    /// ```text
+    /// val outside: Top = Modifier.weight(1f)
+    /// AnimatedVisibility(visible = true) { val t: Transition<EnterExitState> = transition
+    ///     val q: Modifier = Modifier.animateEnterExit(); val b: Top = animateEnterExit() }
+    /// NavHost(nav, startDestination = "a") { val r: String? = route; val i: Int = id
+    ///     val n: Unit = navigation("x", "y") { }; composable("a") { val r2: String? = route } }
+    /// Button(onClick = {}) { val q: Modifier = Modifier.weight(1f); val b: Top = weight(1f) }
+    /// Card { val q: Modifier = Modifier.weight(1f); val b: Top = weight(1f) }
+    /// LazyColumn { items(listOf("a")) { val q: Modifier = Modifier.fillParentMaxWidth()
+    ///     val b: Top = fillParentMaxWidth() } }
+    /// ```
+    /// and rejects each line with the other type: the scope's properties and NavGraphBuilder's
+    /// `navigation` win; `Modifier.x()` is the scope's extension; a bare `x()` is the project's.
     #[test]
     fn compose_container_lambdas_keep_project_names_resolved_like_kotlinc() {
         let (i, t) = project(&[(
             "/p/C.kt",
-            "package a\nobject Dimens {\n    val x = 1\n}\nclass Item {\n    companion object {\n        const val CONST = 1\n    }\n}\nfun Header() {}\nfun weight(f: Float) {}\nfun fillParentMaxWidth() {}\nval limit = 1\nval maxWidth = 1\nfun Screen(xs: List<String>, nav: Nav) {\n    Card { Header(); weight(1f); limit; Dimens.x; Item.CONST }\n    Dialog({}) { Header(); weight(1f); limit; Dimens.x; Item.CONST }\n    LazyColumn { items(xs) { Header(); fillParentMaxWidth(); limit; Dimens.x; Item.CONST } }\n    Button(onClick = {}) { Header() }\n    AnimatedVisibility(true) { Header() }\n    NavHost(nav, \"a\") { composable(\"a\") { Header() } }\n    BoxWithConstraints { maxWidth; Header() }\n}\n",
+            "package a\nobject Dimens {\n    val x = 1\n}\nclass Item {\n    companion object {\n        const val CONST = 1\n    }\n}\nfun Header() {}\nfun weight(f: Float) {}\nfun fillParentMaxWidth() {}\nval limit = 1\nval maxWidth = 1\nfun Screen(xs: List<String>, nav: Nav) {\n    Card { Header(); weight(1f); limit; Dimens.x; Item.CONST }\n    Dialog({}) { Header(); weight(1f); limit; Dimens.x; Item.CONST }\n    LazyColumn { items(xs) { Header(); fillParentMaxWidth(); limit; Dimens.x; Item.CONST } }\n    Button(onClick = {}) { Header() }\n    AnimatedVisibility(true) { Header() }\n    NavHost(nav, \"a\") { composable(\"a\") { Header() } }\n    BoxWithConstraints { maxWidth; Header() }\n    Modifier.weight(1f)\n    AnimatedVisibility(true) { transition; Modifier.animateEnterExit(); animateEnterExit() }\n    NavHost(nav, \"a\") { route; id; navigation(\"x\", \"y\") { }; composable(\"a\") { route } }\n    Button(onClick = {}) { Modifier.weight(1f); weight(1f) }\n}\nval transition = 1\nval route = 1\nval id = 1\nfun Modifier.weight(f: Float) {}\nfun animateEnterExit() {}\nfun Modifier.animateEnterExit() {}\nfun navigation(a: String, b: String, builder: NavGraphBuilder.() -> Unit) {}\n",
         )]);
         let r = Resolver::new(&i, &t);
         let c = |name, n| at(&r, "/p/C.kt", name, n);
         // Card: ColumnScope
         assert_eq!(c("Header", 2), "/p/C.kt:10", "Card: a project composable");
-        assert_eq!(c("weight", 2), "-", "Card: ColumnScope.weight");
+        assert_eq!(c("weight", 2), "/p/C.kt:11", "Card: a bare call is not ColumnScope's");
         assert_eq!(c("limit", 2), "/p/C.kt:13", "Card: a top-level val");
         assert_eq!(c("Dimens", 2), "/p/C.kt:2", "Card: an object");
         assert_eq!(c("x", 2), "/p/C.kt:3", "Card: an object's val");
@@ -6227,7 +6309,7 @@ fun f(state: State, other: State) {
         assert_eq!(c("Item", 3), "/p/C.kt:5", "Dialog");
         // items: LazyItemScope
         assert_eq!(c("Header", 4), "/p/C.kt:10", "items");
-        assert_eq!(c("fillParentMaxWidth", 2), "-", "items: LazyItemScope's");
+        assert_eq!(c("fillParentMaxWidth", 2), "/p/C.kt:12", "items: a bare call");
         assert_eq!(c("limit", 4), "/p/C.kt:13", "items");
         assert_eq!(c("Dimens", 4), "/p/C.kt:2", "items");
         assert_eq!(c("Item", 4), "/p/C.kt:5", "items");
@@ -6238,6 +6320,18 @@ fun f(state: State, other: State) {
         // BoxWithConstraintsScope: its own property wins
         assert_eq!(c("maxWidth", 2), "-", "BoxWithConstraintsScope.maxWidth");
         assert_eq!(c("Header", 8), "/p/C.kt:10", "BoxWithConstraints");
+        // extensions on Modifier: outside a scope the project's, in one the scope's
+        assert_eq!(c("weight", 4), "/p/C.kt:31", "Modifier.weight outside");
+        assert_eq!(c("weight", 5), "-", "Button: RowScope's Modifier.weight");
+        assert_eq!(c("weight", 6), "/p/C.kt:11", "Button: a bare call");
+        assert_eq!(c("animateEnterExit", 1), "-", "AnimatedVisibilityScope's");
+        assert_eq!(c("animateEnterExit", 2), "/p/C.kt:32", "a bare call");
+        // the scopes' properties and NavGraphBuilder's members win
+        assert_eq!(c("transition", 1), "-", "AnimatedVisibilityScope.transition");
+        assert_eq!(c("route", 1), "-", "NavGraphBuilder.route");
+        assert_eq!(c("id", 1), "-", "NavGraphBuilder.id");
+        assert_eq!(c("navigation", 1), "-", "NavGraphBuilder.navigation");
+        assert_eq!(c("route", 2), "-", "composable: NavGraphBuilder.route");
     }
 
     /// kotlinc (see [`closes_type_args`]): `foo(a < b, Item.CONST)` in a library receiver's
@@ -6253,6 +6347,69 @@ fun f(state: State, other: State) {
         assert_eq!(at(&r, "/p/L.kt", "Item", 2), "-", "`a < b, Item`");
         assert_eq!(at(&r, "/p/L.kt", "Item", 3), "-", "`a<b, Item`");
         assert_eq!(at(&r, "/p/L.kt", "Item", 4), "/p/L.kt:2", "type arguments");
+    }
+
+    /// kotlinc 2.1.20 on
+    /// ```text
+    /// @Target(AnnotationTarget.TYPE) annotation class Composable
+    /// class Lib { val Item = "Lib.Item.val"; val String = "Lib.String.val"
+    ///     val Unit = "Lib.Unit.val" }
+    /// class Item
+    /// inline fun <reified T> tn(): String = typeOf<T>().toString()
+    /// fun head(b: Lib.() -> String) = Lib().b()
+    /// println(head { tn<Map<String, (Int) -> Item>>() })
+    /// println(head { tn<Map<Item, @Composable () -> Unit>>() })
+    /// println(head {
+    ///     mapOf<Item, suspend (Int) -> Unit>(Item() to {}).keys.first().javaClass.name })
+    /// println(head { tn<Map<(Int) -> Unit, Item>>() })
+    /// println(head { Item }); println(head { listOf(1).map { n -> Item }.first() })
+    /// ```
+    /// prints `Map<kotlin.String, (kotlin.Int) -> Item>`, `Map<Item, () -> kotlin.Unit>`, `Item`,
+    /// `Map<(kotlin.Int) -> kotlin.Unit, Item>`, then Lib.Item.val twice: in type arguments a
+    /// function type is a type and every name in it is a class, not the receiver's `val`; after a
+    /// lambda's `->` the name is the receiver's `val`. With `val n` in `Lib` too,
+    /// `head { val f = { m: Map<Key, Item>, n: Int -> "$n " + m.values.first().javaClass.name }`
+    /// `f(mapOf(Key() to Item()), 3) }` prints `3 Item`: both are the lambda's parameters.
+    #[test]
+    fn function_types_in_type_arguments_keep_a_type_position_like_kotlinc() {
+        let (i, t) = project(&[(
+            "/p/F.kt",
+            "package a\nclass Item\nclass Key\nfun go() {\n    head { tn<Map<Key, (Int) -> Item>>() }\n    head { tn<Map<Key, @Composable () -> Item>>() }\n    head { tn<Map<Key, suspend (Item) -> Unit>>() }\n    head { tn<Map<(Int) -> Unit, Item>>() }\n    head { listOf(1).map { n -> Item } }\n    head { { m: Map<Key, Item>, n: Int -> n } }\n}\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        let item = |n| at(&r, "/p/F.kt", "Item", n);
+        let key = |n| at(&r, "/p/F.kt", "Key", n);
+        assert_eq!(key(2), "/p/F.kt:3", "before a function type");
+        assert_eq!(item(2), "/p/F.kt:2", "a function type's result");
+        assert_eq!(key(3), "/p/F.kt:3", "before a @Composable function type");
+        assert_eq!(item(3), "/p/F.kt:2", "a @Composable function type's result");
+        assert_eq!(key(4), "/p/F.kt:3", "before a suspend function type");
+        assert_eq!(item(4), "/p/F.kt:2", "a suspend function type's parameter");
+        assert_eq!(item(5), "/p/F.kt:2", "after a function type");
+        assert_eq!(item(6), "-", "after a lambda's arrow: the receiver's member");
+        assert_eq!(item(7), "/p/F.kt:2", "in a lambda parameter's type");
+        assert_eq!(at(&r, "/p/F.kt", "n", 3), "local", "the parameter after it");
+    }
+
+    /// kotlinc 2.1.20 compiles `typealias F = (Int) ->` / `String` and `typealias G = (Int)` /
+    /// `-> String` (each on two lines) and prints f1g2 for `f(1) + g(2)`. On
+    /// `when { a < (b) -> c > d` it reports "property access cannot have explicit type
+    /// arguments": a `>` after a function type closes type arguments.
+    #[test]
+    fn a_function_type_alias_goes_on_past_an_arrow_and_ends_at_its_line() {
+        let text = "package a\ntypealias F = (Int) -> String\nval x = 1\ntypealias G = (Int) ->\n    String\ntypealias H = (Int)\n    -> String\nval y = 2\n";
+        let (i, t) = project(&[("/p/A.kt", text)]);
+        let r = Resolver::new(&i, &t);
+        let f = r.file(Path::new("/p/A.kt")).unwrap();
+        let off = |name: &str| f.syms.decls.iter().find(|d| d.name == name).unwrap().offset;
+        let alias = |name| f.alias_text(&(PathBuf::from("/p/A.kt"), off(name))).unwrap();
+        assert_eq!(alias("F"), "(Int) -> String", "ends at its line");
+        assert_eq!(alias("G"), "(Int) ->\n    String", "an arrow at the line end");
+        assert_eq!(alias("H"), "(Int)\n    -> String", "an arrow at the line start");
+        // the aliased type read as an expression (`typealias` in `type_text`)
+        let ti = f.tok_at(off("G")).unwrap();
+        let e = f.expr_end(ti + 2, f.toks.len());
+        assert_eq!(&f.text[f.start(ti + 2)..f.end(e - 1)], "(Int) ->\n    String");
     }
 
     #[test]

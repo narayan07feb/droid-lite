@@ -6253,6 +6253,32 @@ fn e2e_every_action_dropped_in_a_round_stays_in_the_notices() {
 }
 
 #[test]
+fn e2e_six_actions_dropped_in_one_round_show_one_older_until_dismissed() {
+    let f = Fixture::new("after-saves-six");
+    let mut h = f.harness();
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    let runs = std::rc::Rc::new(std::cell::Cell::new(0));
+    let a = h.state_mut();
+    for k in 0..6 {
+        a.settle_saves(&format!("Rename A{k} → B{k}"), counted(&runs));
+    }
+    let i = a.active;
+    a.tabs[i].text.push_str("// more\n");
+    a.tabs[i].mark_edited();
+    unstick.send(()).unwrap();
+    a.wait_saves();
+    assert_eq!(runs.get(), 0);
+    assert_eq!(a.notices.len(), 5);
+    assert!(a.notices[0].0.starts_with("Rename A1 → B1 did not run"));
+    steps(&mut h, 2);
+    assert!(h.query_by_label("+1 older").is_some());
+    h.get_by_label("Dismiss").click();
+    steps(&mut h, 2);
+    assert!(h.state().notices.is_empty());
+    assert!(h.query_by_label("+1 older").is_none());
+}
+
+#[test]
 fn e2e_opening_or_closing_other_tabs_keeps_an_action_waiting_for_a_save() {
     let f = Fixture::new("after-saves-tabs");
     let mut h = f.harness();
@@ -6297,6 +6323,7 @@ fn e2e_a_notice_seen_again_is_counted_and_only_the_last_ones_stay() {
     steps(&mut h, 2);
     assert!(h.query_by_label("Rename 6 did not run (×2)").is_some());
     assert!(h.query_by_label("Rename 1 did not run").is_none());
+    assert!(h.query_by_label("+2 older").is_some());
 }
 
 #[test]
@@ -7460,6 +7487,265 @@ fn e2e_a_translation_write_lets_a_save_of_its_file_land_first() {
     a.wait_saves();
     let disk = std::fs::read_to_string(&hindi).unwrap();
     assert!(disk.contains("Pranam") && disk.contains("Alvida"), "{disk}");
+}
+
+/// A project with `hi` and `bye` in values and values-hi, its translations table shown:
+/// (the harness, values-hi/strings.xml).
+fn translations_fixture(f: &Fixture) -> (Harness<'static, App>, PathBuf) {
+    let hindi = f.path("app/src/main/res/values-hi/strings.xml");
+    for (dir, text) in [("values", "Hi"), ("values-hi", "Namaste")] {
+        let p = f.path(&format!("app/src/main/res/{dir}/strings.xml"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let xml = format!(
+            "<resources>\n    <string name=\"hi\">{text}</string>\n    <string name=\"bye\">{text}</string>\n</resources>\n"
+        );
+        std::fs::write(&p, xml).unwrap();
+    }
+    let mut h = f.harness();
+    wait(&mut h, "resources", |a| {
+        a.res.get("string", "hi").len() == 2
+    });
+    let ctx = h.ctx.clone();
+    h.state_mut().run(Action::Translations, &ctx);
+    steps(&mut h, 3);
+    (h, hindi)
+}
+
+#[test]
+fn e2e_a_translation_waiting_for_a_save_does_not_run_over_its_file_opened_and_typed_in_meanwhile()
+{
+    let f = Fixture::new("translation-opened-after");
+    let (mut h, hindi) = translations_fixture(&f);
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    h.state_mut().write_translation("bye".into(), 1, "Alvida");
+    // values-hi/strings.xml was not open when it was asked for
+    open(&mut h, &hindi);
+    let a = h.state_mut();
+    let i = a.active;
+    a.tabs[i].text = a.tabs[i].text.replacen("Namaste", "Pranam", 1);
+    a.tabs[i].mark_edited();
+    unstick.send(()).unwrap();
+    a.wait_saves();
+    let disk = std::fs::read_to_string(&hindi).unwrap();
+    assert!(!disk.contains("Alvida"), "{disk}");
+    assert!(a.tabs[i].text.contains("Pranam"));
+    let notices: Vec<&str> = a.notices.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        notices,
+        ["Translation of bye in values-hi did not run: strings.xml changed meanwhile"]
+    );
+}
+
+#[test]
+fn e2e_a_translation_behind_an_action_that_changed_a_tab_still_stops_for_its_file_typed_in() {
+    let f = Fixture::new("translation-behind");
+    let (mut h, hindi) = translations_fixture(&f);
+    let (user, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    let a = h.state_mut();
+    // the action before it changes User.kt's text
+    let typed = user.clone();
+    a.settle_saves("Rename A → B", move |a: &mut App| {
+        let i = a.tabs.iter().position(|t| t.path == typed).unwrap();
+        a.tabs[i].text.push_str("// renamed\n");
+        a.tabs[i].mark_edited();
+    });
+    a.write_translation("bye".into(), 1, "Alvida");
+    unstick.send(()).unwrap();
+    saver::wait();
+    a.poll_saves();
+    assert_eq!(a.after_saves.len(), 1, "the rename ran: {}", a.status);
+    // values-hi/strings.xml opened and typed in before the translation's turn
+    a.open_file(&hindi, None);
+    let i = a.active;
+    a.tabs[i].text = a.tabs[i].text.replacen("Namaste", "Pranam", 1);
+    a.tabs[i].mark_edited();
+    a.wait_saves();
+    assert!(!std::fs::read_to_string(&hindi).unwrap().contains("Alvida"));
+    let notices: Vec<&str> = a.notices.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        notices,
+        ["Translation of bye in values-hi did not run: strings.xml changed meanwhile"]
+    );
+}
+
+#[test]
+fn e2e_a_translation_waiting_for_a_save_runs_when_its_file_was_only_opened_meanwhile() {
+    let f = Fixture::new("translation-opened-clean");
+    let (mut h, hindi) = translations_fixture(&f);
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    h.state_mut().write_translation("bye".into(), 1, "Alvida");
+    open(&mut h, &hindi);
+    let a = h.state_mut();
+    unstick.send(()).unwrap();
+    a.wait_saves();
+    let disk = std::fs::read_to_string(&hindi).unwrap();
+    assert!(disk.contains("Alvida"), "{disk}");
+    assert!(a.notices.is_empty(), "{:?}", a.notices);
+}
+
+#[test]
+fn e2e_a_translation_is_not_written_under_its_file_open_with_unsaved_typing() {
+    let f = Fixture::new("translation-unsaved");
+    let (mut h, hindi) = translations_fixture(&f);
+    open(&mut h, &hindi);
+    let a = h.state_mut();
+    a.settings.autosave = false;
+    let i = a.active;
+    a.tabs[i].text = a.tabs[i].text.replacen("Namaste", "Pranam", 1);
+    a.tabs[i].mark_edited();
+    let before = std::fs::read_to_string(&hindi).unwrap();
+    a.write_translation("bye".into(), 1, "Alvida");
+    assert_eq!(std::fs::read_to_string(&hindi).unwrap(), before);
+    assert!(a.status.contains("has unsaved changes"), "{}", a.status);
+    // saved, it is written
+    a.save_tab(false);
+    a.wait_saves();
+    a.write_translation("bye".into(), 1, "Alvida");
+    let disk = std::fs::read_to_string(&hindi).unwrap();
+    assert!(disk.contains("Pranam") && disk.contains("Alvida"), "{disk}");
+}
+
+#[test]
+fn e2e_an_undo_waiting_for_a_save_does_not_run_over_a_file_opened_and_typed_in_meanwhile() {
+    let f = Fixture::new("undo-opened-after");
+    let mut h = f.harness();
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    let person = f.path("app/src/main/java/com/demo/data/Person.kt");
+    let old = f.path("app/src/main/java/com/demo/data/Human.kt");
+    std::fs::write(&person, "class Person\n").unwrap();
+    // a rename of Human.kt to Person.kt that also changed UserCard.kt
+    let files = vec![(card.clone(), "old card\n".into())];
+    h.state_mut().undo = Some(refactor_ui::Undo::of(&old, &person, files));
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    h.state_mut().undo_refactor();
+    // UserCard.kt was not open when it was asked for
+    open(&mut h, &card);
+    let a = h.state_mut();
+    let i = a.active;
+    a.tabs[i].text.push_str("// typed after\n");
+    a.tabs[i].mark_edited();
+    unstick.send(()).unwrap();
+    a.wait_saves();
+    assert_eq!(std::fs::read_to_string(&card).unwrap(), CARD_KT);
+    assert!(a.tabs[i].text.ends_with("// typed after\n"));
+    assert!(person.exists() && !old.exists(), "not moved back");
+    let notices: Vec<&str> = a.notices.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(notices, ["Undo did not run: UserCard.kt changed meanwhile"]);
+    assert!(a.undo.is_some(), "the undo can run later");
+    // the file it moves back, opened and typed in while it waits again
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    h.state_mut().undo_refactor();
+    open(&mut h, &person);
+    let a = h.state_mut();
+    let i = a.active;
+    a.tabs[i].text.push_str("// typed after\n");
+    a.tabs[i].mark_edited();
+    unstick.send(()).unwrap();
+    a.wait_saves();
+    assert!(person.exists() && !old.exists(), "not moved back");
+    assert_eq!(
+        a.notices.last().map(|(n, _)| n.as_str()),
+        Some("Undo did not run: Person.kt changed meanwhile")
+    );
+}
+
+#[test]
+fn e2e_a_git_revert_and_a_rename_waiting_for_a_save_stop_for_their_file_opened_and_typed_in() {
+    let f = Fixture::new("after-saves-targets");
+    let mut h = f.harness();
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    let root = f.root.clone();
+    let revert = git_ui::Revert::Working {
+        path: card.clone(),
+        untracked: false,
+    };
+    h.state_mut().revert_file(&root, revert);
+    h.state_mut().ask_rename("name", "title", std::slice::from_ref(&card));
+    // UserCard.kt was not open when they were asked for
+    open(&mut h, &card);
+    let a = h.state_mut();
+    let i = a.active;
+    a.tabs[i].text.push_str("// typed after\n");
+    a.tabs[i].mark_edited();
+    unstick.send(()).unwrap();
+    a.wait_saves();
+    assert_eq!(std::fs::read_to_string(&card).unwrap(), CARD_KT);
+    assert!(a.tabs[i].text.ends_with("// typed after\n"));
+    let notices: Vec<&str> = a.notices.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        notices,
+        [
+            "Git revert UserCard.kt did not run: UserCard.kt changed meanwhile",
+            "Rename name → title did not run: UserCard.kt changed meanwhile"
+        ]
+    );
+}
+
+#[test]
+fn e2e_extract_string_and_a_new_activity_never_write_under_unsaved_typing() {
+    let f = Fixture::new("assist-unsaved");
+    let write = |rel: &str, text: &str| {
+        let p = f.path(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, text).unwrap();
+        p
+    };
+    write(
+        "app/build.gradle.kts",
+        "plugins { id(\"com.android.application\") }\nandroid {\n    namespace = \"com.demo\"\n}\n",
+    );
+    let manifest = write(
+        "app/src/main/AndroidManifest.xml",
+        "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n    <application>\n    </application>\n</manifest>\n",
+    );
+    let strings = write(
+        "app/src/main/res/values/strings.xml",
+        "<resources>\n</resources>\n",
+    );
+    let counter = write(
+        "app/src/main/java/com/demo/ui/Counter.kt",
+        "package com.demo.ui\n\n@Composable\nfun Counter() {\n    Text(\"Hello there\")\n}\n",
+    );
+    let mut h = f.harness();
+    h.state_mut().settings.autosave = false;
+    for p in [&strings, &manifest] {
+        open(&mut h, p);
+        let a = h.state_mut();
+        let i = a.active;
+        a.tabs[i].text.push_str("<!-- typed -->\n");
+        a.tabs[i].mark_edited();
+    }
+    // the string is not extracted: strings.xml and the code stay as they were
+    open(&mut h, &counter);
+    place_cursor(&mut h, "Hello there", 3);
+    key(&mut h, Modifiers::ALT, Key::Enter);
+    h.get_by_label("Extract string resource `hello_there`")
+        .click();
+    steps(&mut h, 3);
+    assert!(
+        h.state().status.contains("strings.xml has unsaved changes"),
+        "{}",
+        h.state().status
+    );
+    assert_eq!(std::fs::read_to_string(&strings).unwrap(), "<resources>\n</resources>\n");
+    assert!(tab(&h).text.contains("Text(\"Hello there\")"));
+    // the Activity is made, the manifest left for its tab
+    let before = std::fs::read_to_string(&manifest).unwrap();
+    key(&mut h, Modifiers::COMMAND, Key::N);
+    type_text(&mut h, "Settings");
+    h.get_by_label("Activity (Compose, added to the manifest)")
+        .click();
+    steps(&mut h, 2);
+    h.get_by_label("Create").click();
+    steps(&mut h, 3);
+    assert!(f.path("app/src/main/java/com/demo/ui/SettingsActivity.kt").exists());
+    assert_eq!(std::fs::read_to_string(&manifest).unwrap(), before);
+    assert!(
+        h.state().status.ends_with("add it to AndroidManifest.xml yourself"),
+        "{}",
+        h.state().status
+    );
 }
 
 #[test]

@@ -228,28 +228,41 @@ const SAVE_WAIT_ON_QUIT: std::time::Duration = std::time::Duration::from_secs(10
 const NOTICES_KEPT: usize = 5;
 
 /// An action that must come after the saves on their way (a revert, a refactor, a git command):
-/// it runs once they landed, unless an open tab's text changed meanwhile, or for a git action
-/// the branch or the git index moved. One per `key`: asking again replaces it. Actions run in
-/// the order asked, also one asked for once the saves landed while others still wait.
+/// it runs once they landed, unless an open tab's text changed meanwhile, a file it writes was
+/// opened and typed in meanwhile, or for a git action the branch or the git index moved. One
+/// per `key`: asking again replaces it. Actions run in the order asked, also one asked for once
+/// the saves landed while others still wait.
 struct AfterSaves {
     /// What it says in the status bar ("Revert User.kt").
     what: String,
     /// What it is: its kind and the file's full path ("revert /p/a/User.kt").
     key: String,
     /// The open tabs' text versions when it was asked for ([`App::tab_revs`]), or as the action
-    /// before it left them.
-    revs: Vec<(PathBuf, u64)>,
+    /// before it left them, and the files it writes that were not open then (`None`).
+    revs: Vec<(PathBuf, Option<u64>)>,
     /// A git action: the repository, its state then and its state when it is to run.
     git: Option<GitCheck>,
     run: Box<dyn FnOnce(&mut App)>,
 }
 
-/// The first file open both when an action was asked for (`asked`) and now whose text changed
-/// in between: tabs opened, closed or moved meanwhile change no text.
-fn text_changed<'a>(asked: &[(PathBuf, u64)], now: &'a [(PathBuf, u64)]) -> Option<&'a Path> {
+/// The first file open both when an action was asked for (`asked`) and now (`now`: path,
+/// version, unsaved) whose text changed in between, or a file it writes opened since with
+/// unsaved typing. Other tabs opened, closed or moved meanwhile change no text.
+fn text_changed<'a>(
+    asked: &[(PathBuf, Option<u64>)],
+    now: &'a [(PathBuf, u64, bool)],
+) -> Option<&'a Path> {
     now.iter()
-        .find(|(p, rev)| asked.iter().any(|(q, was)| q == p && was != rev))
-        .map(|(p, _)| p.as_path())
+        .find(|(p, rev, dirty)| {
+            asked.iter().any(|(q, was)| {
+                q == p
+                    && match was {
+                        Some(was) => was != rev,
+                        None => *dirty,
+                    }
+            })
+        })
+        .map(|(p, ..)| p.as_path())
 }
 
 /// The states ([`crate::git::state_stamp`]) a git action waiting for the saves is checked by,
@@ -564,6 +577,8 @@ pub struct App {
     /// Why actions that waited for a save did not run, each with how often in a row it came:
     /// the last [`NOTICES_KEPT`] stay in the status bar until dismissed ([`App::notice`]).
     notices: Vec<(String, u32)>,
+    /// How many older notices made room for those, shown as "+N older" until dismissed.
+    notices_older: usize,
     /// Works out a repository's state for git actions waiting for a save, off this thread.
     stamp: StampFn,
     /// Dev check: `DROID_LITE_SHOT=out.png` saves a screenshot once indexing is done, then quits.
@@ -721,6 +736,7 @@ impl App {
             last_shift: None,
             status: String::new(),
             notices: Vec::new(),
+            notices_older: 0,
             stamp: crate::git::state_stamp,
             shot: std::env::var_os("DROID_LITE_SHOT").map(|p| (PathBuf::from(p), 0)),
             refactor: None,
@@ -1179,12 +1195,19 @@ impl App {
                 self.running_after_saves = true;
                 (a.run)(self);
                 self.running_after_saves = false;
-                // texts it changed count as the ones those after it were asked for with
+                // texts it changed count as the ones those after it were asked for with; the
+                // files they write that are still not open stay so
                 let left = self.tab_revs();
                 if left != revs {
                     for b in &mut self.after_saves {
                         if text_changed(&b.revs, &revs).is_none() {
-                            b.revs = left.clone();
+                            let closed = b.revs.iter().filter(|(p, was)| {
+                                was.is_none() && !left.iter().any(|(q, ..)| q == p)
+                            });
+                            b.revs = closed
+                                .cloned()
+                                .chain(left.iter().map(|(p, r, _)| (p.clone(), Some(*r))))
+                                .collect();
                         }
                     }
                 }
@@ -1211,10 +1234,21 @@ impl App {
         }
     }
 
-    /// The open tabs' files and text versions. Read after [`App::settle`]: a version then
-    /// changes only when a text does.
-    fn tab_revs(&self) -> Vec<(PathBuf, u64)> {
-        self.tabs.iter().map(|t| (t.path.clone(), t.rev)).collect()
+    /// The open tabs' files, text versions and whether they have unsaved typing. Read after
+    /// [`App::settle`]: a version then changes only when a text does.
+    fn tab_revs(&self) -> Vec<(PathBuf, u64, bool)> {
+        self.tabs
+            .iter()
+            .map(|t| (t.path.clone(), t.rev, t.dirty()))
+            .collect()
+    }
+
+    /// The file of `paths` open with unsaved typing, if one is: an action writing it on disk
+    /// would leave the tab behind, and its next save would take the change away.
+    fn unsaved_tab<'a>(&self, paths: impl IntoIterator<Item = &'a Path>) -> Option<&'a Path> {
+        paths
+            .into_iter()
+            .find(|p| self.tabs.iter().any(|t| t.path == *p && t.dirty()))
     }
 
     /// Drops every action waiting for the saves (another project, a branch checked out), with
@@ -1229,7 +1263,7 @@ impl App {
     }
 
     /// Keeps `line` in the status bar until dismissed: one seen already moves to the end with
-    /// its count up, and only the last [`NOTICES_KEPT`] stay.
+    /// its count up, and only the last [`NOTICES_KEPT`] stay: the others are counted.
     fn notice(&mut self, line: String) {
         let n = match self.notices.iter().position(|(l, _)| *l == line) {
             Some(i) => self.notices.remove(i).1 + 1,
@@ -1238,6 +1272,7 @@ impl App {
         self.notices.push((line, n));
         if self.notices.len() > NOTICES_KEPT {
             self.notices.remove(0);
+            self.notices_older += 1;
         }
     }
 
@@ -2760,8 +2795,13 @@ impl App {
                     );
             }
             ui.label(RichText::new(&self.status).color(weak));
-            // why actions that waited for a save did not run, until dismissed
-            for (n, times) in &self.notices {
+            // why actions that waited for a save did not run, until dismissed: newest first,
+            // the button before them so a long row never pushes it out of the window
+            if !self.notices.is_empty() && ui.small_button("Dismiss").clicked() {
+                self.notices.clear();
+                self.notices_older = 0;
+            }
+            for (n, times) in self.notices.iter().rev() {
                 let n = if *times > 1 {
                     format!("{n} (×{times})")
                 } else {
@@ -2769,8 +2809,8 @@ impl App {
                 };
                 ui.label(RichText::new(n).color(WARN));
             }
-            if !self.notices.is_empty() && ui.small_button("Dismiss").clicked() {
-                self.notices.clear();
+            if self.notices_older > 0 {
+                ui.label(RichText::new(format!("+{} older", self.notices_older)).color(WARN));
             }
             // actions waiting for a save on its way, each with a way out
             let mut cancel = None;
