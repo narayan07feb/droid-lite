@@ -277,8 +277,8 @@ impl App {
         t.text = text;
         t.goto = Some(cursor.min(t.text.len()));
         t.reanalyse();
-        let (ip, it) = ((path).to_owned(), (self.tabs[self.active].text).to_owned());
-        self.index.change(move |i| i.update(&ip, &it));
+        self.index
+            .put(path.clone(), self.tabs[self.active].syms.clone());
         if let Some(l) = self.lsp.as_mut() {
             l.did_change(&path, &self.tabs[self.active].text);
         }
@@ -354,8 +354,8 @@ impl App {
         tab.goto = Some(cursor);
         tab.reanalyse();
         let path = tab.path.clone();
-        let (ip, it) = ((path).to_owned(), (self.tabs[self.active].text).to_owned());
-        self.index.change(move |i| i.update(&ip, &it));
+        self.index
+            .put(path.clone(), self.tabs[self.active].syms.clone());
         if let Some(l) = self.lsp.as_mut() {
             l.did_change(&path, &self.tabs[self.active].text);
         }

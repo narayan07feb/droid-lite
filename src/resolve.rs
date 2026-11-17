@@ -84,7 +84,7 @@ struct Imports {
 /// One file, read once per job.
 pub struct FileInfo {
     pub path: PathBuf,
-    pub text: Rc<str>,
+    pub text: Arc<str>,
     pub syms: FileSyms,
     toks: Vec<Token>,
     /// For each `(`, `[`, `{` its closing token, and back.
@@ -99,7 +99,7 @@ pub struct FileInfo {
 const NONE: u32 = u32::MAX;
 
 impl FileInfo {
-    pub fn new(path: &Path, text: Rc<str>) -> FileInfo {
+    pub fn new(path: &Path, text: Arc<str>) -> FileInfo {
         let syms = scan_file(path, &text);
         let toks: Vec<Token> = lex(&text)
             .into_iter()
@@ -762,16 +762,54 @@ fn fits(d: &Decl, args: &Args) -> bool {
         && args.named.iter().all(|a| ps.iter().any(|p| p.name == *a))
 }
 
-/// Reads files for a resolver: open tabs first, then the disk.
+/// Reads files for a resolver: open tabs first, then what was read ahead, then the disk.
+#[derive(Default)]
 pub struct Texts {
     pub open: HashMap<PathBuf, Arc<str>>,
+    /// Files read from disk before the index's lock was taken, each taken once.
+    ahead: std::sync::Mutex<HashMap<PathBuf, Option<Arc<str>>>>,
 }
 
 impl Texts {
-    pub fn read(&self, p: &Path) -> Option<Rc<str>> {
-        match self.open.get(p) {
-            Some(t) => Some(Rc::from(&**t)),
-            None => std::fs::read_to_string(p).ok().map(Rc::from),
+    pub fn new(open: HashMap<PathBuf, Arc<str>>) -> Texts {
+        Texts {
+            open,
+            ..Default::default()
+        }
+    }
+
+    pub fn read(&self, p: &Path) -> Option<Arc<str>> {
+        if let Some(t) = self.open.get(p) {
+            return Some(t.clone());
+        }
+        let ahead = self
+            .ahead
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(p);
+        match ahead {
+            Some(t) => t,
+            None => std::fs::read_to_string(p).ok().map(Arc::from),
+        }
+    }
+
+    /// Reads `paths` from disk now (without the index's lock), for the next [`Texts::read`]
+    /// of each.
+    pub fn read_ahead<'p>(&self, paths: impl IntoIterator<Item = &'p Path>) {
+        for p in paths {
+            let known = self.open.contains_key(p)
+                || self
+                    .ahead
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(p);
+            if !known {
+                let t = std::fs::read_to_string(p).ok().map(Arc::from);
+                self.ahead
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(p.to_path_buf(), t);
+            }
         }
     }
 }
@@ -781,9 +819,18 @@ impl Texts {
 #[derive(Default)]
 pub struct Cache {
     files: RefCell<HashMap<PathBuf, Option<Rc<FileInfo>>>>,
+    /// Every file read, also after [`Resolver::forget`]: what the answers depend on.
+    read: RefCell<HashSet<PathBuf>>,
     types: RefCell<HashMap<(PathBuf, usize), Option<Ty>>>,
     packages: RefCell<Option<HashSet<String>>>,
     depth: RefCell<usize>,
+}
+
+impl Cache {
+    /// Every file this cache's resolvers read.
+    pub fn files_read(&self) -> HashSet<PathBuf> {
+        self.read.borrow().clone()
+    }
 }
 
 enum CacheRef<'a> {
@@ -843,6 +890,21 @@ impl<'a> Resolver<'a> {
         }
         let f = self.texts.read(p).map(|t| Rc::new(FileInfo::new(p, t)));
         self.c.files.borrow_mut().insert(p.to_path_buf(), f.clone());
+        self.c.read.borrow_mut().insert(p.to_path_buf());
+        f
+    }
+
+    /// The file read from `text` (already read by the caller), unless it is known already.
+    fn file_from(&self, p: &Path, text: &Arc<str>) -> Rc<FileInfo> {
+        if let Some(Some(f)) = self.c.files.borrow().get(p) {
+            return f.clone();
+        }
+        let f = Rc::new(FileInfo::new(p, text.clone()));
+        self.c
+            .files
+            .borrow_mut()
+            .insert(p.to_path_buf(), Some(f.clone()));
+        self.c.read.borrow_mut().insert(p.to_path_buf());
         f
     }
 
@@ -949,20 +1011,17 @@ impl<'a> Resolver<'a> {
     fn top_level(&self, f: &FileInfo, name: &str, types: bool) -> Vec<DeclRef> {
         let want = |d: &Decl| d.kind.is_type() == types || !types && d.kind == Kind::Fun;
         if let Some(fqns) = f.imports.named.get(name) {
-            let found: Vec<DeclRef> = fqns
+            // an explicit import wins over the package and `*` (a library class too, which
+            // the project does not declare)
+            return fqns
                 .iter()
                 .flat_map(|q| self.by_fqn(q))
                 .filter(|r| {
-                    self.decl(r)
-                        .is_some_and(|(g, i)| want(&g.syms.decls[i]) || types)
+                    self.decl(r).is_some_and(|(g, i)| {
+                        (want(&g.syms.decls[i]) || types) && visible(f, &r.0, &g.syms.decls[i])
+                    })
                 })
                 .collect();
-            if !found.is_empty() {
-                return found;
-            }
-            if fqns.iter().any(|q| !q.ends_with(&format!(".{name}"))) {
-                return Vec::new(); // an alias of something outside the project
-            }
         }
         let mut here = Vec::new();
         let mut star = Vec::new();
@@ -970,7 +1029,7 @@ impl<'a> Resolver<'a> {
             if !want(d) || d.container.is_some() && !(types && f.java) {
                 continue;
             }
-            if d.container.is_some() {
+            if d.container.is_some() || !visible(f, p, d) {
                 continue;
             }
             if g.package == f.syms.package || *p == f.path {
@@ -1233,7 +1292,7 @@ impl<'a> Resolver<'a> {
             .collect();
         let mut found = Vec::new();
         for (p, g, d) in self.index.named(name) {
-            let visible = *p == f.path
+            let reach = *p == f.path
                 || d.container.is_none()
                     && (g.package == f.syms.package
                         || f.imports.stars.contains(&g.package)
@@ -1243,7 +1302,7 @@ impl<'a> Resolver<'a> {
                 || d.container
                     .as_ref()
                     .is_some_and(|c| enclosing.iter().any(|e| **e == **c));
-            if !visible || !matches!(d.kind, Kind::Fun | Kind::Property) {
+            if !reach || !matches!(d.kind, Kind::Fun | Kind::Property) || !visible(f, p, d) {
                 continue;
             }
             let r = (p.clone(), d.offset);
@@ -2164,7 +2223,11 @@ impl<'a> Resolver<'a> {
             && self.is_package(&segs.join("."))
             && f.local(segs[0], f.start(start)).is_none()
         {
-            let v = self.by_fqn(&format!("{}.{name}", segs.join(".")));
+            let mut v = self.by_fqn(&format!("{}.{name}", segs.join(".")));
+            v.retain(|r| {
+                self.decl(r)
+                    .is_some_and(|(g, gi)| visible(f, &r.0, &g.syms.decls[gi]))
+            });
             return if v.is_empty() {
                 Res::None
             } else {
@@ -2231,12 +2294,13 @@ impl<'a> Resolver<'a> {
             }
         }
         // the receiver's type is not known: an extension visible here, else the one member of
-        // that name in the project, else the ones whose class this file names
+        // that name whose class this file names (a library call may share the name of the
+        // project's only member of that name: that alone is no use of it)
         let ext = self.extensions(f, name, None, args, f.start(i));
         let mut members: Vec<(DeclRef, Decl)> = self
             .index
             .named(name)
-            .filter(|(_, _, d)| d.container.is_some() && !d.kind.is_type())
+            .filter(|(p, _, d)| d.container.is_some() && !d.kind.is_type() && visible(f, p, d))
             .map(|(p, _, d)| ((p.clone(), d.offset), d.clone()))
             .filter(|(r, _)| !ext.contains(r))
             .collect();
@@ -2247,9 +2311,6 @@ impl<'a> Resolver<'a> {
         let members = pick(members, args).unwrap_or_default();
         if members.is_empty() && !ext.is_empty() {
             return Res::Decls(ext);
-        }
-        if members.len() == 1 && ext.is_empty() {
-            return Res::Decls(members);
         }
         let named: Vec<DeclRef> = members
             .into_iter()
@@ -2361,27 +2422,33 @@ impl<'a> Resolver<'a> {
             if stop() {
                 break;
             }
-            for (_, at) in self.usages_in(std::slice::from_ref(target), p) {
+            let Some(text) = self.texts.read(p) else {
+                continue;
+            };
+            for (_, at) in self.usages_in(std::slice::from_ref(target), p, &text) {
                 out.push((p.clone(), at));
             }
         }
         out
     }
 
-    /// The uses of each of `targets` in one file, as (index into `targets`, offset).
-    pub fn usages_in(&self, targets: &[DeclRef], p: &Path) -> Vec<(usize, usize)> {
-        let names: Vec<Option<String>> = targets
+    /// The names of `targets` (`None` for one not found).
+    pub fn names_of(&self, targets: &[DeclRef]) -> Vec<Option<String>> {
+        targets
             .iter()
             .map(|t| self.decl(t).map(|(f, i)| f.syms.decls[i].name.clone()))
-            .collect();
+            .collect()
+    }
+
+    /// The uses of each of `targets` in file `p` whose text the caller read, as (index into
+    /// `targets`, offset).
+    pub fn usages_in(&self, targets: &[DeclRef], p: &Path, text: &Arc<str>) -> Vec<(usize, usize)> {
+        let names = self.names_of(targets);
         let mut out = Vec::new();
-        let Some(text) = self.texts.read(p) else {
-            return out;
-        };
         if !names.iter().flatten().any(|n| text.contains(n.as_str())) {
             return out;
         }
-        let Some(f) = self.file(p) else { return out };
+        let f = self.file_from(p, text);
         let mut seen = HashSet::new();
         for name in names.iter().flatten() {
             if !seen.insert(name) {
@@ -2562,6 +2629,27 @@ impl Drop for DepthGuard<'_> {
 
 /// The candidates that fit the call: by arguments when called, else any. `None` when there are
 /// none at all (so a lookup goes on to the next scope).
+/// Whether code in `f` sees the declaration `d` of file `p`: a `private` one only in its own
+/// file, an `internal` one only in its own module (the folder that holds `src`).
+fn visible(f: &FileInfo, p: &Path, d: &Decl) -> bool {
+    if p == f.path {
+        return true;
+    }
+    if d.has_modifier("private") {
+        return false;
+    }
+    fn module(p: &Path) -> Option<&Path> {
+        p.ancestors()
+            .find(|a| a.ends_with("src"))
+            .and_then(Path::parent)
+    }
+    !d.has_modifier("internal")
+        || match (module(p), module(&f.path)) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
+}
+
 fn pick(found: Vec<(DeclRef, Decl)>, args: Option<&Args>) -> Option<Vec<DeclRef>> {
     if found.is_empty() {
         return None;
@@ -2716,6 +2804,8 @@ pub fn has_word(text: &str, w: &str) -> bool {
 pub struct HiltFile {
     pub providers: Vec<Binding>,
     pub sites: Vec<Site>,
+    /// The names its keys depend on: the words of each key and the annotations read for it.
+    names: HashSet<String>,
 }
 
 /// A `@Provides` / `@Binds` function or an `@Inject constructor` class, by the key it provides.
@@ -2904,7 +2994,7 @@ impl Resolver<'_> {
                         .named(&name)
                         .any(|(_, _, d)| d.kind.is_type() && d.has_annotation("Qualifier"));
                 if qualifier {
-                    quals.push(format!("{name}{}", arg.unwrap_or_default()));
+                    quals.push(format!("{name}{}", qualifier_arg(&arg.unwrap_or_default())));
                 }
                 all.push(name);
             }
@@ -2944,6 +3034,7 @@ impl Resolver<'_> {
                             key.push_str(" @");
                             key.push_str(q);
                         }
+                        out.names.extend(key_words(&key).chain(all.iter().cloned()));
                         out.providers.push(Binding {
                             decl: r.clone(),
                             key,
@@ -2960,9 +3051,11 @@ impl Resolver<'_> {
                     let assisted = header.contains("@AssistedInject");
                     if d.has_annotation("Inject") || assisted {
                         if !assisted {
+                            let key = self.key_of(&Ty::Decl(r.clone()));
+                            out.names.extend(key_words(&key));
                             out.providers.push(Binding {
                                 decl: r.clone(),
-                                key: self.key_of(&Ty::Decl(r.clone())),
+                                key,
                             });
                         }
                         for (pi, p) in d.params.iter().enumerate() {
@@ -2994,8 +3087,11 @@ impl Resolver<'_> {
         ty: &str,
     ) {
         let Some(ti) = f.tok_at(at) else { return };
-        let (quals, _) = self.qualifiers_before(f, ti, param.is_some());
+        let (quals, all) = self.qualifiers_before(f, ti, param.is_some());
+        // a type that does not resolve yet (its class may move into reach) by its words
+        out.names.extend(all.into_iter().chain(key_words(ty)));
         if let Some(key) = self.hilt_key(f, ty, at, &quals) {
+            out.names.extend(key_words(&key));
             out.sites.push(Site {
                 owner: owner.clone(),
                 param,
@@ -3004,6 +3100,32 @@ impl Resolver<'_> {
             });
         }
     }
+}
+
+/// A qualifier's arguments as Dagger compares them: `(value = "a")` is `("a")`, and spaces
+/// outside strings do not count.
+fn qualifier_arg(arg: &str) -> String {
+    let (mut out, mut in_str, mut prev) = (String::new(), false, ' ');
+    for c in arg.chars() {
+        if c == '"' && prev != '\\' {
+            in_str = !in_str;
+        }
+        if in_str || !c.is_whitespace() {
+            out.push(c);
+        }
+        prev = c;
+    }
+    match out.strip_prefix("(value=") {
+        Some(rest) => format!("({rest}"),
+        None => out,
+    }
+}
+
+/// The words of a binding key (`a.Repo @Named("x")`), for [`HiltFile::names`].
+fn key_words(key: &str) -> impl Iterator<Item = String> + '_ {
+    key.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
 }
 
 fn unwrap_provider(t: Ty) -> Ty {
@@ -3032,24 +3154,57 @@ fn has_hilt(f: &FileSyms) -> bool {
 }
 
 impl HiltGraph {
+    /// The next files [`HiltGraph::refresh`] reads, to read them ahead.
+    pub fn upcoming(&self, n: usize) -> impl Iterator<Item = &Path> {
+        self.pending.iter().rev().take(n).map(PathBuf::as_path)
+    }
+
     /// Brings the parts up to date: at first every file with Hilt annotations, later only the
     /// files changed since (bindings are keyed by qualified name, so a file whose declarations
     /// moved is all that is read again). Returns whether it finished (else `stop` cut it short;
     /// call again).
     pub fn refresh(&mut self, r: &Resolver, stop: &dyn Fn() -> bool) -> bool {
+        // a build cut short before the index was replaced: its files belong to the old one
+        if !self.pending.is_empty() && r.index.changed_since(self.round).is_none() {
+            self.pending.clear();
+            self.at = None;
+        }
         if self.pending.is_empty() {
             let changed = self.at.and_then(|g| r.index.changed_since(g));
             self.round = r.index.generation;
             match changed {
                 Some(c) => {
+                    // types of the changed files: one that moved to another package or became
+                    // a `@Qualifier` changes the keys of every file that names it
+                    let mut types: HashSet<String> = HashSet::new();
                     for p in c {
                         let p = p.to_path_buf();
-                        match r.index.files.get(&p) {
+                        let f = r.index.files.get(&p);
+                        types.extend(f.into_iter().flat_map(|f| {
+                            f.decls
+                                .iter()
+                                .filter(|d| d.kind.is_type())
+                                .map(|d| d.name.clone())
+                        }));
+                        match f {
                             Some(f) if has_hilt(f) => self.pending.push(p),
                             _ => {
                                 self.files.remove(&p);
                             }
                         }
+                    }
+                    let queued: HashSet<PathBuf> = self.pending.iter().cloned().collect();
+                    let again: Vec<PathBuf> = self
+                        .files
+                        .iter()
+                        .filter(|(p, (_, part))| {
+                            !queued.contains(*p) && part.names.iter().any(|n| types.contains(n))
+                        })
+                        .map(|(p, _)| p.clone())
+                        .collect();
+                    for p in again {
+                        self.files.remove(&p);
+                        self.pending.push(p);
                     }
                 }
                 None => {
@@ -3089,7 +3244,9 @@ impl HiltGraph {
             if self.files.get(&p).is_some_and(|(old, _)| *old == h) {
                 continue;
             }
+            // read again from this text, not from the disk a second time
             r.changed(&p);
+            r.file_from(&p, &text);
             let part = r.hilt_file(&p);
             self.files.insert(p, (h, Rc::new(part)));
             r.forget(512);
@@ -3156,7 +3313,7 @@ mod tests {
             index.update(Path::new(p), t);
             open.insert(PathBuf::from(p), Arc::from(*t));
         }
-        (index, Texts { open })
+        (index, Texts::new(open))
     }
 
     /// What the `n`-th `name` (from 1) in file `path` resolves to, as `file:line` of each
@@ -3560,6 +3717,216 @@ mod tests {
             is_test_path(Path::new("/p/core-test/src/main/A.kt"))
                 && is_test_path(Path::new("/p/a/src/androidTest/A.kt"))
         );
+    }
+
+    #[test]
+    fn an_explicit_import_wins_over_the_package_also_for_a_library_class() {
+        let (i, t) = project(&[
+            ("/p/a/Request.kt", "package a\nclass Request\n"),
+            (
+                "/p/a/Use.kt",
+                "package a\nimport okhttp3.Request\nfun f(r: Request) = 1\nval g = Request()\n",
+            ),
+        ]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/a/Use.kt", "Request", 2), "-", "a parameter type");
+        assert_eq!(
+            at(&r, "/p/a/Use.kt", "Request", 3),
+            "-",
+            "a constructor call"
+        );
+    }
+
+    #[test]
+    fn a_private_declaration_is_seen_only_in_its_own_file() {
+        let (i, t) = project(&[
+            (
+                "/p/A.kt",
+                "package a\nprivate val tag = \"A\"\nprivate fun Int.twice() = this * 2\nfun a() = tag + 1.twice()\n",
+            ),
+            (
+                "/p/B.kt",
+                "package a\nprivate val tag = \"B\"\nfun b() = tag + 2.twice()\n",
+            ),
+            ("/p/m/src/main/I.kt", "package a\ninternal class Inner\n"),
+            ("/p/m/src/test/T.kt", "package a\nval t = Inner()\n"),
+            ("/p/n/src/main/N.kt", "package a\nval n = Inner()\n"),
+        ]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/B.kt", "tag", 2), "/p/B.kt:2");
+        assert_eq!(at(&r, "/p/A.kt", "tag", 2), "/p/A.kt:2");
+        assert_eq!(at(&r, "/p/B.kt", "twice", 1), "-", "A's private extension");
+        assert_eq!(
+            usages_of(&r, "/p/A.kt", "tag", 2, &["/p/A.kt", "/p/B.kt"]),
+            ["/p/A.kt:4"]
+        );
+        assert_eq!(
+            at(&r, "/p/m/src/test/T.kt", "Inner", 1),
+            "/p/m/src/main/I.kt:2",
+            "internal: the same module"
+        );
+        assert_eq!(
+            at(&r, "/p/n/src/main/N.kt", "Inner", 1),
+            "-",
+            "another module"
+        );
+    }
+
+    #[test]
+    fn a_call_on_an_unknown_receiver_is_not_the_projects_only_member_of_that_name() {
+        let (i, t) = project(&[
+            (
+                "/p/Repo.kt",
+                "package a\nclass Repo {\n    fun execute() = 1\n}\n",
+            ),
+            (
+                "/p/Use.kt",
+                "package a\nimport okhttp3.OkHttpClient\nfun f(c: OkHttpClient) = c.newCall().execute()\n",
+            ),
+        ]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/Use.kt", "execute", 1), "-");
+    }
+
+    #[test]
+    fn a_graph_cut_short_by_a_new_index_reads_only_the_new_projects_files() {
+        let (old, mut t) = project(&[
+            (
+                "/old/src/main/java/a/A.kt",
+                "package a\nclass A @Inject constructor()\n",
+            ),
+            (
+                "/old/src/main/java/a/C.kt",
+                "package a\nclass C @Inject constructor()\n",
+            ),
+        ]);
+        let shared = crate::index::Shared::default();
+        shared.set(old);
+        shared.settle();
+        let mut g = HiltGraph::default();
+        // one file read, then cut short (typing, or another project opening)
+        assert!(!g.refresh(&Resolver::new(&shared.read(), &t), &|| true));
+        let (new, more) = project(&[(
+            "/new/src/main/java/b/D.kt",
+            "package b\nclass D @Inject constructor()\n",
+        )]);
+        t.open.extend(more.open);
+        shared.set(new);
+        shared.settle();
+        let index = shared.read();
+        let r = Resolver::new(&index, &t);
+        while !g.refresh(&r, &|| false) {}
+        let files: Vec<&PathBuf> = g.files.keys().collect();
+        assert_eq!(files, [Path::new("/new/src/main/java/b/D.kt")]);
+    }
+
+    #[test]
+    fn hilt_qualifier_arguments_compare_like_dagger() {
+        let (i, t) = project(&[
+            (
+                "/p/src/main/java/a/Mod.kt",
+                "package a\n@Module\nobject Mod {\n    @Provides @Named(value = \"io\") fun io(): String = \"\"\n}\n",
+            ),
+            (
+                "/p/src/main/java/a/Holder.kt",
+                "package a\nclass Holder @Inject constructor(\n    @Named(\"io\") val v: String,\n)\n",
+            ),
+        ]);
+        let r = Resolver::new(&i, &t);
+        let g = graph(&r);
+        assert_eq!(
+            providers(&r, &g, "/p/src/main/java/a/Holder.kt", 3, Some(0)),
+            ["/p/src/main/java/a/Mod.kt:4"]
+        );
+    }
+
+    #[test]
+    fn hilt_sites_follow_a_type_that_moves_package_or_becomes_a_qualifier() {
+        let (q, m, h) = (
+            "/p/src/main/java/a/Io.kt",
+            "/p/src/main/java/a/Mod.kt",
+            "/p/src/main/java/a/Holder.kt",
+        );
+        let (foo, user) = ("/p/src/main/java/b/Foo.kt", "/p/src/main/java/a/User.kt");
+        let (mut i, mut t) = project(&[
+            (q, "package a\nannotation class Io\n"),
+            (
+                m,
+                "package a\n@Module\nobject Mod {\n    @Provides @Io fun io(): String = \"\"\n    @Provides fun other(): Long = 1\n}\n",
+            ),
+            (
+                h,
+                "package a\nclass Holder @Inject constructor(\n    @Io val v: String,\n)\n",
+            ),
+            (foo, "package c\nclass Foo @Inject constructor()\n"),
+            (
+                user,
+                "package a\nimport b.Foo\nclass User @Inject constructor(\n    val f: Foo,\n)\n",
+            ),
+        ]);
+        let mut g = graph(&Resolver::new(&i, &t));
+        {
+            let r = Resolver::new(&i, &t);
+            assert_eq!(providers(&r, &g, h, 3, Some(0)), [format!("{m}:4")]);
+            assert!(
+                providers(&r, &g, user, 4, Some(0)).is_empty(),
+                "b.Foo is not there yet"
+            );
+        }
+        let edit = |i: &mut Index, t: &mut Texts, p: &str, text: &str| {
+            i.update(Path::new(p), text);
+            t.open.insert(PathBuf::from(p), Arc::from(text));
+        };
+        // `Io` becomes a qualifier: the module's key and the holder's change, neither file did
+        edit(
+            &mut i,
+            &mut t,
+            q,
+            "package a\n@Qualifier\nannotation class Io\n",
+        );
+        edit(
+            &mut i,
+            &mut t,
+            m,
+            "package a\n@Module\nobject Mod {\n    @Provides @Io fun io(): String = \"\"\n    @Provides fun other(): String = \"\"\n}\n",
+        );
+        // Foo moves to the package the user imports
+        edit(
+            &mut i,
+            &mut t,
+            foo,
+            "package b\nclass Foo @Inject constructor()\n",
+        );
+        let r = Resolver::new(&i, &t);
+        while !g.refresh(&r, &|| false) {}
+        assert_eq!(
+            providers(&r, &g, h, 3, Some(0)),
+            [format!("{m}:4")],
+            "only the @Io one"
+        );
+        assert_eq!(providers(&r, &g, user, 4, Some(0)), [format!("{foo}:2")]);
+    }
+
+    #[test]
+    fn a_file_read_ahead_is_taken_from_memory_once() {
+        let dir = std::env::temp_dir().join(format!("droid-lite-ahead-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("A.kt");
+        std::fs::write(&p, "class A\n").unwrap();
+        let t = Texts::default();
+        t.read_ahead([p.as_path()]);
+        std::fs::write(&p, "class B\n").unwrap();
+        assert_eq!(
+            t.read(&p).as_deref(),
+            Some("class A\n"),
+            "what was read ahead"
+        );
+        assert_eq!(
+            t.read(&p).as_deref(),
+            Some("class B\n"),
+            "then the disk again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

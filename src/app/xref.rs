@@ -3,13 +3,15 @@
 //! there, in short chunks under the index's read lock so the editor can keep updating the index.
 //! One thread, started once; a newer request of the same kind cancels the older one; finished
 //! results are kept per file and reused while neither the file nor anything it depends on
-//! changed. A task that panics is logged and dropped; the thread goes on.
+//! changed. A request someone waits for (Find in Files, a hover's usages) runs between the
+//! chunks of a long file pass, on the same thread. A task that panics is logged and dropped;
+//! the thread goes on.
 
 use super::FoundLine;
 use crate::index::{Hit, Shared};
 use crate::resolve::{Cache, DeclRef, HiltGraph, Res, Resolver, Texts};
-use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,15 +28,24 @@ const CHUNK: Duration = Duration::from_millis(8);
 /// How much of the file one step of the name pass reads.
 const STEP: usize = 512;
 
+/// How many files are read from disk at a time, before the lock is taken.
+const AHEAD: usize = 16;
+
+/// The kind of the open file's pass: it gives way to every other kind, which someone waits for.
+const FILE: &str = "file";
+
+/// A file's names and their uses.
+pub(super) type Usages = HashMap<(Option<String>, String), Vec<Hit>>;
+
 /// A file's code insight, for one version of its text.
 #[derive(Clone, Default)]
 pub(super) struct FileXref {
     pub path: PathBuf,
     pub rev: u64,
     /// What each name means: start, end and meaning, in file order.
-    pub refs: Vec<(usize, usize, Res)>,
+    pub refs: Arc<Vec<(usize, usize, Res)>>,
     /// Uses of each declaration of the file, by container and name.
-    pub usages: HashMap<(Option<String>, String), Vec<Hit>>,
+    pub usages: Arc<Usages>,
     pub hilt: Vec<HiltLink>,
 }
 
@@ -60,19 +71,25 @@ pub(super) struct HiltLink {
     pub hits: Vec<Hit>,
 }
 
-type Task = Box<dyn FnOnce(&mut State, &dyn Fn() -> bool) + Send>;
+type Task = Box<dyn FnOnce(&State, &dyn Fn() -> bool) + Send>;
+type Queued = (&'static str, Task);
 
 /// What the worker keeps between tasks.
 pub(super) struct State {
     index: Shared,
-    graph: HiltGraph,
+    graph: RefCell<HiltGraph>,
     /// Finished file results with what they depend on.
-    done: HashMap<PathBuf, Kept>,
+    done: RefCell<HashMap<PathBuf, Kept>>,
     ctx: Option<egui::Context>,
     /// How long one chunk may hold the index's read lock.
     budget: Duration,
     /// How many times the lock was taken.
     holds: Cell<u64>,
+    /// Where tasks arrive, and the ones that arrived and wait.
+    inbox: Option<Receiver<Queued>>,
+    waiting: RefCell<VecDeque<Queued>>,
+    /// A waiting task runs between chunks now (no task inside another inside another).
+    serving: Cell<bool>,
 }
 
 /// A file's names and usages (Hilt links are worked out again each time: the graph moves).
@@ -81,26 +98,29 @@ struct Kept {
     hash: u64,
     /// The index generation it is known good at.
     generation: u64,
-    /// Files whose declarations it found.
+    /// Files it read: where its names are declared, their types, their supertypes.
     deps: HashSet<PathBuf>,
     /// The file's declaration names: a changed file that spells one may use it.
     names: Vec<String>,
     /// Each name the file spells, found or not, with a digest of its declarations in the
     /// project: a changed file that adds one may change what the name means here.
     words: HashMap<String, u64>,
-    refs: Vec<(usize, usize, Res)>,
-    usages: HashMap<(Option<String>, String), Vec<Hit>>,
+    refs: Arc<Vec<(usize, usize, Res)>>,
+    usages: Arc<Usages>,
 }
 
 impl State {
     fn new(index: Shared, ctx: Option<egui::Context>) -> State {
         State {
             index,
-            graph: HiltGraph::default(),
-            done: HashMap::new(),
+            graph: RefCell::default(),
+            done: RefCell::default(),
             ctx,
             budget: CHUNK,
             holds: Cell::new(0),
+            inbox: None,
+            waiting: RefCell::default(),
+            serving: Cell::new(false),
         }
     }
 
@@ -123,6 +143,41 @@ impl State {
     pub(super) fn code_files(&self, root: &Path) -> Arc<Vec<PathBuf>> {
         self.index.flush();
         Arc::new(self.index.read().files_under(root))
+    }
+
+    /// The next task: one someone waits for first, else the oldest; only the newest of each
+    /// kind is kept. `block` waits for one; else `None` when none of those waits.
+    fn next(&self, block: bool) -> Option<Queued> {
+        let inbox = self.inbox.as_ref()?;
+        let mut waiting = self.waiting.borrow_mut();
+        let add = |w: &mut VecDeque<Queued>, t: Queued| {
+            w.retain(|(k, _)| *k != t.0);
+            w.push_back(t);
+        };
+        while let Ok(t) = inbox.try_recv() {
+            add(&mut waiting, t);
+        }
+        if waiting.is_empty() && block {
+            add(&mut waiting, inbox.recv().ok()?);
+        }
+        let at = match waiting.iter().position(|(k, _)| *k != FILE) {
+            Some(i) => i,
+            None if block => 0,
+            None => return None,
+        };
+        waiting.remove(at)
+    }
+
+    /// Runs the tasks someone waits for that arrived meanwhile (between two chunks of a long
+    /// pass).
+    fn serve_waiting(&self) {
+        if self.serving.replace(true) {
+            return;
+        }
+        while let Some((kind, task)) = self.next(false) {
+            run(self, kind, task);
+        }
+        self.serving.set(false);
     }
 }
 
@@ -150,14 +205,67 @@ fn in_chunks(
                 }
             }
         });
+        s.serve_waiting();
         std::thread::yield_now();
     }
     Some(())
 }
 
+/// The uses of `decls` in `files`: each file is read once, from disk before the lock is taken,
+/// and `hit` gets its text with each use (index into `decls`, offset). `None` when cancelled.
+fn uses_in_files(
+    s: &State,
+    texts: &Texts,
+    cache: &Cache,
+    stale: &dyn Fn() -> bool,
+    files: &[PathBuf],
+    decls: &[DeclRef],
+    mut hit: impl FnMut(&Path, &str, usize, usize),
+) -> Option<()> {
+    let names: Vec<String> = s
+        .with(texts, cache, |r| r.names_of(decls))
+        .into_iter()
+        .flatten()
+        .collect();
+    let (mut next, mut ready) = (0, VecDeque::new());
+    loop {
+        if stale() {
+            return None;
+        }
+        // without the lock: the next files that spell one of the names
+        while ready.is_empty() && next < files.len() {
+            let end = (next + AHEAD).min(files.len());
+            for f in &files[next..end] {
+                if let Some(t) = texts.read(f)
+                    && names.iter().any(|n| t.contains(n.as_str()))
+                {
+                    ready.push_back((f, t));
+                }
+            }
+            next = end;
+        }
+        if ready.is_empty() {
+            return Some(());
+        }
+        let t = Instant::now();
+        s.with(texts, cache, |r| {
+            while let Some((f, text)) = ready.pop_front() {
+                for (ti, at) in r.usages_in(decls, f, &text) {
+                    hit(f, &text, ti, at);
+                }
+                if t.elapsed() >= s.budget {
+                    break;
+                }
+            }
+        });
+        s.serve_waiting();
+        std::thread::yield_now();
+    }
+}
+
 /// The handle the editor keeps: sends tasks to the worker thread.
 pub(super) struct Xref {
-    tx: Sender<(&'static str, u64, Task)>,
+    tx: Sender<Queued>,
     latest: HashMap<&'static str, Arc<AtomicU64>>,
     seq: u64,
     /// The newest file result, and where the next ones arrive.
@@ -169,23 +277,16 @@ pub(super) struct Xref {
 
 impl Xref {
     pub fn start(index: Shared, ctx: Option<egui::Context>) -> Xref {
-        let (tx, rx) = channel::<(&'static str, u64, Task)>();
+        let (tx, rx) = channel::<Queued>();
         let spawned = std::thread::Builder::new()
             .name("droid-lite-xref".into())
             // name resolution recurses through receivers and supertypes
             .stack_size(64 << 20)
             .spawn(move || {
                 let mut state = State::new(index, ctx);
-                while let Ok(first) = rx.recv() {
-                    // only the newest task of each kind runs
-                    let mut tasks = vec![first];
-                    while let Ok(t) = rx.try_recv() {
-                        tasks.retain(|(k, _, _)| *k != t.0);
-                        tasks.push(t);
-                    }
-                    for (kind, _, task) in tasks {
-                        run(&mut state, kind, task);
-                    }
+                state.inbox = Some(rx);
+                while let Some((kind, task)) = state.next(true) {
+                    run(&state, kind, task);
                 }
             });
         if spawned.is_err() {
@@ -205,7 +306,7 @@ impl Xref {
     pub fn submit(
         &mut self,
         kind: &'static str,
-        f: impl FnOnce(&mut State, &dyn Fn() -> bool) + Send + 'static,
+        f: impl FnOnce(&State, &dyn Fn() -> bool) + Send + 'static,
     ) {
         self.seq += 1;
         let seq = self.seq;
@@ -217,7 +318,7 @@ impl Xref {
                 f(s, &stale);
             }
         });
-        let _ = self.tx.send((kind, seq, task));
+        let _ = self.tx.send((kind, task));
     }
 
     /// Stops every queued or running task (another project opens): none of them answers.
@@ -288,7 +389,7 @@ impl Xref {
         self.file_rx = Some(rx);
         let path = path.to_path_buf();
         let text: Arc<str> = Arc::from(text);
-        self.submit("file", move |s, stale| {
+        self.submit(FILE, move |s, stale| {
             let files = s.code_files(&root);
             if let Some(r) = file_pass(s, &path, rev, text, open, &files, &root, &targets, stale) {
                 let _ = tx.send(r);
@@ -311,24 +412,25 @@ impl Xref {
     ) {
         self.submit(kind, move |s, stale| {
             let files = s.code_files(&root);
-            let texts = Texts { open };
+            let texts = Texts::new(open);
             let cache = Cache::default();
             let mut found = Vec::new();
-            let mut i = 0;
-            let _ = in_chunks(s, &texts, &cache, stale, |r| {
-                let Some(f) = files.get(i) else { return true };
-                for (_, at) in r.usages_in(std::slice::from_ref(&target), f) {
-                    if let Some(text) = texts.read(f) {
-                        found.push(super::found_line(f, &text, at));
-                    }
-                }
-                i += 1;
-                i == files.len()
-            });
+            let target = std::slice::from_ref(&target);
+            let _ = uses_in_files(
+                s,
+                &texts,
+                &cache,
+                stale,
+                &files,
+                target,
+                |f, text, _, at| {
+                    found.push(super::found_line(f, text, at));
+                },
+            );
             // the declaration is listed too, like the plain search does (the hover card and the
             // usages dropdown leave it out)
-            if let Some(text) = texts.read(&target.0) {
-                found.push(super::found_line(&target.0, &text, target.1));
+            if let Some(text) = texts.read(&target[0].0) {
+                found.push(super::found_line(&target[0].0, &text, target[0].1));
                 found.sort_by(|a, b| a.path.cmp(&b.path).then(a.offset.cmp(&b.offset)));
             }
             if !stale() {
@@ -343,12 +445,12 @@ impl Xref {
 
 /// Runs one task; a panic is logged and the task dropped (its reply channel closes, so whoever
 /// waits sees it ended), and the worker goes on with the next.
-fn run(state: &mut State, kind: &str, task: Task) {
+fn run(state: &State, kind: &str, task: Task) {
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(state, &|| false)));
     if ran.is_err() {
         eprintln!("droid-lite: a code insight task ({kind}) failed; the worker goes on");
         // a pass cut short may have left the graph half taken
-        state.graph = HiltGraph::default();
+        state.graph.replace(HiltGraph::default());
     }
 }
 
@@ -367,14 +469,15 @@ fn words_of(text: &str) -> HashSet<&str> {
 }
 
 /// A digest of the project's declarations named `name`: which files declare it, in which
-/// container (not where in the file, so an edit above them keeps it).
+/// package and container, of which kind and with which modifiers (`private`, `internal`), but
+/// not where in the file, so an edit above them keeps it.
 fn digest(index: &crate::index::Index, name: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     index
         .named(name)
-        .map(|(p, _, d)| {
+        .map(|(p, f, d)| {
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            (p, &d.container).hash(&mut h);
+            (p, &f.package, &d.container, d.kind, &d.modifiers).hash(&mut h);
             h.finish()
         })
         .fold(0, u64::wrapping_add)
@@ -382,7 +485,7 @@ fn digest(index: &crate::index::Index, name: &str) -> u64 {
 
 #[allow(clippy::too_many_arguments)]
 fn file_pass(
-    s: &mut State,
+    s: &State,
     path: &Path,
     rev: u64,
     text: Arc<str>,
@@ -393,36 +496,40 @@ fn file_pass(
     stale: &dyn Fn() -> bool,
 ) -> Option<FileXref> {
     open.insert(path.to_path_buf(), text.clone());
-    let texts = Texts { open };
+    let texts = Texts::new(open);
     let cache = Cache::default();
     let started = Instant::now();
     let hash = text_hash(&text);
     let valid = s
         .done
+        .borrow()
         .get(path)
         .filter(|k| k.hash == hash)
         .and_then(|k| still_valid(s, path, k, &texts));
-    let (refs, usages) = match (valid, s.done.get_mut(path)) {
-        (Some(generation), Some(k)) => {
-            k.generation = generation;
-            (k.refs.clone(), k.usages.clone())
-        }
-        _ => {
+    let kept = valid.and_then(|generation| {
+        let mut done = s.done.borrow_mut();
+        let k = done.get_mut(path)?;
+        k.generation = generation;
+        Some((k.refs.clone(), k.usages.clone()))
+    });
+    let (refs, usages) = match kept {
+        Some(kept) => kept,
+        None => {
             let kept = names_and_usages(
                 s, path, hash, &text, &texts, &cache, files, root, targets, stale,
             )?;
             let out = (kept.refs.clone(), kept.usages.clone());
-            s.done.insert(path.to_path_buf(), kept);
-            if s.done.len() > 24 {
-                let drop: Vec<PathBuf> = s
-                    .done
+            let mut done = s.done.borrow_mut();
+            done.insert(path.to_path_buf(), kept);
+            if done.len() > 24 {
+                let drop: Vec<PathBuf> = done
                     .keys()
                     .filter(|p| *p != path)
                     .take(4)
                     .cloned()
                     .collect();
                 for p in drop {
-                    s.done.remove(&p);
+                    done.remove(&p);
                 }
             }
             out
@@ -483,31 +590,24 @@ fn names_and_usages(
         .map(|(_, o)| (path.to_path_buf(), *o))
         .collect();
     let names: Vec<String> = targets.iter().map(|((_, n), _)| n.clone()).collect();
-    let mut usages: HashMap<(Option<String>, String), Vec<Hit>> = targets
+    let mut usages: Usages = targets
         .iter()
         .map(|(k, _)| (k.clone(), Vec::new()))
         .collect();
-    let mut deps: HashSet<PathBuf> = HashSet::new();
-    let mut i = 0;
-    in_chunks(s, texts, cache, stale, |r| {
-        let Some(f) = files.get(i) else { return true };
-        for (ti, at) in r.usages_in(&decls, f) {
-            deps.insert(f.clone());
-            if let Some(text) = texts.read(f) {
-                let l = super::found_line(f, &text, at);
-                let rel = f.strip_prefix(root).unwrap_or(f);
-                usages.get_mut(&targets[ti].0).unwrap().push(Hit {
-                    name: l.text,
-                    detail: format!("{}:{}", rel.display(), l.line),
-                    path: f.clone(),
-                    offset: at,
-                    score: 0,
-                });
-            }
-        }
-        i += 1;
-        i == files.len()
+    uses_in_files(s, texts, cache, stale, files, &decls, |f, text, ti, at| {
+        let l = super::found_line(f, text, at);
+        let rel = f.strip_prefix(root).unwrap_or(f);
+        usages.get_mut(&targets[ti].0).unwrap().push(Hit {
+            name: l.text,
+            detail: format!("{}:{}", rel.display(), l.line),
+            path: f.to_path_buf(),
+            offset: at,
+            score: 0,
+        });
     })?;
+    // where its names are declared, and every file read on the way (the type of a receiver,
+    // a supertype)
+    let mut deps = cache.files_read();
     for (_, _, r) in &refs {
         if let Res::Decls(v) = r {
             deps.extend(v.iter().map(|d| d.0.clone()));
@@ -519,8 +619,8 @@ fn names_and_usages(
         deps,
         names,
         words,
-        refs,
-        usages,
+        refs: Arc::new(refs),
+        usages: Arc::new(usages),
     })
 }
 
@@ -585,26 +685,28 @@ enum Want {
 }
 
 /// The Hilt links of one file: the project's graph brought up to date (only changed files are
-/// read again), then "injected in N places" on each binding, and on each injection site the
-/// binding it gets. `None` when cancelled.
+/// read again, from disk before the lock is taken), then "injected in N places" on each
+/// binding, and on each injection site the binding it gets. `None` when cancelled.
 fn hilt_pass(
-    s: &mut State,
+    s: &State,
     texts: &Texts,
     cache: &Cache,
     path: &Path,
     root: &Path,
     stale: &dyn Fn() -> bool,
 ) -> Option<Vec<HiltLink>> {
-    let mut graph = std::mem::take(&mut s.graph);
+    let mut graph = s.graph.take();
     loop {
         if stale() {
-            s.graph = graph;
+            s.graph.replace(graph);
             return None;
         }
+        texts.read_ahead(graph.upcoming(AHEAD));
         let t = Instant::now();
         let finished = s.with(texts, cache, |r| {
             graph.refresh(r, &|| t.elapsed() >= s.budget || stale())
         });
+        s.serve_waiting();
         std::thread::yield_now();
         if finished {
             break;
@@ -634,7 +736,7 @@ fn hilt_pass(
             }
         }
     }
-    s.graph = graph;
+    s.graph.replace(graph);
     // their names and types, a few at a time under the lock
     let mut links = Vec::new();
     // one link per declaration: a constructor's sites together, each to its providers
@@ -728,7 +830,7 @@ mod tests {
         open.insert(PathBuf::from(path), Arc::from(text));
     }
 
-    fn pass(s: &mut State, path: &str, rev: u64, open: &HashMap<PathBuf, Arc<str>>) -> FileXref {
+    fn pass(s: &State, path: &str, rev: u64, open: &HashMap<PathBuf, Arc<str>>) -> FileXref {
         let path = Path::new(path);
         let text = open[path].clone();
         let targets: Vec<((Option<String>, String), usize)> = crate::kotlin::scan_file(path, &text)
@@ -787,9 +889,9 @@ mod tests {
         let (a, u) = ("/p/A.kt", "/p/U.kt");
         let use_a = "package a\nfun zz(x: A) = 1\n";
         let (shared, mut open) = project(&[(a, "package a\nclass A\n"), (u, use_a)]);
-        let mut s = State::new(shared.clone(), None);
+        let s = State::new(shared.clone(), None);
         assert_eq!(
-            meaning(&pass(&mut s, u, 1, &open), &open, u, "A", 1),
+            meaning(&pass(&s, u, 1, &open), &open, u, "A", 1),
             "/p/A.kt:2"
         );
         // a checkout in a terminal moved A; the project is opened again (a fresh index, the
@@ -799,17 +901,152 @@ mod tests {
         shared.settle();
         open = again;
         assert_eq!(
-            meaning(&pass(&mut s, u, 1, &open), &open, u, "A", 1),
+            meaning(&pass(&s, u, 1, &open), &open, u, "A", 1),
             "/p/A.kt:5"
         );
-        // same version number, other text: worked out again
+    }
+
+    #[test]
+    fn a_tab_with_other_text_at_the_same_version_is_worked_out_again() {
+        let (a, u) = ("/p/A.kt", "/p/U.kt");
+        let (shared, mut open) = project(&[
+            (a, "package a\nclass A\n"),
+            (u, "package a\nfun zz(x: A) = 1\n"),
+        ]);
+        let s = State::new(shared, None);
+        assert_eq!(
+            meaning(&pass(&s, u, 1, &open), &open, u, "A", 1),
+            "/p/A.kt:2"
+        );
+        // the index did not change, the tab's text did (a tab opened again)
         open.insert(
             PathBuf::from(u),
             Arc::from("package a\n\n\n\nfun zz(x: A) = 1\n"),
         );
         assert_eq!(
-            meaning(&pass(&mut s, u, 1, &open), &open, u, "A", 1),
-            "/p/A.kt:5"
+            meaning(&pass(&s, u, 1, &open), &open, u, "A", 1),
+            "/p/A.kt:2"
+        );
+    }
+
+    #[test]
+    fn a_kept_result_follows_a_package_or_visibility_change_elsewhere() {
+        let (f, u) = ("/p/F.kt", "/p/U.kt");
+        let (shared, mut open) = project(&[
+            (f, "package b\nclass Foo\n"),
+            (u, "package a\nfun zz() = Foo()\n"),
+        ]);
+        let s = State::new(shared.clone(), None);
+        assert_eq!(meaning(&pass(&s, u, 1, &open), &open, u, "Foo", 1), "-");
+        // only the `package` line of the other file changes
+        change(&shared, &mut open, f, "package a\nclass Foo\n");
+        assert_eq!(
+            meaning(&pass(&s, u, 1, &open), &open, u, "Foo", 1),
+            "/p/F.kt:2"
+        );
+        change(&shared, &mut open, f, "package a\nprivate class Foo\n");
+        assert_eq!(
+            meaning(&pass(&s, u, 1, &open), &open, u, "Foo", 1),
+            "-",
+            "private to its file"
+        );
+    }
+
+    #[test]
+    fn a_kept_result_follows_a_change_to_a_supertype_file_it_read() {
+        let u = "/p/U.kt";
+        let (shared, mut open) = project(&[
+            (
+                "/p/Base.kt",
+                "package a\nopen class Base {\n    open fun go() = 1\n}\n",
+            ),
+            (
+                "/p/Other.kt",
+                "package a\nopen class Other {\n    open fun go() = 2\n}\n",
+            ),
+            ("/p/M.kt", "package a\nopen class M : Base()\n"),
+            ("/p/C.kt", "package a\nclass C : M()\n"),
+            (u, "package a\nfun zz(c: C) = c.go()\n"),
+        ]);
+        let s = State::new(shared.clone(), None);
+        assert_eq!(
+            meaning(&pass(&s, u, 1, &open), &open, u, "go", 1),
+            "/p/Base.kt:3"
+        );
+        // the class between C and the member changes its supertype; U spells neither
+        change(
+            &shared,
+            &mut open,
+            "/p/M.kt",
+            "package a\nopen class M : Other()\n",
+        );
+        assert_eq!(
+            meaning(&pass(&s, u, 1, &open), &open, u, "go", 1),
+            "/p/Other.kt:3"
+        );
+    }
+
+    #[test]
+    fn a_name_whose_file_is_deleted_means_nothing_any_more() {
+        let (f, u) = ("/p/F.kt", "/p/U.kt");
+        let (shared, mut open) = project(&[
+            (f, "package a\nclass Foo\n"),
+            (u, "package a\nfun zz() = Foo()\n"),
+        ]);
+        let s = State::new(shared.clone(), None);
+        assert_eq!(
+            meaning(&pass(&s, u, 1, &open), &open, u, "Foo", 1),
+            "/p/F.kt:2"
+        );
+        shared.change(move |i| i.remove(Path::new(f)));
+        shared.settle();
+        open.remove(Path::new(f));
+        assert_eq!(meaning(&pass(&s, u, 1, &open), &open, u, "Foo", 1), "-");
+    }
+
+    #[test]
+    fn a_kept_result_shares_its_names_and_usages_not_a_copy() {
+        let u = "/p/U.kt";
+        let (shared, open) = project(&[(u, "package a\nclass A\nfun zz(x: A) = 1\n")]);
+        let s = State::new(shared, None);
+        let (one, two) = (pass(&s, u, 1, &open), pass(&s, u, 2, &open));
+        assert!(Arc::ptr_eq(&one.refs, &two.refs));
+        assert!(Arc::ptr_eq(&one.usages, &two.usages));
+    }
+
+    #[test]
+    fn a_request_someone_waits_for_runs_between_chunks_of_a_long_pass() {
+        use std::sync::atomic::AtomicBool;
+        let mut x = Xref::start(Shared::default(), None);
+        let served = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = channel();
+        let flag = served.clone();
+        x.submit(FILE, move |s, stale| {
+            let (texts, cache) = (Texts::default(), Cache::default());
+            let t = Instant::now();
+            // chunk after chunk until the request ran (or ten seconds went by)
+            let _ = in_chunks(s, &texts, &cache, stale, |_| {
+                std::thread::sleep(Duration::from_millis(1));
+                flag.load(Ordering::SeqCst) || t.elapsed() > Duration::from_secs(10)
+            });
+            let _ = done_tx.send(flag.load(Ordering::SeqCst));
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let (tx, rx) = channel();
+        let flag = served.clone();
+        x.submit("find", move |_, _| {
+            flag.store(true, Ordering::SeqCst);
+            let _ = tx.send(());
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(()),
+            "answered before the pass ended"
+        );
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(15)),
+            Ok(true),
+            "the pass went on after it"
         );
     }
 
@@ -824,7 +1061,7 @@ mod tests {
         let holder =
             "package a\nclass Holder @Inject constructor(@Named(\"a\") val value: String)\n";
         let (shared, mut open) = project(&[(m, &module("a")), (h, holder)]);
-        let mut s = State::new(shared.clone(), None);
+        let s = State::new(shared.clone(), None);
         let links = |x: &FileXref| -> Vec<String> {
             x.hilt
                 .iter()
@@ -832,33 +1069,33 @@ mod tests {
                 .map(|l| l.title.clone())
                 .collect()
         };
-        assert_eq!(links(&pass(&mut s, h, 1, &open)), ["Dependencies: String"]);
+        assert_eq!(links(&pass(&s, h, 1, &open)), ["Dependencies: String"]);
         change(&shared, &mut open, m, &module("b"));
         assert!(
-            links(&pass(&mut s, h, 1, &open)).is_empty(),
+            links(&pass(&s, h, 1, &open)).is_empty(),
             "@Named(\"b\") is not what it asks for"
         );
         change(&shared, &mut open, m, &module("a"));
-        assert_eq!(links(&pass(&mut s, h, 1, &open)), ["Dependencies: String"]);
+        assert_eq!(links(&pass(&s, h, 1, &open)), ["Dependencies: String"]);
     }
 
     #[test]
     fn a_name_declared_later_is_found() {
         let u = "/p/U.kt";
         let (shared, mut open) = project(&[(u, "package a\nfun zz() = Foo()\n")]);
-        let mut s = State::new(shared.clone(), None);
-        assert_eq!(meaning(&pass(&mut s, u, 1, &open), &open, u, "Foo", 1), "-");
+        let s = State::new(shared.clone(), None);
+        assert_eq!(meaning(&pass(&s, u, 1, &open), &open, u, "Foo", 1), "-");
         // an unrelated change keeps the kept result
         change(&shared, &mut open, "/p/B.kt", "package a\nclass Bar\n");
-        let kept = s.done[Path::new(u)].generation;
-        pass(&mut s, u, 1, &open);
+        let kept = s.done.borrow()[Path::new(u)].generation;
+        pass(&s, u, 1, &open);
         assert!(
-            s.done[Path::new(u)].generation > kept,
+            s.done.borrow()[Path::new(u)].generation > kept,
             "reused, now known good later"
         );
         change(&shared, &mut open, "/p/F.kt", "package a\nclass Foo\n");
         assert_eq!(
-            meaning(&pass(&mut s, u, 1, &open), &open, u, "Foo", 1),
+            meaning(&pass(&s, u, 1, &open), &open, u, "Foo", 1),
             "/p/F.kt:2"
         );
     }
@@ -873,10 +1110,10 @@ mod tests {
         let (shared, open) = project(&[(a, &text)]);
         let mut long = State::new(shared.clone(), None);
         long.budget = Duration::from_secs(60);
-        let one = pass(&mut long, a, 1, &open);
+        let one = pass(&long, a, 1, &open);
         let mut short = State::new(shared, None);
         short.budget = Duration::ZERO;
-        let other = pass(&mut short, a, 1, &open);
+        let other = pass(&short, a, 1, &open);
         assert_eq!(format!("{:?}", one.refs), format!("{:?}", other.refs));
         assert_eq!(one.usages[&(None, "A".to_string())].len(), 80);
         assert_eq!(other.usages[&(None, "A".to_string())].len(), 80);
@@ -896,8 +1133,9 @@ mod tests {
             let _reply = tx;
             panic!("a bug in a task");
         });
-        assert!(
-            rx.recv_timeout(Duration::from_secs(10)).is_err(),
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
             "its reply closes, nobody waits forever"
         );
         let (tx, rx) = channel();
@@ -916,7 +1154,10 @@ mod tests {
         });
         x.cancel_all();
         gate_tx.send(()).unwrap();
-        assert!(rx.recv_timeout(Duration::from_secs(10)).is_err());
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        );
     }
 
     /// The pass over the biggest files of a real project: time, and the longest the index's
@@ -944,7 +1185,7 @@ mod tests {
             .map(|f| (std::fs::metadata(f).map_or(0, |m| m.len()), f.clone()))
             .collect();
         by_size.sort();
-        let mut state = State::new(index.clone(), None);
+        let state = State::new(index.clone(), None);
         // what the editor does on its thread per request: copy the file list, look a name up
         let t = Instant::now();
         let copy: Vec<PathBuf> = files
@@ -979,7 +1220,7 @@ mod tests {
             LONGEST_LOCK.store(0, Ordering::Relaxed);
             let t = Instant::now();
             let r = file_pass(
-                &mut state,
+                &state,
                 path,
                 1,
                 text.clone(),
@@ -1011,7 +1252,7 @@ mod tests {
             // the same file again: from the kept result
             let t = Instant::now();
             file_pass(
-                &mut state,
+                &state,
                 path,
                 1,
                 text,

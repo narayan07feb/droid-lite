@@ -337,8 +337,7 @@ impl App {
             self.status = format!("Cannot write {}: {e}", path.display());
             return false;
         }
-        let (ip, it) = (path.to_owned(), text.to_owned());
-        self.index.change(move |i| i.update(&ip, &it));
+        self.index.update(path, text);
         if let Some(t) = self.tabs.iter_mut().find(|t| t.path == path) {
             t.text = text.to_string();
             t.saved = text.to_string();
@@ -366,8 +365,7 @@ impl App {
         let p = from.to_owned();
         self.index.change(move |i| i.remove(&p));
         if let Ok(text) = std::fs::read_to_string(to) {
-            let (ip, it) = (to.to_owned(), (text).to_owned());
-            self.index.change(move |i| i.update(&ip, &it));
+            self.index.update(to, &text);
         }
     }
 
@@ -419,8 +417,7 @@ impl App {
                 t.goto = Some(t.cursor);
                 t.reanalyse();
                 let (path, text) = (t.path.clone(), t.text.clone());
-                let (ip, it) = ((path).to_owned(), (text).to_owned());
-                self.index.change(move |i| i.update(&ip, &it));
+                self.index.put(path.clone(), t.syms.clone());
                 if let Some(l) = self.lsp.as_mut() {
                     l.did_change(&path, &text);
                 }
@@ -612,8 +609,7 @@ impl App {
                 if done {
                     let t = &self.tabs[self.active];
                     let (path, text) = (t.path.clone(), t.text.clone());
-                    let (ip, it) = ((path).to_owned(), (text).to_owned());
-                    self.index.change(move |i| i.update(&ip, &it));
+                    self.index.put(path.clone(), t.syms.clone());
                     if let Some(l) = self.lsp.as_mut() {
                         l.did_change(&path, &text);
                     }

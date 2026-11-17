@@ -56,7 +56,21 @@ impl Shared {
             .push(Box::new(f));
         self.flush();
     }
-    /// Applies the queued changes if the index is free; returns whether none are left.
+    /// A file's text changed: its symbols are read here, before queueing, so the index's lock
+    /// is held only to put them in.
+    pub fn update(&self, path: &Path, text: &str) {
+        if is_code(path) {
+            self.put(path.to_path_buf(), scan_file(path, text));
+        }
+    }
+    /// [`Shared::update`] with the symbols already read (a tab read them for its own use).
+    pub fn put(&self, path: PathBuf, syms: FileSyms) {
+        if is_code(&path) {
+            self.change(move |i| i.insert_scanned(path, syms));
+        }
+    }
+    /// Applies the queued changes if the index is free; returns whether none are left. The
+    /// queue is let go before they run: queueing another never waits for them.
     pub fn flush(&self) -> bool {
         let mut queue = self.1.lock().unwrap_or_else(|e| e.into_inner());
         if queue.is_empty() {
@@ -67,7 +81,9 @@ impl Shared {
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return false,
         };
-        for f in queue.drain(..) {
+        let changes = std::mem::take(&mut *queue);
+        drop(queue);
+        for f in changes {
             f(&mut index);
         }
         true
@@ -729,6 +745,42 @@ pub fn rank_by<T>(
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn a_change_queued_while_changes_apply_does_not_wait_for_them() {
+        let shared = Shared::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let inner = shared.clone();
+        std::thread::spawn(move || {
+            let again = inner.clone();
+            // a change that queues another while it runs (the editor queueing during a flush)
+            inner.change(move |_| again.change(|i| i.generation += 100));
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+            "queueing waited for the changes being applied"
+        );
+        shared.settle();
+        assert!(
+            shared.read().generation >= 100,
+            "the second change went in too"
+        );
+    }
+
+    #[test]
+    fn put_takes_symbols_read_before_queueing() {
+        let shared = Shared::default();
+        let p = Path::new("/p/A.kt");
+        shared.put(p.to_path_buf(), scan_file(p, "package a\nclass A\n"));
+        shared.update(Path::new("/p/notes.txt"), "class B\n");
+        shared.settle();
+        assert_eq!(shared.read().named("A").count(), 1);
+        assert!(
+            !shared.read().files.contains_key(Path::new("/p/notes.txt")),
+            "not code"
+        );
+    }
 
     #[test]
     fn a_replaced_index_tells_nothing_about_changes_since_the_old_one() {

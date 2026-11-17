@@ -218,9 +218,38 @@ fn prune_soon() {
     if last == 0 || now.abs_diff(last) > 60_000 {
         LAST.store(now, std::sync::atomic::Ordering::Relaxed);
         if let Some(root) = history_root() {
-            // it reads every history folder: never on the window's thread
-            super::saver::run(move || prune_all(&root, HISTORY_CAP));
+            // it reads every history folder: never on the window's thread, nor on the save
+            // thread (a save, quitting and a refactor wait for that one)
+            in_background(move || prune_all(&root, HISTORY_CAP));
         }
+    }
+}
+
+/// Runs `job` on its own low-priority thread, one job at a time in the order they were sent.
+/// A job that panics does not stop the thread.
+fn in_background(job: impl FnOnce() + Send + 'static) {
+    type Job = Box<dyn FnOnce() + Send>;
+    static QUEUE: std::sync::OnceLock<Option<std::sync::mpsc::Sender<Job>>> =
+        std::sync::OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("droid-lite-prune".into())
+            .spawn(move || {
+                // background priority: the disk and the CPU go to everything else first
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    libc::setpriority(libc::PRIO_DARWIN_THREAD, 0, libc::PRIO_DARWIN_BG);
+                }
+                for job in rx {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    });
+    if let Some(q) = queue {
+        let _ = q.send(Box::new(job));
     }
 }
 
@@ -815,6 +844,29 @@ mod tests {
             record_history(Path::new("/nonexistent/droid-lite/A.kt")).is_ok(),
             "nothing to keep"
         );
+    }
+
+    #[test]
+    fn a_save_never_waits_behind_pruning() {
+        let (gate_tx, gate) = std::sync::mpsc::channel::<()>();
+        let (ran_tx, ran) = std::sync::mpsc::channel();
+        // a prune that takes long
+        in_background(move || {
+            let _ = gate.recv_timeout(std::time::Duration::from_secs(20));
+            let _ = ran_tx.send(());
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            super::super::saver::wait();
+            let _ = tx.send(());
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(()),
+            "the save thread was free"
+        );
+        gate_tx.send(()).unwrap();
+        assert_eq!(ran.recv_timeout(std::time::Duration::from_secs(10)), Ok(()));
     }
 
     #[test]

@@ -192,9 +192,7 @@ fn usages_and_definitions(p: &Project) -> (Score, f64) {
 /// A provider is right when its "injected in" places are the graph's and each of those places
 /// links back to exactly this provider.
 fn hilt(p: &Project) -> f64 {
-    let texts = crate::resolve::Texts {
-        open: HashMap::new(),
-    };
+    let texts = crate::resolve::Texts::default();
     let r = crate::resolve::Resolver::new(&p.index, &texts);
     let mut graph = crate::resolve::HiltGraph::default();
     let t = std::time::Instant::now();
@@ -317,9 +315,7 @@ mod engine {
 
     fn texts() -> &'static Texts {
         static T: std::sync::OnceLock<Texts> = std::sync::OnceLock::new();
-        T.get_or_init(|| Texts {
-            open: HashMap::new(),
-        })
+        T.get_or_init(Texts::default)
     }
 
     /// Places that use the declaration at `offset` of `path` (not the declaration itself).
@@ -387,9 +383,7 @@ fn debug_one_place() {
         return;
     };
     let p = open(&std::fs::canonicalize(&root).unwrap());
-    let texts = crate::resolve::Texts {
-        open: HashMap::new(),
-    };
+    let texts = crate::resolve::Texts::default();
     let r = crate::resolve::Resolver::new(&p.index, &texts);
     for w in what.split(',') {
         let mut it = w.rsplitn(3, ':');
@@ -434,9 +428,7 @@ fn debug_hilt_file() {
         return;
     };
     let p = open(&std::fs::canonicalize(&root).unwrap());
-    let texts = crate::resolve::Texts {
-        open: HashMap::new(),
-    };
+    let texts = crate::resolve::Texts::default();
     let r = crate::resolve::Resolver::new(&p.index, &texts);
     for rel in what.split(',') {
         let h = r.hilt_file(&p.root.join(rel));

@@ -95,18 +95,53 @@ struct Tab {
     rev: u64,
 }
 
+/// A text version no tab had before: a tab opened again never repeats one, so a result worked
+/// out for an older text of its file is never taken for this one.
+fn new_rev() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Tab {
+    fn open(path: &Path, text: String) -> Tab {
+        Tab {
+            path: path.to_path_buf(),
+            saved: text.clone(),
+            text,
+            syms: FileSyms::default(),
+            lints: Vec::new(),
+            diagnostics: Vec::new(),
+            cache: None,
+            recolor: false,
+            dirty_since: None,
+            goto: None,
+            cursor: 0,
+            selection: 0..0,
+            disk_changed: false,
+            deleted: false,
+            unreadable: None,
+            readonly: crate::libs::is_archive_path(path),
+            git: Default::default(),
+            diff: Default::default(),
+            rev: new_rev(),
+            annotations: None,
+            select: None,
+            caret: None,
+            bracket: (u64::MAX, 0, None),
+        }
+    }
+
     fn dirty(&self) -> bool {
         self.text != self.saved
     }
     /// The text changed: caches key on `rev`; analysis follows after a typing pause.
     fn mark_edited(&mut self) {
-        self.rev += 1;
+        self.rev = new_rev();
         self.dirty_since = Some(Instant::now());
     }
 
     fn reanalyse(&mut self) {
-        self.rev += 1;
+        self.rev = new_rev();
         self.syms = crate::kotlin::scan_file(&self.path, &self.text);
         self.lints = if is_code(&self.path) {
             compose::lint(&self.text, &self.syms)
@@ -728,8 +763,7 @@ impl App {
         remember_project(&project.root);
         self.index.set(index);
         for t in &self.tabs {
-            let (ip, it) = ((t.path).to_owned(), (t.text).to_owned());
-            self.index.change(move |i| i.update(&ip, &it));
+            self.index.update(&t.path, &t.text);
         }
         self.branch = branch;
         self.reload_stability(&project, ctx);
@@ -815,31 +849,7 @@ impl App {
                 self.status = format!("Cannot read {}", path.display());
                 return;
             };
-            let mut tab = Tab {
-                path: path.to_path_buf(),
-                saved: text.clone(),
-                text,
-                syms: FileSyms::default(),
-                lints: Vec::new(),
-                diagnostics: Vec::new(),
-                cache: None,
-                recolor: false,
-                dirty_since: None,
-                goto: None,
-                cursor: 0,
-                selection: 0..0,
-                disk_changed: false,
-                deleted: false,
-                unreadable: None,
-                readonly: crate::libs::is_archive_path(path),
-                git: Default::default(),
-                diff: Default::default(),
-                rev: 0,
-                annotations: None,
-                select: None,
-                caret: None,
-                bracket: (u64::MAX, 0, None),
-            };
+            let mut tab = Tab::open(path, text);
             tab.reanalyse();
             if let Some(l) = self.lsp.as_mut().filter(|_| is_code(path)) {
                 l.did_open(path, &tab.text);
@@ -933,8 +943,7 @@ impl App {
                         if !self.previews.saved.contains(&d.path) {
                             self.previews.saved.push(d.path.clone());
                         }
-                        let (ip, it) = ((d.path).to_owned(), (d.text).to_owned());
-                        self.index.change(move |i| i.update(&ip, &it));
+                        self.index.update(&d.path, &d.text);
                         if let Some(l) = self.lsp.as_mut() {
                             l.did_save(&d.path);
                         }
@@ -1649,8 +1658,7 @@ impl App {
                 continue;
             }
             t.reanalyse();
-            let (ip, it) = ((t.path).to_owned(), (t.text).to_owned());
-            self.index.change(move |i| i.update(&ip, &it));
+            self.index.put(t.path.clone(), t.syms.clone());
             if let Some(l) = self.lsp.as_mut() {
                 l.did_change(&t.path, &t.text);
             }
@@ -1873,8 +1881,7 @@ impl App {
         t.caret = Some(cursor.min(t.text.len()));
         t.reanalyse();
         let (path, text) = (t.path.clone(), t.text.clone());
-        let (ip, it) = ((path).to_owned(), (text).to_owned());
-        self.index.change(move |i| i.update(&ip, &it));
+        self.index.put(path.clone(), t.syms.clone());
         if let Some(l) = self.lsp.as_mut() {
             l.did_change(&path, &text);
         }
@@ -3463,8 +3470,8 @@ impl App {
         t.goto = Some(cursor);
         t.reanalyse();
         let path = t.path.clone();
-        let (ip, it) = ((path).to_owned(), (self.tabs[self.active].text).to_owned());
-        self.index.change(move |i| i.update(&ip, &it));
+        self.index
+            .put(path.clone(), self.tabs[self.active].syms.clone());
         if let Some(l) = self.lsp.as_mut() {
             l.did_change(&path, &self.tabs[self.active].text);
         }
@@ -5191,6 +5198,27 @@ mod tests {
             assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
         }
         assert!(write_atomic(Path::new(&file), &[b'n'; 100]).is_err());
+    }
+
+    #[test]
+    fn a_tab_opened_again_never_repeats_a_text_version_of_the_old_one() {
+        let p = Path::new("/p/A.kt");
+        let mut old = Tab::open(p, "class A\n".into());
+        old.reanalyse();
+        let mut seen = vec![old.rev];
+        old.mark_edited();
+        seen.push(old.rev);
+        old.reanalyse();
+        seen.push(old.rev);
+        // closed; the file changed on disk; opened again
+        let mut again = Tab::open(p, "class B\n".into());
+        assert!(!seen.contains(&again.rev));
+        again.reanalyse();
+        assert!(
+            !seen.contains(&again.rev),
+            "{} is one of {seen:?}",
+            again.rev
+        );
     }
 
     #[test]

@@ -58,8 +58,9 @@ pub(super) struct Annotations {
 pub(super) struct DeclUsages {
     /// File, text version and index generation it was counted for.
     key: (std::path::PathBuf, u64, u64),
-    /// By container and name, so the counts stay on screen while a newer count runs.
-    pub(super) by_decl: HashMap<(Option<String>, String), Vec<Hit>>,
+    /// By container and name, so the counts stay on screen while a newer count runs; shared
+    /// with the worker's result, not copied.
+    pub(super) by_decl: std::sync::Arc<super::xref::Usages>,
 }
 
 /// Whether a declaration gets a usages link: not overrides (their callers go through the
