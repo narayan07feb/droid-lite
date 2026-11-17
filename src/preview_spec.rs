@@ -24,17 +24,108 @@ pub struct Spec {
     pub locale: Option<String>,
     /// `device = "spec:width=411dp,height=891dp"` or `Devices.PIXEL_5`, as written.
     pub device: Option<String>,
+    /// The function's `@PreviewParameter`: the worker draws one picture per value of its provider.
+    pub param: Option<Param>,
+}
+
+/// `@PreviewParameter(Provider::class, limit = 3) name: Type` on a preview function's parameter.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Param {
+    /// The provider class, fully qualified (from the imports or the file's package).
+    pub provider: String,
+    pub limit: Option<u32>,
+    /// The parameter's type as written (`ChatData`, `List<Item>`).
+    pub type_name: String,
 }
 
 impl Spec {
     /// What the worker reads for one picture.
     pub fn json(&self) -> serde_json::Value {
+        let p = self.param.as_ref();
         serde_json::json!({
             "function": self.function, "title": self.title, "night": self.night,
             "fontScale": self.font_scale, "widthDp": self.width_dp, "heightDp": self.height_dp,
             "showBackground": self.show_background, "background": self.background,
             "locale": self.locale, "device": self.device,
+            "provider": p.map(|p| &p.provider), "limit": p.and_then(|p| p.limit),
+            "paramType": p.map(|p| &p.type_name),
         })
+    }
+}
+
+/// The index of the `)` that closes the `(` at `open` (strings skipped).
+fn closing(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut in_str = false;
+    for (n, c) in text.bytes().enumerate().skip(open) {
+        match c {
+            b'"' => in_str = !in_str,
+            b'(' if !in_str => depth += 1,
+            b')' if !in_str => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(n);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The `@PreviewParameter` of the function declared at `fun_at` (the offset of its `fun`), like
+/// Android Studio reads it: the provider (its full name from the file's imports, else its package),
+/// `limit`, and the parameter's type.
+pub fn preview_parameter(text: &str, fun_at: usize) -> Option<Param> {
+    let open = fun_at + text.get(fun_at..)?.find('(')?;
+    let params = &text[open + 1..closing(text, open)?];
+    let at = params.find("PreviewParameter(")?;
+    let args_open = at + "PreviewParameter".len();
+    let args_close = closing(params, args_open)?;
+    let parts = parts(&params[args_open + 1..args_close]);
+    let named = |k: &str| parts.iter().find_map(|p| p.split_once('=').filter(|(n, _)| n.trim() == k).map(|(_, v)| v.trim()));
+    let provider = named("provider").or_else(|| parts.first().map(|p| p.trim()).filter(|p| !p.contains('=')))?;
+    let provider = provider.strip_suffix("::class")?.trim();
+    // `chatData: ChatData,` after the annotation: the type up to the next top-level `,` or `=`
+    let rest = &params[args_close + 1..];
+    let ty = rest.split_once(':').map_or("", |(_, t)| t);
+    let mut depth = 0;
+    let end = ty
+        .char_indices()
+        .find(|&(_, c)| {
+            match c {
+                '<' | '(' => depth += 1,
+                '>' | ')' => depth -= 1,
+                _ => {}
+            }
+            depth == 0 && (c == ',' || c == '=')
+        })
+        .map_or(ty.len(), |(i, _)| i);
+    Some(Param {
+        provider: full_name(text, provider),
+        limit: named("limit").and_then(number).map(|n| n as u32),
+        type_name: ty[..end].trim().to_string(),
+    })
+}
+
+/// The full name of a class named `name` in `text`: through an import of its first part (an
+/// `as` alias too), as written when already qualified, else in the file's package.
+fn full_name(text: &str, name: &str) -> String {
+    let (first, rest) = name.split_once('.').unwrap_or((name, ""));
+    let dotted = |base: &str| if rest.is_empty() { base.to_string() } else { format!("{base}.{rest}") };
+    for l in text.lines().map(str::trim) {
+        let Some(i) = l.strip_prefix("import ") else { continue };
+        let (path, alias) = i.split_once(" as ").map_or((i.trim(), None), |(p, a)| (p.trim(), Some(a.trim())));
+        if alias.unwrap_or_else(|| path.rsplit('.').next().unwrap_or("")) == first {
+            return dotted(path);
+        }
+    }
+    if first.starts_with(|c: char| c.is_lowercase()) {
+        return name.to_string();
+    }
+    match crate::preview_src::package_of(text) {
+        p if p.is_empty() => name.to_string(),
+        p => format!("{p}.{name}"),
     }
 }
 
@@ -114,6 +205,16 @@ pub fn annotations_before(text: &str, offset: usize) -> String {
 /// `key = value` pairs of annotation arguments.
 fn args(a: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
+    for p in parts(a) {
+        if let Some((k, v)) = p.split_once('=') {
+            out.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    out
+}
+
+/// Annotation arguments split at their top-level commas.
+fn parts(a: &str) -> Vec<String> {
     let mut depth = 0;
     let mut in_str = false;
     let mut part = String::new();
@@ -132,12 +233,7 @@ fn args(a: &str) -> HashMap<String, String> {
         part.push(c);
     }
     parts.push(part);
-    for p in parts {
-        if let Some((k, v)) = p.split_once('=') {
-            out.insert(k.trim().to_string(), v.trim().to_string());
-        }
-    }
-    out
+    parts
 }
 
 fn string(v: &str) -> Option<String> {
@@ -337,5 +433,23 @@ mod tests {
         assert_eq!(classes.len(), 1);
         assert_eq!(classes[0].0, "ThemePreviews");
         assert_eq!(annotations(&classes[0].1).len(), 2);
+    }
+
+    #[test]
+    fn a_preview_parameter_gives_its_provider_by_full_name_its_limit_and_the_parameter_type() {
+        let src = "package a.ui.fragment\n\nimport a.ui.preview.ChatProvider\nimport a.other.Outer\nimport a.x.Long as Short\n\n@Preview(showBackground = true)\n@Composable\nprivate fun ChatPreview(\n    @PreviewParameter(ChatProvider::class) chatData: ChatData,\n) = Theme { }\n\n@Preview\n@Composable\nfun Few(@PreviewParameter(provider = Local::class, limit = 2) items: List<Pair<Int, String>>, x: Int = 1) {}\n\n@Preview\n@Composable\nfun Nested(@PreviewParameter(Outer.Inner::class, limit = 0x3) n: Int) {}\n\n@Preview\n@Composable\nfun Aliased(@PreviewParameter(Short::class) s: String) {}\n\n@Preview\n@Composable\nfun Qualified(@androidx.compose.ui.tooling.preview.PreviewParameter(b.c.P::class) s: String?) {}\n\n@Preview\n@Composable\nfun Plain(x: Int = 1) {}\n";
+        let at = |f: &str| src.find(&format!("fun {f}(")).unwrap();
+        let chat = preview_parameter(src, at("ChatPreview")).unwrap();
+        assert_eq!(chat, Param { provider: "a.ui.preview.ChatProvider".into(), limit: None, type_name: "ChatData".into() }, "from the import");
+        let few = preview_parameter(src, at("Few")).unwrap();
+        assert_eq!(few, Param { provider: "a.ui.fragment.Local".into(), limit: Some(2), type_name: "List<Pair<Int, String>>".into() }, "same package, named arguments");
+        assert_eq!(preview_parameter(src, at("Nested")).unwrap().provider, "a.other.Outer.Inner", "a nested class through its outer class's import");
+        assert_eq!(preview_parameter(src, at("Nested")).unwrap().limit, Some(3));
+        assert_eq!(preview_parameter(src, at("Aliased")).unwrap().provider, "a.x.Long", "an import alias");
+        let q = preview_parameter(src, at("Qualified")).unwrap();
+        assert_eq!((q.provider.as_str(), q.type_name.as_str()), ("b.c.P", "String?"), "a qualified name as written");
+        assert_eq!(preview_parameter(src, at("Plain")), None, "no @PreviewParameter");
+        let json = Spec { param: Some(few), ..Default::default() }.json();
+        assert_eq!((json["provider"].as_str(), json["limit"].as_u64()), (Some("a.ui.fragment.Local"), Some(2)), "the worker reads them");
     }
 }

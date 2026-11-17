@@ -544,18 +544,27 @@ public class PreviewWorker {
         // code and the open file live in this loader
         try (URLClassLoader loader = new URLClassLoader(urls.toArray(URL[]::new), PreviewWorker.class.getClassLoader())) {
             Class<?> c = loader.loadClass(r.cls);
+            Thread.currentThread().setContextClassLoader(loader);
             StringBuilder images = new StringBuilder();
+            List<Picture> pictures = pictures(r.previews, loader);
             int drawn = 0;
-            for (Map<String, Object> spec : r.previews) {
-                status(r, "Drawing " + (drawn + 1) + " of " + r.previews.size() + " previews", drawn, r.previews.size());
+            for (Picture pic : pictures) {
+                status(r, "Drawing " + (drawn + 1) + " of " + pictures.size() + " previews", drawn, pictures.size());
                 drawn++;
+                Map<String, Object> spec = pic.spec;
                 String fn = (String) spec.get("function");
-                String title = spec.get("title") instanceof String s ? s : fn;
+                String title = pic.title;
                 long t = System.nanoTime();
                 if (images.length() > 0) images.append(',');
+                if (pic.error != null) {
+                    images.append("{\"name\":").append(Json.str(title)).append(",\"error\":").append(Json.str(pic.error)).append('}');
+                    continue;
+                }
                 try {
-                    ComposableMethod m = ComposableMethodKt.getDeclaredComposableMethod(c, fn);
+                    ComposableMethod m = pic.values == null ? ComposableMethodKt.getDeclaredComposableMethod(c, fn)
+                        : ComposableMethodKt.getDeclaredComposableMethod(c, fn, parameterType(c, fn, (String) spec.get("paramType")));
                     m.asMethod().setAccessible(true);
+                    Object[] values = pic.values == null ? new Object[0] : pic.values;
                     Class<?> hostClass = hostDir == null ? null : loader.loadClass("droidlite.host.PreviewHostKt");
                     ComposableMethod hostMethod = hostClass == null ? null
                         : ComposableMethodKt.getDeclaredComposableMethod(hostClass, "PreviewHost", kotlin.jvm.functions.Function2.class);
@@ -564,7 +573,6 @@ public class PreviewWorker {
                     int w = intOf(spec.get("widthDp")), h = intOf(spec.get("heightDp"));
                     long bg = spec.get("background") instanceof Number b ? b.longValue()
                         : Boolean.TRUE.equals(spec.get("showBackground")) ? (Boolean.TRUE.equals(spec.get("night")) ? 0xFF000000L : 0xFFFFFFFFL) : 0L;
-                    Thread.currentThread().setContextClassLoader(loader);
                     sdk.prepare();
                     try {
                         // this picture's device (night mode, font scale, locale, screen size): it needs the
@@ -572,7 +580,7 @@ public class PreviewWorker {
                         sdk.unsafeUpdateConfig(deviceFor(spec), "android:Theme.Material.NoActionBar.Fullscreen",
                             com.android.ide.common.rendering.api.SessionParams.RenderingMode.SHRINK);
                         kotlin.jvm.functions.Function2<androidx.compose.runtime.Composer, Integer, kotlin.Unit> preview =
-                            (composer, changed) -> { m.invoke(composer, null); return kotlin.Unit.INSTANCE; };
+                            (composer, changed) -> { m.invoke(composer, null, values); return kotlin.Unit.INSTANCE; };
                         kotlin.jvm.functions.Function2<androidx.compose.runtime.Composer, Integer, kotlin.Unit> framed = frameMethod == null ? preview
                             : (composer, changed) -> { frameMethod.invoke(composer, null, w, h, bg, preview); return kotlin.Unit.INSTANCE; };
                         sdk.snapshot(hostMethod == null ? framed
@@ -593,6 +601,84 @@ public class PreviewWorker {
         } finally {
             deleteTree(out); // the classes of one request are not needed after it
         }
+    }
+
+    /** One card: a spec, drawn with these argument values (null: the function takes none), or an error. */
+    record Picture(Map<String, Object> spec, String title, Object[] values, String error) {}
+
+    /** At most this many values of one @PreviewParameter provider are drawn (each is a whole picture). */
+    static final int MAX_PARAMETER_VALUES = 20;
+
+    /** The cards of a request, like Android Studio: a spec whose function takes a @PreviewParameter is
+     *  one card per value of its provider, "<title> (1)", "<title> (2)"…; a provider that throws or
+     *  gives no values is one error card naming it. */
+    static List<Picture> pictures(List<Map<String, Object>> specs, ClassLoader loader) {
+        List<Picture> out = new ArrayList<>();
+        Map<String, Object> values = new HashMap<>(); // provider and limit -> its values or what went wrong
+        for (Map<String, Object> spec : specs) {
+            String title = spec.get("title") instanceof String s ? s : (String) spec.get("function");
+            if (!(spec.get("provider") instanceof String provider)) {
+                out.add(new Picture(spec, title, null, null));
+                continue;
+            }
+            int limit = spec.get("limit") instanceof Number n ? n.intValue() : Integer.MAX_VALUE;
+            Object got = values.computeIfAbsent(provider + "#" + limit, k -> {
+                try {
+                    List<Object> v = providerValues(loader, provider, limit);
+                    return v.isEmpty() ? "The PreviewParameterProvider " + provider + " gave no values." : v;
+                } catch (Throwable e) {
+                    return "The PreviewParameterProvider " + provider + " failed: " + trace(e);
+                }
+            });
+            if (got instanceof String error) {
+                out.add(new Picture(spec, title, null, error));
+                continue;
+            }
+            List<?> v = (List<?>) got;
+            for (int i = 0; i < v.size(); i++) out.add(new Picture(spec, title + " (" + (i + 1) + ")", new Object[] {v.get(i)}, null));
+        }
+        return out;
+    }
+
+    /** The provider's `values` (a Kotlin Sequence), at most `limit` and MAX_PARAMETER_VALUES. The
+     *  class by its full name, or a nested class (`Outer.Inner` is `Outer$Inner`). */
+    static List<Object> providerValues(ClassLoader loader, String provider, int limit) throws Exception {
+        Class<?> pc = null;
+        for (String name = provider; pc == null; ) {
+            try {
+                pc = Class.forName(name, true, loader);
+            } catch (ClassNotFoundException e) {
+                int dot = name.lastIndexOf('.');
+                if (dot < 0) throw new ClassNotFoundException(provider);
+                name = name.substring(0, dot) + "$" + name.substring(dot + 1);
+            }
+        }
+        var k = pc.getDeclaredConstructor();
+        k.setAccessible(true);
+        var getValues = pc.getMethod("getValues");
+        getValues.setAccessible(true);
+        Iterator<?> it = ((kotlin.sequences.Sequence<?>) getValues.invoke(k.newInstance())).iterator();
+        List<Object> out = new ArrayList<>();
+        while (out.size() < Math.min(limit, MAX_PARAMETER_VALUES) && it.hasNext()) out.add(it.next());
+        return out;
+    }
+
+    /** The JVM type of the preview function's @PreviewParameter (its first parameter), from the
+     *  compiled method: `Int` is int, a typealias its class. With several functions of that name, the
+     *  one whose type has the written type's simple name. */
+    static Class<?> parameterType(Class<?> c, String fn, String written) throws NoSuchMethodException {
+        String simple = written == null ? "" : written.replaceAll("<.*", "").replace("?", "").trim();
+        simple = simple.substring(simple.lastIndexOf('.') + 1);
+        Class<?> any = null;
+        for (var m : c.getDeclaredMethods()) {
+            if (!m.getName().equals(fn) || m.getParameterCount() < 2) continue;
+            Class<?> t = m.getParameterTypes()[0];
+            if (t == androidx.compose.runtime.Composer.class) continue;
+            if (t.getSimpleName().equals(simple)) return t;
+            if (any == null) any = t;
+        }
+        if (any == null) throw new NoSuchMethodException(c.getName() + "." + fn + " with a @PreviewParameter " + written);
+        return any;
     }
 
     static void deleteTree(Path p) {

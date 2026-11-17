@@ -500,6 +500,23 @@ mod tests {
     }
 
     #[test]
+    fn a_preview_parameter_provider_in_another_package_comes_with_the_open_file() {
+        let d = std::env::temp_dir().join(format!("dl-provider-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let screen = write(&d, "chat/src/main/kotlin/a/chat/ui/fragment/ChatScreen.kt",
+            "package a.chat.ui.fragment\n\nimport a.chat.ui.composable.preview.ChatProvider\nimport a.chat.domain.ChatData\n\n@Preview\n@Composable\nprivate fun ChatPreview(@PreviewParameter(ChatProvider::class) d: ChatData) {}\n");
+        let provider = write(&d, "chat/src/main/kotlin/a/chat/ui/composable/preview/ChatProvider.kt",
+            "package a.chat.ui.composable.preview\n\nimport a.chat.domain.ChatData\nimport a.chat.domain.addMessage\n\nclass ChatProvider : PreviewParameterProvider<ChatData> {\n    override val values = sequenceOf(ChatData().addMessage())\n}\n");
+        let sibling = write(&d, "chat/src/main/kotlin/a/chat/ui/composable/preview/OtherProvider.kt", "package a.chat.ui.composable.preview\n\nclass OtherProvider\n");
+        let data = write(&d, "chat/src/main/kotlin/a/chat/domain/ChatData.kt", "package a.chat.domain\n\nclass ChatData\n");
+        let utils = write(&d, "chat/src/main/kotlin/a/chat/domain/Utils.kt", "package a.chat.domain\n\nfun ChatData.addMessage() = this\n");
+        let pk = Packages::read(&[screen.clone(), provider.clone(), sibling, data.clone(), utils.clone()]);
+        let (files, _) = pk.closure(&screen, &std::fs::read_to_string(&screen).unwrap(), 10).unwrap();
+        assert_eq!(files, [data, utils, provider], "the provider and what it imports; not the rest of its package");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn java_static_imports_point_into_their_package() {
         assert_eq!(imports_of("import static co.b.views.Helper.show;\nimport a.B;\n"), ["co.b.views.Helper.show", "a.B"]);
     }

@@ -99,14 +99,18 @@ struct Own {
 }
 
 /// The pictures the file's preview functions ask for (Light and Dark, font scales, sizes…), from
-/// their annotations and the project's annotation classes.
+/// their annotations and the project's annotation classes; with the function's `@PreviewParameter`
+/// (the worker draws each picture once per value).
 fn specs_for(text: &str, functions: &[String], classes: &std::collections::HashMap<String, String>) -> Vec<crate::preview_spec::Spec> {
     functions
         .iter()
         .flat_map(|f| {
             let at = [format!("fun {f}("), format!("fun {f} (")].iter().find_map(|p| text.find(p.as_str()));
             let ann = at.map(|i| crate::preview_spec::annotations_before(text, i)).unwrap_or_default();
-            crate::preview_spec::specs(f, &ann, classes)
+            let param = at.and_then(|i| crate::preview_spec::preview_parameter(text, i));
+            let mut v = crate::preview_spec::specs(f, &ann, classes);
+            v.iter_mut().for_each(|s| s.param = param.clone());
+            v
         })
         .collect()
 }
@@ -1347,11 +1351,21 @@ fn fnv(s: &str) -> u64 {
     s.bytes().fold(0xcbf29ce484222325, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
 }
 
+/// Tests use short limits, except one that drives the real worker (`DROID_LITE_REAL_PREVIEW_DIR`).
+fn short_limits() -> bool {
+    cfg!(test) && std::env::var_os("DROID_LITE_REAL_PREVIEW_DIR").is_none()
+}
+
 /// How long the worker may be silent before it counts as hung: it sends a line at least every 10 s
 /// while a request is drawn or waits (a heartbeat during a long compile).
-const REPLY_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 120 });
+fn reply_timeout() -> Duration {
+    Duration::from_secs(if short_limits() { 1 } else { 120 })
+}
+
 /// The longest one request may take in all, heartbeats or not: past it the worker is stopped.
-const REQUEST_LIMIT: Duration = Duration::from_secs(if cfg!(test) { 4 } else { 10 * 60 });
+fn request_limit() -> Duration {
+    Duration::from_secs(if short_limits() { 4 } else { 10 * 60 })
+}
 
 /// Why [`ask`] got no answer.
 #[derive(Debug, PartialEq)]
@@ -1360,7 +1374,7 @@ enum NoAnswer {
     Replaced,
     /// The worker was silent past the reply timeout (it sends a line at least every 10 s, while our
     /// request is drawn or waits behind another client's draw), or the request took longer than
-    /// [`REQUEST_LIMIT`] in all: it hung.
+    /// [`request_limit`] in all: it hung.
     Silent(String),
     /// The connection ended or broke (the worker exited when idle, crashed, or sent garbage): connect
     /// again; another client may have started a fresh worker on the same socket, never stop that one.
@@ -1390,16 +1404,17 @@ fn ask(
         "key": own.map_or("", |o| o.key.as_str()),
     });
     writeln!(w, "{line}").map_err(lost)?;
-    // a worker that hangs is given up: no line at all (heartbeats count) for REPLY_TIMEOUT, or no
-    // answer in REQUEST_LIMIT
-    let until = Instant::now() + REQUEST_LIMIT;
+    // a worker that hangs is given up: no line at all (heartbeats count) for reply_timeout(), or no
+    // answer in request_limit()
+    let (reply_timeout, request_limit) = (reply_timeout(), request_limit());
+    let until = Instant::now() + request_limit;
     loop {
         let left = until.saturating_duration_since(Instant::now());
-        let over = || NoAnswer::Silent(format!("no answer in {} min", REQUEST_LIMIT.as_secs().div_ceil(60)));
+        let over = || NoAnswer::Silent(format!("no answer in {} min", request_limit.as_secs().div_ceil(60)));
         if left.is_zero() {
             return Err(over());
         }
-        rd.get_ref().set_read_timeout(Some(REPLY_TIMEOUT.min(left))).map_err(lost)?;
+        rd.get_ref().set_read_timeout(Some(reply_timeout.min(left))).map_err(lost)?;
         let mut reply = String::new();
         match rd.read_line(&mut reply) {
             Ok(0) => return Err(NoAnswer::Lost("the connection closed".into())),
@@ -1408,7 +1423,7 @@ fn ask(
                 if Instant::now() >= until {
                     return Err(over());
                 }
-                return Err(NoAnswer::Silent(format!("no answer in {} s", REPLY_TIMEOUT.as_secs())));
+                return Err(NoAnswer::Silent(format!("no answer in {} s", reply_timeout.as_secs())));
             }
             Err(e) => return Err(lost(e)),
         }
@@ -2325,5 +2340,74 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         assert_eq!(std::fs::read(&out).unwrap().len(), data.len());
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1, "no part left");
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// The real worker on a small project (not run by default: it needs the Gradle cache's Kotlin
+    /// 2.4.21 and Compose 1.10.4, and starts a JVM): `DROID_LITE_REAL_PREVIEW_DIR=/tmp/x/p cargo test
+    /// --release real_worker -- --ignored`. A @PreviewParameter provider in another package gives one
+    /// card per value (with `limit`, and under a multipreview), and one that throws an error card.
+    #[test]
+    #[ignore]
+    fn real_worker_draws_one_card_per_preview_parameter_value() {
+        let Some(pv) = std::env::var_os("DROID_LITE_REAL_PREVIEW_DIR").map(PathBuf::from) else { return };
+        let _lock = crate::app::test_lock();
+        let d = tmp("realparam");
+        let w = |rel: &str, text: &str| {
+            let p = d.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, text).unwrap();
+            p
+        };
+        w("gradle/libs.versions.toml", "[versions]\nkotlin = \"2.4.21\"\n\n[libraries]\nfoundation = { module = \"androidx.compose.foundation:foundation-android\", version = \"1.10.4\" }\ntooling = { module = \"androidx.compose.ui:ui-tooling-preview-android\", version = \"1.10.4\" }\n");
+        let cards = w("app/src/main/kotlin/demo/ui/Cards.kt", "package demo.ui\n\nimport androidx.compose.foundation.text.BasicText\nimport androidx.compose.runtime.Composable\nimport androidx.compose.ui.tooling.preview.Preview\nimport androidx.compose.ui.tooling.preview.PreviewLightDark\nimport androidx.compose.ui.tooling.preview.PreviewParameter\nimport demo.ui.preview.Boom\nimport demo.ui.preview.Names\n\n@Preview\n@Composable\nfun NamePreview(@PreviewParameter(Names::class) name: String) { BasicText(name) }\n\n@Preview\n@Composable\nfun FirstOnly(@PreviewParameter(Names::class, limit = 1) name: String) { BasicText(name) }\n\n@Preview\n@Composable\nfun BoomPreview(@PreviewParameter(Boom::class) n: Int) { BasicText(\"$n\") }\n\n@PreviewLightDark\n@Composable\nprivate fun Both(@PreviewParameter(Names::class) name: String) { BasicText(name) }\n\n@Preview\n@Composable\nfun Plain() { BasicText(\"plain\") }\n");
+        let providers = w("app/src/main/kotlin/demo/ui/preview/Providers.kt", "package demo.ui.preview\n\nimport androidx.compose.ui.tooling.preview.PreviewParameterProvider\n\nclass Names : PreviewParameterProvider<String> {\n    override val values = sequenceOf(\"Ana\", \"Bo\")\n}\n\nclass Boom : PreviewParameterProvider<Int> {\n    override val values: Sequence<Int> get() = error(\"no data\")\n}\n");
+        let vars = ["DROID_LITE_PREVIEW_DIR", "DROID_LITE_PREVIEW_WORKER", "DROID_LITE_PREVIEW_IDLE_SECS"];
+        let old: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        // SAFETY: the test lock is held, so no other test reads the environment meanwhile.
+        unsafe {
+            std::env::set_var(vars[0], &pv);
+            std::env::remove_var(vars[1]);
+            std::env::set_var(vars[2], "60");
+        }
+        let _ = std::fs::remove_dir_all(pv.join("cache")); // drawn by the worker, not a cached answer
+        let r = Request {
+            file: cards.clone(),
+            class: "demo.ui.CardsKt".into(),
+            previews: ["NamePreview", "FirstOnly", "BoomPreview", "Both", "Plain"].map(String::from).to_vec(),
+            seq: 1,
+            project: Some(ProjectRef { root: d.clone(), scripts: vec![], files: std::sync::Arc::new(vec![cards, providers]), changed: vec![] }),
+        };
+        let got = std::cell::RefCell::new(None);
+        State::default().draw(&r, &|e| match e {
+            Event::Done { cards, .. } => *got.borrow_mut() = Some(Ok(cards)),
+            Event::Failed { error, .. } => *got.borrow_mut() = Some(Err(error)),
+            _ => {}
+        });
+        for e in std::fs::read_dir(&pv).unwrap().flatten() {
+            if e.path().extension().is_some_and(|x| x == "sock") {
+                stop_worker(&e.path(), None, Duration::from_secs(2));
+            }
+        }
+        for (k, v) in vars.iter().zip(old) {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        let cards = got.into_inner().expect("an answer").expect("drawn");
+        let names: Vec<&str> = cards.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["NamePreview (1)", "NamePreview (2)", "FirstOnly (1)", "BoomPreview", "Both - Light (1)", "Both - Light (2)", "Both - Dark (1)", "Both - Dark (2)", "Plain"]);
+        for (n, c) in &cards {
+            if *n == "BoomPreview" {
+                let e = c.as_ref().err().expect("the provider threw");
+                assert!(e.contains("demo.ui.preview.Boom") && e.contains("no data"), "{e}");
+            } else {
+                assert!(c.is_ok(), "{n}: {:?}", c.as_ref().err());
+            }
+        }
+        // the two values are two different pictures
+        let png = |i: usize| cards[i].1.as_ref().unwrap().png.clone();
+        assert_ne!(png(0), png(1));
     }
 }
