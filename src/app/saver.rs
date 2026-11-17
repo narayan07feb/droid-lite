@@ -29,13 +29,20 @@ pub(super) fn run(job: impl FnOnce() + Send + 'static) {
     let _ = queue.send(Box::new(job));
 }
 
-/// Waits until every job sent before has run (on quit, so nothing is left half done).
+/// Waits until every job sent before has run (tests).
+#[cfg(test)]
 pub(super) fn wait() {
+    while !wait_for(std::time::Duration::from_secs(3600)) {}
+}
+
+/// Waits until every job sent before has run, `limit` at most: false when one still runs (a
+/// save to a slow or stuck disk).
+pub(super) fn wait_for(limit: std::time::Duration) -> bool {
     let (tx, rx) = channel();
     run(move || {
         let _ = tx.send(());
     });
-    let _ = rx.recv();
+    rx.recv_timeout(limit).is_ok()
 }
 
 /// What a tab had when ⌘S (or auto-save) was pressed.

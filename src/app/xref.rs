@@ -1193,18 +1193,25 @@ mod tests {
         let mut x = Xref::start(Shared::default(), None);
         let served = Arc::new(AtomicBool::new(false));
         let (done_tx, done_rx) = channel();
+        let (started_tx, started_rx) = channel();
         let flag = served.clone();
         x.submit(FILE, move |s, stale| {
             let (texts, cache) = (Texts::default(), Cache::default());
             let t = Instant::now();
             // chunk after chunk until the request ran (or ten seconds went by)
             let _ = in_chunks(s, &texts, &cache, stale, |_| {
+                let _ = started_tx.send(());
                 std::thread::sleep(Duration::from_millis(1));
                 flag.load(Ordering::SeqCst) || t.elapsed() > Duration::from_secs(10)
             });
             let _ = done_tx.send(flag.load(Ordering::SeqCst));
         });
-        std::thread::sleep(Duration::from_millis(50));
+        // the request is sent only once the pass is in its chunks
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(()),
+            "the pass started"
+        );
         let (tx, rx) = channel();
         let flag = served.clone();
         x.submit("find", move |_, _| {
@@ -1540,11 +1547,27 @@ mod tests {
             );
             (x.unwrap(), open)
         });
-        std::thread::sleep(Duration::from_millis(300));
+        // the worker has Base.kt open once a writer can open it without waiting (never forever)
+        let t = Instant::now();
+        let mut writer = loop {
+            use std::os::unix::fs::OpenOptionsExt;
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&b)
+            {
+                Ok(w) => break w,
+                Err(_) if t.elapsed() < Duration::from_secs(10) => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(e) => panic!("the worker never read Base.kt: {e}"),
+            }
+        };
         // the editor queues a change while the worker waits for the disk
         shared.update(&dir.join("D.kt"), "package a\nclass D\n");
         let free = shared.flush();
-        std::fs::write(&b, base).unwrap();
+        std::io::Write::write_all(&mut writer, base.as_bytes()).unwrap();
+        drop(writer);
         let (x, mut open) = pass.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(free, "the index was locked while the disk was read");

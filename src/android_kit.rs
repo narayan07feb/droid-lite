@@ -555,8 +555,8 @@ fn android_name(header: &str) -> Option<&str> {
         let after = rest[i + "android:name".len()..].trim_start();
         if let Some(v) = after.strip_prefix('=') {
             let v = v.trim_start();
-            let q = v.chars().next()?;
-            let v = &v[q.len_utf8()..];
+            let q = v.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+            let v = &v[1..];
             return Some(&v[..v.find(q)?]);
         }
         rest = &rest[i + 1..];
@@ -571,8 +571,8 @@ pub fn namespace(manifest: &str, build: &str) -> String {
         let header = &manifest[i..i + manifest[i..].find('>')?];
         let p = header.find("package")?;
         let v = header[p + 7..].trim_start().strip_prefix('=')?.trim_start();
-        let q = v.chars().next()?;
-        let v = &v[q.len_utf8()..];
+        let q = v.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let v = &v[1..];
         Some(v[..v.find(q)?].to_string())
     });
     attr.or_else(|| quoted_after(build, "namespace").map(String::from))
@@ -1252,15 +1252,14 @@ android {
     }
 
     #[test]
-    fn a_manifest_attribute_that_starts_with_a_multibyte_letter_does_not_panic() {
-        assert_eq!(namespace("<manifest package=éa.bé>", ""), "a.b");
-        let c = components(
-            "<manifest>\n<application>\n<activity android:name=é.Mainé />\n",
-            "a",
-        );
+    fn a_manifest_attribute_needs_double_or_single_quotes() {
+        assert_eq!(namespace("<manifest package=éa.bé>", ""), "", "not quoted");
+        assert_eq!(namespace("<manifest package='a.b'>", ""), "a.b");
+        let m = "<manifest>\n<application>\n<activity android:name=é.Mainé />\n<activity android:name='.Two' />\n";
+        let c = components(m, "a");
         assert_eq!(
             c.iter().map(|c| c.class.as_str()).collect::<Vec<_>>(),
-            ["a.Main"]
+            ["a.Two"]
         );
     }
 

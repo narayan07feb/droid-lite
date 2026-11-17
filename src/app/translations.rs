@@ -261,7 +261,9 @@ impl App {
         if self.refuse_during_checkout() {
             return;
         }
-        self.settle_saves();
+        if !self.settle_saves() {
+            return;
+        }
         let Some((_, table)) = &self.translations.table else {
             return;
         };

@@ -43,7 +43,9 @@ pub struct Param {
     pub has_default: bool,
     /// `Some(true)` for a `var` constructor parameter, `Some(false)` for `val`.
     pub mutable: Option<bool>,
-    /// Byte offset of the name (fits the padding after the two flags: no extra memory).
+    /// A Kotlin `vararg` parameter.
+    pub vararg: bool,
+    /// Byte offset of the name (fits the padding after the three flags: no extra memory).
     pub offset: u32,
 }
 
@@ -297,6 +299,7 @@ impl<'a> Scanner<'a> {
                 match self.text(m) {
                     "val" => p.mutable = Some(false),
                     "var" => p.mutable = Some(true),
+                    "vararg" => p.vararg = true,
                     _ => {}
                 }
                 if self.kind(m) == Some(Tok::Annotation) && self.is(m + 1, "(") {
@@ -948,6 +951,7 @@ fn java_params(s: &Scanner, open: usize) -> Vec<Param> {
                 ty: s.join(a, last).replace(" ...", "...").replace("...", "[]"),
                 has_default: false,
                 mutable: None,
+                vararg: false,
                 offset: s.t[last].range.start as u32,
             });
         }
@@ -1067,6 +1071,7 @@ typealias Users = List<User>
                 ty: "Modifier".into(),
                 has_default: true,
                 mutable: None,
+                vararg: false,
                 offset: SAMPLE.find("modifier: Modifier").unwrap() as u32,
             }
         );

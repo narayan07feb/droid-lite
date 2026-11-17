@@ -248,7 +248,9 @@ impl App {
         if self.refuse_during_checkout() {
             return;
         }
-        self.settle_saves();
+        if !self.settle_saves() {
+            return;
+        }
         let (path, res) = match r {
             Revert::Working {
                 path,
@@ -283,7 +285,9 @@ impl App {
         let Some(root) = self.project.as_ref().map(|p| p.root.clone()) else {
             return;
         };
-        self.settle_saves();
+        if !self.settle_saves() {
+            return;
+        }
         match git::run(&root, args) {
             Ok(()) => self.status = format!("git {} done", args.join(" ")),
             Err(e) => self.status = format!("git {}: {e}", args[0]),

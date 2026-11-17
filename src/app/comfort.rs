@@ -213,30 +213,48 @@ fn write_version(dir: &Path, text: &[u8]) -> std::io::Result<()> {
 /// When [`prune_soon`] last started a prune (ms since the epoch; 0 for never).
 static PRUNED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// A test holds the next prune here until it sends (a prune that takes long).
 #[cfg(test)]
-static PRUNE_HOLD: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>> =
-    std::sync::Mutex::new(None);
+thread_local! {
+    /// A test holds the next prune its own thread starts until it sends (a prune that takes
+    /// long); other tests' prunes never take it.
+    static PRUNE_HOLD: std::cell::RefCell<Option<std::sync::mpsc::Receiver<()>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Runs between reading and claiming [`PRUNED_AT`] (another thread's claim in between).
+    static BETWEEN_READ_AND_CLAIM: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether this call may start a prune now: none for a minute. Only one of the UI and save
+/// threads wins when both ask at once.
+fn claim_prune(now: u64) -> bool {
+    use std::sync::atomic::Ordering;
+    let last = PRUNED_AT.load(Ordering::Acquire);
+    #[cfg(test)]
+    if let Some(f) = BETWEEN_READ_AND_CLAIM.take() {
+        f();
+    }
+    (last == 0 || now.abs_diff(last) > 60_000)
+        && PRUNED_AT
+            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+}
 
 /// [`prune_all`] at most once a minute (it reads every history folder).
 fn prune_soon() {
-    let now = now_ms();
-    let last = PRUNED_AT.load(std::sync::atomic::Ordering::Relaxed);
-    if last == 0 || now.abs_diff(last) > 60_000 {
-        PRUNED_AT.store(now, std::sync::atomic::Ordering::Relaxed);
-        if let Some(root) = history_root() {
+    if claim_prune(now_ms())
+        && let Some(root) = history_root()
+    {
+        #[cfg(test)]
+        let hold = PRUNE_HOLD.take();
+        // it reads every history folder: never on the window's thread, nor on the save
+        // thread (a save, quitting and a refactor wait for that one)
+        in_background(move || {
             #[cfg(test)]
-            let hold = PRUNE_HOLD.lock().unwrap_or_else(|e| e.into_inner()).take();
-            // it reads every history folder: never on the window's thread, nor on the save
-            // thread (a save, quitting and a refactor wait for that one)
-            in_background(move || {
-                #[cfg(test)]
-                if let Some(h) = hold {
-                    let _ = h.recv_timeout(std::time::Duration::from_secs(20));
-                }
-                prune_all(&root, HISTORY_CAP)
-            });
-        }
+            if let Some(h) = hold {
+                let _ = h.recv_timeout(std::time::Duration::from_secs(20));
+            }
+            prune_all(&root, HISTORY_CAP)
+        });
     }
 }
 
@@ -868,17 +886,11 @@ mod tests {
     fn a_save_never_waits_behind_pruning() {
         let _guard = super::super::e2e::config_guard();
         let (gate_tx, gate) = std::sync::mpsc::channel::<()>();
-        *PRUNE_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = Some(gate);
+        PRUNE_HOLD.set(Some(gate));
         PRUNED_AT.store(0, std::sync::atomic::Ordering::Relaxed);
         // keeping a version starts a prune, which takes long
         record_text(Path::new("/p/A.kt"), b"typed").unwrap();
-        assert!(
-            PRUNE_HOLD
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_none(),
-            "a prune started"
-        );
+        assert!(PRUNE_HOLD.with_borrow(Option::is_none), "a prune started");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             super::super::saver::wait();
@@ -890,6 +902,38 @@ mod tests {
             "the save thread was free"
         );
         let _ = gate_tx.send(());
+    }
+
+    #[test]
+    fn of_two_threads_asking_at_once_only_one_starts_a_prune() {
+        let _guard = super::super::e2e::config_guard();
+        PRUNED_AT.store(0, std::sync::atomic::Ordering::Relaxed);
+        let now = now_ms();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // the other thread claims after this one read the time of the last prune
+        BETWEEN_READ_AND_CLAIM.set(Some(Box::new(move || {
+            let other = std::thread::spawn(move || claim_prune(now)).join().unwrap();
+            tx.send(other).unwrap();
+        })));
+        let mine = claim_prune(now);
+        let other = rx.recv().unwrap();
+        assert!(other, "the other thread claimed first");
+        assert!(!mine, "this one does not start a second prune");
+    }
+
+    #[test]
+    fn a_prune_another_thread_starts_never_takes_this_tests_hold() {
+        let _guard = super::super::e2e::config_guard();
+        let (_gate_tx, gate) = std::sync::mpsc::channel::<()>();
+        PRUNE_HOLD.set(Some(gate));
+        PRUNED_AT.store(0, std::sync::atomic::Ordering::Relaxed);
+        std::thread::spawn(prune_soon).join().unwrap();
+        assert_ne!(
+            PRUNED_AT.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the other thread started a prune"
+        );
+        assert!(PRUNE_HOLD.take().is_some(), "the hold is still this test's");
     }
 
     #[test]

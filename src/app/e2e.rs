@@ -171,6 +171,27 @@ fn wait(h: &mut Harness<'static, App>, what: &str, done: impl Fn(&App) -> bool) 
     panic!("timed out waiting for: {what}");
 }
 
+/// Waits until the project's watcher is live (FSEvents starts a moment after the window opens)
+/// and has delivered what happened before: rewrites `file` unchanged until the window applies an
+/// event for it.
+fn watcher_live(h: &mut Harness<'static, App>, file: &Path) {
+    let text = std::fs::read(file).unwrap();
+    super::disk::SEEN.take();
+    for _ in 0..100 {
+        std::fs::write(file, &text).unwrap();
+        for _ in 0..10 {
+            h.step();
+            if super::disk::SEEN
+                .with_borrow(|s| s.iter().any(|p| p.file_name() == file.file_name()))
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    panic!("the watcher never reported {}", file.display());
+}
+
 fn steps(h: &mut Harness<'static, App>, n: usize) {
     for _ in 0..n {
         h.step();
@@ -584,7 +605,7 @@ fn e2e_reload_when_file_changes_on_disk() {
     let mut h = f.harness();
     let user = f.path("app/src/main/java/com/demo/data/User.kt");
     open(&mut h, &user);
-    std::thread::sleep(Duration::from_millis(300));
+    watcher_live(&mut h, &user);
     std::fs::write(&user, "package com.demo.data\n\nclass Changed\n").unwrap();
     wait(&mut h, "reload", |a| {
         a.tabs[a.active].text.contains("class Changed")
@@ -1920,7 +1941,7 @@ fn e2e_session_restore_history_autosave_and_settings() {
         .center();
     // typing not saved yet, which the restore replaces, is kept as a new version first (after
     // the watcher saw the save: a late event would mark the edited tab as changed on disk)
-    std::thread::sleep(Duration::from_millis(300));
+    watcher_live(&mut h, &card);
     steps(&mut h, 3);
     let a = h.state().active;
     h.state_mut().tabs[a].text.push_str("// three\n");
@@ -4928,7 +4949,7 @@ fn e2e_autosave_never_overwrites_a_file_changed_on_disk() {
     let user = f.path("app/src/main/java/com/demo/data/User.kt");
     open(&mut h, &user);
     assert!(h.state().settings.autosave);
-    std::thread::sleep(Duration::from_millis(300));
+    watcher_live(&mut h, &user);
     type_text(&mut h, "mine");
     std::fs::write(&user, "package com.demo.data\n\nclass Theirs\n").unwrap();
     wait(&mut h, "conflict bar", |a| a.tabs[a.active].disk_changed);
@@ -4999,7 +5020,7 @@ fn e2e_closing_with_edits_auto_save_will_not_write_asks_first() {
     let user = f.path("app/src/main/java/com/demo/data/User.kt");
     let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
     open(&mut h, &user);
-    std::thread::sleep(Duration::from_millis(300));
+    watcher_live(&mut h, &user);
     type_text(&mut h, "mine");
     assert!(tab(&h).dirty());
     // edits auto-save writes on quit: the window just closes
@@ -5046,7 +5067,7 @@ fn e2e_closing_with_edits_auto_save_will_not_write_asks_first() {
     // a file deleted on disk while it has edits asks too
     h.state_mut().close_ok = false;
     open(&mut h, &card);
-    std::thread::sleep(Duration::from_millis(300));
+    watcher_live(&mut h, &card);
     type_text(&mut h, "x");
     std::fs::remove_file(&card).unwrap();
     wait(&mut h, "deleted", |a| a.tabs[a.active].deleted);
@@ -5133,7 +5154,7 @@ fn e2e_switching_project_with_unsaved_edits_asks_first() {
     opened(&mut h, &f.root);
     // the file changed on disk meanwhile: a folder dropped on the window waits for a choice
     edit(&mut h, "// two\n");
-    std::thread::sleep(Duration::from_millis(300));
+    watcher_live(&mut h, &user);
     let theirs = "package com.demo.data\n\nclass Theirs\n";
     std::fs::write(&user, theirs).unwrap();
     wait(&mut h, "conflict bar", |a| a.tabs[a.active].disk_changed);
@@ -5217,7 +5238,7 @@ fn e2e_a_running_check_out_locks_edits_and_commands_and_quit_stops_it() {
     let user = f.path("app/src/main/java/com/demo/data/User.kt");
     let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
     open(&mut h, &user);
-    std::thread::sleep(Duration::from_millis(300));
+    watcher_live(&mut h, &user);
     h.get_by_label(&format!("{}  Pull requests", ic::GIT_PULL_REQUEST))
         .click();
     wait(&mut h, "the PR list", |a| {
@@ -5568,7 +5589,7 @@ fn e2e_a_file_that_cannot_be_read_never_blanks_its_tab() {
     let mut h = f.harness();
     let user = f.path("app/src/main/java/com/demo/data/User.kt");
     open(&mut h, &user);
-    std::thread::sleep(Duration::from_millis(300));
+    watcher_live(&mut h, &user);
     std::fs::write(&user, [0xff, 0xfe, b'x']).unwrap();
     wait(&mut h, "unreadable", |a| {
         a.tabs[a.active].unreadable.is_some()
@@ -5645,6 +5666,74 @@ fn e2e_own_late_save_event_is_not_a_change_on_disk() {
     h.state_mut().save();
     h.state_mut().wait_saves();
     assert!(!tab(&h).disk_changed && !tab(&h).deleted);
+}
+
+#[test]
+fn e2e_a_late_watcher_event_for_a_save_keeps_the_typed_symbols_in_the_index() {
+    let f = Fixture::new("latesaveindex");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    let a = h.state().active;
+    h.state_mut().save();
+    h.state_mut().wait_saves();
+    let saved = tab(&h).text.clone();
+    h.state_mut().tabs[a].text.push_str("class Typed\n");
+    h.state_mut().tabs[a].mark_edited();
+    h.state_mut().settle(true);
+    let has_typed = |h: &Harness<'static, App>| {
+        let app = h.state();
+        app.index.settle();
+        let index = app.index.read();
+        index.files[user.as_path()]
+            .decls
+            .iter()
+            .any(|d| d.name == "Typed")
+    };
+    assert!(has_typed(&h), "the index has the typed class");
+    // the watcher reports the earlier save now
+    let (tx, rx) = channel();
+    h.state_mut().disk_rx.push(rx);
+    let syms = crate::kotlin::scan_file(&user, &saved);
+    tx.send(vec![super::disk::DiskChange::File(
+        user.clone(),
+        saved,
+        Some(syms),
+    )])
+    .unwrap();
+    wait(&mut h, "the event applied", |a| a.disk_rx.is_empty());
+    assert!(has_typed(&h), "still there after the event");
+}
+
+#[test]
+fn e2e_a_stuck_save_stops_a_revert_with_a_message_instead_of_freezing_the_window() {
+    let f = Fixture::new("stucksave");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    // the save thread hangs (a stuck network disk) with a save of User.kt behind it
+    let (unstick, stuck) = channel::<()>();
+    saver::run(move || {
+        let _ = stuck.recv_timeout(Duration::from_secs(30));
+    });
+    let a = h.state().active;
+    h.state_mut().tabs[a].text.push_str("// typed\n");
+    h.state_mut().save_tab(false);
+    h.state_mut().tabs[a].text.push_str("// more\n");
+    h.state_mut().revert();
+    assert!(
+        h.state().status.starts_with("A save is still running"),
+        "{}",
+        h.state().status
+    );
+    assert!(tab(&h).text.ends_with("// more\n"), "not reverted");
+    unstick.send(()).unwrap();
+    h.state_mut().wait_saves();
+    assert!(
+        std::fs::read_to_string(&user)
+            .unwrap()
+            .ends_with("// typed\n")
+    );
 }
 
 #[test]
@@ -6650,4 +6739,12 @@ fn e2e_a_translation_write_lets_a_save_of_its_file_land_first() {
     a.wait_saves();
     let disk = std::fs::read_to_string(&hindi).unwrap();
     assert!(disk.contains("Pranam") && disk.contains("Alvida"), "{disk}");
+}
+
+#[test]
+fn a_found_line_offset_from_another_version_of_the_file_never_panics() {
+    let l = found_line(Path::new("/p/A.kt"), "é\nab", 1);
+    assert_eq!((l.offset, l.line, l.text.as_str()), (0, 1, "é"));
+    let l = found_line(Path::new("/p/A.kt"), "ab", 9);
+    assert_eq!((l.offset, l.line), (2, 1));
 }

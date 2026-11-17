@@ -17,6 +17,12 @@ pub(super) enum DiskChange {
     Gone(PathBuf),
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Paths of the disk changes the window applied (tests wait for the watcher with it).
+    pub(super) static SEEN: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl App {
     /// Collects watcher events and hands them to a worker thread, which reads and scans the files.
     /// A `git checkout` of hundreds of files therefore never blocks the window.
@@ -70,6 +76,14 @@ impl App {
     }
 
     fn apply_disk_changes(&mut self, changes: Vec<DiskChange>, ctx: &egui::Context) {
+        #[cfg(test)]
+        SEEN.with_borrow_mut(|seen| {
+            seen.extend(changes.iter().map(|c| match c {
+                DiskChange::File(p, ..) | DiskChange::Unreadable(p, _) | DiskChange::Gone(p) => {
+                    p.clone()
+                }
+            }))
+        });
         if let Some(l) = self.lsp.as_mut() {
             let watched: Vec<(PathBuf, u8)> = changes
                 .iter()
@@ -101,7 +115,14 @@ impl App {
                         project.files.insert(at, path.clone());
                         tree_dirty = true;
                     }
+                    // an open tab with other edits keeps its own symbols in the index: this
+                    // event may be for an earlier save of it
+                    let edited = self
+                        .tabs
+                        .iter()
+                        .any(|t| t.path == path && t.text != text && t.dirty());
                     if let Some(syms) = syms
+                        && !edited
                         && project.files.binary_search(&path).is_ok()
                     {
                         let p = path.clone();

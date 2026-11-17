@@ -1,6 +1,6 @@
 //! Rename (with a preview), optimize imports, extract variable, and undo of the last refactoring.
 
-use super::{App, tree, word_bounds};
+use super::{App, SAVE_WAIT, saver, tree, word_bounds};
 use crate::lsp;
 use crate::project::is_code;
 use crate::refactor;
@@ -262,7 +262,10 @@ impl App {
         if self.refuse_during_checkout() {
             return;
         }
-        self.settle_saves();
+        if !self.settle_saves() {
+            self.refactor = Some(Refactor::Preview(p));
+            return;
+        }
         let mut undo = Undo {
             label: format!("rename {} → {}", p.old, p.new),
             files: Vec::new(),
@@ -311,16 +314,28 @@ impl App {
     /// Lets saves still on their way land first: one landing after a refactor's write, a file
     /// move, a revert or a checkout would find the file changed, write over it, or bring it back
     /// at its old name.
-    pub(super) fn settle_saves(&mut self) {
-        if self.saves_pending > 0 {
-            self.wait_saves();
+    /// Waits [`SAVE_WAIT`] at most: when a save is still running then, it says so and returns
+    /// false, and the caller changes nothing (the user can run it again, or not).
+    pub(super) fn settle_saves(&mut self) -> bool {
+        if self.saves_pending == 0 {
+            return true;
         }
+        let done = saver::wait_for(SAVE_WAIT);
+        self.poll_saves();
+        if !done {
+            self.status = "A save is still running (a slow or stuck disk?): nothing was \
+                           changed. Try again when it is done"
+                .into();
+        }
+        done
     }
 
     /// Writes a file and keeps the open tab, the index and kotlin-lsp in step.
     /// What is on disk and typing it replaces go to local history first, else nothing is written.
     fn write_file(&mut self, path: &Path, text: &str) -> bool {
-        self.settle_saves();
+        if !self.settle_saves() {
+            return false;
+        }
         let typed = self
             .tabs
             .iter()
@@ -374,8 +389,10 @@ impl App {
         if self.refuse_during_checkout() {
             return;
         }
+        if !self.settle_saves() {
+            return;
+        }
         let Some(u) = self.undo.take() else { return };
-        self.settle_saves();
         // a file at the old name again (made since) is never replaced: the undo waits
         if let Some((from, to)) = &u.moved {
             let why = if from.exists() {

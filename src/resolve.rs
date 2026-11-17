@@ -72,6 +72,8 @@ struct Local {
     for_in: bool,
     /// Token index of the `{` of the lambda it is a parameter of, and its position.
     lambda: Option<(usize, usize)>,
+    /// Destructured (`(a, b) ->`, `val (a, b) =`, `for ((a, b) in …)`): which component it is.
+    component: Option<usize>,
 }
 
 struct Imports {
@@ -382,36 +384,41 @@ impl FileInfo {
                         init: None,
                         for_in: false,
                         lambda: None,
+                        component: None,
                     });
                 }
             }
-            // plain constructor parameters: seen by initializers in the class body
-            if d.kind.is_type() {
-                let end = self
-                    .bodies
-                    .get(
-                        &self
-                            .syms
-                            .decls
-                            .iter()
-                            .position(|x| std::ptr::eq(x, d))
-                            .unwrap_or(0),
-                    )
-                    .map_or(d.offset, |r| r.end);
-                for p in d
-                    .params
+            // plain constructor parameters: seen by the header, property initializers and init
+            // blocks, not by functions, accessors or nested classes
+            if d.kind.is_type() && !self.java {
+                let ci = self
+                    .syms
+                    .decls
                     .iter()
-                    .filter(|p| p.mutable.is_none() && !self.java)
-                {
-                    out.push(Local {
-                        name: p.name.clone(),
-                        at: p.offset as usize,
-                        scope: p.offset as usize..end,
-                        ty: Some(p.ty.clone()),
-                        init: None,
-                        for_in: false,
-                        lambda: None,
-                    });
+                    .position(|x| std::ptr::eq(x, d))
+                    .unwrap_or(0);
+                let end = self.bodies.get(&ci).map_or(d.offset, |r| r.end);
+                let hidden = self.hidden_from_constructor(ci, end);
+                for p in d.params.iter().filter(|p| p.mutable.is_none()) {
+                    let mut from = p.offset as usize;
+                    for h in hidden.iter().chain(std::iter::once(&(end..end))) {
+                        if h.end <= from {
+                            continue;
+                        }
+                        if h.start > from {
+                            out.push(Local {
+                                name: p.name.clone(),
+                                at: p.offset as usize,
+                                scope: from..h.start,
+                                ty: Some(p.ty.clone()),
+                                init: None,
+                                for_in: false,
+                                lambda: None,
+                                component: None,
+                            });
+                        }
+                        from = h.end;
+                    }
                 }
             }
         }
@@ -438,6 +445,7 @@ impl FileInfo {
                         init: (self.t(i + 2) == "=").then_some(i + 3),
                         for_in: self.t(i + 2) == ":",
                         lambda: None,
+                        component: None,
                     });
                 }
                 i += 1;
@@ -449,16 +457,22 @@ impl FileInfo {
                     if self.t(j) == "(" {
                         // destructuring
                         let e = self.pair(j).unwrap_or(j);
+                        let init = (self.t(e + 1) == "=").then_some(e + 2);
+                        let mut n = 0;
                         for k in j + 1..e {
+                            if self.t(k) == "," {
+                                n += 1;
+                            }
                             if self.ident(k) && matches!(self.t(k + 1), "," | ")" | ":") {
                                 out.push(Local {
                                     name: self.name(k).to_string(),
                                     at: self.start(k),
                                     scope: self.scope_of(k),
                                     ty: None,
-                                    init: None,
+                                    init,
                                     for_in: false,
                                     lambda: None,
+                                    component: Some(n),
                                 });
                             }
                         }
@@ -486,6 +500,7 @@ impl FileInfo {
                             init,
                             for_in: false,
                             lambda: None,
+                            component: None,
                         });
                     }
                 }
@@ -499,7 +514,13 @@ impl FileInfo {
                         } else {
                             self.scope_of(i).end
                         };
+                        // `for ((a, b) in …)`: components of each element
+                        let parts = self.t(i + 2) == "(";
+                        let mut n = 0;
                         for k in i + 2..in_at {
+                            if self.t(k) == "," {
+                                n += 1;
+                            }
                             if self.ident(k) && matches!(self.t(k + 1), "," | ")" | "in" | ":") {
                                 out.push(Local {
                                     name: self.name(k).to_string(),
@@ -507,8 +528,9 @@ impl FileInfo {
                                     scope: self.start(k)..body_end,
                                     ty: (self.t(k + 1) == ":").then(|| self.t(k + 2).to_string()),
                                     init: Some(in_at + 1),
-                                    for_in: in_at == k + 1,
+                                    for_in: in_at == k + 1 || parts,
                                     lambda: None,
+                                    component: parts.then_some(n),
                                 });
                             }
                         }
@@ -527,6 +549,7 @@ impl FileInfo {
                         init: None,
                         for_in: false,
                         lambda: None,
+                        component: None,
                     });
                 }
                 "fun" => {
@@ -566,6 +589,7 @@ impl FileInfo {
                                     init: None,
                                     for_in: false,
                                     lambda: None,
+                                    component: None,
                                 });
                             }
                         }
@@ -579,6 +603,8 @@ impl FileInfo {
                         let mut k = i + 1;
                         let mut names = Vec::new();
                         let mut pos = 0;
+                        // inside `( … )`: the component of the destructured parameter
+                        let mut part: Option<usize> = None;
                         let mut ok = false;
                         while k < close {
                             match self.t(k) {
@@ -586,26 +612,34 @@ impl FileInfo {
                                     ok = true;
                                     break;
                                 }
-                                "," => pos += 1,
-                                "(" | ")" | "." | "<" | ">" | "?" => {}
+                                "," => match part.as_mut() {
+                                    Some(n) => *n += 1,
+                                    None => pos += 1,
+                                },
+                                "(" => part = Some(0),
+                                ")" => part = None,
+                                "." | "<" | ">" | "?" => {}
                                 ":" => {
                                     // a typed parameter: skip its type
                                     k += 1;
                                     while k < close
                                         && self.t(k) != ","
+                                        && !(part.is_some() && self.t(k) == ")")
                                         && !(self.t(k) == "-" && self.t(k + 1) == ">")
                                     {
                                         k += 1;
                                     }
                                     continue;
                                 }
-                                _ if self.ident(k) || self.t(k) == "_" => names.push((k, pos)),
+                                _ if self.ident(k) || self.t(k) == "_" => {
+                                    names.push((k, pos, part))
+                                }
                                 _ => break,
                             }
                             k += 1;
                         }
                         if ok && !names.is_empty() {
-                            for (k, pos) in names {
+                            for (k, pos, part) in names {
                                 let typed = self.t(k + 1) == ":";
                                 out.push(Local {
                                     name: self.name(k).to_string(),
@@ -615,6 +649,7 @@ impl FileInfo {
                                     init: None,
                                     for_in: false,
                                     lambda: Some((i, pos)),
+                                    component: part,
                                 });
                             }
                         }
@@ -624,6 +659,50 @@ impl FileInfo {
             }
             i += 1;
         }
+        out
+    }
+
+    /// Byte ranges inside class `ci` (which ends at `end`) where its plain constructor
+    /// parameters are not seen: member functions, property accessors and nested classes. Sorted.
+    fn hidden_from_constructor(&self, ci: usize, end: usize) -> Vec<Range<usize>> {
+        let start = self.syms.decls[ci].offset;
+        let mut out: Vec<Range<usize>> = Vec::new();
+        for (ei, e) in self.syms.decls.iter().enumerate() {
+            if ei == ci || e.offset <= start || e.offset >= end {
+                continue;
+            }
+            if e.kind == Kind::Fun
+                && let Some(b) = &e.body
+            {
+                out.push(e.offset..b.end);
+            } else if e.kind.is_type()
+                && let Some(b) = self.bodies.get(&ei)
+            {
+                out.push(b.clone());
+            }
+        }
+        // `get() = …`, `set(v) { … }`
+        let (a, b) = (
+            self.toks.partition_point(|t| t.range.start < start),
+            self.toks.partition_point(|t| t.range.start < end),
+        );
+        for k in a..b {
+            if matches!(self.t(k), "get" | "set")
+                && self.t(k + 1) == "("
+                && self.t(k - 1) != "."
+                && let Some(c) = self.pair(k + 1)
+            {
+                let last = match self.t(c + 1) {
+                    "{" => self.pair(c + 1),
+                    "=" => Some(self.expr_end(c + 2, self.toks.len()).saturating_sub(1)),
+                    _ => None,
+                };
+                if let Some(l) = last {
+                    out.push(self.start(k)..self.end(l));
+                }
+            }
+        }
+        out.sort_by_key(|r| r.start);
         out
     }
 
@@ -719,26 +798,74 @@ impl FileInfo {
         (j < i - 1).then(|| self.text[self.start(j)..self.end(i - 2)].to_string())
     }
 
-    /// Type parameters of the declaration (`fun <T, R> …`).
-    fn type_params(&self, d: &Decl) -> Vec<String> {
+    /// Type parameters seen in the declaration, with their bounds (`""` for none): its own
+    /// (`fun <T, R> …`, `class Box<T : Item>`), then those of the classes around it.
+    fn type_params(&self, d: &Decl) -> Vec<(String, String)> {
         let Some(i) = self.tok_at(d.offset) else {
             return Vec::new();
         };
-        let mut j = i;
-        while j > 0 && !matches!(self.t(j), "fun" | "val" | "var" | "class" | "interface") {
-            j -= 1;
-        }
         let mut out = Vec::new();
-        if self.t(j + 1) == "<" {
-            let mut k = j + 2;
-            while k < i && self.t(k) != ">" {
-                if self.ident(k) && matches!(self.t(k + 1), "," | ">" | ":") {
-                    out.push(self.t(k).to_string());
-                }
-                k += 1;
+        if d.kind.is_type() {
+            self.type_param_list(i + 1, &mut out);
+        } else {
+            let mut j = i;
+            while j > 0 && !matches!(self.t(j), "fun" | "val" | "var" | "class" | "interface") {
+                j -= 1;
+            }
+            if j < i {
+                self.type_param_list(j + 1, &mut out);
+            }
+        }
+        for c in self.classes_at(d.offset) {
+            if let Some(k) = self.tok_at(self.syms.decls[c].offset) {
+                self.type_param_list(k + 1, &mut out);
             }
         }
         out
+    }
+
+    /// Reads `<A, B : Bound>` at token `open` into `out`.
+    fn type_param_list(&self, open: usize, out: &mut Vec<(String, String)>) {
+        if self.t(open) != "<" {
+            return;
+        }
+        let mut k = open + 1;
+        let mut depth = 0;
+        while k < self.toks.len() && !(depth == 0 && self.t(k) == ">") {
+            match self.t(k) {
+                "<" => depth += 1,
+                ">" => depth -= 1,
+                "(" | ")" | "{" | "}" | "=" => return,
+                _ => {}
+            }
+            if depth == 0 && self.ident(k) && matches!(self.t(k + 1), "," | ">" | ":") {
+                let name = self.name(k).to_string();
+                let mut bound = String::new();
+                if self.t(k + 1) == ":" {
+                    // the bound runs to the `,` or `>` that closes it
+                    let a = k + 2;
+                    let mut e = a;
+                    let mut d = 0;
+                    while e < self.toks.len() && !(d == 0 && matches!(self.t(e), "," | ">")) {
+                        match self.t(e) {
+                            "<" => d += 1,
+                            ">" => d -= 1,
+                            _ => {}
+                        }
+                        e += 1;
+                    }
+                    if e > a {
+                        bound = self.text[self.start(a)..self.end(e - 1)].to_string();
+                    }
+                    k = e;
+                } else {
+                    k += 1;
+                }
+                out.push((name, bound));
+                continue;
+            }
+            k += 1;
+        }
     }
 }
 
@@ -755,11 +882,27 @@ fn fits(d: &Decl, args: &Args) -> bool {
         return true;
     }
     let ps = &d.params;
-    let required = ps.iter().filter(|p| !p.has_default).count();
+    // a Kotlin `vararg` takes any number of arguments, none too
+    let required = ps
+        .iter()
+        .filter(|p| !p.has_default && !is_vararg(p))
+        .count();
     let java_vararg = ps.last().is_some_and(|p| p.ty.ends_with("[]"));
-    (args.count <= ps.len() || java_vararg)
+    (args.count <= ps.len() || java_vararg || ps.iter().any(is_vararg))
         && args.count >= required
         && args.named.iter().all(|a| ps.iter().any(|p| p.name == *a))
+}
+
+fn is_vararg(p: &crate::kotlin::Param) -> bool {
+    p.vararg
+}
+
+/// Like Kotlin, overloads that need no `vararg` win over ones that do.
+fn plain_first<T>(v: Vec<T>, vararg: impl Fn(&T) -> bool) -> Vec<T> {
+    if v.iter().all(&vararg) {
+        return v;
+    }
+    v.into_iter().filter(|x| !vararg(x)).collect()
 }
 
 /// Reads files for a resolver: open tabs first, then what was read ahead, then the disk.
@@ -873,6 +1016,11 @@ pub struct Cache {
     types: RefCell<HashMap<(PathBuf, usize), Option<Ty>>>,
     packages: RefCell<Option<HashSet<String>>>,
     depth: RefCell<usize>,
+    /// Set when the depth guard cut a resolution short: its `None` is not an answer to keep.
+    cut: std::cell::Cell<bool>,
+    /// How many names were resolved (tests count the work).
+    #[cfg(test)]
+    resolved: std::cell::Cell<usize>,
 }
 
 impl Cache {
@@ -953,10 +1101,15 @@ impl<'a> Resolver<'a> {
         f
     }
 
-    /// The file read from `text` (already read by the caller), unless it is known already.
+    /// The file read from `text` (already read by the caller), unless it is known already with
+    /// that same text: the offsets found go with `text`.
     fn file_from(&self, p: &Path, text: &Arc<str>) -> Rc<FileInfo> {
-        if let Some(Some(f)) = self.c.files.borrow().get(p) {
-            return f.clone();
+        let known = self.c.files.borrow().get(p).cloned().flatten();
+        if let Some(f) = known {
+            if Arc::ptr_eq(&f.text, text) || f.text == *text {
+                return f;
+            }
+            self.changed(p);
         }
         let f = Rc::new(FileInfo::new(p, text.clone()));
         self.c
@@ -976,6 +1129,7 @@ impl<'a> Resolver<'a> {
     fn guard(&self) -> Option<DepthGuard<'_>> {
         let mut d = self.c.depth.borrow_mut();
         if *d > 24 {
+            self.c.cut.set(true);
             return None;
         }
         *d += 1;
@@ -1124,7 +1278,13 @@ impl<'a> Resolver<'a> {
     }
 
     /// A type written as text in file `f` at `at`: `List<User>?`, `Outer.Inner`, `pkg.Type`.
-    fn type_text(&self, f: &FileInfo, text: &str, at: usize, tparams: &[String]) -> Option<Ty> {
+    fn type_text(
+        &self,
+        f: &FileInfo,
+        text: &str,
+        at: usize,
+        tparams: &[(String, String)],
+    ) -> Option<Ty> {
         let _g = self.guard()?;
         let t = text.trim().trim_end_matches('?').trim();
         let t = t.strip_prefix("vararg ").unwrap_or(t).trim();
@@ -1153,8 +1313,12 @@ impl<'a> Resolver<'a> {
                 }
             })
             .collect();
-        if tparams.iter().any(|p| p == base) {
-            return Some(Ty::Any);
+        // a type parameter: what its bound is, when that is a project type
+        if let Some((_, bound)) = tparams.iter().find(|(p, _)| p == base) {
+            return Some(match self.type_text(f, bound, at, &[]) {
+                Some(t @ Ty::Decl(_)) => t,
+                _ => Ty::Any,
+            });
         }
         let segs: Vec<&str> = base.split('.').map(str::trim).collect();
         // `pkg.a.Type`
@@ -1416,12 +1580,26 @@ impl<'a> Resolver<'a> {
         if let Some(t) = self.c.types.borrow().get(r) {
             return t.clone();
         }
+        // `None` while it is worked out: a declaration whose type needs itself gets none
         self.c.types.borrow_mut().insert(r.clone(), None);
+        let was_cut = self.c.cut.replace(false);
+        let t = self.type_of_decl_uncached(r);
+        let cut = self.c.cut.replace(was_cut || self.c.cut.get());
+        if t.is_none() && cut {
+            // cut short by the depth guard: worked out again next time
+            self.c.types.borrow_mut().remove(r);
+        } else {
+            self.c.types.borrow_mut().insert(r.clone(), t.clone());
+        }
+        t
+    }
+
+    fn type_of_decl_uncached(&self, r: &DeclRef) -> Option<Ty> {
         let _g = self.guard()?;
         let (f, i) = self.decl(r)?;
         let d = &f.syms.decls[i];
         let tp = f.type_params(d);
-        let t = if d.kind.is_type() {
+        if d.kind.is_type() {
             Some(Ty::Decl(r.clone()))
         } else if !d.ty.is_empty() {
             self.type_text(&f, &d.ty, d.offset, &tp)
@@ -1440,9 +1618,7 @@ impl<'a> Resolver<'a> {
                 "by" => self.delegate_type(&f, j + 1),
                 _ => None,
             }
-        };
-        self.c.types.borrow_mut().insert(r.clone(), t.clone());
-        t
+        }
     }
 
     /// `by viewModels<T>()`, `by lazy { T() }`, `by inject<T>()`.
@@ -1468,22 +1644,53 @@ impl<'a> Resolver<'a> {
         if let Some(t) = &l.ty
             && !t.is_empty()
         {
-            let tp = f
-                .fun_at(l.at)
+            // the type parameters of the function (or class) it is a parameter of, or is in
+            let owner = f
+                .syms
+                .decls
+                .iter()
+                .position(|d| d.params.iter().any(|p| p.offset as usize == l.at))
+                .or_else(|| f.fun_at(l.at))
+                .or_else(|| f.classes_at(l.at).first().copied());
+            let tp = owner
                 .map(|i| f.type_params(&f.syms.decls[i]))
                 .unwrap_or_default();
             return self.type_text(f, t, l.at, &tp);
         }
-        if let Some((open, pos)) = l.lambda {
-            return self.lambda_param(f, open, pos);
+        let t = if let Some((open, pos)) = l.lambda {
+            self.lambda_param(f, open, pos)?
+        } else {
+            let init = l.init?;
+            if f.t(init) == "by" {
+                return self.delegate_type(f, init + 1);
+            }
+            let e = f.expr_end(init, f.toks.len());
+            let t = self.type_of_expr(f, init, e)?;
+            if l.for_in { iter_elem(&t)? } else { t }
+        };
+        match l.component {
+            Some(n) => self.component(&t, n),
+            None => Some(t),
         }
-        let init = l.init?;
-        if f.t(init) == "by" {
-            return self.delegate_type(f, init + 1);
+    }
+
+    /// The `n`-th component (`componentN()`, from 0) of a value of type `t`: of a `Pair`,
+    /// `Triple` or map entry, or the `n`-th constructor parameter of a data class.
+    fn component(&self, t: &Ty, n: usize) -> Option<Ty> {
+        match t {
+            Ty::Lib(name, _) => match name.as_str() {
+                "Pair" | "Triple" | "Entry" => t.arg(n),
+                _ if name.ends_with("List") || name.ends_with("Array") => elem(t),
+                _ => None,
+            },
+            Ty::Decl(r) => {
+                let (g, gi) = self.decl(r)?;
+                let d = &g.syms.decls[gi];
+                let p = d.params.get(n)?;
+                self.type_text(&g, &p.ty, p.offset as usize, &g.type_params(d))
+            }
+            Ty::Any => None,
         }
-        let e = f.expr_end(init, f.toks.len());
-        let t = self.type_of_expr(f, init, e)?;
-        if l.for_in { elem(&t) } else { Some(t) }
     }
 
     /// The type of the `pos`-th parameter (or `it`) of the lambda whose `{` is token `open`.
@@ -1532,9 +1739,20 @@ impl<'a> Resolver<'a> {
             }
         };
         let t = match name {
-            "let" | "also" | "takeIf" | "takeUnless" | "run" | "apply" => recv(),
+            "let" | "also" | "takeIf" | "takeUnless" => recv(),
             "forEachIndexed" | "mapIndexed" | "filterIndexed" if pos == 1 => {
-                recv().as_ref().and_then(elem)
+                recv().as_ref().and_then(iter_elem)
+            }
+            // `map.forEach { k, v -> }`: the key and the value
+            "forEach"
+                if f.locals
+                    .iter()
+                    .any(|l| l.lambda == Some((open, 1)) && l.component.is_none()) =>
+            {
+                recv()
+                    .filter(|t| t.lib().is_some_and(|n| n.ends_with("Map")))
+                    .and_then(|t| t.arg(pos))
+                    .or_else(|| recv().as_ref().and_then(iter_elem))
             }
             "update" | "updateAndGet" | "getAndUpdate" | "collect" | "collectLatest" | "onEach"
             | "forEach" | "map" | "mapNotNull" | "filter" | "filterNot" | "first"
@@ -1542,7 +1760,7 @@ impl<'a> Resolver<'a> {
             | "none" | "find" | "count" | "sortedBy" | "sortedByDescending" | "flatMap"
             | "associateBy" | "associateWith" | "groupBy" | "sumOf" | "maxByOrNull"
             | "minByOrNull" | "distinctBy" | "partition" | "indexOfFirst" | "takeWhile"
-            | "dropWhile" | "mapTo" | "onSuccess" => recv().as_ref().and_then(elem),
+            | "dropWhile" | "mapTo" | "onSuccess" => recv().as_ref().and_then(iter_elem),
             _ => None,
         };
         // a trailing lambda of a project function: its last parameter's type
@@ -1901,12 +2119,56 @@ impl<'a> Resolver<'a> {
             if !named && open > 0 && !f.is_when_block(open) {
                 let p = open - 1;
                 let is_call = f.ident(p) || matches!(f.t(p), ")" | "@" | "=" | "(" | ",");
-                if is_call {
+                if is_call && self.lambda_has_it(f, open) {
                     return self.lambda_param(f, open, 0);
                 }
             }
         }
         None
+    }
+
+    /// Whether the lambda (or block) at `{` token `open` gives its body an `it`: not the body of
+    /// `if`/`for`/`while`/`catch`, nor a receiver lambda (`apply`, `run`, `with`, `T.() -> R`) or
+    /// one without parameters (`() -> R`).
+    fn lambda_has_it(&self, f: &FileInfo, open: usize) -> bool {
+        let mut callee = open - 1;
+        if f.t(callee) == "@" && callee > 1 {
+            callee -= 2;
+        }
+        if f.t(callee) == ")" {
+            let Some(o) = f.pair(callee) else { return true };
+            if o == 0 {
+                return true;
+            }
+            callee = o - 1;
+        }
+        match f.t(callee) {
+            "if" | "for" | "while" | "catch" | "when" => return false,
+            "apply" | "run" | "with" | "buildString" => return false,
+            _ => {}
+        }
+        if !f.ident(callee) {
+            return true;
+        }
+        // a project function: the type of the parameter the lambda goes to
+        let Res::Decls(v) = self.resolve_tok(f, callee) else {
+            return true;
+        };
+        let Some((g, gi)) = v.first().and_then(|r| self.decl(r)) else {
+            return true;
+        };
+        let Some(p) = g.syms.decls[gi].params.last() else {
+            return true;
+        };
+        let ty = p.ty.trim();
+        let ty = ty.strip_prefix("suspend ").unwrap_or(ty).trim();
+        match ty.split_once("->") {
+            Some((inputs, _)) => {
+                let inputs = inputs.trim();
+                inputs.starts_with('(') && inputs != "()"
+            }
+            None => true,
+        }
     }
 
     // ---------------------------------------------------------------- resolution
@@ -1930,19 +2192,32 @@ impl<'a> Resolver<'a> {
     /// arguments' types (when those are known).
     fn by_arg_types(&self, f: &FileInfo, i: usize, v: Vec<DeclRef>) -> Vec<DeclRef> {
         let mut open = i + 1;
-        if f.t(open) != "(" || f.java && f.t(open) != "(" {
-            return v;
+        // `foo<T>(…)`: the arguments follow the type arguments
+        if f.t(open) == "<" && !f.java {
+            let mut depth = 0;
+            while open < f.toks.len() {
+                match f.t(open) {
+                    "<" => depth += 1,
+                    ">" => depth -= 1,
+                    "(" | ")" | "{" | "}" | "=" | ";" => return v,
+                    _ => {}
+                }
+                open += 1;
+                if depth == 0 {
+                    break;
+                }
+            }
         }
-        if f.t(open) == "<" {
-            open = (open..f.toks.len())
-                .find(|&k| f.t(k) == "(")
-                .unwrap_or(open);
+        if f.t(open) != "(" {
+            return v;
         }
         let args: Vec<Option<Ty>> = split_args_tokens(f, open)
             .into_iter()
             .map(|(s, e)| {
-                if f.t(s + 1) == "=" {
-                    None
+                if is_comparison(f, s, e) {
+                    Some(Ty::Lib("Boolean".into(), Vec::new()))
+                } else if f.t(s + 1) == "=" {
+                    None // a named argument
                 } else {
                     self.type_of_expr(f, s, e)
                 }
@@ -1975,6 +2250,8 @@ impl<'a> Resolver<'a> {
     }
 
     fn resolve_tok_inner(&self, f: &FileInfo, i: usize) -> Res {
+        #[cfg(test)]
+        self.c.resolved.set(self.c.resolved.get() + 1);
         let Some(_g) = self.guard() else {
             return Res::None;
         };
@@ -2019,6 +2296,7 @@ impl<'a> Resolver<'a> {
         let args = self.call_args(f, i);
         // a named argument: `Foo(name = …)`, `x.copy(name = …)`
         if f.t(i + 1) == "="
+            && f.t(i + 2) != "="
             && i > 0
             && matches!(f.t(i - 1), "(" | ",")
             && let Some(r) = self.named_arg(f, i, &name)
@@ -2211,6 +2489,10 @@ impl<'a> Resolver<'a> {
                     })
                 })
                 .collect();
+            let funs = plain_first(funs, |r| {
+                self.decl(r)
+                    .is_some_and(|(g, gi)| g.syms.decls[gi].params.iter().any(is_vararg))
+            });
             if args.is_some() && !funs.is_empty() && (types.is_empty() || !looks_type) {
                 return Res::Decls(funs);
             }
@@ -2302,10 +2584,11 @@ impl<'a> Resolver<'a> {
                 Res::Decls(v)
             };
         }
-        // `Type.name`
+        // `Type.name` (a type's name starts upper-case: `value.name` is not probed, so a chain
+        // `a.b.c.d` resolves each link once, not twice)
         if dot == start + 1 || f.t(dot - 1) != ")" {
             let last = dot - 1;
-            if f.ident(last) {
+            if f.ident(last) && f.name(last).starts_with(char::is_uppercase) {
                 let r = self.resolve_tok(f, last);
                 if let Res::Decls(v) = &r
                     && let Some(t) = v.iter().find(|r| {
@@ -2324,6 +2607,13 @@ impl<'a> Resolver<'a> {
                         }
                     }
                     if !self.is_object(t) {
+                        // `fun Foo.Companion.create()`
+                        if let Some(c) = self.companion(t) {
+                            let e = self.extensions(f, name, Some(&Ty::Decl(c)), args, f.start(i));
+                            if !e.is_empty() {
+                                return Res::Decls(e);
+                            }
+                        }
                         return Res::None;
                     }
                 }
@@ -2340,20 +2630,32 @@ impl<'a> Resolver<'a> {
             if !v.is_empty() {
                 return Res::Decls(v);
             }
-            // a smart cast to a subtype (`is Content -> state.items`)
+            // a smart cast to a subtype (`is Content -> state.items`): the one subtype that has
+            // the member, else the one the nearest `is` before names
             if let Ty::Decl(r) = t
                 && let Some((g, gi)) = self.decl(r)
             {
-                let mut found = Vec::new();
+                let mut subs: Vec<(String, Vec<DeclRef>)> = Vec::new();
                 for h in self.index.implementations(&g.syms.decls[gi].name) {
                     let sub = (h.path.clone(), h.offset);
-                    if self.hierarchy_up(&Ty::Decl(sub.clone())).contains(t) {
-                        found.extend(self.member_of(&Ty::Decl(sub), name, args));
+                    if self.hierarchy_up(&Ty::Decl(sub.clone())).contains(t)
+                        && let Some((sf, si)) = self.decl(&sub)
+                    {
+                        let mut m = self.member_of(&Ty::Decl(sub), name, args);
+                        if !m.is_empty() {
+                            m.sort();
+                            subs.push((sf.syms.decls[si].name.clone(), m));
+                        }
                     }
                 }
-                found.sort();
-                found.dedup();
-                if !found.is_empty() {
+                let chosen = if subs.len() == 1 {
+                    subs.pop()
+                } else {
+                    let names: Vec<&str> = subs.iter().map(|(n, _)| n.as_str()).collect();
+                    let k = f.smart_cast_before(start, dot, &names);
+                    k.and_then(|k| subs.into_iter().find(|(n, _)| *n == f.name(k)))
+                };
+                if let Some((_, found)) = chosen {
                     return Res::Decls(found);
                 }
             }
@@ -2421,35 +2723,38 @@ impl<'a> Resolver<'a> {
 
     /// Whether the declaration `r` is `target` or overrides it.
     pub fn means(&self, r: &DeclRef, target: &DeclRef) -> bool {
-        if r == target {
-            return true;
-        }
-        let mut cur = r.clone();
-        for _ in 0..16 {
+        // what `r` overrides, along every supertype (`class C : A, B` overrides both)
+        let mut todo = vec![r.clone()];
+        let mut seen = HashSet::new();
+        while let Some(cur) = todo.pop() {
+            if cur == *target {
+                return true;
+            }
+            if !seen.insert(cur.clone()) || seen.len() > 64 {
+                continue;
+            }
             let Some((f, i)) = self.decl(&cur) else {
-                return false;
+                continue;
             };
             let d = &f.syms.decls[i];
             if !d.has_modifier("override") && !f.java {
-                return false;
+                continue;
             }
             let Some(c) = f.classes_at(d.offset).first().copied().or_else(|| {
                 f.syms.decls.iter().position(|x| {
                     x.kind.is_type() && Some(x.name.as_str()) == d.container.as_deref()
                 })
             }) else {
-                return false;
+                continue;
             };
             let class = (f.path.clone(), f.syms.decls[c].offset);
             let args = (d.kind == Kind::Fun).then(|| Args {
                 count: d.params.len(),
                 ..Default::default()
             });
-            let up: Vec<DeclRef> = self
-                .hierarchy_up(&Ty::Decl(class))
-                .into_iter()
-                .skip(1)
-                .find_map(|t| match t {
+            // the nearest member of that name up each direct supertype
+            for s in self.supertypes(&class) {
+                let up = self.hierarchy_up(&s).into_iter().find_map(|t| match t {
                     Ty::Decl(s) => {
                         let v: Vec<DeclRef> = self
                             .members(&s)
@@ -2464,14 +2769,8 @@ impl<'a> Resolver<'a> {
                         (!v.is_empty()).then_some(v)
                     }
                     _ => None,
-                })
-                .unwrap_or_default();
-            if up.contains(target) {
-                return true;
-            }
-            match up.into_iter().next() {
-                Some(n) => cur = n,
-                None => return false,
+                });
+                todo.extend(up.into_iter().flatten());
             }
         }
         false
@@ -2612,6 +2911,57 @@ impl<'a> Resolver<'a> {
 }
 
 impl FileInfo {
+    /// The name token of the nearest `x is Name` (or `is Name ->` branch of a `when`) before the
+    /// receiver at tokens `start..dot`, inside the same function, whose name is one of `names`.
+    fn smart_cast_before(&self, start: usize, dot: usize, names: &[&str]) -> Option<usize> {
+        let at = self.start(start);
+        let from = self
+            .fun_at(at)
+            .and_then(|fi| self.syms.decls[fi].body.as_ref())
+            .map_or(0, |b| {
+                self.toks.partition_point(|t| t.range.start < b.start)
+            });
+        let recv = &self.text[self.start(start)..self.end(dot - 1)];
+        (from..start).rev().find_map(|k| {
+            if self.t(k) != "is" || !names.contains(&self.name(k + 1)) {
+                return None;
+            }
+            // `if (recv is Name) …` / `recv is Name && …`, with the receiver in what it guards
+            let s = self.expr_start(k);
+            let subject = s < k
+                && &self.text[self.start(s)..self.end(k - 1)] == recv
+                && (from..s)
+                    .rev()
+                    .find(|&o| self.t(o) == "(" && self.pair(o).is_some_and(|c| c > k))
+                    .is_some_and(|o| {
+                        let c = self.pair(o).unwrap_or(o);
+                        if start < c {
+                            return true;
+                        }
+                        if o == 0 || !matches!(self.t(o - 1), "if" | "while") {
+                            return false;
+                        }
+                        let end = match self.t(c + 1) {
+                            "{" => self.pair(c + 1).unwrap_or(c + 1),
+                            _ => self.expr_end(c + 1, self.toks.len()),
+                        };
+                        start < end
+                    });
+            // a `when (recv)` branch `is Name ->` the receiver is in
+            let branch = (self.newline_before(k) || matches!(self.t(k - 1), "{" | "," | ";"))
+                && self.block_around(k).is_some_and(|(o, c)| {
+                    o > 0
+                        && c > start
+                        && self.t(o - 1) == ")"
+                        && self.is_when_block(o)
+                        && self.pair(o - 1).is_some_and(|p| {
+                            self.text[self.end(p)..self.start(o - 1)].trim() == recv
+                        })
+                });
+            (subject || branch).then_some(k + 1)
+        })
+    }
+
     /// First token of the receiver expression that ends right before token `dot` (a `.`, `?.`
     /// or `::`): `a.b(c)[0]!!` of `a.b(c)[0]!!.name`.
     fn expr_start(&self, dot: usize) -> usize {
@@ -2728,11 +3078,11 @@ fn pick(found: Vec<(DeclRef, Decl)>, args: Option<&Args>) -> Option<Vec<DeclRef>
                 .iter()
                 .filter(|(_, d)| d.kind == Kind::Fun || d.kind.is_type())
                 .collect();
-            let ok: Vec<DeclRef> = funs
-                .iter()
-                .filter(|(_, d)| fits(d, a))
-                .map(|(r, _)| r.clone())
-                .collect();
+            let ok = plain_first(
+                funs.iter().filter(|(_, d)| fits(d, a)).collect(),
+                |(_, d)| d.params.iter().any(is_vararg),
+            );
+            let ok: Vec<DeclRef> = ok.into_iter().map(|(r, _)| r.clone()).collect();
             if !ok.is_empty() {
                 ok
             } else if !funs.is_empty() && funs.len() == found.len() {
@@ -2771,9 +3121,26 @@ fn elem(t: &Ty) -> Option<Ty> {
     }
 }
 
+/// What iterating over a value of type `t` gives: a map's entries, else its elements.
+fn iter_elem(t: &Ty) -> Option<Ty> {
+    match t {
+        Ty::Lib(n, a) if n.ends_with("Map") && a.len() == 2 => {
+            Some(Ty::Lib("Entry".into(), a.clone()))
+        }
+        _ => elem(t),
+    }
+}
+
 /// The type a library member returns, for the members code reads through most.
 fn lib_member(t: &Ty, name: &str) -> Option<Ty> {
     let Ty::Lib(n, _) = t else { return None };
+    if n == "Entry" {
+        match name {
+            "key" | "component1" => return t.arg(0),
+            "value" | "component2" => return t.arg(1),
+            _ => {}
+        }
+    }
     match name {
         "value"
         | "first"
@@ -2828,6 +3195,23 @@ fn split_top(s: &str) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+/// Whether tokens `s..e` hold `==` or `!=` outside brackets (the lexer gives `=` `=`).
+fn is_comparison(f: &FileInfo, s: usize, e: usize) -> bool {
+    let mut k = s;
+    while k + 1 < e {
+        match f.t(k) {
+            "(" | "[" | "{" => {
+                k = f.pair(k).unwrap_or(k) + 1;
+                continue;
+            }
+            "=" | "!" if f.t(k + 1) == "=" => return true,
+            _ => {}
+        }
+        k += 1;
+    }
+    false
 }
 
 /// Token ranges of the arguments of the call whose `(` is token `open`.
@@ -4198,5 +4582,254 @@ mod tests {
         ]);
         let r = Resolver::new(&i, &t);
         assert_eq!(at(&r, "/p/T.kt", "nav", 1), "/p/E.kt:4");
+    }
+
+    #[test]
+    fn an_equality_inside_call_arguments_is_not_a_named_argument() {
+        let (i, t) = project(&[
+            (
+                "/p/B.kt",
+                "package a\nclass Box(val x: Int)\nfun check(b: Boolean) {}\n",
+            ),
+            (
+                "/p/U.kt",
+                "package a\nfun f(x: Int, y: Int) {\n    Box(x == y)\n    check(1, x == y)\n}\n",
+            ),
+        ]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/U.kt", "x", 2), "local", "`Box(x == y)`");
+        assert_eq!(at(&r, "/p/U.kt", "x", 3), "local", "`check(1, x == y)`");
+    }
+
+    #[test]
+    fn a_comparison_argument_picks_the_boolean_overload() {
+        let (i, t) = project(&[(
+            "/p/P.kt",
+            "package a
+fun pick(b: Boolean) = 1
+fun pick(s: Int) = 2
+fun f(x: Int, y: Int) {
+    pick(x == y)
+    pick(x != y)
+}
+",
+        )]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/P.kt", "pick", 3), "/p/P.kt:2", "`==`");
+        assert_eq!(at(&r, "/p/P.kt", "pick", 4), "/p/P.kt:2", "`!=`");
+    }
+
+    #[test]
+    fn a_plain_constructor_parameter_is_seen_by_initializers_but_not_by_member_functions() {
+        let (i, t) = project(&[(
+            "/p/A.kt",
+            "package a\nclass A(name: String) {\n    val name = name.trim()\n    init { println(name) }\n    fun f() = name\n    fun g(): String { return name }\n}\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(
+            at(&r, "/p/A.kt", "name", 3),
+            "local",
+            "a property initializer"
+        );
+        assert_eq!(at(&r, "/p/A.kt", "name", 4), "local", "an init block");
+        assert_eq!(
+            at(&r, "/p/A.kt", "name", 5),
+            "/p/A.kt:3",
+            "an expression body"
+        );
+        assert_eq!(at(&r, "/p/A.kt", "name", 6), "/p/A.kt:3", "a block body");
+    }
+
+    #[test]
+    fn a_member_of_subtypes_needs_an_is_check_when_more_than_one_subtype_has_it() {
+        let (i, t) = project(&[(
+            "/p/S.kt",
+            "package a\nsealed class State {\n    object Loading : State() { val message = \"wait\" }\n    class Error(val message: String) : State()\n}\nfun f(state: State) {\n    state.message\n    if (state is Error) state.message\n}\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(
+            at(&r, "/p/S.kt", "message", 3),
+            "-",
+            "no `is`: either subtype"
+        );
+        assert_eq!(
+            at(&r, "/p/S.kt", "message", 4),
+            "/p/S.kt:4",
+            "after `is Error`"
+        );
+        let (i, t) = project(&[(
+            "/p/S.kt",
+            "package a
+sealed class State {
+    object Loading : State() { val message = \"wait\" }
+    class Error(val message: String) : State()
+}
+fun f(state: State, other: State) {
+    when (state) {
+        is Loading -> state.message
+        is Error -> state.message
+    }
+    if (other is Error) state.message
+}
+",
+        )]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(
+            at(&r, "/p/S.kt", "message", 3),
+            "/p/S.kt:3",
+            "`is Loading ->`"
+        );
+        assert_eq!(
+            at(&r, "/p/S.kt", "message", 4),
+            "/p/S.kt:4",
+            "`is Error ->`"
+        );
+        assert_eq!(at(&r, "/p/S.kt", "message", 5), "-", "`other is Error`");
+    }
+
+    #[test]
+    fn a_class_type_parameter_has_the_members_of_its_bound() {
+        let (i, t) = project(&[(
+            "/p/B.kt",
+            "package a\ninterface UiState { val items: List<String> }\nclass Other(val items: Int)\nabstract class Base<S : UiState>(val o: Other) {\n    abstract val state: S\n    fun f() = state.items\n    fun g(s: S) = s.items\n}\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(
+            at(&r, "/p/B.kt", "items", 3),
+            "/p/B.kt:2",
+            "a property of type S"
+        );
+        assert_eq!(
+            at(&r, "/p/B.kt", "items", 4),
+            "/p/B.kt:2",
+            "a parameter of type S"
+        );
+    }
+
+    #[test]
+    fn it_comes_from_the_nearest_lambda_that_has_it() {
+        let (i, t) = project(&[
+            (
+                "/p/I.kt",
+                "package a\nclass Item(val ok: Boolean, val name: String)\nclass Box(val name: String)\nfun Box.edit(block: Box.() -> Unit) {}\n",
+            ),
+            (
+                "/p/U.kt",
+                "package a\nfun f(list: List<Item>, out: MutableList<Box>, box: Box) {\n    list.forEach { if (it.ok) { it.name } }\n    list.forEach { out.apply { it.name } }\n    list.forEach { with(box) { it.name } }\n    list.forEach { box.edit { it.name } }\n    list.forEach { for (b in out) { it.name } }\n}\n",
+            ),
+        ]);
+        let r = Resolver::new(&i, &t);
+        for n in 1..=5 {
+            assert_eq!(at(&r, "/p/U.kt", "name", n), "/p/I.kt:2", "use {n}");
+        }
+    }
+
+    #[test]
+    fn a_long_chain_of_properties_resolves_each_link_once() {
+        let (i, t) = project(&[(
+            "/p/N.kt",
+            "package a\nclass Node(val next: Node)\nfun f(n: Node) = n.next.next.next.next.next.next.next.next.next.next\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/N.kt", "next", 11), "/p/N.kt:2");
+        let work = r.c.resolved.get();
+        assert!(work < 100, "{work} names resolved for 10 links");
+    }
+
+    #[test]
+    fn a_type_cut_short_by_the_depth_guard_is_worked_out_again() {
+        let (i, t) = project(&[(
+            "/p/A.kt",
+            "package a\nclass Item(val name: String)\nclass Other(val name: String)\nval item = Item(\"x\")\nfun f() = item.name\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        let f = r.file(Path::new("/p/A.kt")).unwrap();
+        let item = f
+            .syms
+            .decls
+            .iter()
+            .find(|d| d.name == "item")
+            .unwrap()
+            .offset;
+        let item = (PathBuf::from("/p/A.kt"), item);
+        *r.c.depth.borrow_mut() = 25;
+        assert_eq!(r.type_of_decl(&item), None, "cut short");
+        *r.c.depth.borrow_mut() = 0;
+        assert_eq!(at(&r, "/p/A.kt", "name", 3), "/p/A.kt:2");
+    }
+
+    #[test]
+    fn destructured_lambda_parameters_and_map_entries_get_their_component_types() {
+        let (i, t) = project(&[
+            (
+                "/p/K.kt",
+                "package a\nclass K(val kk: Int)\nclass K2(val kk: Int)\nclass V(val vv: Int)\nclass V2(val vv: Int)\n",
+            ),
+            (
+                "/p/U.kt",
+                "package a\nfun f(m: Map<K, V>, p: Pair<K, V>, k2: K2, v2: V2) {\n    m.forEach { (k, v) -> k.kk; v.vv }\n    m.filter { it.value.vv > 0 }\n    m.forEach { k, v -> k.kk }\n    val (a, b) = p\n    a.kk\n    for ((c, d) in m) { d.vv }\n}\n",
+            ),
+        ]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/U.kt", "kk", 1), "/p/K.kt:2", "`(k, v) ->` key");
+        assert_eq!(at(&r, "/p/U.kt", "vv", 1), "/p/K.kt:4", "`(k, v) ->` value");
+        assert_eq!(at(&r, "/p/U.kt", "vv", 2), "/p/K.kt:4", "`it` is an entry");
+        assert_eq!(at(&r, "/p/U.kt", "kk", 2), "/p/K.kt:2", "`k, v ->` key");
+        assert_eq!(at(&r, "/p/U.kt", "kk", 3), "/p/K.kt:2", "`val (a, b)`");
+        assert_eq!(
+            at(&r, "/p/U.kt", "vv", 3),
+            "/p/K.kt:4",
+            "`for ((c, d) in m)`"
+        );
+    }
+
+    #[test]
+    fn type_arguments_and_kotlin_varargs_tell_overloads_apart() {
+        let (i, t) = project(&[(
+            "/p/O.kt",
+            "package a\nfun <T> make(x: Int): T = TODO()\nfun <T> make(x: String): T = TODO()\nfun put(a: String) {}\nfun put(a: String, vararg more: String) {}\nfun use() {\n    make<Any>(1)\n    put(\"a\", \"b\", \"c\")\n    put(\"a\")\n}\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/O.kt", "make", 3), "/p/O.kt:2", "`make<Any>(1)`");
+        assert_eq!(at(&r, "/p/O.kt", "put", 3), "/p/O.kt:5", "three arguments");
+        assert_eq!(at(&r, "/p/O.kt", "put", 4), "/p/O.kt:4", "no vararg needed");
+    }
+
+    #[test]
+    fn an_override_of_two_supertypes_counts_for_both() {
+        let (i, t) = project(&[(
+            "/p/C.kt",
+            "package a\ninterface A { fun foo() }\ninterface B { fun foo() }\nclass C : A, B { override fun foo() {} }\nfun use(c: C) { c.foo() }\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        let all = ["/p/C.kt"];
+        assert_eq!(usages_of(&r, "/p/C.kt", "foo", 2, &all), ["/p/C.kt:5"]);
+        assert_eq!(usages_of(&r, "/p/C.kt", "foo", 3, &all), ["/p/C.kt:5"]);
+    }
+
+    #[test]
+    fn an_extension_on_a_companion_is_called_on_the_class() {
+        let (i, t) = project(&[(
+            "/p/F.kt",
+            "package a\nclass Foo {\n    companion object\n}\nfun Foo.Companion.create() = Foo()\nfun use() = Foo.create()\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/F.kt", "create", 2), "/p/F.kt:5");
+    }
+
+    #[test]
+    fn usages_in_a_text_newer_than_the_one_read_have_offsets_in_that_text() {
+        let (i, t) = project(&[
+            ("/p/A.kt", "package a\nclass A { fun go() = 1 }\n"),
+            ("/p/U.kt", "package a\nfun f(a: A) = a.go()\n"),
+        ]);
+        let r = Resolver::new(&i, &t);
+        let go = r.file(Path::new("/p/A.kt")).unwrap();
+        let go = (PathBuf::from("/p/A.kt"), go.text.find("go").unwrap());
+        r.file(Path::new("/p/U.kt")).unwrap();
+        let newer: Arc<str> = Arc::from("package a\n\n// moved down\nfun f(a: A) = a.go()\n");
+        let found = r.usages_in(&[go], Path::new("/p/U.kt"), &newer);
+        let names: Vec<&str> = found.iter().map(|(_, o)| &newer[*o..*o + 2]).collect();
+        assert_eq!(names, ["go"]);
     }
 }

@@ -209,6 +209,11 @@ struct EditorCache {
 
 /// Analysis waits this long after the last keystroke, so typing in big files stays smooth.
 const SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+/// How long an action that must come after the saves on their way (a revert, a refactor, a git
+/// command) waits for them before it says a save is still running and does nothing.
+const SAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long quitting waits for them: then what is still unsaved is kept in local history.
+const SAVE_WAIT_ON_QUIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SearchKind {
@@ -291,6 +296,11 @@ struct Item {
 }
 
 fn found_line(path: &Path, text: &str, o: usize) -> FoundLine {
+    // an offset from another version of the file is kept inside this one
+    let mut o = o.min(text.len());
+    while !text.is_char_boundary(o) {
+        o -= 1;
+    }
     let ls = text[..o].rfind('\n').map_or(0, |i| i + 1);
     let le = text[o..].find('\n').map_or(text.len(), |i| o + i);
     FoundLine {
@@ -970,7 +980,8 @@ impl App {
         }
     }
 
-    /// Waits for every save sent so far and applies them (on quit, and in tests).
+    /// Waits for every save sent so far and applies them (tests).
+    #[cfg(test)]
     fn wait_saves(&mut self) {
         saver::wait();
         self.poll_saves();
@@ -978,8 +989,8 @@ impl App {
 
     fn close_tab(&mut self, i: usize) {
         // ⌘S then ⌘W: the save on its way decides whether edits are left
-        if self.tabs.get(i).is_some_and(Tab::dirty) {
-            self.settle_saves();
+        if self.tabs.get(i).is_some_and(Tab::dirty) && !self.settle_saves() {
+            return;
         }
         if i < self.tabs.len() {
             // a deleted file's tab closes like Android Studio's: ⌘S would bring the file back
@@ -1026,7 +1037,9 @@ impl App {
     /// Drops the active tab's edits; they stay in local history (else they stay in the tab).
     fn revert(&mut self) {
         // ⌘S then Revert: the save lands first, so it is what the tab goes back to
-        self.settle_saves();
+        if !self.settle_saves() {
+            return;
+        }
         if let Some(t) = self.tabs.get_mut(self.active) {
             if t.dirty()
                 && let Err(e) = comfort::record_text(&t.path, t.text.as_bytes())
@@ -4278,7 +4291,11 @@ impl eframe::App for App {
         if self.settings.autosave && stopped.is_empty() {
             self.autosave();
         }
-        self.wait_saves();
+        // a save stuck on a slow disk does not hold the quit: its tab is still unsaved below
+        if !saver::wait_for(SAVE_WAIT_ON_QUIT) {
+            eprintln!("droid-lite: a save was still running at quit; its tab's text is kept");
+        }
+        self.poll_saves();
         // a forced quit never loses typing: what is still unsaved goes to local history, else to
         // the unsaved folder (and the log)
         let failed = self.keep_copies(&self.unsaved_tabs());
