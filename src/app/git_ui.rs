@@ -43,7 +43,7 @@ pub(super) struct GitState {
     history: Vec<Commit>,
     history_rx: Option<Receiver<Vec<Commit>>>,
     /// Open diff panel: title and `git show` / `git diff` output.
-    commit: Option<(String, Vec<String>)>,
+    pub(super) commit: Option<(String, Vec<String>)>,
     /// The diff panel shows one column (unified) instead of old | new side by side.
     unified: bool,
     commit_rx: Option<Receiver<(String, String)>>,

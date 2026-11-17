@@ -846,6 +846,13 @@ impl App {
     }
 
     fn save(&mut self) {
+        self.save_tab(false);
+    }
+
+    /// Writes the active tab. `auto` (auto-save) never writes over a file that changed on disk
+    /// since it was loaded or saved here, nor brings back one deleted meanwhile, even before the
+    /// watcher reports it: the tab gets the changed-on-disk bar instead.
+    fn save_tab(&mut self, auto: bool) {
         if self.refuse_during_checkout() {
             return;
         }
@@ -863,6 +870,14 @@ impl App {
             Ok(disk) => {
                 // changed on disk since it was loaded or saved here (the watcher may not know yet)
                 let theirs = disk != tab.saved.as_bytes();
+                if theirs && auto {
+                    tab.disk_changed = true;
+                    self.status = format!(
+                        "Auto-save did not write {}: it changed on disk; reload or keep yours",
+                        tab.path.display()
+                    );
+                    return;
+                }
                 if theirs && !tab.dirty() {
                     tab.disk_changed = true;
                     self.status = "File changed on disk; reload or keep yours".into();
@@ -878,7 +893,16 @@ impl App {
                     return;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if auto && !tab.saved.is_empty() {
+                    tab.deleted = true;
+                    self.status = format!(
+                        "Auto-save did not write {}: it was deleted on disk",
+                        tab.path.display()
+                    );
+                    return;
+                }
+            }
             Err(e) => {
                 self.status = format!("Save failed: cannot read {}: {e}", tab.path.display());
                 return;
@@ -4833,26 +4857,53 @@ pub fn install_crash_backup() {
 }
 
 /// Writes `bytes` to `path` so a failure (a full disk) never leaves it half written: a temp file
-/// in the same folder, synced, then renamed over it with the file's permissions (through a
-/// symlink to its target). A file that cannot be written is refused as before; in a folder that
-/// cannot take the temp file, the file is written in place.
+/// in the same folder (made with the file's permissions, so it is never more open than the
+/// file), synced, then renamed over it (through a symlink to its target). A file that cannot be
+/// written is refused as before; in a folder that cannot take the temp file, the file is written
+/// in place. A file with other hard links is written in place too (a rename would cut it off
+/// from them), and put back as it was when that write fails.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let perms = match std::fs::metadata(&target) {
+    let meta = match std::fs::metadata(&target) {
         Ok(m) => {
             // a read-only file stays read-only (a rename would replace it)
             std::fs::OpenOptions::new().write(true).open(&target)?;
-            Some(m.permissions())
+            Some(m)
         }
         Err(_) => None,
     };
+    if meta.as_ref().is_some_and(|m| m.nlink() > 1) {
+        let old = std::fs::read(&target)?;
+        let put = |b: &[u8]| {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&target)?;
+            f.write_all(b).and_then(|()| f.sync_all())
+        };
+        return put(bytes).inspect_err(|_| {
+            let _ = put(&old);
+        });
+    }
+    let mode = meta.as_ref().map(|m| m.permissions().mode() & 0o7777);
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let tmp = target.with_file_name(format!(".{name}.droid-lite-{}.tmp", std::process::id()));
-    let mut f = match std::fs::File::create(&tmp) {
+    let pid = std::process::id();
+    let mut tmp = target.with_file_name(format!(".{name}.droid-lite-{pid}.tmp"));
+    let mut made = create_temp(&tmp, mode);
+    if made
+        .as_ref()
+        .is_err_and(|e| e.raw_os_error() == Some(libc::ENAMETOOLONG))
+    {
+        // a name near the limit: the temp file gets a short one
+        tmp = target.with_file_name(format!(".droid-lite-{pid}.tmp"));
+        made = create_temp(&tmp, mode);
+    }
+    let mut f = match made {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             return std::fs::write(&target, bytes);
@@ -4861,13 +4912,35 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     };
     let written = f
         .write_all(bytes)
-        .and_then(|()| perms.map_or(Ok(()), |p| f.set_permissions(p)))
         .and_then(|()| f.sync_all())
         .and_then(|()| std::fs::rename(&tmp, &target));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     written
+}
+
+/// A new temp file with `mode` (the file's permissions; a new file's default when `None`) from
+/// the start: a file only its owner may read is never readable by others while it is written.
+fn create_temp(tmp: &Path, mode: Option<u32>) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::remove_file(tmp); // one a crash left
+    let f = temp_options(mode).open(tmp)?;
+    if let Some(m) = mode {
+        // the umask may have taken bits away, and setuid/sticky bits need a chmod
+        f.set_permissions(std::fs::Permissions::from_mode(m))?;
+    }
+    Ok(f)
+}
+
+/// Opens a new file with `mode` already at its creation (no window where it is more open).
+fn temp_options(mode: Option<u32>) -> std::fs::OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true)
+        .create_new(true)
+        .mode(mode.map_or(0o666, |m| m & 0o777));
+    o
 }
 
 /// `~/.config/droid-lite` (or `$DROID_LITE_CONFIG_DIR`). Tests never touch the user's folder:
@@ -5009,6 +5082,56 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
         assert!(write_atomic(&file, b"newer").is_err());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_temp_file_is_never_more_open_than_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("droid-lite-tmpmode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join(".A.tmp");
+        let f = temp_options(Some(0o600)).open(&tmp).unwrap();
+        let mode = f.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "from its creation, before any chmod");
+        drop(f);
+        let f = create_temp(&tmp, Some(0o640)).unwrap();
+        assert_eq!(f.metadata().unwrap().permissions().mode() & 0o777, 0o640, "one a crash left is replaced");
+        drop(f);
+        let secret = dir.join("secret.properties");
+        std::fs::write(&secret, "key=1").unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_atomic(&secret, b"key=2").unwrap();
+        assert_eq!(std::fs::metadata(&secret).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hard_linked_file_keeps_its_links() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("droid-lite-hardlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("A.kt"), dir.join("B.kt"));
+        std::fs::write(&a, "old").unwrap();
+        std::fs::hard_link(&a, &b).unwrap();
+        write_atomic(&a, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "new", "the other link sees the save");
+        assert_eq!(std::fs::metadata(&a).unwrap().ino(), std::fs::metadata(&b).unwrap().ino());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_name_near_the_limit_still_saves() {
+        let dir = std::env::temp_dir().join(format!("droid-lite-longname-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("{}.kt", "N".repeat(240)));
+        std::fs::write(&file, "old").unwrap();
+        write_atomic(&file, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temp file is left");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

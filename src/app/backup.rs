@@ -1,6 +1,12 @@
 //! Crash backup: edits that are not saved go to the `unsaved/` folder every 30 s (only when they
 //! changed), on SIGTERM and SIGINT (a signal thread) and from a panic hook, and when a quit cannot
 //! keep them in local history. The next start puts them back in their tabs.
+//!
+//! Each backup names the process that wrote it (pid and start time) and the hash of the file on
+//! disk when it was written. Recovery takes only backups whose process is gone (another running
+//! window keeps its own), and puts one back in its tab only while the file on disk is still the
+//! one it was written against; a file changed on disk since gets the backup in local history
+//! and a diff instead, never written over the newer file.
 
 use super::{App, hash};
 use serde_json::{Value, json};
@@ -16,6 +22,9 @@ const SNAP_EVERY: Duration = Duration::from_secs(1);
 
 /// The unsaved buffers (path, text), at most [`SNAP_EVERY`] old.
 static SNAPSHOT: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+/// Files [`write_snapshot`] wrote a backup of: the window tracks them like its own (a panic on
+/// another thread does not end the window, so it must remove them once saved).
+static SNAP_WRITTEN: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// What the window last copied and wrote.
 #[derive(Default)]
@@ -41,16 +50,80 @@ pub(super) fn unsaved_dir() -> Option<PathBuf> {
     }
 }
 
+/// This process's backup of `path` (each window has its own).
 fn backup_file(dir: &Path, path: &Path) -> PathBuf {
-    dir.join(format!("{:016x}.json", hash(&path.to_string_lossy())))
+    backup_file_of(dir, path, std::process::id())
 }
 
-/// Writes the unsaved `text` of `path` to `dir` (a temp file, then a rename).
+fn backup_file_of(dir: &Path, path: &Path, pid: u32) -> PathBuf {
+    dir.join(format!("{:016x}-{pid}.json", hash(&path.to_string_lossy())))
+}
+
+/// FNV-1a of `bytes`: the same in every build, unlike std's hasher.
+fn disk_hash(bytes: &[u8]) -> String {
+    let h = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!("{h:016x}")
+}
+
+/// When process `pid` started (µs since 1970), if the system says.
+#[cfg(target_os = "macos")]
+pub(super) fn started(pid: u32) -> Option<u64> {
+    // SAFETY: proc_pidinfo fills at most `size` bytes of `info`
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    (n == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(super) fn started(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// This process: pid and start time (0 when unknown).
+fn me() -> (u32, u64) {
+    static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let pid = std::process::id();
+    (pid, *START.get_or_init(|| started(pid).unwrap_or(0)))
+}
+
+/// Whether the process that wrote a backup still runs and is another one (another window).
+/// A pid that now belongs to a process started at another time is gone.
+fn owner_alive(pid: u32, start: u64) -> bool {
+    if pid == 0 || pid == me().0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 only checks that the process exists
+        let exists = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        exists && (start == 0 || started(pid).is_none_or(|s| s == start))
+    }
+    #[cfg(not(unix))]
+    false
+}
+
+/// Writes the unsaved `text` of `path` to `dir` (a temp file, then a rename), with this process
+/// and the hash of the file on disk now.
 pub(super) fn write_one(dir: &Path, path: &Path, text: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let file = backup_file(dir, path);
     let tmp = file.with_extension(format!("tmp{}", std::process::id()));
-    let body = json!({ "path": path.to_string_lossy(), "text": text }).to_string();
+    let (pid, start) = me();
+    let disk = std::fs::read(path).ok().map(|b| disk_hash(&b));
+    let body = json!({ "path": path.to_string_lossy(), "text": text, "disk": disk, "pid": pid, "start": start })
+        .to_string();
     std::fs::write(&tmp, body)
         .and_then(|()| std::fs::rename(&tmp, &file))
         .map_err(|e| {
@@ -78,7 +151,12 @@ pub(super) fn write_snapshot(wait: bool) -> usize {
     let mut n = 0;
     for (path, text) in snap.iter() {
         match write_one(&dir, path, text) {
-            Ok(_) => n += 1,
+            Ok(_) => {
+                n += 1;
+                if let Ok(mut w) = SNAP_WRITTEN.try_lock() {
+                    w.push(path.clone());
+                }
+            }
             Err(e) => eprintln!(
                 "droid-lite: could not keep the unsaved edits of {}: {e}",
                 path.display()
@@ -114,11 +192,9 @@ pub fn install_signal_handler() {
         // SAFETY: write(2) is async-signal-safe; the pipe stays open for the whole run
         unsafe { libc::write(PIPE.load(Ordering::Relaxed), (&raw const b).cast(), 1) };
     }
-    let mut fds = [0; 2];
-    // SAFETY: pipe(2) fills the two descriptors
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+    let Some(fds) = cloexec_pipe() else {
         return;
-    }
+    };
     PIPE.store(fds[1], Ordering::Relaxed);
     std::thread::spawn(move || {
         loop {
@@ -149,7 +225,32 @@ pub fn install_signal_handler() {
     }
 }
 
+/// A pipe whose ends a started process (Gradle, adb, git) does not inherit.
+#[cfg(unix)]
+fn cloexec_pipe() -> Option<[libc::c_int; 2]> {
+    let mut fds = [0; 2];
+    // SAFETY: pipe(2) fills the two descriptors; fcntl(2) only sets their close-on-exec flag
+    unsafe {
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            return None;
+        }
+        for fd in fds {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+    }
+    Some(fds)
+}
+
 impl App {
+    /// Backups the signal thread or a panic hook wrote count as this window's own. Whether
+    /// there were any.
+    fn adopt_snapshot_backups(&mut self) -> bool {
+        let written = std::mem::take(&mut *SNAP_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+        let any = !written.is_empty();
+        self.backup.ours.extend(written);
+        any
+    }
+
     /// (path, text version) of the tabs with unsaved edits.
     fn unsaved_sig(&self) -> Vec<(PathBuf, u64)> {
         self.unsaved_tabs()
@@ -161,6 +262,10 @@ impl App {
     /// Every frame: the snapshot follows the unsaved tabs (at most once a second), and the
     /// folder gets them when they changed, at most every 30 s. Tabs without edits cost nothing.
     pub(super) fn backup_tick(&mut self, ctx: &egui::Context) {
+        // a panic on another thread wrote backups: they go once their tabs have no edits
+        if self.adopt_snapshot_backups() {
+            self.write_backups();
+        }
         let sig = self.unsaved_sig();
         if sig != self.backup.snap {
             if self
@@ -193,6 +298,7 @@ impl App {
     pub(super) fn write_backups(&mut self) {
         self.backup.written = self.unsaved_sig();
         self.backup.written_at = Some(Instant::now());
+        self.adopt_snapshot_backups();
         let Some(dir) = unsaved_dir() else {
             return;
         };
@@ -218,6 +324,7 @@ impl App {
     /// tabs `failed` (their copy failed) go to the folder, or at least to stderr's log; this
     /// window's other backups are not needed any more.
     pub(super) fn backups_kept(&mut self, failed: &[(usize, String)]) {
+        self.adopt_snapshot_backups();
         let dir = unsaved_dir();
         let mut kept = HashSet::new();
         for (i, why) in failed {
@@ -243,15 +350,17 @@ impl App {
     }
 
     /// After a project opens: edits a crash or a failed quit left in the folder for its files
-    /// are put back in their tabs ("Recovered unsaved edits for …"). A backup that matches the
-    /// file on disk is dropped; one whose file is gone stays in the folder.
+    /// are put back in their tabs ("Recovered unsaved edits for …"). Only backups of processes
+    /// that are gone count (another window keeps its own). A backup that matches the file on
+    /// disk is dropped; one whose file is gone stays in the folder; one whose file changed on
+    /// disk since it was written goes to local history with a diff, never into the tab.
     pub(super) fn recover_unsaved(&mut self) {
         let (Some(dir), Some(root)) =
             (unsaved_dir(), self.project.as_ref().map(|p| p.root.clone()))
         else {
             return;
         };
-        let mut found: Vec<(PathBuf, PathBuf, String)> = std::fs::read_dir(&dir)
+        let mut found: Vec<(PathBuf, PathBuf, String, Option<String>)> = std::fs::read_dir(&dir)
             .into_iter()
             .flatten()
             .filter_map(Result::ok)
@@ -261,14 +370,20 @@ impl App {
                 let v: Value = serde_json::from_str(&std::fs::read_to_string(&f).ok()?).ok()?;
                 let path = PathBuf::from(v["path"].as_str()?);
                 let text = v["text"].as_str()?.to_string();
-                path.starts_with(&root).then_some((f, path, text))
+                let pid = v["pid"].as_u64().unwrap_or(0) as u32;
+                if !path.starts_with(&root) || owner_alive(pid, v["start"].as_u64().unwrap_or(0)) {
+                    return None;
+                }
+                let disk = v["disk"].as_str().map(String::from);
+                Some((f, path, text, disk))
             })
             .collect();
         found.sort_by(|a, b| a.1.cmp(&b.1));
-        let mut names = Vec::new();
+        let (mut names, mut changed) = (Vec::new(), Vec::new());
         let first = found.first().map(|f| f.1.clone());
-        for (file, path, text) in found {
-            if std::fs::read(&path).is_ok_and(|b| b == text.as_bytes()) {
+        for (file, path, text, disk) in found {
+            let now = std::fs::read(&path);
+            if now.as_ref().is_ok_and(|b| *b == text.as_bytes()) {
                 let _ = std::fs::remove_file(&file); // saved since
                 continue;
             }
@@ -283,6 +398,24 @@ impl App {
                 ));
                 continue;
             }
+            if now.ok().map(|b| disk_hash(&b)) != disk {
+                // the file changed on disk after the backup: the newer file stays
+                match super::comfort::record_text(&path, text.as_bytes()) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&file);
+                        changed.push(format!("{name} (in Local history)"));
+                    }
+                    Err(e) => changed.push(format!(
+                        "{name} (could not keep it in Local history: {e}; the copy stays in {})",
+                        file.display()
+                    )),
+                }
+                self.show_diff_text(
+                    format!("Unsaved backup of {name} (file on disk → backup)"),
+                    super::comfort::diff_texts(&path, &text),
+                );
+                continue;
+            }
             self.show_file(&path, None);
             let Some(t) = self.tabs.iter_mut().find(|t| t.path == path && !t.readonly) else {
                 continue;
@@ -292,12 +425,26 @@ impl App {
                 t.cursor = t.cursor.min(t.text.len());
                 t.mark_edited();
             }
+            // this window's own backup replaces the old process's
+            if file != backup_file(&dir, &path) && write_one(&dir, &path, &t.text).is_ok() {
+                let _ = std::fs::remove_file(&file);
+            }
             self.backup.ours.insert(path);
             names.push(name);
         }
+        let mut notes = Vec::new();
         if !names.is_empty() {
+            notes.push(format!("Recovered unsaved edits for {}", names.join(", ")));
+        }
+        if !changed.is_empty() {
+            notes.push(format!(
+                "Changed on disk since their unsaved backup, so not put back: {}",
+                changed.join(", ")
+            ));
+        }
+        if !notes.is_empty() {
             // a note that stays a while (later status messages replace the status bar's)
-            let text = format!("Recovered unsaved edits for {}", names.join(", "));
+            let text = notes.join(". ");
             self.status = text.clone();
             self.toast_to(text, first.map(|p| (p, 0)), super::Bottom::Problems);
         }
@@ -357,17 +504,75 @@ mod tests {
             unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
         }
         let status = child.wait().unwrap();
-        let text = std::fs::read_to_string(backup_file(&dir.join("unsaved"), Path::new("/p/A.kt")))
-            .ok()
-            .and_then(|b| {
-                Some(
-                    serde_json::from_str::<Value>(&b).ok()?["text"]
-                        .as_str()?
-                        .to_string(),
-                )
-            });
+        let file = backup_file_of(&dir.join("unsaved"), Path::new("/p/A.kt"), child.id());
+        let text = std::fs::read_to_string(file).ok().and_then(|b| {
+            Some(
+                serde_json::from_str::<Value>(&b).ok()?["text"]
+                    .as_str()?
+                    .to_string(),
+            )
+        });
         let _ = std::fs::remove_dir_all(&dir);
         (status, text)
+    }
+
+    #[test]
+    fn the_signal_pipe_is_not_inherited_by_started_processes() {
+        let fds = cloexec_pipe().unwrap();
+        for fd in fds {
+            // SAFETY: reads the flags of a descriptor this test owns, then closes it
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            unsafe { libc::close(fd) };
+            assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC, "fd {fd}");
+        }
+    }
+
+    #[test]
+    fn a_backup_names_its_process_and_the_disk_file_it_was_written_against() {
+        let dir = std::env::temp_dir().join(format!("dl-backup-owner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("A.kt");
+        std::fs::write(&src, "on disk").unwrap();
+        let f = write_one(&dir.join("unsaved"), &src, "typed").unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        assert_eq!(v["disk"].as_str(), Some(disk_hash(b"on disk").as_str()));
+        assert_eq!(v["pid"].as_u64(), Some(u64::from(std::process::id())));
+        assert_eq!(v["start"].as_u64(), Some(me().1));
+        assert!(me().1 > 0, "the start time is known on macOS");
+        assert_eq!(
+            f,
+            backup_file(&dir.join("unsaved"), &src),
+            "one file per process"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_live_other_process_owns_its_backups() {
+        assert!(
+            !owner_alive(std::process::id(), me().1),
+            "this process's own"
+        );
+        assert!(!owner_alive(0, 0), "no owner written");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start = started(pid).unwrap();
+        assert!(owner_alive(pid, start), "another window still runs");
+        assert!(
+            owner_alive(pid, 0),
+            "an unknown start time: the pid decides"
+        );
+        assert!(
+            !owner_alive(pid, start + 1),
+            "the pid now belongs to another process"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!owner_alive(pid, start), "the window is gone");
     }
 
     #[test]

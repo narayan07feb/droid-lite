@@ -142,8 +142,8 @@ pub(super) fn record_text(path: &Path, text: &[u8]) -> Result<(), String> {
     {
         return Ok(());
     }
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("path.txt"), path.to_string_lossy().as_bytes())
+    private_dir(&dir).map_err(|e| e.to_string())?;
+    private_file(&dir.join("path.txt"), path.to_string_lossy().as_bytes())
         .map_err(|e| e.to_string())?;
     write_version(&dir, text).map_err(|e| e.to_string())?;
     let cutoff = now_ms().saturating_sub(HISTORY_DAYS * 86_400_000);
@@ -157,9 +157,42 @@ pub(super) fn record_text(path: &Path, text: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Writes a new version file `<ms>-<pid>-<n>`: two versions in one millisecond never share a name.
+/// Makes `dir` (0700 when new) and its parent (the history root) closed to other users, also
+/// when they exist already: local history holds unsaved source.
+fn private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    for d in [dir.parent(), Some(dir)].into_iter().flatten() {
+        let mode = std::fs::metadata(d)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(mode & 0o700))?;
+        }
+    }
+    Ok(())
+}
+
+/// Writes `bytes` to `file`, readable by this user only (0600).
+fn private_file(file: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(file)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(bytes)
+}
+
+/// Writes a new version file `<ms>-<pid>-<n>` (0600): two versions in one millisecond never
+/// share a name.
 fn write_version(dir: &Path, text: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     loop {
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -167,6 +200,7 @@ fn write_version(dir: &Path, text: &[u8]) -> std::io::Result<()> {
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(dir.join(name))
         {
             Ok(mut f) => return f.write_all(text),
@@ -362,7 +396,8 @@ impl App {
     }
 
     /// Saves every edited tab, as IntelliJ does when the window loses focus (and on quit). A tab
-    /// whose file changed on disk meanwhile is not written: its bar asks which version to keep.
+    /// whose file changed on disk meanwhile is not written, also when the watcher has not
+    /// reported the change yet: its bar asks which version to keep.
     /// While a checkout runs, [`App::save`] refuses, so nothing is written.
     pub(super) fn autosave(&mut self) {
         let active = self.active;
@@ -370,7 +405,7 @@ impl App {
             let t = &self.tabs[i];
             if t.dirty() && !t.deleted && !t.disk_changed {
                 self.active = i;
-                self.save();
+                self.save_tab(true);
             }
         }
         self.active = active;
@@ -720,6 +755,25 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&v[0].file).unwrap(), "v2");
         assert!(diff_texts(&v[1].file, "v3\n").contains("+v3"));
         std::fs::remove_file(&file).ok();
+    }
+
+    #[test]
+    fn local_history_is_readable_by_this_user_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = super::super::e2e::config_guard();
+        let root = history_root().unwrap();
+        // a history folder an older version made with the default mode
+        let dir = history_dir(Path::new("/p/Secret.kt")).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        record_text(Path::new("/p/Secret.kt"), b"val token = 1").unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join("path.txt")), 0o600);
+        let v = history(Path::new("/p/Secret.kt"));
+        assert_eq!(mode(&v[0].file), 0o600);
     }
 
     #[test]

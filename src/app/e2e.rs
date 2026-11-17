@@ -5452,6 +5452,119 @@ fn e2e_unsaved_edits_are_backed_up_and_recovered_after_a_crash() {
 }
 
 #[test]
+fn e2e_a_backup_older_than_the_file_on_disk_is_offered_with_a_diff_not_put_back() {
+    let f = Fixture::new("stalebackup");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    h.state_mut().settings.autosave = false;
+    let a = h.state().active;
+    h.state_mut().tabs[a].text.push_str("// typed before the crash\n");
+    h.state_mut().tabs[a].mark_edited();
+    steps(&mut h, 2);
+    let typed = tab(&h).text.clone();
+    assert_eq!(unsaved_backups(&f), vec![typed.clone()]);
+    // a crash, then the file is saved from another editor
+    drop(h);
+    let theirs = "package com.demo.data\n\nclass Theirs\n";
+    std::fs::write(&user, theirs).unwrap();
+    let mut h = f.harness();
+    wait(&mut h, "offered", |a| {
+        a.toast_texts().iter().any(|t| t.starts_with("Changed on disk since their unsaved backup"))
+    });
+    assert!(h.state().tabs.iter().filter(|t| t.path == user).all(|t| t.text == theirs));
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs, "the newer file stays");
+    assert_eq!(newest_version(&user).as_deref(), Some(typed.as_str()), "the backup is in Local history");
+    let (title, diff) = h.state().git.commit.clone().expect("a diff is shown");
+    assert!(title.contains("Unsaved backup of User.kt"), "{title}");
+    assert!(diff.iter().any(|l| l == "+// typed before the crash"), "{diff:?}");
+    assert!(unsaved_backups(&f).is_empty(), "not offered again");
+}
+
+#[test]
+fn e2e_another_running_window_keeps_its_backups() {
+    let f = Fixture::new("otherwindow");
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    let dir = f.config.join("unsaved");
+    let typed = format!("{USER_KT}// typed in the other window\n");
+    // a backup the other window (a live process) wrote
+    let file = super::backup::write_one(&dir, &user, &typed).unwrap();
+    let mut other = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    v["pid"] = other.id().into();
+    v["start"] = super::backup::started(other.id()).unwrap().into();
+    let theirs = dir.join(format!("other-{}.json", other.id()));
+    std::fs::write(&theirs, v.to_string()).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    let mut h = f.harness();
+    steps(&mut h, 3);
+    assert!(h.state().tabs.iter().filter(|t| t.path == user).all(|t| t.text == USER_KT));
+    assert!(theirs.exists(), "the other window's backup stays");
+    assert!(!h.state().toast_texts().iter().any(|t| t.contains("Recovered")));
+    // that window crashed: the next start takes it
+    other.kill().unwrap();
+    other.wait().unwrap();
+    drop(h);
+    let mut h = f.harness();
+    wait(&mut h, "recovered", |a| a.toast_texts().contains(&"Recovered unsaved edits for User.kt"));
+    assert_eq!(h.state().tabs.iter().find(|t| t.path == user).unwrap().text, typed);
+    assert!(!theirs.exists(), "this window's own backup replaces it");
+    assert_eq!(unsaved_backups(&f), vec![typed]);
+}
+
+#[test]
+fn e2e_a_panic_time_backup_goes_once_its_tab_is_saved() {
+    let f = Fixture::new("panicbackup");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    h.state_mut().settings.autosave = false;
+    // the folder was written a moment ago: the next write waits 30 s
+    h.state_mut().backup.written_at = Some(std::time::Instant::now());
+    let a = h.state().active;
+    h.state_mut().tabs[a].text.push_str("// typed\n");
+    h.state_mut().tabs[a].mark_edited();
+    steps(&mut h, 2);
+    assert!(unsaved_backups(&f).is_empty());
+    // a panic on a worker thread writes the snapshot; the window goes on
+    assert_eq!(super::backup::write_snapshot(true), 1);
+    assert_eq!(unsaved_backups(&f).len(), 1);
+    h.state_mut().save();
+    steps(&mut h, 2);
+    assert!(unsaved_backups(&f).is_empty(), "saved: the backup goes");
+}
+
+#[test]
+fn e2e_autosave_never_writes_over_a_change_on_disk_the_watcher_has_not_reported() {
+    let f = Fixture::new("autosaverace");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    h.state_mut().watcher = None;
+    let a = h.state().active;
+    h.state_mut().tabs[a].text.push_str("// mine\n");
+    h.state_mut().tabs[a].mark_edited();
+    let theirs = "package com.demo.data\n\nclass Theirs\n";
+    std::fs::write(&user, theirs).unwrap();
+    h.state_mut().autosave();
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs);
+    assert!(tab(&h).disk_changed && tab(&h).dirty(), "the bar asks");
+    assert!(h.state().status.starts_with("Auto-save did not write"), "{}", h.state().status);
+    // Keep mine: auto-save writes it
+    steps(&mut h, 2);
+    h.get_by_label("Keep mine").click();
+    steps(&mut h, 2);
+    h.state_mut().autosave();
+    assert!(std::fs::read_to_string(&user).unwrap().ends_with("// mine\n"));
+    // deleted meanwhile: auto-save does not bring it back
+    std::fs::remove_file(&user).unwrap();
+    h.state_mut().tabs[a].text.push_str("// more\n");
+    h.state_mut().autosave();
+    assert!(!user.exists());
+    assert!(tab(&h).deleted);
+}
+
+#[test]
 fn e2e_translations_and_history_restore_wait_for_a_checkout() {
     let f = Fixture::new("checkoutlock");
     let strings = |dir: &str, text: &str| {
