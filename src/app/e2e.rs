@@ -5784,7 +5784,7 @@ fn e2e_an_action_waiting_for_a_save_does_not_run_after_more_typing() {
     assert!(
         h.state()
             .status
-            .starts_with("Revert User.kt did not run: a text changed meanwhile"),
+            .starts_with("Revert User.kt did not run: User.kt changed meanwhile"),
         "{}",
         h.state().status
     );
@@ -5955,7 +5955,7 @@ fn e2e_an_edit_undone_while_an_action_waits_for_a_save_still_counts_as_a_change(
     a.wait_saves();
     assert_eq!(runs.get(), 0);
     assert!(
-        a.status.contains("a text changed meanwhile"),
+        a.status.contains("User.kt changed meanwhile"),
         "{}",
         a.status
     );
@@ -6039,6 +6039,28 @@ fn e2e_git_add_then_commit_queued_behind_a_save_both_run() {
     assert!(
         git_out(&f.root, &["show", "--name-only", "--format=", "HEAD"]).contains("User.kt"),
         "the commit has the file the add staged"
+    );
+}
+
+#[test]
+fn e2e_an_action_asked_for_again_keeps_its_place_before_the_ones_behind_it() {
+    let f = Fixture::new("after-saves-again");
+    let mut h = f.harness();
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    let a = h.state_mut();
+    a.git_command(&["add", "app/src/main/java/com/demo/data/User.kt"]);
+    a.git_command(&["commit", "-q", "-m", "typed"]);
+    // the add clicked again while both wait
+    a.git_command(&["add", "app/src/main/java/com/demo/data/User.kt"]);
+    let order: Vec<&str> = a.after_saves.iter().map(|w| w.what.as_str()).collect();
+    assert_eq!(order.len(), 2, "{order:?}");
+    assert!(order[0].starts_with("git add"), "{order:?}");
+    unstick.send(()).unwrap();
+    a.wait_saves();
+    assert_eq!(git_out(&f.root, &["log", "-1", "--format=%s"]), "typed\n", "{}", a.status);
+    assert!(
+        git_out(&f.root, &["show", "--name-only", "--format=", "HEAD"]).contains("User.kt"),
+        "the add ran before the commit"
     );
 }
 
@@ -6220,13 +6242,61 @@ fn e2e_every_action_dropped_in_a_round_stays_in_the_notices() {
     unstick.send(()).unwrap();
     a.wait_saves();
     assert_eq!(runs.get(), 0);
+    let notices: Vec<&str> = a.notices.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(
-        a.notices,
+        notices,
         [
-            "Rename A → B did not run: a text changed meanwhile",
-            "Rename C → D did not run: a text changed meanwhile"
+            "Rename A → B did not run: User.kt changed meanwhile",
+            "Rename C → D did not run: User.kt changed meanwhile"
         ]
     );
+}
+
+#[test]
+fn e2e_opening_or_closing_other_tabs_keeps_an_action_waiting_for_a_save() {
+    let f = Fixture::new("after-saves-tabs");
+    let mut h = f.harness();
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    open(&mut h, &card);
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    let runs = std::rc::Rc::new(std::cell::Cell::new(0));
+    h.state_mut().settle_saves("git stash", counted(&runs));
+    // a clean tab closed and another file opened while it waits
+    let c = h.state().tabs.iter().position(|t| t.path == card).unwrap();
+    h.state_mut().close_tab(c);
+    open(&mut h, &f.path("app/build.gradle.kts"));
+    unstick.send(()).unwrap();
+    h.state_mut().wait_saves();
+    assert_eq!(runs.get(), 1, "{}", h.state().status);
+}
+
+#[test]
+fn e2e_a_notice_seen_again_is_counted_and_only_the_last_ones_stay() {
+    let f = Fixture::new("after-saves-notice-cap");
+    let mut h = f.harness();
+    for i in 0..7 {
+        h.state_mut().notice(format!("Rename {i} did not run"));
+    }
+    h.state_mut().notice("Rename 6 did not run".into());
+    let kept: Vec<(&str, u32)> = h
+        .state()
+        .notices
+        .iter()
+        .map(|(n, k)| (n.as_str(), *k))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            ("Rename 2 did not run", 1),
+            ("Rename 3 did not run", 1),
+            ("Rename 4 did not run", 1),
+            ("Rename 5 did not run", 1),
+            ("Rename 6 did not run", 2)
+        ]
+    );
+    steps(&mut h, 2);
+    assert!(h.query_by_label("Rename 6 did not run (×2)").is_some());
+    assert!(h.query_by_label("Rename 1 did not run").is_none());
 }
 
 #[test]
@@ -6250,7 +6320,7 @@ fn e2e_waiting_actions_are_told_apart_by_their_place() {
 }
 
 #[test]
-fn e2e_a_pr_check_out_waits_for_the_actions_waiting_for_a_save() {
+fn e2e_a_pr_check_out_is_refused_until_the_actions_waiting_for_a_save_ran() {
     let f = Fixture::new("after-saves-pr");
     let mut h = f.harness();
     let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);

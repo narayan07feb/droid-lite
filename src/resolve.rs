@@ -2814,8 +2814,10 @@ impl<'a> Resolver<'a> {
         for (k, t) in receivers.iter().enumerate() {
             // a member of a library receiver (`append` in `buildString { }`)
             if let Ty::Lib(n, _) = t
-                && args.is_some()
-                && known_members(n).is_some_and(|m| m.contains(&name))
+                && match args {
+                    Some(_) => known_members(n).is_some_and(|m| m.contains(&name)),
+                    None => known_properties(n).contains(&name),
+                }
             {
                 return Res::None;
             }
@@ -3650,6 +3652,51 @@ fn known_lambda_call(name: &str) -> Option<KnownLambda> {
         "Box" => (Some("BoxScope"), false),
         "LazyColumn" | "LazyRow" => (Some("LazyListScope"), false),
         "DisposableEffect" => (Some("DisposableEffectScope"), false),
+        // The Compose and Navigation lambdas below were read from the jars in the Gradle cache
+        // (javap, and kotlinc 2.1.20 type-checking `val s: X = this` / `it` in each against
+        // them, with a wrong receiver as the control):
+        // material3-android 1.4.0 CardKt: `Card(…, content: ColumnScope.() -> Unit)`, the
+        // same for ElevatedCard and OutlinedCard; ModalBottomSheetKt `ModalBottomSheet(…,
+        // content: ColumnScope.() -> Unit)`. material-android 1.10.4 (Material 2) `Card(…,
+        // content: () -> Unit)` has none: there only ColumnScope's members stay unresolved.
+        "Card" | "ElevatedCard" | "OutlinedCard" | "ModalBottomSheet" => {
+            (Some("ColumnScope"), false)
+        }
+        // material3-android 1.4.0 ButtonKt: `Button(onClick, …, content: RowScope.() -> Unit)`,
+        // the same for TextButton, OutlinedButton, ElevatedButton and FilledTonalButton.
+        "Button" | "TextButton" | "OutlinedButton" | "ElevatedButton" | "FilledTonalButton" => {
+            (Some("RowScope"), false)
+        }
+        // animation-android 1.9.3 AnimatedVisibilityKt: `AnimatedVisibility(visible, …,
+        // content: AnimatedVisibilityScope.() -> Unit)`.
+        "AnimatedVisibility" => (Some("AnimatedVisibilityScope"), false),
+        // animation-android 1.9.3 AnimatedContentKt: `AnimatedContent(targetState, …,
+        // content: AnimatedContentScope.(targetState: S) -> Unit)`; navigation-compose-android
+        // 2.9.7 NavGraphBuilderKt: `NavGraphBuilder.composable(route, …, content:
+        // AnimatedContentScope.(NavBackStackEntry) -> Unit)`.
+        "AnimatedContent" | "composable" => (Some("AnimatedContentScope"), true),
+        // foundation-layout-android 1.9.3 BoxWithConstraintsKt: `BoxWithConstraints(…,
+        // content: BoxWithConstraintsScope.() -> Unit)`.
+        "BoxWithConstraints" => (Some("BoxWithConstraintsScope"), false),
+        // navigation-compose-android 2.9.7 NavHostKt: `NavHost(navController,
+        // startDestination, …, builder: NavGraphBuilder.() -> Unit)`.
+        "NavHost" => (Some("NavGraphBuilder"), false),
+        // foundation-android 1.9.3 LazyListScope / LazyDslKt: `item(key, contentType, content:
+        // LazyItemScope.() -> Unit)`, `items(items: List<T>, …, itemContent:
+        // LazyItemScope.(item: T) -> Unit)`, `items(count, …, itemContent:
+        // LazyItemScope.(index: Int) -> Unit)`, `itemsIndexed(items, …, itemContent:
+        // LazyItemScope.(index: Int, item: T) -> Unit)`. A grid's or a staggered grid's
+        // `items` has a LazyGridItemScope / LazyStaggeredGridItemScope, whose members
+        // (`animateItem`) LazyItemScope's include.
+        "item" | "itemsIndexed" => (Some("LazyItemScope"), false),
+        "items" => (Some("LazyItemScope"), true),
+        // material3-android 1.4.0 `IconButton(onClick, …, content: () -> Unit)`,
+        // `FloatingActionButton(onClick, …, content: () -> Unit)`; ui-android 1.9.2
+        // AndroidDialog_androidKt `Dialog(onDismissRequest, properties, content: () -> Unit)`.
+        "IconButton" | "FloatingActionButton" | "Dialog" => (None, false),
+        // animation-android 1.9.3 CrossfadeKt: `Crossfade(targetState, …, content: (T) ->
+        // Unit)`.
+        "Crossfade" => (None, true),
         "remember"
         | "rememberSaveable"
         | "derivedStateOf"
@@ -3784,14 +3831,17 @@ fn type_position(f: &FileInfo, i: usize) -> bool {
         "as" | "is" | "@" => true,
         "?" => i > 1 && f.t(i - 2) == "as",
         "<" | "," => {
-            // inside type arguments: back to an unmatched `<` after a name
+            // inside type arguments: back to an unmatched `<` after a name, which a `>` closes
+            // (else it is a comparison: `foo(a < b, Item.CONST)`)
             let mut depth = 0;
             let mut k = i;
-            while k > 0 {
+            while k > 0 && i - k < TYPE_ARGS_SCAN {
                 k -= 1;
+                #[cfg(test)]
+                TYPE_SCAN_STEPS.set(TYPE_SCAN_STEPS.get() + 1);
                 match f.t(k) {
                     ">" => depth += 1,
-                    "<" if depth == 0 => return k > 0 && f.ident(k - 1),
+                    "<" if depth == 0 => return k > 0 && f.ident(k - 1) && closes_type_args(f, k),
                     "<" => depth -= 1,
                     "," | "." | "?" | "*" | "out" | "in" => {}
                     _ if f.ident(k) => {}
@@ -3802,6 +3852,52 @@ fn type_position(f: &FileInfo, i: usize) -> bool {
         }
         _ => false,
     }
+}
+
+/// How many tokens [`type_position`] reads back to the `<` of type arguments, and forward to
+/// their `>`: a long list of call arguments is never read whole for each name in it.
+const TYPE_ARGS_SCAN: usize = 64;
+
+#[cfg(test)]
+thread_local! {
+    /// The tokens [`type_position`] read back on this thread (tests).
+    static TYPE_SCAN_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether the `<` at token `open` has a `>` closing it with only type tokens between, as
+/// kotlinc reads type arguments. kotlinc 2.1.20 on
+/// ```text
+/// class Lib { val Item = Holder("Lib.Item.val") }
+/// class Holder(val CONST: String)
+/// class Item { companion object { const val CONST = "top.Item.CONST" } }
+/// fun head(b: Lib.() -> String) = Lib().b()
+/// fun foo(c: Boolean, s: String) = s
+/// fun main() { val a = 1; val b = 2
+///     println(head { foo(a < b, Item.CONST) }); println(head { foo(a<b, Item.CONST) }) }
+/// ```
+/// prints Lib.Item.val twice: no `>`, a comparison. On `foo2(a < b, c > d)` (four `Int` vals) it
+/// reports "property access cannot have explicit type arguments": a `>` closing it makes
+/// type arguments, spaces or not.
+fn closes_type_args(f: &FileInfo, open: usize) -> bool {
+    let mut depth = 0;
+    let mut k = open + 1;
+    while k < f.toks.len() && k - open < TYPE_ARGS_SCAN {
+        match f.t(k) {
+            "<" => depth += 1,
+            ">" if depth == 0 => return true,
+            ">" => depth -= 1,
+            // a function type: `Map<K, (A) -> B>`
+            "(" => match f.pair(k) {
+                Some(c) if c + 1 < f.toks.len() && f.t(c + 1) == "->" => k = c,
+                _ => return false,
+            },
+            "," | "." | "?" | "*" | "out" | "in" | "->" | "@" => {}
+            _ if f.ident(k) => {}
+            _ => return false,
+        }
+        k += 1;
+    }
+    false
 }
 
 /// Library extensions on any `T` that take a lambda: called with no `x.` where there is an
@@ -3894,8 +3990,56 @@ fn known_members(receiver: &str) -> Option<&'static [&'static str]> {
         "BoxScope" => &["align", "matchParentSize"],
         "LazyListScope" => &["item", "items", "itemsIndexed", "stickyHeader"],
         "DisposableEffectScope" => &["onDispose"],
+        // from the jars named at [`known_lambda_call`]: the interfaces' own members, with the
+        // ones they inherit (AnimatedContentScope extends AnimatedVisibilityScope,
+        // BoxWithConstraintsScope extends BoxScope)
+        "AnimatedVisibilityScope" | "AnimatedContentScope" => &["animateEnterExit"],
+        "BoxWithConstraintsScope" => &["align", "matchParentSize"],
+        "LazyItemScope" => &[
+            "fillParentMaxSize",
+            "fillParentMaxWidth",
+            "fillParentMaxHeight",
+            "animateItem",
+        ],
+        // NavGraphBuilder and NavDestinationBuilder (navigation-common-android 2.9.7), and the
+        // extensions on NavGraphBuilder in navigation-compose (`composable`, `dialog`,
+        // `navigation`), navigation-common (`navigation`), navigation-runtime (`activity`) and
+        // navigation-fragment (`fragment`, `dialog`) 2.9.7
+        "NavGraphBuilder" => &[
+            "destination",
+            "unaryPlus",
+            "addDestination",
+            "build",
+            "argument",
+            "deepLink",
+            "deepLinkSafeArgs",
+            "action",
+            "composable",
+            "dialog",
+            "navigation",
+            "activity",
+            "fragment",
+        ],
         _ => return None,
     })
+}
+
+/// The properties of a library receiver from [`known_lambda_call`] that a bare name in its
+/// lambda can mean, from the same jars: kotlinc picks them before the class's and top-level
+/// ones.
+fn known_properties(receiver: &str) -> &'static [&'static str] {
+    match receiver {
+        "AnimatedVisibilityScope" | "AnimatedContentScope" => &["transition"],
+        "BoxWithConstraintsScope" => &[
+            "constraints",
+            "minWidth",
+            "maxWidth",
+            "minHeight",
+            "maxHeight",
+        ],
+        "NavGraphBuilder" => &["provider", "id", "route", "label"],
+        _ => &[],
+    }
 }
 
 fn split_top(s: &str) -> Vec<String> {
@@ -6032,5 +6176,113 @@ fun f(state: State, other: State) {
         assert_eq!(at(&r, "/p/H.kt", "Item", 4), "/p/H.kt:4", "`listOf<T>`");
         assert_eq!(at(&r, "/p/H.kt", "title", 3), "/p/H.kt:2", "outside");
         assert_eq!(at(&r, "/p/H.kt", "id", 3), "/p/H.kt:9", "outside");
+    }
+
+    /// kotlinc 2.1.20 on stand-ins with the receivers read from the jars ([`known_lambda_call`]):
+    /// ```text
+    /// interface ColumnScope { fun weight(f: Float) = "Lib.ColumnScope.weight" }
+    /// interface LazyItemScope { fun fillParentMaxWidth() = "Lib.LazyItemScope.fillParentMaxWidth" }
+    /// object CS : ColumnScope
+    /// object LIS : LazyItemScope
+    /// fun Card(content: ColumnScope.() -> String) = CS.content()
+    /// fun Dialog(onDismissRequest: () -> Unit, content: () -> String) = content()
+    /// fun <T> items(xs: List<T>, itemContent: LazyItemScope.(item: T) -> String) =
+    ///     xs.map { LIS.itemContent(it) }.joinToString()
+    /// fun Header() = "top.Header"
+    /// fun weight(f: Float) = "top.weight"
+    /// fun fillParentMaxWidth() = "top.fillParentMaxWidth"
+    /// val limit = "top.limit"
+    /// object Dimens { val x = "top.Dimens.x" }
+    /// class Item { companion object { const val CONST = "top.Item.CONST" } }
+    /// fun main() {
+    ///   println("card: " + Card { listOf(Header(), weight(1f), limit, Dimens.x, Item.CONST).joinToString() })
+    ///   println("dialog: " + Dialog({}) { listOf(Header(), weight(1f), limit, Dimens.x, Item.CONST).joinToString() })
+    ///   println("items: " + items(listOf("a")) { listOf(it, Header(), fillParentMaxWidth(), limit, Dimens.x,
+    ///     Item.CONST).joinToString() }) }
+    /// ```
+    /// prints `card: top.Header, Lib.ColumnScope.weight, top.limit, top.Dimens.x, top.Item.CONST`,
+    /// `dialog: top.Header, top.weight, top.limit, top.Dimens.x, top.Item.CONST` and
+    /// `items: a, top.Header, Lib.LazyItemScope.fillParentMaxWidth, top.limit, top.Dimens.x,
+    /// top.Item.CONST`: in a container's lambda the project's composables, objects, classes and
+    /// top-level vals stay the project's; only the receiver's own members win (unresolved here).
+    #[test]
+    fn compose_container_lambdas_keep_project_names_resolved_like_kotlinc() {
+        let (i, t) = project(&[(
+            "/p/C.kt",
+            "package a\nobject Dimens {\n    val x = 1\n}\nclass Item {\n    companion object {\n        const val CONST = 1\n    }\n}\nfun Header() {}\nfun weight(f: Float) {}\nfun fillParentMaxWidth() {}\nval limit = 1\nval maxWidth = 1\nfun Screen(xs: List<String>, nav: Nav) {\n    Card { Header(); weight(1f); limit; Dimens.x; Item.CONST }\n    Dialog({}) { Header(); weight(1f); limit; Dimens.x; Item.CONST }\n    LazyColumn { items(xs) { Header(); fillParentMaxWidth(); limit; Dimens.x; Item.CONST } }\n    Button(onClick = {}) { Header() }\n    AnimatedVisibility(true) { Header() }\n    NavHost(nav, \"a\") { composable(\"a\") { Header() } }\n    BoxWithConstraints { maxWidth; Header() }\n}\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        let c = |name, n| at(&r, "/p/C.kt", name, n);
+        // Card: ColumnScope
+        assert_eq!(c("Header", 2), "/p/C.kt:10", "Card: a project composable");
+        assert_eq!(c("weight", 2), "-", "Card: ColumnScope.weight");
+        assert_eq!(c("limit", 2), "/p/C.kt:13", "Card: a top-level val");
+        assert_eq!(c("Dimens", 2), "/p/C.kt:2", "Card: an object");
+        assert_eq!(c("x", 2), "/p/C.kt:3", "Card: an object's val");
+        assert_eq!(c("Item", 2), "/p/C.kt:5", "Card: a class");
+        assert_eq!(c("CONST", 2), "/p/C.kt:7", "Card: a companion constant");
+        // Dialog: no receiver
+        assert_eq!(c("Header", 3), "/p/C.kt:10", "Dialog");
+        assert_eq!(c("weight", 3), "/p/C.kt:11", "Dialog: no receiver to hide it");
+        assert_eq!(c("Item", 3), "/p/C.kt:5", "Dialog");
+        // items: LazyItemScope
+        assert_eq!(c("Header", 4), "/p/C.kt:10", "items");
+        assert_eq!(c("fillParentMaxWidth", 2), "-", "items: LazyItemScope's");
+        assert_eq!(c("limit", 4), "/p/C.kt:13", "items");
+        assert_eq!(c("Dimens", 4), "/p/C.kt:2", "items");
+        assert_eq!(c("Item", 4), "/p/C.kt:5", "items");
+        // RowScope, AnimatedVisibilityScope, NavGraphBuilder + AnimatedContentScope
+        assert_eq!(c("Header", 5), "/p/C.kt:10", "Button");
+        assert_eq!(c("Header", 6), "/p/C.kt:10", "AnimatedVisibility");
+        assert_eq!(c("Header", 7), "/p/C.kt:10", "NavHost and composable");
+        // BoxWithConstraintsScope: its own property wins
+        assert_eq!(c("maxWidth", 2), "-", "BoxWithConstraintsScope.maxWidth");
+        assert_eq!(c("Header", 8), "/p/C.kt:10", "BoxWithConstraints");
+    }
+
+    /// kotlinc (see [`closes_type_args`]): `foo(a < b, Item.CONST)` in a library receiver's
+    /// lambda is a comparison, and `Item` is the receiver's `val Item`; `mapOf<String, Item>()`
+    /// has type arguments.
+    #[test]
+    fn a_comparison_in_call_arguments_is_no_type_position_like_kotlinc() {
+        let (i, t) = project(&[(
+            "/p/L.kt",
+            "package a\nclass Item {\n    companion object {\n        const val CONST = 1\n    }\n}\nfun foo(c: Boolean, n: Int) {}\nfun go(a: Int, b: Int) {\n    head { foo(a < b, Item.CONST) }\n    head { foo(a<b, Item.CONST) }\n    head { mapOf<String, Item>() }\n}\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/L.kt", "Item", 2), "-", "`a < b, Item`");
+        assert_eq!(at(&r, "/p/L.kt", "Item", 3), "-", "`a<b, Item`");
+        assert_eq!(at(&r, "/p/L.kt", "Item", 4), "/p/L.kt:2", "type arguments");
+    }
+
+    #[test]
+    fn type_arguments_past_the_scan_bound_are_not_read_as_a_type_position() {
+        let near = format!("{}Item", "A, ".repeat(10));
+        let far = format!("Item{}", ", A".repeat(TYPE_ARGS_SCAN));
+        let text = format!(
+            "package a\nclass A\nclass Item\nfun go() {{\n    head {{ listOf<{near}>() }}\n    head {{ listOf<{far}>() }}\n}}\n"
+        );
+        let (i, t) = project(&[("/p/B.kt", text.as_str())]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/B.kt", "Item", 2), "/p/B.kt:3", "within the bound");
+        assert_eq!(at(&r, "/p/B.kt", "Item", 3), "-", "its `>` past the bound");
+    }
+
+    #[test]
+    fn a_name_late_in_a_long_argument_list_reads_a_bounded_window_back() {
+        let args: Vec<String> = (0..500).map(|k| format!("a{k}")).collect();
+        let text = format!(
+            "package a\nfun go() {{\n    head {{ foo({}) }}\n}}\n",
+            args.join(", ")
+        );
+        let (i, t) = project(&[("/p/A.kt", text.as_str())]);
+        let r = Resolver::new(&i, &t);
+        TYPE_SCAN_STEPS.set(0);
+        assert_eq!(at(&r, "/p/A.kt", "a499", 1), "-");
+        let steps = TYPE_SCAN_STEPS.get();
+        assert!(
+            (1..=TYPE_ARGS_SCAN).contains(&steps),
+            "{steps} tokens read back"
+        );
     }
 }

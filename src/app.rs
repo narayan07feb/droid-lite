@@ -224,6 +224,9 @@ const SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
 /// ([`App::guard_close`]), so this is for saves the quit itself started.
 const SAVE_WAIT_ON_QUIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How many notices of actions that did not run stay in the status bar ([`App::notice`]).
+const NOTICES_KEPT: usize = 5;
+
 /// An action that must come after the saves on their way (a revert, a refactor, a git command):
 /// it runs once they landed, unless an open tab's text changed meanwhile, or for a git action
 /// the branch or the git index moved. One per `key`: asking again replaces it. Actions run in
@@ -235,10 +238,18 @@ struct AfterSaves {
     key: String,
     /// The open tabs' text versions when it was asked for ([`App::tab_revs`]), or as the action
     /// before it left them.
-    revs: Vec<u64>,
+    revs: Vec<(PathBuf, u64)>,
     /// A git action: the repository, its state then and its state when it is to run.
     git: Option<GitCheck>,
     run: Box<dyn FnOnce(&mut App)>,
+}
+
+/// The first file open both when an action was asked for (`asked`) and now whose text changed
+/// in between: tabs opened, closed or moved meanwhile change no text.
+fn text_changed<'a>(asked: &[(PathBuf, u64)], now: &'a [(PathBuf, u64)]) -> Option<&'a Path> {
+    now.iter()
+        .find(|(p, rev)| asked.iter().any(|(q, was)| q == p && was != rev))
+        .map(|(p, _)| p.as_path())
 }
 
 /// The states ([`crate::git::state_stamp`]) a git action waiting for the saves is checked by,
@@ -550,8 +561,9 @@ pub struct App {
     shift_down: bool,
     last_shift: Option<Instant>,
     status: String,
-    /// Why actions that waited for a save did not run: stay in the status bar until dismissed.
-    notices: Vec<String>,
+    /// Why actions that waited for a save did not run, each with how often in a row it came:
+    /// the last [`NOTICES_KEPT`] stay in the status bar until dismissed ([`App::notice`]).
+    notices: Vec<(String, u32)>,
     /// Works out a repository's state for git actions waiting for a save, off this thread.
     stamp: StampFn,
     /// Dev check: `DROID_LITE_SHOT=out.png` saves a screenshot once indexing is done, then quits.
@@ -1144,14 +1156,14 @@ impl App {
         }
         let a = self.after_saves.remove(0);
         let revs = self.tab_revs();
-        let why = if a.revs != revs {
-            Some("a text changed meanwhile")
+        let why = if let Some(p) = text_changed(&a.revs, &revs) {
+            Some(format!("{} changed meanwhile", short_name(p)))
         } else {
             match &state {
-                Some((None, _)) => Some("git ran meanwhile"),
-                Some((Some(None), _) | (_, None)) => Some("git did not answer"),
+                Some((None, _)) => Some("git ran meanwhile".to_string()),
+                Some((Some(None), _) | (_, None)) => Some("git did not answer".to_string()),
                 Some((Some(Some(asked)), Some(now))) if asked != now => {
-                    Some("the branch or the staged files changed meanwhile")
+                    Some("the branch or the staged files changed meanwhile".to_string())
                 }
                 _ => None,
             }
@@ -1160,7 +1172,7 @@ impl App {
             Some(why) => {
                 let line = format!("{} did not run: {why}", a.what);
                 self.status = line.clone();
-                self.notices.push(line);
+                self.notice(line);
             }
             None => {
                 let root = a.git.as_ref().map(|g| g.root.clone());
@@ -1171,7 +1183,7 @@ impl App {
                 let left = self.tab_revs();
                 if left != revs {
                     for b in &mut self.after_saves {
-                        if b.revs == revs {
+                        if text_changed(&b.revs, &revs).is_none() {
                             b.revs = left.clone();
                         }
                     }
@@ -1199,10 +1211,10 @@ impl App {
         }
     }
 
-    /// The open tabs' text versions, in order. Read after [`App::settle`]: a version then
+    /// The open tabs' files and text versions. Read after [`App::settle`]: a version then
     /// changes only when a text does.
-    fn tab_revs(&self) -> Vec<u64> {
-        self.tabs.iter().map(|t| t.rev).collect()
+    fn tab_revs(&self) -> Vec<(PathBuf, u64)> {
+        self.tabs.iter().map(|t| (t.path.clone(), t.rev)).collect()
     }
 
     /// Drops every action waiting for the saves (another project, a branch checked out), with
@@ -1213,7 +1225,20 @@ impl App {
         }
         let names: Vec<String> = self.after_saves.drain(..).map(|a| a.what).collect();
         self.status = format!("{} will not run: {why}", names.join(", "));
-        self.notices.push(self.status.clone());
+        self.notice(self.status.clone());
+    }
+
+    /// Keeps `line` in the status bar until dismissed: one seen already moves to the end with
+    /// its count up, and only the last [`NOTICES_KEPT`] stay.
+    fn notice(&mut self, line: String) {
+        let n = match self.notices.iter().position(|(l, _)| *l == line) {
+            Some(i) => self.notices.remove(i).1 + 1,
+            None => 1,
+        };
+        self.notices.push((line, n));
+        if self.notices.len() > NOTICES_KEPT {
+            self.notices.remove(0);
+        }
     }
 
     /// Waits until the states the waiting git actions were asked for in are in (tests: before
@@ -2736,7 +2761,12 @@ impl App {
             }
             ui.label(RichText::new(&self.status).color(weak));
             // why actions that waited for a save did not run, until dismissed
-            for n in &self.notices {
+            for (n, times) in &self.notices {
+                let n = if *times > 1 {
+                    format!("{n} (×{times})")
+                } else {
+                    n.clone()
+                };
                 ui.label(RichText::new(n).color(WARN));
             }
             if !self.notices.is_empty() && ui.small_button("Dismiss").clicked() {

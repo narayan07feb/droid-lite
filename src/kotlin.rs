@@ -229,7 +229,7 @@ impl<'a> Scanner<'a> {
             if depth == 0
                 && (w == "}"
                     || w == ";"
-                    || (self.newline_before(j) && self.starts_decl(j) && !self.is(j, "object")))
+                    || (self.newline_before(j) && self.starts_decl(j) && !self.object_expr(j)))
             {
                 return j;
             }
@@ -241,6 +241,19 @@ impl<'a> Scanner<'a> {
             j += 1;
         }
         j
+    }
+    /// `object` at token `j` starts an object expression (`object : Runnable {`, `object {`),
+    /// not a declaration: only a declaration has a name after it. kotlinc 2.1.20 on
+    /// ```text
+    /// val limit = 1
+    /// object Dimens { val x = "Dimens.x" }
+    /// val r =
+    ///     object : Runnable { override fun run() { println("anonymous run") } }
+    /// fun main() { println(Dimens.x); println(limit); r.run() }
+    /// ```
+    /// prints Dimens.x, 1, anonymous run.
+    fn object_expr(&self, j: usize) -> bool {
+        self.is(j, "object") && !self.is_name(j + 1)
     }
     fn dotted(&mut self) -> String {
         let mut s = String::new();
@@ -1143,6 +1156,16 @@ typealias Users = List<User>
         assert_eq!(f.package, "a.b");
         assert_eq!(find(&f, "Foo").kind, Kind::Class);
         assert_eq!(find(&f, "Inner").container.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn a_named_object_after_a_property_initializer_is_a_declaration_like_kotlinc() {
+        let f = scan(
+            "val limit = 1\nobject Dimens {\n    val x = 1\n}\nval r =\n    object : Runnable { override fun run() {} }\nfun g() = 1\n",
+        );
+        let names: Vec<_> = f.decls.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["limit", "Dimens", "x", "r", "g"]);
+        assert_eq!(find(&f, "x").container.as_deref(), Some("Dimens"));
     }
 
     #[test]

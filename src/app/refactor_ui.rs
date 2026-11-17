@@ -401,15 +401,19 @@ impl App {
             asked: super::Stamp::start(r, self.ctx.clone(), self.stamp),
             now: None,
         });
-        // asked again (a second click): the newer one replaces it
-        self.after_saves.retain(|a| a.key != key);
-        self.after_saves.push(AfterSaves {
+        let a = AfterSaves {
             what: what.to_string(),
             key: key.to_string(),
             revs: self.tab_revs(),
             git,
             run: Box::new(again),
-        });
+        };
+        // asked again (a second click): the newer one replaces it in its place, so the actions
+        // asked for after it still run after it (`git add` stays before `git commit`)
+        match self.after_saves.iter_mut().find(|w| w.key == key) {
+            Some(w) => *w = a,
+            None => self.after_saves.push(a),
+        }
         false
     }
 
