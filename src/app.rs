@@ -5,6 +5,7 @@ mod assist;
 mod backup;
 mod capture_ui;
 mod comfort;
+mod diff_view;
 mod disk;
 #[cfg(test)]
 mod e2e;
@@ -79,6 +80,8 @@ struct Tab {
     /// A library source opened from a jar: navigate and copy, never edit or save.
     readonly: bool,
     git: git_ui::TabBlame,
+    /// The Diff checkbox: the older version beside the editor.
+    diff: diff_view::TabDiff,
     annotations: Option<gutter::Annotations>,
     /// Selection to set with the next `goto` (a find match).
     select: Option<std::ops::Range<usize>>,
@@ -802,6 +805,7 @@ impl App {
                 unreadable: None,
                 readonly: crate::libs::is_archive_path(path),
                 git: Default::default(),
+                diff: Default::default(),
                 rev: 0,
                 annotations: None,
                 select: None,
@@ -1526,6 +1530,9 @@ impl App {
             .filter(|d| d.body.as_ref().is_some_and(|b| b.contains(&t.cursor)))
             .collect();
         let mut jump = None;
+        let mut diff_ctl = None;
+        let blocked = self.diff_blocked();
+        let shortcut = keymap::text(self.keymap, Action::ToggleDiff);
         let r = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             for d in inside.iter().filter_map(|d| d.container.as_ref()).take(1) {
@@ -1540,11 +1547,17 @@ impl App {
                     jump = Some(d.offset);
                 }
             }
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                diff_ctl = diff_view::controls(ui, &t.diff, blocked, &shortcut);
+            });
             label.id
         });
         if let Some(o) = jump {
             let p = t.path.clone();
             self.open_file(&p, Some(o));
+        }
+        if let Some(c) = diff_ctl {
+            self.diff_ctl(c);
         }
         r.inner
     }
@@ -1663,6 +1676,7 @@ impl App {
                 self.deep_link = Some(self.res.links.first().cloned().unwrap_or_default())
             }
             Action::NewFile => self.new_file(None),
+            Action::ToggleDiff => self.toggle_diff(),
         }
     }
 
@@ -2723,9 +2737,17 @@ impl App {
         lens_lines.sort_unstable();
         lens_lines.dedup();
         let lens_h = gutter::lens_height(row_h);
-        let lens_key = lens_lines
-            .iter()
-            .fold(0x51u64, |h, l| h.rotate_left(5) ^ *l as u64);
+        // Diff on: the older version beside the editor, its removed lines as room in the editor
+        let diff = tab.diff.on.then(|| tab.diff.view.clone()).flatten();
+        let diff_scroll = tab.diff.scroll;
+        let mut room: Vec<(usize, f32)> = lens_lines.iter().map(|&l| (l, lens_h)).collect();
+        if let Some(v) = &diff {
+            room.extend(v.room.iter().map(|&(l, n)| (l, n as f32 * row_h)));
+            room.sort_by_key(|(l, _)| *l);
+        }
+        let room_key = room.iter().fold(0x51u64, |h, (l, r)| {
+            h.rotate_left(5) ^ *l as u64 ^ (u64::from(r.to_bits()) << 32)
+        });
         let mut open_commit: Option<String> = None;
         let Tab {
             text,
@@ -2774,13 +2796,13 @@ impl App {
             let Some(c) = cache.as_mut() else {
                 return ui.fonts_mut(|f| f.layout_job(Default::default()));
             };
-            if lens_lines.is_empty() {
+            if room.is_empty() {
                 return c.galley.clone();
             }
-            // room for the link rows, made again only when the text or the rows change
-            let k = c.key ^ lens_key;
+            // room for the link rows and diff spacers, made again only when the text or rows change
+            let k = c.key ^ room_key;
             if c.shown.as_ref().is_none_or(|(sk, _)| *sk != k) {
-                let g = gutter::with_lens_room(&c.galley, &lens_lines, lens_h);
+                let g = gutter::with_room(&c.galley, &room);
                 c.shown = Some((k, std::sync::Arc::new(g)));
             }
             c.shown.as_ref().map(|(_, g)| g.clone()).expect("set above")
@@ -2789,10 +2811,29 @@ impl App {
         let mut hover_word: Option<HoverWord> = None;
         let mut cmd_click = false;
         let mut popup_pos = None;
-        egui::ScrollArea::both()
+        // Diff on: the older version in the left half, the editor in the right half
+        let split = diff.as_ref().map(|_| {
+            let full = ui.available_rect_before_wrap();
+            let half = (full.width() / 2.0).floor();
+            (full, full.with_max_x(full.left() + half))
+        });
+        // the left column scrolls the editor (both sides move together)
+        let wheel = split
+            .filter(|(_, left)| ui.rect_contains_pointer(*left))
+            .map(|_| ui.input(|i| i.smooth_scroll_delta))
+            .filter(|d| *d != egui::Vec2::ZERO);
+        let mut right_ui = split.map(|(full, left)| {
+            ui.new_child(egui::UiBuilder::new().max_rect(full.with_min_x(left.right() + 1.0)))
+        });
+        let host: &mut Ui = match right_ui.as_mut() {
+            Some(r) => r,
+            None => &mut *ui,
+        };
+        let mut placed: Option<(std::sync::Arc<egui::Galley>, egui::Pos2)> = None;
+        let scrolled = diff_view::follow_wheel(egui::ScrollArea::both(), wheel, diff_scroll)
             .id_salt(id)
             .auto_shrink([false, false])
-            .show(ui, |ui| {
+            .show(host, |ui| {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     let blame_rect = show_column.then(|| {
@@ -2808,6 +2849,7 @@ impl App {
                     );
                     // filled in after layout, so it sits under the text
                     let line_bg = ui.painter().add(egui::Shape::Noop);
+                    let diff_bg = ui.painter().add(egui::Shape::Noop);
                     // library sources (and any file while a checkout runs): a read-only copy keeps
                     // selection and navigation, drops edits
                     let ro_copy = (*readonly || locked).then(|| text.clone());
@@ -2900,6 +2942,18 @@ impl App {
                         &font,
                         theme,
                     );
+                    if let Some(v) = &diff {
+                        let at = diff_view::Placed {
+                            galley: &out.galley,
+                            pos: out.galley_pos,
+                            row_h,
+                            lens: &lens_lines,
+                            lens_h,
+                        };
+                        let shapes = diff_view::new_side(v, &at, gutter.right(), ui.clip_rect());
+                        ui.painter().set(diff_bg, egui::Shape::Vec(shapes));
+                        placed = Some((out.galley.clone(), out.galley_pos));
+                    }
                     let aids = ScopeView {
                         text,
                         galley: &out.galley,
@@ -3046,6 +3100,23 @@ impl App {
                     }
                 });
             });
+        if let Some((full, left)) = split {
+            ui.advance_cursor_after_rect(full);
+            if let (Some(v), Some((galley, pos))) = (&diff, &placed) {
+                let at = diff_view::Placed {
+                    galley,
+                    pos: *pos,
+                    row_h,
+                    lens: &lens_lines,
+                    lens_h,
+                };
+                diff_view::paint_old(ui, left, v, &at, scrolled.state.clamped_offset().x, &font);
+            }
+            let line = egui::Stroke::new(1.0, crate::theme::t().border);
+            ui.painter().vline(left.right() + 0.5, full.y_range(), line);
+        }
+        tab.diff.scroll = scrolled.state.clamped_offset();
+        tab.diff.left = split.map(|(_, left)| left);
         let path = tab.path.clone();
         if changed {
             // analysis, the index and kotlin-lsp catch up after a typing pause (see `settle`)
@@ -4039,6 +4110,7 @@ impl eframe::App for App {
         watch.stage("disk changes", || self.poll_disk(&ctx));
         watch.stage("analysis", || self.settle(false));
         watch.stage("git blame", || self.poll_git(&ctx));
+        self.poll_diff(&ctx);
         self.poll_usages();
         self.poll_logcat(&ctx);
         self.poll_launch();

@@ -72,6 +72,7 @@ pub enum Action {
     NewFile,
     Translations,
     DeepLink,
+    ToggleDiff,
 }
 
 /// Every action, in the order the action palette lists them with an empty query.
@@ -118,6 +119,7 @@ pub const ALL: &[Action] = {
         ToggleRight,
         ToggleBottom,
         FocusMode,
+        ToggleDiff,
         Save,
         CloseTab,
         NewWindow,
@@ -174,6 +176,7 @@ impl Action {
             Action::NewFile => "New Kotlin file (Composable, ViewModel, Activity…)",
             Action::Translations => "Translations (strings in every language)",
             Action::DeepLink => "Open a deep link on the device",
+            Action::ToggleDiff => "Toggle diff (the older version beside this file)",
         }
     }
 }
@@ -234,6 +237,7 @@ pub fn bindings(km: Keymap) -> Vec<(Action, KeyboardShortcut)> {
             (RunTask, sc(CTRL | SHIFT, Key::R)),
             (QuickFix, sc(ALT, Key::Enter)),
             (NewFile, sc(CMD, Key::N)),
+            (ToggleDiff, sc(CTRL | SHIFT, Key::D)),
         ],
         Keymap::AndroidStudio => vec![
             (GotoClass, sc(CMD, Key::O)),
@@ -277,6 +281,7 @@ pub fn bindings(km: Keymap) -> Vec<(Action, KeyboardShortcut)> {
             (RunTask, sc(CTRL | SHIFT, Key::R)),
             (QuickFix, sc(ALT, Key::Enter)),
             (NewFile, sc(CMD, Key::N)),
+            (ToggleDiff, sc(CTRL | SHIFT, Key::D)),
         ],
     };
     v.sort_by_key(|(_, s)| std::cmp::Reverse(count(s.modifiers)));

@@ -90,11 +90,8 @@ pub fn file_at(path: &Path, rev: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Line changes from `old` to `new`, through `git diff --no-index -U0`.
-pub fn hunks(old: &str, new: &str) -> Vec<Hunk> {
-    if old == new {
-        return Vec::new();
-    }
+/// `git diff --no-index` of two texts (written to temp files), with `args` before the paths.
+fn diff_no_index(old: &str, new: &str, args: &[&str]) -> String {
     let dir = std::env::temp_dir().join(format!(
         "droid-lite-hunks-{}-{:?}",
         std::process::id(),
@@ -103,10 +100,12 @@ pub fn hunks(old: &str, new: &str) -> Vec<Hunk> {
     let _ = std::fs::create_dir_all(&dir);
     let (a, b) = (dir.join("old"), dir.join("new"));
     if std::fs::write(&a, old).is_err() || std::fs::write(&b, new).is_err() {
-        return Vec::new();
+        return String::new();
     }
     let out = Command::new("git")
-        .args(["diff", "--no-index", "--no-color", "-U0", "--"])
+        .args(["diff", "--no-index", "--no-color"])
+        .args(args)
+        .arg("--")
         .arg(&a)
         .arg(&b)
         .output()
@@ -115,6 +114,30 @@ pub fn hunks(old: &str, new: &str) -> Vec<Hunk> {
     let _ = std::fs::remove_file(&a);
     let _ = std::fs::remove_file(&b);
     let _ = std::fs::remove_dir(&dir);
+    out
+}
+
+/// The `-U0` diff from `old` to `new` as lines, for side-by-side views: a `\r` at a line end
+/// does not count as a change, text that looks binary is still compared line by line, and the
+/// "\\ No newline at end of file" notes are left out.
+pub fn line_diff(old: &str, new: &str) -> Vec<String> {
+    if old == new {
+        return Vec::new();
+    }
+    let args = ["-U0", "--text", "--no-ext-diff", "--ignore-cr-at-eol"];
+    diff_no_index(old, new, &args)
+        .lines()
+        .filter(|l| !l.starts_with('\\'))
+        .map(String::from)
+        .collect()
+}
+
+/// Line changes from `old` to `new`, through `git diff --no-index -U0`.
+pub fn hunks(old: &str, new: &str) -> Vec<Hunk> {
+    if old == new {
+        return Vec::new();
+    }
+    let out = diff_no_index(old, new, &["-U0"]);
     let mut v: Vec<Hunk> = Vec::new();
     for line in out.lines() {
         if let Some(h) = line.strip_prefix("@@ -") {
@@ -307,6 +330,8 @@ pub struct Change {
 /// What the Current changes tab shows: uncommitted work, and what this branch changed against its base.
 #[derive(Clone, Debug, Default)]
 pub struct Changes {
+    /// `git status` worked: the project is in a git repository.
+    pub repo: bool,
     pub working: Vec<Change>,
     pub branch: Vec<Change>,
     /// The base the branch is compared with, e.g. `origin/develop`.
@@ -1131,8 +1156,10 @@ pub fn changes(root: &Path, choice: Option<&str>) -> Changes {
         .as_deref()
         .map(|b| branch_changes(root, b))
         .unwrap_or_default();
+    let working = status(root);
     Changes {
-        working: status(root).unwrap_or_default(),
+        repo: working.is_ok(),
+        working: working.unwrap_or_default(),
         branch,
         base,
         pr,

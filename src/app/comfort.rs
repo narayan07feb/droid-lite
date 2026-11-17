@@ -277,7 +277,13 @@ impl App {
         let tabs: Vec<Value> = self
             .tabs
             .iter()
-            .map(|t| json!({ "path": t.path.to_string_lossy(), "cursor": t.cursor }))
+            .map(|t| {
+                let mut v = json!({ "path": t.path.to_string_lossy(), "cursor": t.cursor });
+                if t.diff.on {
+                    v["diff"] = t.diff.against.key().into();
+                }
+                v
+            })
             .collect();
         let v = json!({
             "tabs": tabs,
@@ -336,6 +342,13 @@ impl App {
             let p = PathBuf::from(p);
             if p.is_file() && !self.tabs.iter().any(|t| t.path == p) {
                 self.show_file(&p, Some(cursor));
+                let against = t["diff"]
+                    .as_str()
+                    .and_then(super::diff_view::Against::from_key);
+                if let (Some(a), Some(tab)) = (against, self.tabs.iter_mut().find(|t| t.path == p))
+                {
+                    tab.diff.set(true, a);
+                }
             }
         }
         if let Some(a) = v["active"]

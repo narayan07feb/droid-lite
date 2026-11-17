@@ -120,18 +120,20 @@ pub(super) fn lens_height(row_h: f32) -> f32 {
     (row_h * 0.85).round()
 }
 
-/// The same galley with room for a link row above each of `lines` (sorted, one row per line:
-/// the editor never wraps). Painting, clicks and the cursor all follow the moved rows.
-pub(super) fn with_lens_room(g: &Galley, lines: &[usize], h: f32) -> Galley {
+/// The same galley with `h` of room above line `l` for each `(l, h)` in `room` (sorted by line;
+/// one row per line: the editor never wraps). A line past the last row adds room at the end.
+/// Painting, clicks and the cursor all follow the moved rows.
+pub(super) fn with_room(g: &Galley, room: &[(usize, f32)]) -> Galley {
     let mut g = g.clone();
-    let mut next = lines.iter().peekable();
+    let mut next = room.iter().peekable();
     let mut dy = 0.0;
     for (i, row) in g.rows.iter_mut().enumerate() {
-        while next.next_if(|&&l| l <= i).is_some() {
+        while let Some((_, h)) = next.next_if(|(l, _)| *l <= i) {
             dy += h;
         }
         row.pos.y += dy;
     }
+    dy += next.map(|(_, h)| h).sum::<f32>();
     g.rect.max.y += dy;
     g.mesh_bounds.max.y += dy;
     g
@@ -992,7 +994,7 @@ mod tests {
         .textures_delta
         .clear(); // no renderer here to take the font texture
         let g = g.unwrap();
-        let moved = with_lens_room(&g, &[0, 2], 10.0);
+        let moved = with_room(&g, &[(0, 10.0), (2, 10.0), (9, 5.0)]);
         let ys: Vec<f32> = moved
             .rows
             .iter()
@@ -1000,7 +1002,11 @@ mod tests {
             .map(|(m, o)| m.pos.y - o.pos.y)
             .collect();
         assert_eq!(ys, [10.0, 10.0, 20.0, 20.0]);
-        assert_eq!(moved.rect.height(), g.rect.height() + 20.0);
+        assert_eq!(
+            moved.rect.height(),
+            g.rect.height() + 25.0,
+            "room after the end"
+        );
         // a click between rows lands on the nearest one
         let row1 = moved.rows[2].pos.y;
         assert_eq!(

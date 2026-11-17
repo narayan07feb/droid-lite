@@ -5519,3 +5519,371 @@ fn e2e_a_stopped_checkout_reply_waits_while_the_project_opens() {
         Some(("Check out of #7 was stopped".to_string(), true))
     );
 }
+
+/// The editor's text area on screen.
+fn editor_rect(h: &Harness<'static, App>) -> egui::Rect {
+    h.get_by_role(egui::accesskit::Role::MultilineTextInput)
+        .rect()
+}
+
+/// The Diff checkbox is greyed out.
+fn diff_disabled(h: &Harness<'static, App>) -> bool {
+    use egui_kittest::kittest::NodeT;
+    h.get_by_label("Diff").accesskit_node().is_disabled()
+}
+
+fn diff_view(a: &App) -> Option<std::sync::Arc<super::diff_view::Aligned>> {
+    a.tabs[a.active].diff.view.clone()
+}
+
+/// The one changed word of a changed row, on the old and the new side.
+fn words(r: &super::diff_view::Row) -> ((usize, usize), (usize, usize)) {
+    let one = |v: &[std::ops::Range<usize>]| {
+        assert_eq!(v.len(), 1, "{v:?}");
+        (v[0].start, v[0].end)
+    };
+    (one(&r.old_words), one(&r.new_words))
+}
+
+/// (added, removed, changed) of the active tab's diff.
+fn diff_counts(a: &App) -> Option<(usize, usize, usize)> {
+    diff_view(a).map(|v| (v.added, v.removed, v.changed))
+}
+
+#[test]
+fn e2e_diff_checkbox_splits_the_tab_and_follows_typing() {
+    use super::diff_view::Kind;
+    let f = Fixture::new("diffview");
+    let mut h = f.harness();
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    open(&mut h, &card);
+    wait(&mut h, "git status", |a| {
+        a.git.changes.as_ref().is_some_and(|c| c.repo)
+    });
+    // line 7 changed ("count" → "clicks"), line 13 (`@Preview`) removed
+    {
+        let t = h.state_mut().tabs.last_mut().unwrap();
+        t.text = CARD_KT
+            .replace(
+                "val count = mutableStateOf(0)",
+                "val clicks = mutableStateOf(0)",
+            )
+            .replace("@Preview\n", "");
+        t.reanalyse(); // shorter text: the symbols must follow before the Compose panel reads them
+    }
+    steps(&mut h, 2);
+    let alone = editor_rect(&h);
+    assert!(!diff_disabled(&h));
+    assert!(
+        h.query_by_label("Last commit").is_none(),
+        "off: the normal editor"
+    );
+    h.get_by_label("Diff").click();
+    wait(&mut h, "diff", |a| diff_counts(a) == Some((0, 1, 1)));
+    steps(&mut h, 3);
+    let v = diff_view(h.state()).unwrap();
+    let changed = &v.rows[v.row_of_new[6]];
+    assert_eq!(changed.kind, Kind::Changed);
+    assert_eq!(words(changed), ((8, 13), (8, 14)));
+    // the removed line is a spacer row above the editor's line 13
+    assert_eq!(v.room, [(12, 1)]);
+    // two columns: the older version on the left half, the editor on the right half
+    let left = tab(&h).diff.left.expect("left column");
+    let split = editor_rect(&h);
+    assert!(split.left() > left.right(), "{split:?} {left:?}");
+    assert!(
+        left.width() > 400.0 && split.left() > alone.left() + 400.0,
+        "{left:?}"
+    );
+    h.get_by_label("Last commit");
+    h.get_by_label_contains("0 added · 1 removed · 1 changed");
+    // the editor rows below the removed line moved down one row, so both sides stay aligned
+    let font = egui::FontId::monospace(crate::theme::font_size());
+    let row_h = h.ctx.fonts_mut(|f| f.row_height(&font));
+    let gap = |h: &Harness<'static, App>| {
+        let c = tab(h).cache.as_ref().unwrap();
+        let g = c
+            .shown
+            .as_ref()
+            .map_or(c.galley.clone(), |(_, g)| g.clone());
+        g.rows[12].pos.y - g.rows[11].pos.y
+    };
+    let gap_on = gap(&h);
+    if let Ok(dir) = std::env::var("DROID_LITE_SNAPSHOT_DIR") {
+        h.render()
+            .unwrap()
+            .save(Path::new(&dir).join("e2e-diff.png"))
+            .unwrap();
+    }
+    // typing updates the highlight: a new last line is added
+    let end = tab(&h).text.len();
+    h.state_mut().tabs.last_mut().unwrap().goto = Some(end);
+    steps(&mut h, 3);
+    type_text(&mut h, "// note");
+    assert!(tab(&h).text.ends_with("}\n// note"));
+    wait(&mut h, "added line", |a| diff_counts(a) == Some((1, 1, 1)));
+    let v = diff_view(h.state()).unwrap();
+    assert_eq!(v.rows.last().unwrap().kind, Kind::Added);
+    // remembered in the session
+    let session = std::fs::read_dir(f.config.join("sessions"))
+        .unwrap()
+        .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect::<String>();
+    assert!(session.contains(r#""diff":"head""#), "{session}");
+    // a running checkout makes the editor read-only, also with the diff on
+    let root = f.root.clone();
+    let reply = h.state_mut().prs.add_stopping(&root, 7);
+    type_text(&mut h, "zzz");
+    assert!(
+        tab(&h).text.ends_with("}\n// note"),
+        "no edit during a checkout"
+    );
+    drop(reply);
+    h.state_mut().prs = Default::default();
+    // off again (the shortcut): the normal editor
+    key(&mut h, Modifiers::CTRL | Modifiers::SHIFT, Key::D);
+    steps(&mut h, 2);
+    assert!(!tab(&h).diff.on);
+    assert!(tab(&h).diff.left.is_none());
+    assert!((editor_rect(&h).left() - alone.left()).abs() < 1.0);
+    assert!(h.query_by_label("Last commit").is_none());
+    // the spacer row is gone
+    let gap_off = gap(&h);
+    assert!(
+        (gap_on - gap_off - row_h).abs() < 0.5,
+        "{gap_on} {gap_off} {row_h}"
+    );
+}
+
+#[test]
+fn e2e_diff_session_restores_the_checkbox() {
+    let f = Fixture::new("diffsession");
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    {
+        let mut h = f.harness();
+        open(&mut h, &card);
+        wait(&mut h, "git status", |a| {
+            a.git.changes.as_ref().is_some_and(|c| c.repo)
+        });
+        h.get_by_label("Diff").click();
+        steps(&mut h, 2);
+        h.get_by_label("PR base").click();
+        steps(&mut h, 2);
+        assert_eq!(tab(&h).diff.against, super::diff_view::Against::Base);
+    }
+    let h = f.harness();
+    let t = &h.state().tabs[h.state().active];
+    assert_eq!(t.path, card);
+    assert!(t.diff.on);
+    assert_eq!(t.diff.against, super::diff_view::Against::Base);
+}
+
+#[test]
+fn e2e_diff_compares_with_the_pr_base() {
+    let f = Fixture::new("diffbase");
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&f.root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    let main = git(&["branch", "--show-current"]);
+    git(&["update-ref", &format!("refs/remotes/origin/{main}"), &main]);
+    git(&["checkout", "-q", "-b", "feature"]);
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    std::fs::write(&user, USER_KT.replace("var age", "val age")).unwrap();
+    git(&["commit", "-q", "-am", "feature"]);
+    let mut h = f.harness();
+    open(&mut h, &user);
+    wait(&mut h, "PR base", |a| {
+        a.git
+            .changes
+            .as_ref()
+            .is_some_and(|c| c.repo && c.base.is_some())
+    });
+    h.get_by_label("Diff").click();
+    // committed: nothing changed since the last commit
+    wait(&mut h, "vs HEAD", |a| diff_counts(a) == Some((0, 0, 0)));
+    steps(&mut h, 2);
+    h.get_by_label("No changes");
+    h.get_by_label("PR base").click();
+    wait(&mut h, "vs the PR base", |a| {
+        diff_counts(a) == Some((0, 0, 1))
+    });
+    steps(&mut h, 2);
+    h.get_by_label_contains("0 added · 0 removed · 1 changed");
+    let v = diff_view(h.state()).unwrap();
+    let r = &v.rows[2];
+    assert_eq!(words(r), ((34, 37), (34, 37)));
+    assert_eq!(
+        v.old_lines[2],
+        "data class User(val name: String, var age: Int)"
+    );
+    // back to the last commit
+    h.get_by_label("Last commit").click();
+    wait(&mut h, "vs HEAD again", |a| {
+        diff_counts(a) == Some((0, 0, 0))
+    });
+}
+
+#[test]
+fn e2e_diff_is_disabled_outside_git() {
+    let f = Fixture::new("diffnogit");
+    std::fs::remove_dir_all(f.root.join(".git")).unwrap();
+    let mut h = f.harness();
+    open(&mut h, &f.path("app/src/main/java/com/demo/data/User.kt"));
+    wait(&mut h, "git status", |a| a.git.changes.is_some());
+    steps(&mut h, 2);
+    assert!(!h.state().git.changes.as_ref().unwrap().repo);
+    assert!(diff_disabled(&h));
+    h.get_by_label("Diff").click();
+    steps(&mut h, 2);
+    key(&mut h, Modifiers::CTRL | Modifiers::SHIFT, Key::D);
+    assert!(!tab(&h).diff.on);
+    assert!(tab(&h).diff.left.is_none());
+    assert!(
+        h.state().status.starts_with("Not a git project"),
+        "{}",
+        h.state().status
+    );
+}
+
+/// UI-thread cost of the diff: the editor part of a frame on a 5,000-line file, diff off and on.
+/// `cargo test --release e2e_diff_frame_cost -- --nocapture` prints the numbers.
+#[test]
+fn e2e_diff_frame_cost_on_a_5000_line_file() {
+    let f = Fixture::new("diffperf");
+    let big = f.path("app/src/main/java/com/demo/Big.kt");
+    let text: String = (0..5000)
+        .map(|i| format!("    val value{i} = compute({i}, \"label {i}\") // line {i}\n"))
+        .collect();
+    std::fs::write(&big, &text).unwrap();
+    for args in [&["add", "."][..], &["commit", "-q", "-m", "big"]] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&f.root)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let mut h = f.harness();
+    open(&mut h, &big);
+    wait(&mut h, "git status", |a| {
+        a.git.changes.as_ref().is_some_and(|c| c.repo)
+    });
+    // every 10th line changed, every 50th removed
+    let edited: String = text
+        .lines()
+        .enumerate()
+        .filter(|(i, _)| i % 50 != 25)
+        .map(|(i, l)| {
+            if i % 10 == 3 {
+                format!("{}\n", l.replace("compute", "computeAgain"))
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect();
+    {
+        let t = h.state_mut().tabs.last_mut().unwrap();
+        t.text = edited;
+        t.reanalyse();
+    }
+    // the middle of the file, where rows of every kind are on screen; typing makes line 2502
+    // (unchanged) a changed one
+    let mid = tab(&h).text.find("value2502 ").unwrap();
+    h.state_mut().tabs.last_mut().unwrap().goto = Some(mid);
+    steps(&mut h, 5);
+    let editor_ms = |h: &mut Harness<'static, App>| {
+        let mut v: Vec<f32> = (0..40)
+            .map(|_| {
+                h.step();
+                let a = h.state();
+                a.perf
+                    .last
+                    .iter()
+                    .find(|(s, _)| *s == "editor")
+                    .map_or(0.0, |s| s.1)
+            })
+            .collect();
+        v.sort_by(f32::total_cmp);
+        v[v.len() / 2]
+    };
+    // the slowest editor part of the frames while typing ten characters (and the compare after)
+    let typing_ms = |h: &mut Harness<'static, App>| {
+        let mut worst = 0.0f32;
+        for c in "xyzxyzxyzx".chars() {
+            h.event(Event::Text(c.to_string()));
+            for _ in 0..3 {
+                h.step();
+                let a = h.state();
+                let ms = a
+                    .perf
+                    .last
+                    .iter()
+                    .find(|(s, _)| *s == "editor")
+                    .map_or(0.0, |s| s.1);
+                worst = worst.max(ms);
+            }
+        }
+        for _ in 0..30 {
+            h.step();
+            std::thread::sleep(Duration::from_millis(10));
+            let a = h.state();
+            let ms = a
+                .perf
+                .last
+                .iter()
+                .find(|(s, _)| *s == "editor")
+                .map_or(0.0, |s| s.1);
+            worst = worst.max(ms);
+        }
+        worst
+    };
+    let off = editor_ms(&mut h);
+    let off_typing = typing_ms(&mut h);
+    h.get_by_label("Diff").click();
+    // the typing above (diff off) changed line 2502 too
+    wait(&mut h, "diff", |a| diff_counts(a) == Some((0, 100, 501)));
+    steps(&mut h, 3);
+    assert!(tab(&h).diff.left.is_some());
+    let on = editor_ms(&mut h);
+    let on_typing = typing_ms(&mut h);
+    assert!(
+        tab(&h).text.contains("xyzxyzxyzxxyzxyzxyzx"),
+        "typed into the editor side"
+    );
+    type_text(&mut h, "\nq");
+    wait(&mut h, "compare after typing", |a| {
+        diff_counts(a) == Some((1, 100, 501))
+    });
+    eprintln!(
+        "diff frame cost, 5000 lines: editor part median {off:.2} ms off, {on:.2} ms on; \
+         slowest while typing {off_typing:.2} ms off, {on_typing:.2} ms on"
+    );
+    assert!(
+        on < 50.0,
+        "the editor part of a frame took {on} ms with the diff on"
+    );
+    // a wheel over the older version scrolls both sides
+    let left = tab(&h).diff.left.unwrap();
+    let before = tab(&h).diff.scroll.y;
+    h.event(Event::PointerMoved(left.center()));
+    h.event(Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, -300.0),
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Unknown,
+        modifiers: Modifiers::NONE,
+    });
+    wait(&mut h, "scrolled from the left column", |a| {
+        a.tabs[a.active].diff.scroll.y > before + 100.0
+    });
+}
