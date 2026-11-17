@@ -363,6 +363,9 @@ type Opened = (
     crate::resources::Resources,
 );
 
+/// A ⌘-hover usage count: key, index generation asked at, the usages.
+type UsageCount = (String, u64, Vec<FoundLine>);
+
 pub struct App {
     project: Option<Project>,
     tree: Vec<tree::Node>,
@@ -446,7 +449,10 @@ pub struct App {
     find: Option<find::FindBar>,
     /// ⌘-hover usage lists by name: (index generation, result once counted).
     usages: HashMap<String, (u64, Option<Vec<FoundLine>>)>,
-    usages_rx: Vec<Receiver<(String, u64, Vec<FoundLine>)>>,
+    /// Counts on their way: key, index generation asked at, where the answer arrives.
+    usages_rx: Vec<(String, u64, Receiver<UsageCount>)>,
+    /// The open tabs' texts last handed to the worker ([`App::open_texts`]).
+    open_shared: HashMap<PathBuf, std::sync::Arc<str>>,
     /// Compile errors and warnings from the last Gradle run: file → (line, column, severity, message).
     build_problems: HashMap<PathBuf, Vec<(u32, u32, u8, String)>>,
     settings: comfort::Settings,
@@ -577,6 +583,7 @@ impl App {
             find: None,
             usages: HashMap::new(),
             usages_rx: Vec::new(),
+            open_shared: HashMap::new(),
             build_problems: HashMap::new(),
             settings,
             window_focused: true,
@@ -670,6 +677,14 @@ impl App {
         self.history.clear();
         self.forward.clear();
         self.recent.clear();
+        // nothing the worker was doing for the old project answers here
+        self.xref.cancel_all();
+        self.find_rx = None;
+        self.lsp_found = None;
+        self.usages.clear();
+        self.usages_rx.clear();
+        self.decl_usages = None;
+        self.open_shared.clear();
         self.index.set(Index::default());
         self.gradle = None; // Drop stops a running build of the old project
         self.compose_view = None;
@@ -1141,7 +1156,7 @@ impl App {
     /// and the manifest for a class.
     fn search_usages(&mut self, word: String, target: crate::resolve::DeclRef, ctx: &egui::Context) {
         let Some(p) = &self.project else { return };
-        let code: Vec<PathBuf> = p.files.iter().filter(|f| is_code(f)).cloned().collect();
+        let root = p.root.clone();
         let is_type = self
             .index
             .read()
@@ -1163,7 +1178,7 @@ impl App {
         let c = ctx.clone();
         self.status = format!("Searching for `{word}`…");
         self.xref
-            .find_usages("find", target, open, std::sync::Arc::new(code), move |mut found| {
+            .find_usages("find", target, open, root, move |mut found| {
                 // layouts and the manifest name classes
                 for f in other {
                     let Ok(text) = std::fs::read_to_string(&f) else { continue };
@@ -1434,14 +1449,22 @@ impl App {
             self.outputs_gen += 1;
             self.stability_rx = None;
         }
-        if let Some(rx) = &self.find_rx
-            && let Ok(f) = rx.try_recv()
-        {
-            self.status = format!("{} matches", f.len());
-            self.found = f;
-            self.find_rx = None;
-            if let Some(l) = self.lsp_found.take() {
-                self.merge_found(l);
+        if let Some(rx) = &self.find_rx {
+            match rx.try_recv() {
+                Ok(f) => {
+                    self.status = format!("{} matches", f.len());
+                    self.found = f;
+                    self.find_rx = None;
+                    if let Some(l) = self.lsp_found.take() {
+                        self.merge_found(l);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                // the worker's search failed (it logged why): say so instead of searching forever
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.status = "Search failed: internal error".into();
+                    self.find_rx = None;
+                }
             }
         }
         self.poll_tests();

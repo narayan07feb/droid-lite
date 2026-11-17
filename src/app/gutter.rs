@@ -492,22 +492,29 @@ impl App {
             .filter(|d| wants_usages(d))
             .map(|d| (usage_key(d), d.offset))
             .collect();
-        let files: std::sync::Arc<Vec<std::path::PathBuf>> = std::sync::Arc::new(
-            p.files
-                .iter()
-                .filter(|f| crate::project::is_code(f))
-                .cloned()
-                .collect(),
-        );
-        let open: HashMap<std::path::PathBuf, std::sync::Arc<str>> = self
-            .tabs
-            .iter()
-            .filter(|t| !t.deleted)
-            .map(|t| (t.path.clone(), std::sync::Arc::from(t.text.as_str())))
-            .collect();
+        // the file list is worked out on the worker; open texts are copied only when changed
         let (path, rev, text, root) = (t.path.clone(), t.rev, t.text.clone(), p.root.clone());
+        let open = self.open_texts(false);
         self.xref
-            .want_file(&path, rev, generation, &text, open, files, root, targets);
+            .want_file(&path, rev, generation, &text, open, root, targets);
+    }
+
+    /// The open tabs' texts as the worker reads them (a deleted file's only `with_deleted`),
+    /// shared with the last copy while a tab's text is the same.
+    pub(super) fn open_texts(
+        &mut self,
+        with_deleted: bool,
+    ) -> HashMap<std::path::PathBuf, std::sync::Arc<str>> {
+        let mut out = HashMap::new();
+        for t in self.tabs.iter().filter(|t| with_deleted || !t.deleted) {
+            let shared = match self.open_shared.get(&t.path) {
+                Some(s) if **s == *t.text => s.clone(),
+                _ => std::sync::Arc::from(t.text.as_str()),
+            };
+            out.insert(t.path.clone(), shared);
+        }
+        self.open_shared = out.clone();
+        out
     }
 
     pub(super) fn handle(&mut self, r: Request, ctx: &egui::Context) {

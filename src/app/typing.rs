@@ -2,9 +2,7 @@
 
 use super::{App, FoundLine, found_line, word_bounds};
 use crate::edit;
-use crate::project::is_code;
 use egui::{Event, Key, Modifiers, RichText, Ui};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::channel;
 
@@ -78,16 +76,31 @@ impl App {
     pub(super) fn poll_usages(&mut self) {
         let index_gen = self.index.read().generation;
         let mut done = Vec::new();
-        self.usages_rx.retain(|rx| match rx.try_recv() {
+        let mut gone = Vec::new();
+        self.usages_rx.retain(|(key, g, rx)| match rx.try_recv() {
             Ok(v) => {
                 done.push(v);
                 false
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => true,
-            Err(_) => false,
+            // cancelled (a newer hover) or failed: never answered
+            Err(_) => {
+                gone.push((key.clone(), *g));
+                false
+            }
         });
         for (word, g, found) in done {
             self.usages.insert(word, (g, Some(found)));
+        }
+        // a count that will never come is asked again next time, not left "counting"
+        for (key, g) in gone {
+            if self
+                .usages
+                .get(&key)
+                .is_some_and(|e| e.0 == g && e.1.is_none())
+            {
+                self.usages.remove(&key);
+            }
         }
         // keep the cache small: only answers for the current index
         self.usages.retain(|_, (g, _)| *g == index_gen);
@@ -108,51 +121,41 @@ impl App {
         // an answer from before the last edit or disk change is stale
         if self.usages.get(&key).is_none_or(|(g, _)| *g != index_gen) {
             self.usages.insert(key.clone(), (index_gen, None));
-            let files: Vec<PathBuf> = self
+            let root = self
                 .project
                 .as_ref()
-                .map(|p| p.files.iter().filter(|f| is_code(f)).cloned().collect())
+                .map(|p| p.root.clone())
                 .unwrap_or_default();
             // open tabs count as they are now, saved or not
-            let open: HashMap<PathBuf, std::sync::Arc<str>> = self
-                .tabs
-                .iter()
-                .map(|t| (t.path.clone(), std::sync::Arc::from(t.text.as_str())))
-                .collect();
+            let open = self.open_texts(true);
             let (tx, rx) = channel();
             let (w, k) = (word.to_string(), key.clone());
             match target {
-                Some(t) => self.xref.find_usages(
-                    "hover",
-                    t,
-                    open,
-                    std::sync::Arc::new(files),
-                    move |found| {
-                        let _ = tx.send((k, index_gen, found));
-                    },
-                ),
+                Some(t) => self.xref.find_usages("hover", t, open, root, move |found| {
+                    let _ = tx.send((k, index_gen, found));
+                }),
                 // not known (yet): every place that spells the name
-                None => self.xref.submit("hover", move |_, stale| {
+                None => self.xref.submit("hover", move |s, stale| {
                     let mut found = Vec::new();
-                    for f in files {
+                    for f in s.code_files(&root).iter() {
                         if stale() {
                             return;
                         }
                         let Some(text) = open
-                            .get(&f)
+                            .get(f)
                             .map(|t| t.to_string())
-                            .or_else(|| std::fs::read_to_string(&f).ok())
+                            .or_else(|| std::fs::read_to_string(f).ok())
                         else {
                             continue;
                         };
                         for r in crate::refactor::occurrences(&text, &w) {
-                            found.push(found_line(&f, &text, r.start));
+                            found.push(found_line(f, &text, r.start));
                         }
                     }
                     let _ = tx.send((k, index_gen, found));
                 }),
             }
-            self.usages_rx.push(rx);
+            self.usages_rx.push((key.clone(), index_gen, rx));
         }
         self.usages.get(&key).and_then(|(_, f)| f.as_ref())
     }

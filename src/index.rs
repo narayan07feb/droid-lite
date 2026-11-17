@@ -24,6 +24,9 @@ pub struct Index {
     /// The latest changed files with the generation each change made, so a cached result can
     /// tell whether a file it depends on changed (bounded; older changes are only counted).
     changes: std::collections::VecDeque<(u64, Arc<Path>)>,
+    /// Generations up to this one belong to an index this one replaced (another project, or the
+    /// same one read again): nothing changed since then can be told.
+    floor: u64,
 }
 
 /// How many file changes the index remembers.
@@ -69,8 +72,15 @@ impl Shared {
         }
         true
     }
-    pub fn set(&self, index: Index) {
-        self.change(move |i| *i = index);
+    /// Replaces the index. Generations keep counting up from the old one's, so a result cached
+    /// against the old index is never taken for one of the new.
+    pub fn set(&self, mut index: Index) {
+        self.change(move |i| {
+            index.generation += i.generation + 1;
+            index.floor = index.generation;
+            index.changes.clear();
+            *i = index;
+        });
     }
     /// Waits until the queued changes are in (the worker never holds the lock long).
     #[cfg(test)]
@@ -150,6 +160,9 @@ impl Index {
 
     /// Files changed after generation `since`, or `None` when that is older than the log.
     pub fn changed_since(&self, since: u64) -> Option<Vec<Arc<Path>>> {
+        if since < self.floor {
+            return None;
+        }
         let oldest = self.changes.front().map_or(self.generation, |(g, _)| *g);
         if since + 1 < oldest && self.changes.len() == CHANGES_KEPT {
             return None;
@@ -199,16 +212,19 @@ impl Index {
     /// Drops every file under `dir` (a deleted folder): one range of the sorted paths, not a scan
     /// of every file.
     pub fn remove_under(&mut self, dir: &Path) {
-        let gone: Vec<PathBuf> = self
-            .shared
+        for p in self.files_under(dir) {
+            self.remove(&p);
+        }
+    }
+
+    /// The files under `dir`, sorted.
+    pub fn files_under(&self, dir: &Path) -> Vec<PathBuf> {
+        self.shared
             .range::<Path, _>((std::ops::Bound::Included(dir), std::ops::Bound::Unbounded))
             .map(|(p, _)| p)
             .take_while(|p| p.starts_with(dir))
             .cloned()
-            .collect();
-        for p in gone {
-            self.remove(&p);
-        }
+            .collect()
     }
 
     pub fn decls(&self) -> impl Iterator<Item = (&PathBuf, &FileSyms, &Decl)> {
@@ -713,6 +729,29 @@ pub fn rank_by<T>(
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn a_replaced_index_tells_nothing_about_changes_since_the_old_one() {
+        let shared = Shared::default();
+        let mut a = Index::default();
+        a.update(Path::new("/p/A.kt"), "package a\nclass A\n");
+        shared.set(a);
+        shared.settle();
+        let old = shared.read().generation;
+        assert_eq!(shared.read().changed_since(old).map(|c| c.len()), Some(0));
+        let mut b = Index::default();
+        b.update(Path::new("/q/B.kt"), "package b\nclass B\n");
+        shared.set(b);
+        shared.settle();
+        let now = shared.read().generation;
+        assert!(now > old, "generations keep counting across a swap");
+        assert!(shared.read().changed_since(old).is_none());
+        assert_eq!(shared.read().changed_since(now).map(|c| c.len()), Some(0));
+        shared.change(|i| i.update(Path::new("/q/B.kt"), "package b\nclass B2\n"));
+        shared.settle();
+        let changed = shared.read().changed_since(now).unwrap();
+        assert!(!changed.is_empty() && changed.iter().all(|p| **p == *Path::new("/q/B.kt")));
+    }
 
     #[test]
     fn pairs_expect_and_actual_across_source_sets() {

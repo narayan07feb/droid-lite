@@ -262,6 +262,7 @@ impl App {
         if self.refuse_during_checkout() {
             return;
         }
+        self.settle_saves();
         let mut undo = Undo {
             label: format!("rename {} → {}", p.old, p.new),
             files: Vec::new(),
@@ -307,9 +308,18 @@ impl App {
         self.undo = Some(undo);
     }
 
+    /// Lets saves still on their way land first: one landing after a refactor's write (or a file
+    /// move) would find the file changed, or bring it back at its old name.
+    fn settle_saves(&mut self) {
+        if self.saves_pending > 0 {
+            self.wait_saves();
+        }
+    }
+
     /// Writes a file and keeps the open tab, the index and kotlin-lsp in step.
     /// What is on disk and typing it replaces go to local history first, else nothing is written.
     fn write_file(&mut self, path: &Path, text: &str) -> bool {
+        self.settle_saves();
         let typed = self
             .tabs
             .iter()
@@ -366,6 +376,7 @@ impl App {
             return;
         }
         let Some(u) = self.undo.take() else { return };
+        self.settle_saves();
         // a file at the old name again (made since) is never replaced: the undo waits
         if let Some((from, to)) = &u.moved {
             let why = if from.exists() {

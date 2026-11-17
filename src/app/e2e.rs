@@ -6380,3 +6380,96 @@ fn e2e_save_never_waits_for_the_disk_and_two_quick_saves_land_in_order() {
     assert_eq!(h.state().status, format!("Saved {}", user.display()));
     assert_eq!(h.state().saves_pending, 0);
 }
+
+#[test]
+fn e2e_a_cancelled_usage_count_is_asked_again() {
+    let f = Fixture::new("count-cancelled");
+    let mut h = f.harness();
+    let a = h.state_mut();
+    let g = a.index.read().generation;
+    // a count asked, then its task cancelled by a newer hover: the reply never comes
+    let (tx, rx) = channel();
+    a.usages.insert("User".into(), (g, None));
+    a.usages_rx.push(("User".into(), g, rx));
+    drop(tx);
+    a.poll_usages();
+    assert!(!a.usages.contains_key("User"), "not left counting");
+    assert!(a.usages_rx.is_empty());
+}
+
+#[test]
+fn e2e_open_texts_share_a_tab_text_until_it_changes() {
+    let f = Fixture::new("open-texts");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    let a = h.state_mut();
+    let one = a.open_texts(false);
+    let two = a.open_texts(false);
+    assert!(
+        std::sync::Arc::ptr_eq(&one[&user], &two[&user]),
+        "no copy per request"
+    );
+    let i = a.active;
+    a.tabs[i].text.push_str("// more\n");
+    let three = a.open_texts(false);
+    assert!(!std::sync::Arc::ptr_eq(&two[&user], &three[&user]));
+    assert!(three[&user].ends_with("// more\n"));
+}
+
+#[test]
+fn e2e_a_late_search_of_the_old_project_never_fills_the_new_one() {
+    let f = Fixture::new("switch-late-find");
+    let mut h = f.harness();
+    let (tx, rx) = channel();
+    h.state_mut().find_rx = Some(rx);
+    let other = f.path("app");
+    let ctx = h.ctx.clone();
+    h.state_mut().switch_project(&other, &ctx);
+    let _ = tx.send(vec![found_line(
+        &f.path("app/src/main/java/com/demo/data/User.kt"),
+        USER_KT,
+        0,
+    )]);
+    steps(&mut h, 5);
+    assert!(h.state().find_rx.is_none());
+    assert!(
+        h.state().found.is_empty(),
+        "the old project's answer is not shown"
+    );
+}
+
+#[test]
+fn e2e_a_refactor_waits_for_a_save_on_its_way() {
+    let f = Fixture::new("refactor-waits-save");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    place_cursor(&mut h, "class User(", 6);
+    key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::R);
+    for _ in 0.."User".len() {
+        key(&mut h, Modifiers::NONE, Key::Backspace);
+    }
+    type_text(&mut h, "Person");
+    key(&mut h, Modifiers::NONE, Key::Enter);
+    wait(&mut h, "rename preview", |a| {
+        matches!(a.refactor, Some(refactor_ui::Refactor::Preview(_)))
+    });
+    // the save thread is busy: a save of User.kt waits behind it
+    let (go, gate) = channel::<()>();
+    saver::run(move || {
+        let _ = gate.recv_timeout(Duration::from_secs(5));
+    });
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = go.send(());
+    });
+    h.state_mut().save_tab(false);
+    assert_eq!(h.state().saves_pending, 1);
+    h.get_by_label("Apply").click();
+    steps(&mut h, 3);
+    h.state_mut().wait_saves();
+    let person = f.path("app/src/main/java/com/demo/data/Person.kt");
+    assert!(person.exists());
+    assert!(!user.exists(), "the save landed first, not after the move");
+}

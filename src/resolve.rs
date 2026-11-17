@@ -2764,7 +2764,12 @@ fn variant(p: &Path) -> String {
 impl Resolver<'_> {
     fn key_of(&self, t: &Ty) -> String {
         match t {
-            Ty::Decl((p, o)) => format!("{}#{o}", p.display()),
+            // by fully qualified name, not place: a consumer's key stays right when only the
+            // declaring file changes (an import added above it)
+            Ty::Decl(r) => match self.decl(r) {
+                Some((f, i)) => crate::index::qualified(&f.syms, &f.syms.decls[i]),
+                None => format!("{}#{}", r.0.display(), r.1),
+            },
             Ty::Lib(n, a) if a.is_empty() => n.clone(),
             Ty::Lib(n, a) => format!(
                 "{n}<{}>",
@@ -3028,7 +3033,9 @@ fn has_hilt(f: &FileSyms) -> bool {
 
 impl HiltGraph {
     /// Brings the parts up to date: at first every file with Hilt annotations, later only the
-    /// files changed since. Returns whether it finished (else `stop` cut it short; call again).
+    /// files changed since (bindings are keyed by qualified name, so a file whose declarations
+    /// moved is all that is read again). Returns whether it finished (else `stop` cut it short;
+    /// call again).
     pub fn refresh(&mut self, r: &Resolver, stop: &dyn Fn() -> bool) -> bool {
         if self.pending.is_empty() {
             let changed = self.at.and_then(|g| r.index.changed_since(g));
@@ -3062,11 +3069,14 @@ impl HiltGraph {
                 return true;
             }
         }
+        // at least one file each call, so a short time budget still gets there
+        let mut first = true;
         while let Some(p) = self.pending.pop() {
-            if stop() {
+            if !first && stop() {
                 self.pending.push(p);
                 return false;
             }
+            first = false;
             let Some(text) = r.texts.read(&p) else {
                 continue;
             };
@@ -3496,6 +3506,34 @@ mod tests {
             providers(&r, &g, "/p/m/src/main/java/a/Mod.kt", 12, Some(0)),
             ["/p/m/src/main/java/a/Q.kt:7"]
         );
+    }
+
+    #[test]
+    fn hilt_links_survive_a_change_to_only_the_providing_file() {
+        let repo = "/p/src/main/java/a/Repo.kt";
+        let vm = "/p/src/main/java/a/Vm.kt";
+        let (mut i, mut t) = project(&[
+            (repo, "package a\nclass Repo @Inject constructor()\n"),
+            (
+                vm,
+                "package a\nclass Vm @Inject constructor(\n    val repo: Repo,\n)\n",
+            ),
+        ]);
+        let mut g = {
+            let r = Resolver::new(&i, &t);
+            let g = graph(&r);
+            assert_eq!(providers(&r, &g, vm, 3, Some(0)), [format!("{repo}:2")]);
+            g
+        };
+        // an import above the class moves it; only Repo.kt is read again
+        let moved = "package a\n\nimport javax.inject.Inject\n\nclass Repo @Inject constructor()\n";
+        i.update(Path::new(repo), moved);
+        t.open.insert(PathBuf::from(repo), Arc::from(moved));
+        let r = Resolver::new(&i, &t);
+        while !g.refresh(&r, &|| false) {}
+        assert_eq!(providers(&r, &g, vm, 3, Some(0)), [format!("{repo}:5")]);
+        let b = g.files[Path::new(repo)].1.providers[0].clone();
+        assert_eq!(g.injected_in(&b).len(), 1, "Injected in");
     }
 
     #[test]
