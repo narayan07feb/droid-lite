@@ -444,6 +444,10 @@ pub struct App {
     settings: comfort::Settings,
     /// The window had focus last frame (auto-save runs when it loses it).
     window_focused: bool,
+    /// A close waits for the unsaved-edits choice ([`App::guard_close`]).
+    close_asked: bool,
+    /// That choice was made: the next close request goes through.
+    close_ok: bool,
     show_settings: bool,
     /// Hash of the last saved session, and when it was written.
     session_saved: (u64, Instant),
@@ -555,6 +559,8 @@ impl App {
             build_problems: HashMap::new(),
             settings,
             window_focused: true,
+            close_asked: false,
+            close_ok: false,
             show_settings: false,
             session_saved: (0, Instant::now()),
             history_for: None,
@@ -798,6 +804,9 @@ impl App {
     }
 
     fn save(&mut self) {
+        if self.refuse_during_checkout() {
+            return;
+        }
         self.settle(true);
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
@@ -1163,6 +1172,9 @@ impl App {
 
     /// Runs a Gradle task; `serial` makes install tasks target that device.
     fn run_gradle_on(&mut self, task: String, serial: Option<&str>, ctx: &egui::Context) {
+        if self.refuse_during_checkout() {
+            return;
+        }
         let Some(p) = &self.project else { return };
         if let Some(r) = self.gradle.as_mut() {
             r.stop();
@@ -1459,6 +1471,9 @@ impl App {
 
     /// Puts one uncommitted change back to its HEAD lines (the click on a change bar).
     fn revert_hunk(&mut self, h: &crate::git::Hunk) {
+        if self.refuse_during_checkout() {
+            return;
+        }
         let Some(t) = self.tabs.get_mut(self.active) else {
             return;
         };
@@ -1477,6 +1492,24 @@ impl App {
 
     /// Runs one command, from a shortcut or a menu.
     fn run(&mut self, action: Action, ctx: &egui::Context) {
+        // commands that change files or start a build wait for a running checkout
+        let edits = matches!(
+            action,
+            Action::Complete
+                | Action::Rename
+                | Action::ExtractVariable
+                | Action::OptimizeImports
+                | Action::ToggleComment
+                | Action::DeleteLine
+                | Action::DuplicateLine
+                | Action::MoveLineUp
+                | Action::MoveLineDown
+                | Action::QuickFix
+                | Action::NewFile
+        );
+        if edits && self.refuse_during_checkout() {
+            return;
+        }
         self.settle(true);
         let open = |kind| {
             Some(Search {
@@ -2493,6 +2526,8 @@ impl App {
 
         let font = FontId::monospace(crate::theme::font_size());
         let row_h = ui.fonts_mut(|f| f.row_height(&font));
+        // a running checkout may rewrite the file: no edits until it ends
+        let locked = self.checkout_busy();
         let tab = &mut self.tabs[self.active];
         let id = egui::Id::unique(("editor", &tab.path));
         let mut marks: Vec<(std::ops::Range<usize>, Color32)> = tab
@@ -2693,8 +2728,9 @@ impl App {
                     );
                     // filled in after layout, so it sits under the text
                     let line_bg = ui.painter().add(egui::Shape::Noop);
-                    // library sources: a read-only copy keeps selection and navigation, drops edits
-                    let ro_copy = readonly.then(|| text.clone());
+                    // library sources (and any file while a checkout runs): a read-only copy keeps
+                    // selection and navigation, drops edits
+                    let ro_copy = (*readonly || locked).then(|| text.clone());
                     let mut ro_str: &str = ro_copy.as_deref().unwrap_or("");
                     let buffer: &mut dyn egui::TextBuffer = if ro_copy.is_some() {
                         &mut ro_str
@@ -3079,6 +3115,10 @@ impl App {
     }
 
     fn accept_completion(&mut self) {
+        if self.refuse_during_checkout() {
+            self.completion = None;
+            return;
+        }
         self.settle(true);
         let Some(c) = self.completion.take() else {
             return;
@@ -3561,7 +3601,11 @@ impl App {
                 self.previews.zoom = None;
             }
         }
-        if render && let Some(mut r) = render_req {
+        // during a checkout the status says to wait
+        if render
+            && !self.refuse_during_checkout()
+            && let Some(mut r) = render_req
+        {
             if let Some(p) = r.project.as_mut() {
                 p.changed = std::mem::take(&mut self.previews.saved);
             }
@@ -3579,6 +3623,7 @@ impl App {
     fn poll_previews(&mut self, ctx: &egui::Context) {
         // by itself: a file with previews that was just opened or saved (no unsaved edits) is drawn
         if let Some(tab) = self.tabs.get(self.active)
+            && !self.checkout_busy() // the files may change under the worker
             && tab.text == tab.saved
             && let Some(mut r) = preview_request(tab, self.project.as_ref())
         {
@@ -3888,10 +3933,21 @@ impl App {
 
 impl eframe::App for App {
     fn on_exit(&mut self) {
+        // a checkout still switching files stops first (it would go on after the window)
+        let stopped = self.stop_checkouts();
+        for n in &stopped {
+            eprintln!("droid-lite: Check out of #{n} was stopped");
+        }
         self.save_session(true);
-        if self.settings.autosave {
+        // after a stopped checkout the tree may be half switched: nothing is written over it
+        if self.settings.autosave && stopped.is_empty() {
             self.autosave();
         }
+        // a forced quit never loses typing: what is still unsaved goes to local history
+        let unsaved: Vec<usize> = (0..self.tabs.len())
+            .filter(|&i| self.tabs[i].dirty() && !self.tabs[i].readonly)
+            .collect();
+        self.keep_copies(&unsaved);
         // every plugin list, view, run and watch (and tools they left running) is killed now
         // (their Drop), not left to threads that end with the app
         self.tests = Default::default();
@@ -3913,6 +3969,7 @@ impl eframe::App for App {
         self.poll_prs();
         self.refresh_changes(&ctx); // git status for tree colours, not only the Current changes tab
         self.watch_focus(&ctx);
+        self.guard_close(&ctx);
         self.save_session(false);
         watch.stage("shortcuts", || self.shortcuts(&ctx));
         self.usages_popup_keys(&ctx);

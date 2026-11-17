@@ -259,7 +259,7 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   const props = pkg.contributes.configuration.properties;
   check('enginePath is a machine setting', props['droidLite.enginePath'].scope === 'machine');
   check('logcatMaxLines setting', props['droidLite.logcatMaxLines'].default === 20000);
-  check('version 0.5.5', pkg.version === '0.5.5');
+  check('version 0.5.6', pkg.version === '0.5.6');
   check('Allow… on a test item that needs an OK', pkg.contributes.menus['testing/item/context']
     .some((m) => m.command === 'droidLite.allowTestPlugin' && /testId =~ \/\^needs-ok:\//.test(m.when)));
 
@@ -489,6 +489,13 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   check('a never-answered lenses call ends', Array.isArray(lensResult));
   ext.limits.lenses = 15000;
   fs.rmSync(silent);
+  // the engine that ran past the limit is stopped: the next call goes to a new one
+  const hungPid = requests().filter((r) => r.method === 'lenses').at(-1).pid;
+  await provider.provideCodeLenses(doc('Api.kt'));
+  const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  check('a timed-out engine is replaced', requests().filter((r) => r.method === 'lenses').at(-1).pid !== hungPid);
+  await until('the timed-out engine to end', () => !alive(hungPid), 3000).catch(() => {});
+  check('a timed-out engine is stopped', !alive(hungPid));
 
   // a device call that is never answered fails after its limit
   check('device calls wait 60 s at most', ext.limits.screenshot === 60000 && ext.limits.devices === 60000);
@@ -560,6 +567,27 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   check('logcat is capped', clears > 1
     && shown.includes('[older lines cleared]') && kept.split('\n').length - 3 <= 10 && kept.includes('line 24'));
 
+  // two quick Show logcat clicks: one adb logcat, never an orphaned one; a later click replaces it
+  const slowAdb = path.join(dir, 'slow-adb');
+  const adbPids = path.join(dir, 'adb.pids');
+  fs.writeFileSync(slowAdb, `#!/bin/sh\necho $$ >> '${adbPids}'\nexec sleep 30\n`, { mode: 0o755 });
+  fs.writeFileSync(adbFile, JSON.stringify(slowAdb));
+  const adbAsks = () => requests().filter((r) => r.method === 'adb').length;
+  const asked = adbAsks();
+  await Promise.all([commands['droidLite.logcat'](), commands['droidLite.logcat']()]);
+  await until('adb started', () => fs.existsSync(adbPids));
+  await sleep(200);
+  const pidsOf = () => fs.readFileSync(adbPids, 'utf8').trim().split('\n').map(Number);
+  check('two quick Show logcat start one adb', pidsOf().length === 1 && adbAsks() === asked + 1);
+  await commands['droidLite.logcat']();
+  await until('the second adb', () => pidsOf().length === 2);
+  await until('the first adb to end', () => !alive(pidsOf()[0]), 2000).catch(() => {});
+  check('Show logcat again replaces the running one', !alive(pidsOf()[0]) && alive(pidsOf()[1]));
+  await commands['droidLite.logcatStop']();
+  await until('logcat stopped', () => !alive(pidsOf()[1]), 2000).catch(() => {});
+  check('Stop logcat ends it', !alive(pidsOf()[1]));
+  fs.rmSync(adbFile);
+
   // an adb that cannot run: logcat shows the error and is off again
   fs.writeFileSync(adbFile, JSON.stringify(path.join(dir, 'no-such-adb')));
   errors.length = 0;
@@ -594,14 +622,15 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   const cleanDoc = { ...editDoc('file', 'clean', path.join(src, 'RealApi.kt')), isDirty: false };
   fake.workspace.textDocuments = [{ ...editDoc('file', dirtyRestart), isDirty: true }, otherDoc, cleanDoc,
     { ...editDoc('git', 'git', api), isDirty: true }];
-  process.kill(enginePid);
+  const stoppedAt = requests().length;
+  process.kill(requests().at(-1).pid);
   await sleep(200);
   check('an engine stop ends the recording', status.command === 'droidLite.menu' && /device-mobile/.test(status.text));
   await provider.provideCodeLenses(doc('Api.kt'));
-  const next = requests().filter((r) => r.pid !== enginePid).map((r) => r.method);
+  const next = requests().slice(stoppedAt).map((r) => r.method);
   check('a restarted engine indexes first', next[0] === 'initialize' && next.includes('lenses'));
   await sleep(600);
-  const resent = requests().filter((r) => r.pid !== enginePid && r.method === 'update');
+  const resent = requests().slice(stoppedAt).filter((r) => r.method === 'update');
   check('a restarted engine gets the unsaved edits again', resent.length === 1 && resent[0].params.path === api
     && resent[0].params.text === dirtyRestart);
   fake.workspace.textDocuments = [];
@@ -717,6 +746,26 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   fs.rmSync(delayFile);
   fake.window.state.focused = false;
   ctx2.subscriptions.push(...ctx3.subscriptions);
+
+  // an engine that hangs and ignores its stdin: killed 2 s after a call ran past its limit
+  const hung = path.join(dir, 'hung-engine');
+  const hungMark = path.join(dir, 'hung.pid');
+  fs.writeFileSync(hung, `#!/bin/sh\necho $$ > '${hungMark}'\nexec sleep 30\n`, { mode: 0o755 });
+  cfg.enginePath = hung;
+  ext.limits.devices = 100;
+  errors.length = 0;
+  const hungIndex = commands['droidLite.reindex'](); // its initialize is never answered
+  await until('the hung engine', () => fs.existsSync(hungMark));
+  const hungEngine = Number(fs.readFileSync(hungMark, 'utf8'));
+  const hungAt = Date.now();
+  await commands['droidLite.screenshot']();
+  check('a call to a hung engine fails at its limit', errors.some((m) => /did not answer devices/.test(m)));
+  await hungIndex; // failed with the engine, not after limits.initialize
+  check('a hung engine is not killed at once', alive(hungEngine));
+  await until('the hung engine to be killed', () => !alive(hungEngine), 4000).catch(() => {});
+  check('a hung engine is killed after 2 s', !alive(hungEngine) && Date.now() - hungAt >= 2000);
+  ext.limits.devices = 60000;
+  cfg.enginePath = fakeEngine;
 
   for (const s of [...ctx.subscriptions, ...ctx2.subscriptions]) s.dispose?.();
   fs.rmSync(dir, { recursive: true, force: true });

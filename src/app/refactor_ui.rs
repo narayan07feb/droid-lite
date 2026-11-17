@@ -247,6 +247,9 @@ impl App {
     }
 
     fn apply_preview(&mut self, p: Preview) {
+        if self.refuse_during_checkout() {
+            return;
+        }
         let mut undo = Undo {
             label: format!("rename {} → {}", p.old, p.new),
             files: Vec::new(),
@@ -331,6 +334,9 @@ impl App {
     }
 
     pub(super) fn undo_refactor(&mut self) {
+        if self.refuse_during_checkout() {
+            return;
+        }
         let Some(u) = self.undo.take() else { return };
         if let Some((from, to)) = &u.moved
             && std::fs::rename(to, from).is_ok()

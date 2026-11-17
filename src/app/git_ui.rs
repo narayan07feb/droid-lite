@@ -33,6 +33,9 @@ pub(super) struct TabBlame {
     seen_at: Option<Instant>,
 }
 
+/// The Current changes lists, with the branch and HEAD commit read with them.
+type Refreshed = (git::Changes, Option<String>, Option<String>);
+
 #[derive(Default)]
 pub(super) struct GitState {
     pub show_column: bool,
@@ -46,7 +49,7 @@ pub(super) struct GitState {
     commit_rx: Option<Receiver<(String, String)>>,
     /// Uncommitted files and the branch's changes (refreshed in the background).
     pub changes: Option<git::Changes>,
-    changes_rx: Option<Receiver<git::Changes>>,
+    changes_rx: Option<Receiver<Refreshed>>,
     /// Set by file-system events and git commands; the next Current changes tab frame refreshes.
     pub changes_stale: bool,
     commit_message: String,
@@ -60,7 +63,7 @@ pub(super) struct GitState {
 }
 
 /// Discard one file's changes: the uncommitted ones, or what this branch changed in it.
-enum Revert {
+pub(super) enum Revert {
     Working { path: PathBuf, untracked: bool },
     Branch { path: PathBuf, base: String },
 }
@@ -223,20 +226,28 @@ impl App {
             let c = ctx.clone();
             std::thread::spawn(move || {
                 // gh may use the network: never on the UI thread
-                let _ = tx.send(git::changes(&root, choice.as_deref()));
+                let ch = git::changes(&root, choice.as_deref());
+                let _ = tx.send((ch, git::branch(&root), git::head_sha(&root)));
                 c.request_repaint();
             });
             self.git.changes_rx = Some(rx);
         }
         if let Some(rx) = &self.git.changes_rx
-            && let Ok(ch) = rx.try_recv()
+            && let Ok((ch, branch, head)) = rx.try_recv()
         {
             self.git.changes = Some(ch);
             self.git.changes_rx = None;
+            // a commit, or a branch switched outside Droid Lite: the branch name and the
+            // PR list's "● current" follow
+            self.branch = branch;
+            self.prs.head = head;
         }
     }
 
-    fn revert_file(&mut self, root: &Path, r: Revert) {
+    pub(super) fn revert_file(&mut self, root: &Path, r: Revert) {
+        if self.refuse_during_checkout() {
+            return;
+        }
         let (path, res) = match r {
             Revert::Working {
                 path,
@@ -264,7 +275,10 @@ impl App {
         self.git.changes_stale = true;
     }
 
-    fn git_command(&mut self, args: &[&str]) {
+    pub(super) fn git_command(&mut self, args: &[&str]) {
+        if self.refuse_during_checkout() {
+            return;
+        }
         let Some(root) = self.project.as_ref().map(|p| p.root.clone()) else {
             return;
         };

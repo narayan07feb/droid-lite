@@ -122,19 +122,27 @@ fn now_ms() -> u64 {
 /// Keeps the current disk content of `path` before it is overwritten (save, refactor, auto-save).
 /// Identical content is not stored twice; old and extra versions are dropped.
 pub(super) fn record_history(path: &Path) {
-    let (Some(dir), Ok(text)) = (history_dir(path), std::fs::read(path)) else {
+    if let Ok(text) = std::fs::read(path) {
+        record_text(path, &text);
+    }
+}
+
+/// Keeps `text` as a version of `path` in local history ([`record_history`] for text that is not
+/// on disk: an editor buffer that is not saved).
+pub(super) fn record_text(path: &Path, text: &[u8]) {
+    let Some(dir) = history_dir(path) else {
         return;
     };
     let mut versions = history(path);
     if versions
         .first()
-        .is_some_and(|v| std::fs::read(&v.file).is_ok_and(|t| t == text))
+        .is_some_and(|v| std::fs::read(&v.file).is_ok_and(|t| t == *text))
     {
         return;
     }
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join("path.txt"), path.to_string_lossy().as_bytes());
-    let _ = std::fs::write(dir.join(now_ms().to_string()), &text);
+    let _ = std::fs::write(dir.join(now_ms().to_string()), text);
     versions = history(path);
     let cutoff = now_ms().saturating_sub(HISTORY_DAYS * 86_400_000);
     for (i, v) in versions.iter().enumerate() {
@@ -263,6 +271,7 @@ impl App {
 
     /// Saves every edited tab, as IntelliJ does when the window loses focus (and on quit). A tab
     /// whose file changed on disk meanwhile is not written: its bar asks which version to keep.
+    /// While a checkout runs, [`App::save`] refuses, so nothing is written.
     pub(super) fn autosave(&mut self) {
         let active = self.active;
         for i in 0..self.tabs.len() {
@@ -273,6 +282,107 @@ impl App {
             }
         }
         self.active = active;
+    }
+
+    /// Tabs with edits that auto-save does not write: the file changed or vanished on disk, or
+    /// auto-save is off. Quitting would lose them.
+    pub(super) fn unwritten_edits(&self) -> Vec<usize> {
+        (0..self.tabs.len())
+            .filter(|&i| {
+                let t = &self.tabs[i];
+                t.dirty() && !t.readonly && (t.deleted || t.disk_changed || !self.settings.autosave)
+            })
+            .collect()
+    }
+
+    /// Puts the text of tabs `tabs` in local history, so nothing typed is lost.
+    pub(super) fn keep_copies(&self, tabs: &[usize]) {
+        for &i in tabs {
+            let t = &self.tabs[i];
+            record_text(&t.path, t.text.as_bytes());
+        }
+    }
+
+    /// The window is asked to close while tabs have edits auto-save will not write: the close
+    /// waits for a choice, "Keep my version (save)", "Keep a copy and close" (in local history)
+    /// or "Cancel".
+    pub(super) fn guard_close(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.close_ok
+            && !self.unwritten_edits().is_empty()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_asked = true;
+        }
+        if !self.close_asked {
+            return;
+        }
+        let tabs = self.unwritten_edits();
+        if tabs.is_empty() {
+            self.close_asked = false;
+            return;
+        }
+        let root = self
+            .project
+            .as_ref()
+            .map(|p| p.root.clone())
+            .unwrap_or_default();
+        let list = crate::git::file_list(
+            "These files have edits that are not saved:",
+            &root,
+            tabs.iter().map(|&i| self.tabs[i].path.as_path()),
+        );
+        let mut pick = None;
+        egui::Window::new("Unsaved edits")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(list);
+                ui.label(
+                    RichText::new(
+                        "Their files changed or were deleted on disk (or auto-save is off).",
+                    )
+                    .color(theme::t().weak)
+                    .small(),
+                );
+                ui.horizontal(|ui| {
+                    for (i, b) in ["Keep my version (save)", "Keep a copy and close", "Cancel"]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        if ui.button(b).clicked() {
+                            pick = Some(i);
+                        }
+                    }
+                });
+            });
+        match pick {
+            Some(0) => {
+                let active = self.active;
+                for &i in &tabs {
+                    self.active = i;
+                    self.save();
+                }
+                self.active = active;
+                // a save that failed (its folder is gone) keeps the window open, with the reason
+                if self.unwritten_edits().is_empty() {
+                    self.close_now(ctx);
+                }
+            }
+            Some(1) => {
+                self.keep_copies(&tabs);
+                self.close_now(ctx);
+            }
+            Some(_) => self.close_asked = false,
+            None => {}
+        }
+    }
+
+    fn close_now(&mut self, ctx: &egui::Context) {
+        self.close_asked = false;
+        self.close_ok = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     /// Detects the window losing focus and auto-saves then.

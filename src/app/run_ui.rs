@@ -56,6 +56,9 @@ impl App {
 
     /// Installs the debug app on the picked device, then starts the app or one preview.
     pub(super) fn run_on_device(&mut self, what: Launch, ctx: &egui::Context) {
+        if self.refuse_during_checkout() {
+            return;
+        }
         let Some((module, app_id, _, serial)) = self.device_target() else {
             return;
         };

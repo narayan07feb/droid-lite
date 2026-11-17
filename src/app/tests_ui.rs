@@ -751,6 +751,9 @@ impl App {
         action: Option<usize>,
         ctx: &egui::Context,
     ) {
+        if self.refuse_during_checkout() {
+            return;
+        }
         let Some(p) = self.tests.plugins.get(i) else {
             return;
         };

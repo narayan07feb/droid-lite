@@ -13,6 +13,7 @@ let recording; // serial while a screen recording runs (UNKNOWN: record_start di
 let saving = false; // a recording is being saved (record_stop may take ~16 min): device calls wait
 const UNKNOWN = '?';
 let logcat; // running `adb logcat` process
+let logcatStarting = false; // a Show logcat is between its click and its spawn
 let onStopped = () => {}; // the current engine stopped (set in activate)
 let onIndexed = () => {}; // an initialize answered (set in activate)
 let onIndexing = () => {}; // an initialize was sent or answered (set in activate)
@@ -48,6 +49,7 @@ function start(ctx) {
     pending.clear();
     if (engine === e) { engine = undefined; ready = undefined; recording = undefined; onStopped(); }
   };
+  e.stop = stop;
   proc.on('exit', () => stop('Droid Lite engine stopped'));
   proc.on('error', (err) => stop(`Droid Lite engine could not run: ${err.message}`));
   proc.stdin.on('error', (err) => stop(`Droid Lite engine stopped: ${err.message}`));
@@ -61,6 +63,16 @@ const limits = {
   initialize: 600000, ping: 15000, update: 15000, remove: 15000, lenses: 15000, stability: 15000, implementations: 15000,
   previews: 180000, devices: 60000, adb: 60000, screenshot: 60000, record_start: 60000, record_stop: 1080000, // engine worst case ~976 s (pull capped at 15 min)
 };
+// an engine that ran past a request's limit may hang: it is stopped (stdin closed, SIGKILL after
+// 2 s) and the next call starts a new one; its other waiting calls fail now
+function restart(e, why) {
+  e.stop(why);
+  e.proc.stdin.end();
+  const kill = setTimeout(() => e.proc.kill('SIGKILL'), 2000);
+  kill.unref?.();
+  e.proc.once('exit', () => clearTimeout(kill));
+}
+
 // a previews call starts its limit again on each progress line, for any file (a first run downloads
 // and compiles; a file queued behind another waits while that one draws), up to this cap (ms)
 const caps = { previews: 900000 };
@@ -85,7 +97,9 @@ function call(ctx, method, params = {}) {
       timer = setTimeout(() => {
         e.pending.delete(id);
         progress?.dispose();
-        reject(new Error(`Droid Lite engine did not answer ${method} in ${(left < ms ? cap : ms) / 1000} s`));
+        const why = `Droid Lite engine did not answer ${method} in ${(left < ms ? cap : ms) / 1000} s`;
+        reject(new Error(why));
+        restart(e, why);
       }, Math.min(ms, left));
     };
     const progress = cap && events.event((m) => { if (m.event === 'preview_status') arm(); });
@@ -523,14 +537,23 @@ function activate(ctx) {
       revealFile(file, 'Recording');
     })),
     vscode.commands.registerCommand('droidLite.logcat', guard(async () => {
-      const serial = await pickDevice(ctx);
+      // a second click while the first waits for the device or adb: one logcat, never two
+      if (logcatStarting) return;
+      logcatStarting = true;
+      let serial;
+      let adb;
+      try {
+        serial = await pickDevice(ctx);
+        if (serial) adb = await call(ctx, 'adb');
+      } finally {
+        logcatStarting = false;
+      }
       if (!serial) return;
-      logcat?.kill();
-      const adb = await call(ctx, 'adb');
       const config = vscode.workspace.getConfiguration('droidLite');
       const max = config.get('logcatMaxLines') || 20000;
       out.clear();
       out.show(true);
+      logcat?.kill(); // replaced right before the new one starts: no await in between
       const proc = cp.spawn(adb, ['-s', serial, 'logcat', '-v', 'threadtime', '-T', String(config.get('logcatHistory'))]);
       // the channel keeps at most `max` lines; adb's errors go there too, so no pipe fills
       let lines = 0;

@@ -12,9 +12,13 @@ impl App {
     /// Handles keys the plain text editor does not know, before it sees them:
     /// Enter keeps the indent, brackets and quotes close themselves, Backspace removes an empty pair.
     pub(super) fn editor_keys(&mut self, ui: &mut Ui) {
+        let busy = self.checkout_busy();
         let Some(t) = self.tabs.get_mut(self.active) else {
             return;
         };
+        if t.readonly || busy {
+            return;
+        }
         let id = egui::Id::unique(("editor", &t.path));
         if !ui.memory(|m| m.has_focus(id)) || self.completion.is_some() {
             return;

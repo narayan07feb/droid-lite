@@ -1,15 +1,20 @@
 //! The sidebar's Pull requests view: your open PRs and the ones waiting for your review (through
 //! `gh`, off the UI thread). A PR opens to its changed files; a file shows its diff in the diff panel.
 //! "Check out" switches the project to a PR's branch (`gh pr checkout`), never over uncommitted work,
-//! unsaved edits, a half-done rebase or merge, or a running build.
+//! unsaved edits, a half-done rebase or merge, or a running build. While it runs, editors are
+//! read-only and builds, test runs, previews, saves and Git commands wait ([`App::checkout_busy`]).
 
 use super::App;
 use crate::git::{self, PrFilter, PrItem};
 use crate::icons as ic;
 use egui::{RichText, Sense, Ui};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
+
+/// Why a command waits while a checkout runs.
+pub(super) const WAIT_CHECKOUT: &str = "Wait for the check out to finish";
 
 type Files = Result<Vec<(String, String)>, String>;
 type List = Result<Vec<PrItem>, String>;
@@ -28,6 +33,14 @@ pub(super) struct Checkout {
     pub head: Option<String>,
 }
 
+/// A `gh pr checkout` thread: its project, PR, stop switch (with gh's process group) and reply.
+pub(super) struct Running {
+    root: PathBuf,
+    number: u64,
+    ctl: Arc<git::Ctl>,
+    rx: Receiver<Checkout>,
+}
+
 #[derive(Default)]
 pub(super) struct PrsState {
     /// The sidebar shows the pull requests instead of the Project tree.
@@ -43,19 +56,42 @@ pub(super) struct PrsState {
     files_rx: Option<Receiver<(u64, Files)>>,
     /// "Checking out #7…", then its result or why it was refused; `true` for an error.
     pub note: Option<(String, bool)>,
-    /// The running `gh pr checkout`.
-    checkout_rx: Option<Receiver<Checkout>>,
+    /// The running `gh pr checkout` of this project.
+    checkout: Option<Running>,
+    /// Checkouts of projects closed since they started, being stopped: a new one in the same
+    /// project waits until each has ended.
+    stopping: Vec<Running>,
 }
 
 impl PrsState {
     /// Another project opened: its lists, files, note and replies still on their way are
-    /// dropped; the sidebar choice and the filter stay.
+    /// dropped (a running checkout is stopped); the sidebar choice and the filter stay.
     pub(super) fn reset(&mut self) {
+        let mut stopping = std::mem::take(&mut self.stopping);
+        if let Some(r) = self.checkout.take() {
+            r.ctl.stop();
+            stopping.push(r);
+        }
         *self = PrsState {
             shown: self.shown,
             filter: self.filter,
+            stopping,
             ..Default::default()
         };
+    }
+
+    /// How many checkouts of closed projects are still being stopped.
+    #[cfg(test)]
+    pub(super) fn stopping_count(&self) -> usize {
+        self.stopping.len()
+    }
+
+    /// A checkout of `root` runs or is being stopped.
+    fn running_in(&self, root: &Path) -> Option<&Running> {
+        self.checkout
+            .iter()
+            .chain(&self.stopping)
+            .find(|r| r.root == root)
     }
 }
 
@@ -126,7 +162,7 @@ impl App {
         ui.separator();
         if let Some((text, error)) = &self.prs.note {
             ui.horizontal(|ui| {
-                if self.prs.checkout_rx.is_some() {
+                if self.prs.checkout.is_some() {
                     ui.spinner();
                 }
                 let t = RichText::new(text);
@@ -163,7 +199,7 @@ impl App {
         let mut toggle = None;
         let mut diff = None;
         let mut checkout = None;
-        let busy = self.prs.checkout_rx.is_some();
+        let busy = self.prs.checkout.is_some();
         egui::ScrollArea::vertical()
             .id_salt("prs")
             .auto_shrink([false, false])
@@ -313,10 +349,23 @@ impl App {
             self.prs.head = head;
             self.prs.list_rx = None;
         }
-        if let Some(rx) = &self.prs.checkout_rx
-            && let Ok(reply) = rx.try_recv()
+        if let Some(r) = &self.prs.checkout
+            && let Ok(reply) = r.rx.try_recv()
         {
-            self.prs.checkout_rx = None;
+            self.prs.checkout = None;
+            self.checked_out(reply);
+        }
+        // a stopped checkout reports once gh has ended; only its own project shows it
+        let mut ended = Vec::new();
+        self.prs.stopping.retain(|r| match r.rx.try_recv() {
+            Ok(reply) => {
+                ended.push(reply);
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(_) => false,
+        });
+        for reply in ended {
             self.checked_out(reply);
         }
         if let Some(rx) = &self.prs.files_rx
@@ -334,7 +383,10 @@ impl App {
     /// Why Check out must wait: a build, test run or preview of this project is running (a
     /// branch switch under it breaks it), or editor tabs have unsaved edits (they would end up on
     /// the other branch, or be lost when the files reload).
-    fn checkout_refusal(&self, root: &std::path::Path) -> Option<String> {
+    fn checkout_refusal(&self, root: &Path) -> Option<String> {
+        if let Some(r) = self.prs.running_in(root) {
+            return Some(format!("Wait for the check out of #{} to stop", r.number));
+        }
         let running = if self.gradle.is_some() {
             Some("the Gradle build")
         } else if self.tests.running() {
@@ -347,7 +399,7 @@ impl App {
         if let Some(r) = running {
             return Some(format!("Wait for {r} to finish"));
         }
-        let unsaved: Vec<&std::path::Path> = self
+        let unsaved: Vec<&Path> = self
             .tabs
             .iter()
             .filter(|t| t.dirty())
@@ -369,11 +421,13 @@ impl App {
         self.prs.note = Some((text, false));
         let (tx, rx) = channel();
         let c = ctx.clone();
+        let ctl = Arc::new(git::Ctl::default());
+        let (r, stop) = (root.clone(), ctl.clone());
         std::thread::spawn(move || {
-            let result = git::checkout_pr(&root, n, &git::gh_program(), git::CHECKOUT_TIMEOUT);
-            let (branch, head) = (git::branch(&root), git::head_sha(&root));
+            let result = git::checkout_pr(&r, n, &git::gh_program(), git::CHECKOUT_TIMEOUT, &stop);
+            let (branch, head) = (git::branch(&r), git::head_sha(&r));
             let _ = tx.send(Checkout {
-                root,
+                root: r,
                 number: n,
                 result,
                 branch,
@@ -381,7 +435,54 @@ impl App {
             });
             c.request_repaint();
         });
-        self.prs.checkout_rx = Some(rx);
+        self.prs.checkout = Some(Running {
+            root,
+            number: n,
+            ctl,
+            rx,
+        });
+    }
+
+    /// A `gh pr checkout` of this project runs (or one of it is still being stopped): its files
+    /// may change under the editor, so edits, saves, builds, test runs, previews and Git
+    /// commands wait.
+    pub(super) fn checkout_busy(&self) -> bool {
+        self.prs.checkout.is_some()
+            || self
+                .project
+                .as_ref()
+                .is_some_and(|p| self.prs.running_in(&p.root).is_some())
+    }
+
+    /// [`App::checkout_busy`]; the status bar then says to wait.
+    pub(super) fn refuse_during_checkout(&mut self) -> bool {
+        let busy = self.checkout_busy();
+        if busy {
+            self.status = WAIT_CHECKOUT.into();
+        }
+        busy
+    }
+
+    /// On quit: stops every running checkout (SIGTERM, SIGKILL after [`git::STOP_GRACE`]) and
+    /// waits for each thread to report. The numbers of the PRs whose checkout was stopped.
+    pub(super) fn stop_checkouts(&mut self) -> Vec<u64> {
+        let all: Vec<Running> = self
+            .prs
+            .checkout
+            .take()
+            .into_iter()
+            .chain(std::mem::take(&mut self.prs.stopping))
+            .collect();
+        for r in &all {
+            r.ctl.stop();
+        }
+        let limit = git::STOP_GRACE + std::time::Duration::from_secs(3);
+        all.into_iter()
+            .map(|r| {
+                let _ = r.rx.recv_timeout(limit);
+                r.number
+            })
+            .collect()
     }
 
     /// After `gh pr checkout`, success or not (gh may have switched before it failed): the branch
@@ -397,6 +498,7 @@ impl App {
         self.git.changes_stale = true;
         match reply.result {
             Ok((branch, submodules)) => {
+                self.close_gone_tabs();
                 let mut text = format!("Checked out #{} ({branch})", reply.number);
                 if submodules {
                     text.push_str(". Submodules point at other commits: run git submodule update");
@@ -410,5 +512,21 @@ impl App {
                 self.prs.note = Some((e, true));
             }
         }
+    }
+
+    /// After a checkout: tabs without edits whose file the other branch does not have (renamed or
+    /// deleted) close; ⌘S would write the old file back. Tabs with edits keep their bar.
+    fn close_gone_tabs(&mut self) {
+        for i in (0..self.tabs.len()).rev() {
+            let t = &self.tabs[i];
+            if !t.dirty() && !t.readonly && !t.path.exists() {
+                let t = self.tabs.remove(i);
+                self.forget_tab(&t);
+                if self.active > i {
+                    self.active -= 1;
+                }
+            }
+        }
+        self.active = self.active.min(self.tabs.len().saturating_sub(1));
     }
 }

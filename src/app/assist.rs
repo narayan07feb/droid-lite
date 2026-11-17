@@ -216,6 +216,9 @@ impl App {
     }
 
     fn apply_fix(&mut self, f: Fix) {
+        if self.refuse_during_checkout() {
+            return;
+        }
         let Some(t) = self.tabs.get_mut(self.active) else {
             return;
         };

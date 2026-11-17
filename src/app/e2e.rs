@@ -4542,6 +4542,7 @@ fn e2e_check_out_a_pull_request_from_the_sidebar() {
 #[test]
 fn e2e_pull_requests_of_one_project_never_show_in_another() {
     let f = Fixture::new("prswitch");
+    let a_branch = crate::git::branch(&f.root);
     // project B: another repository
     let b = std::env::temp_dir().join(format!("droid-lite-e2e-prswitch-b-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&b);
@@ -4555,14 +4556,15 @@ fn e2e_pull_requests_of_one_project_never_show_in_another() {
     gb(&["config", "user.email", "t@example.com"]);
     gb(&["add", "."]);
     gb(&["commit", "-q", "-m", "B"]);
-    // a fake gh: each project its own list; a checkout that takes a second
+    // a fake gh: each project its own list; a checkout that waits and ignores SIGTERM, with a
+    // child in its group
     let bin = std::env::temp_dir().join(format!("droid-lite-fake-gh-sw-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&bin);
     std::fs::create_dir_all(&bin).unwrap();
     let gh = bin.join("gh");
     std::fs::write(
         &gh,
-        "#!/bin/sh\ncase \"$1 $2 $PWD\" in\n  'pr list '*prswitch-b*) echo '[{\"number\":1,\"title\":\"Only in B\"}]';;\n  'pr list '*) echo '[{\"number\":7,\"title\":\"Only in A\"}]';;\n  'pr checkout '*) sleep 1; git checkout -q -b pr-7;;\nesac\n",
+        "#!/bin/sh\ncase \"$1 $2 $PWD\" in\n  'pr list '*prswitch-b*) echo '[{\"number\":1,\"title\":\"Only in B\"}]';;\n  'pr list '*) echo '[{\"number\":7,\"title\":\"Only in A\"}]';;\n  'pr checkout '*) trap '' TERM; sleep 30 & echo $! > \"$0.pid\"; wait; git checkout -q -b pr-7;;\nesac\n",
     )
     .unwrap();
     std::process::Command::new("chmod")
@@ -4578,9 +4580,17 @@ fn e2e_pull_requests_of_one_project_never_show_in_another() {
     wait(&mut h, "A's list", |a| {
         a.prs.lists.contains_key(&crate::git::PrFilter::Mine)
     });
-    // A's checkout is still running when B opens
+    // A's checkout is still running when B opens: it is stopped (SIGTERM, then SIGKILL after
+    // the grace time, as this gh ignores SIGTERM)
     click_check_out(&mut h, "#7 Only in A");
     assert!(h.state().prs.note.is_some());
+    let pid_file = bin.join("gh.pid");
+    wait(&mut h, "gh runs", |_| pid_file.exists());
+    let child: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     let ctx = h.ctx.clone();
     h.state_mut().open_project(&b, &ctx);
     wait(&mut h, "B open", |a| {
@@ -4588,7 +4598,19 @@ fn e2e_pull_requests_of_one_project_never_show_in_another() {
     });
     assert_eq!(h.state().branch.as_deref(), Some("trunk"));
     assert!(h.state().prs.note.is_none(), "A's checkout note is gone");
-    assert!(h.state().prs.shown, "the sidebar still shows the pull requests");
+    assert!(
+        h.state().prs.shown,
+        "the sidebar still shows the pull requests"
+    );
+    assert_eq!(
+        h.state().prs.stopping_count(),
+        1,
+        "A's checkout is being stopped"
+    );
+    assert!(
+        !h.state().checkout_busy(),
+        "nothing in B waits for A's checkout"
+    );
     wait(&mut h, "B's list", |a| {
         matches!(
             a.prs.lists.get(&crate::git::PrFilter::Mine),
@@ -4598,12 +4620,6 @@ fn e2e_pull_requests_of_one_project_never_show_in_another() {
     steps(&mut h, 3);
     assert!(h.query_by_label("#1 Only in B").is_some());
     assert!(h.query_by_label("#7 Only in A").is_none());
-    // A's checkout ends: nothing of it reaches B
-    std::thread::sleep(Duration::from_millis(1500));
-    steps(&mut h, 5);
-    assert_eq!(h.state().branch.as_deref(), Some("trunk"));
-    assert!(h.state().prs.note.is_none());
-    assert_eq!(crate::git::branch(&f.root).as_deref(), Some("pr-7"), "A did switch");
     // a reply that names A's root changes nothing in B, even if it got through
     h.state_mut().checked_out(super::prs_ui::Checkout {
         root: f.root.clone(),
@@ -4615,6 +4631,53 @@ fn e2e_pull_requests_of_one_project_never_show_in_another() {
     assert_eq!(h.state().branch.as_deref(), Some("trunk"));
     assert!(h.state().prs.note.is_none());
     assert!(h.state().prs.lists.contains_key(&crate::git::PrFilter::Mine));
+    // A's checkout ends: nothing of it reaches B, and A never switched
+    wait(&mut h, "A's checkout stopped", |a| {
+        a.prs.stopping_count() == 0
+    });
+    steps(&mut h, 5);
+    assert_eq!(h.state().branch.as_deref(), Some("trunk"));
+    assert!(h.state().prs.note.is_none());
+    assert_eq!(crate::git::branch(&f.root), a_branch, "A did not switch");
+    // SAFETY: signal 0 only checks whether the process lives
+    assert!(
+        unsafe { libc::kill(child, 0) } != 0,
+        "gh's child was killed too"
+    );
+    // back in A while an old checkout of A is still being stopped: a new one waits for it
+    let open = |h: &mut Harness<'static, App>, root: &Path| {
+        let ctx = h.ctx.clone();
+        h.state_mut().open_project(root, &ctx);
+        wait(h, "project open", |a| {
+            a.indexing.is_none() && a.project.as_ref().is_some_and(|p| p.root == root)
+        });
+    };
+    let _ = std::fs::remove_file(&pid_file);
+    open(&mut h, &f.root);
+    wait(&mut h, "A's list", |a| {
+        a.prs.lists.contains_key(&crate::git::PrFilter::Mine)
+    });
+    click_check_out(&mut h, "#7 Only in A");
+    wait(&mut h, "gh runs", |_| pid_file.exists());
+    open(&mut h, &b);
+    open(&mut h, &f.root);
+    assert!(h.state().checkout_busy(), "A's files may still change");
+    wait(&mut h, "A's list", |a| {
+        a.prs.lists.contains_key(&crate::git::PrFilter::Mine)
+    });
+    click_check_out(&mut h, "#7 Only in A");
+    steps(&mut h, 2);
+    assert_eq!(
+        h.state().prs.note,
+        Some(("Wait for the check out of #7 to stop".to_string(), true))
+    );
+    // its end shows in A, the project it belongs to
+    wait(&mut h, "the old checkout stopped", |a| !a.checkout_busy());
+    assert_eq!(
+        h.state().prs.note,
+        Some(("Check out of #7 was stopped".to_string(), true))
+    );
+    assert_eq!(crate::git::branch(&f.root), a_branch);
     drop(h);
     let _ = std::fs::remove_dir_all(&bin);
     let _ = std::fs::remove_dir_all(&b);
@@ -4640,9 +4703,16 @@ fn e2e_autosave_never_overwrites_a_file_changed_on_disk() {
     assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs);
     assert!(tab(&h).dirty() && tab(&h).text.contains("mine"));
     assert!(tab(&h).disk_changed, "the bar still asks");
-    // nor on quit
+    // nor on quit; the edits go to local history instead, so a forced quit loses nothing
     eframe::App::on_exit(h.state_mut());
     assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs);
+    let kept = super::comfort::history(&user);
+    assert_eq!(
+        kept.first()
+            .map(|v| std::fs::read_to_string(&v.file).unwrap()),
+        Some(tab(&h).text.clone()),
+        "the unsaved edits are in local history"
+    );
     // Keep mine: from then on auto-save writes the edits
     h.input_mut().focused = true;
     steps(&mut h, 2);
@@ -4651,4 +4721,297 @@ fn e2e_autosave_never_overwrites_a_file_changed_on_disk() {
     h.input_mut().focused = false;
     steps(&mut h, 3);
     assert!(std::fs::read_to_string(&user).unwrap().contains("mine"));
+}
+
+/// Puts the keyboard focus in the active editor, as a click in it does.
+fn focus_editor(h: &mut Harness<'static, App>) {
+    let id = egui::Id::unique(("editor", &tab(h).path));
+    h.ctx.memory_mut(|m| m.request_focus(id));
+    steps(h, 2);
+    assert!(
+        h.ctx.memory(|m| m.has_focus(id)),
+        "the editor has the focus"
+    );
+}
+
+/// Asks the window to close, as its close button does; whether the app cancelled it.
+fn ask_to_close(h: &mut Harness<'static, App>) -> bool {
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .events
+        .push(egui::ViewportEvent::Close);
+    h.step();
+    h.output()
+        .viewport_output
+        .get(&egui::ViewportId::ROOT)
+        .is_some_and(|v| {
+            v.commands
+                .iter()
+                .any(|c| matches!(c, egui::ViewportCommand::CancelClose))
+        })
+}
+
+#[test]
+fn e2e_closing_with_edits_auto_save_will_not_write_asks_first() {
+    let f = Fixture::new("closeask");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    open(&mut h, &user);
+    std::thread::sleep(Duration::from_millis(300));
+    type_text(&mut h, "mine");
+    assert!(tab(&h).dirty());
+    // edits auto-save writes on quit: the window just closes
+    assert!(!ask_to_close(&mut h));
+    assert!(!h.state().close_asked);
+    // the file changed on disk meanwhile: the close waits for a choice
+    let theirs = "package com.demo.data\n\nclass Theirs\n";
+    std::fs::write(&user, theirs).unwrap();
+    wait(&mut h, "conflict bar", |a| a.tabs[a.active].disk_changed);
+    assert!(ask_to_close(&mut h), "the close is cancelled");
+    steps(&mut h, 2);
+    let list =
+        "These files have edits that are not saved:\napp/src/main/java/com/demo/data/User.kt";
+    assert!(h.query_by_label(list).is_some(), "the files are listed");
+    h.get_by_label("Cancel").click();
+    steps(&mut h, 3);
+    assert!(h.query_by_label(list).is_none());
+    assert!(!h.state().close_ok);
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs);
+    // Keep a copy and close: the edits go to local history, the file on disk stays
+    assert!(ask_to_close(&mut h));
+    steps(&mut h, 2);
+    h.get_by_label("Keep a copy and close").click();
+    steps(&mut h, 3);
+    assert!(h.state().close_ok && !h.state().close_asked);
+    let newest = |p: &Path| {
+        super::comfort::history(p)
+            .first()
+            .map(|v| std::fs::read_to_string(&v.file).unwrap())
+    };
+    assert_eq!(newest(&user), Some(tab(&h).text.clone()));
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs);
+    assert!(!ask_to_close(&mut h), "then the close goes through");
+    // Keep my version (save): written, then closed
+    h.state_mut().close_ok = false;
+    assert!(ask_to_close(&mut h));
+    steps(&mut h, 2);
+    h.get_by_label("Keep my version (save)").click();
+    steps(&mut h, 3);
+    assert!(std::fs::read_to_string(&user).unwrap().contains("mine"));
+    assert!(h.state().close_ok && !h.state().close_asked);
+    // a file deleted on disk while it has edits asks too
+    h.state_mut().close_ok = false;
+    open(&mut h, &card);
+    std::thread::sleep(Duration::from_millis(300));
+    type_text(&mut h, "x");
+    std::fs::remove_file(&card).unwrap();
+    wait(&mut h, "deleted", |a| a.tabs[a.active].deleted);
+    assert!(ask_to_close(&mut h));
+    steps(&mut h, 2);
+    assert!(
+        h.query_by_label(
+            "These files have edits that are not saved:\napp/src/main/java/com/demo/ui/UserCard.kt"
+        )
+        .is_some()
+    );
+    // auto-save off: every edit counts
+    h.get_by_label("Keep a copy and close").click();
+    steps(&mut h, 3);
+    assert_eq!(newest(&card), Some(tab(&h).text.clone()));
+    h.state_mut().close_ok = false;
+    h.state_mut().settings.autosave = false;
+    let active = h.state().active;
+    h.state_mut().close_tab(active); // a deleted file's tab closes even with edits
+    assert_eq!(tab(&h).path, user);
+    let a = h.state().active;
+    h.state_mut().tabs[a].text.push_str("// y\n");
+    assert!(ask_to_close(&mut h), "with auto-save off, any edit asks");
+}
+
+#[test]
+fn e2e_a_running_check_out_locks_edits_and_commands_and_quit_stops_it() {
+    let f = Fixture::new("cobusy");
+    let git = |args: &[&str]| crate::git::run(&f.root, args).unwrap();
+    let start = crate::git::branch(&f.root).unwrap();
+    // a fake gh: checking out #7 waits for gh.go, then switches to a branch without UserCard.kt
+    let bin = std::env::temp_dir().join(format!("droid-lite-fake-gh-busy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&bin);
+    std::fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        "#!/bin/sh\ncase \"$1 $2 $3\" in\n  'pr list '*) echo '[{\"number\":7,\"title\":\"Fix login\"}]';;\n  'pr checkout 7') echo $$ > \"$0.pid\"; while [ ! -f \"$0.go\" ]; do sleep 0.05; done; git checkout -q -b pr-7 && git rm -q app/src/main/java/com/demo/ui/UserCard.kt && git commit -qm rm;;\n  *) exit 2;;\nesac\n",
+    )
+    .unwrap();
+    std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(&gh)
+        .status()
+        .unwrap();
+    // SAFETY: the SERIAL lock (held by the fixture) keeps other tests out of the environment.
+    unsafe { std::env::set_var("DROID_LITE_GH", &gh) };
+    let (pid_file, go) = (bin.join("gh.pid"), bin.join("gh.go"));
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    open(&mut h, &user);
+    std::thread::sleep(Duration::from_millis(300));
+    h.get_by_label(&format!("{}  Pull requests", ic::GIT_PULL_REQUEST))
+        .click();
+    wait(&mut h, "the PR list", |a| {
+        a.prs.lists.contains_key(&crate::git::PrFilter::Mine)
+    });
+    click_check_out(&mut h, "#7 Fix login");
+    wait(&mut h, "gh runs", |_| pid_file.exists());
+    assert!(h.state().checkout_busy());
+    let wait_note = super::prs_ui::WAIT_CHECKOUT;
+    // typing changes nothing: plain text, nor a bracket pair
+    let before = tab(&h).text.clone();
+    place_cursor(&mut h, "emptyList()", 11); // a line end, where ( gets its )
+    focus_editor(&mut h);
+    type_text(&mut h, "z");
+    type_text(&mut h, "(");
+    assert_eq!(tab(&h).text, before);
+    // nor do line commands
+    let ctx = h.ctx.clone();
+    h.state_mut().run(Action::DuplicateLine, &ctx);
+    assert_eq!(tab(&h).text, before);
+    assert_eq!(h.state().status, wait_note);
+    // an edit made before is neither auto-saved when the window loses focus nor saved
+    let a = h.state().active;
+    h.state_mut().tabs[a].text.push_str("// later\n");
+    h.input_mut().focused = true;
+    steps(&mut h, 2);
+    h.input_mut().focused = false;
+    steps(&mut h, 3);
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), USER_KT);
+    h.state_mut().status.clear();
+    h.state_mut().save();
+    assert_eq!(h.state().status, wait_note);
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), USER_KT);
+    h.state_mut().tabs[a].text = before.clone();
+    // builds, test runs and Git commands wait
+    h.state_mut().status.clear();
+    h.state_mut().run_gradle("assembleDebug".into(), &ctx);
+    assert!(h.state().gradle.is_none());
+    assert_eq!(h.state().status, wait_note);
+    h.state_mut().tests.plugins.push(Default::default());
+    h.state_mut().status.clear();
+    h.state_mut().run_case(0, "a case", None, &ctx);
+    assert_eq!(h.state().status, wait_note);
+    h.state_mut().tests.plugins.clear();
+    let head = crate::git::head_sha(&f.root);
+    h.state_mut().status.clear();
+    h.state_mut()
+        .git_command(&["commit", "-q", "--allow-empty", "-m", "during"]);
+    assert_eq!(h.state().status, wait_note);
+    assert_eq!(crate::git::head_sha(&f.root), head);
+    // a change bar's revert, a completion, a run on a device and a Current changes revert wait too
+    h.state_mut().status.clear();
+    let hunk = crate::git::Hunk {
+        new_start: 0,
+        new_len: 1,
+        old: vec!["package other".into()],
+    };
+    h.state_mut().revert_hunk(&hunk);
+    assert_eq!(
+        (tab(&h).text.clone(), h.state().status.as_str()),
+        (before.clone(), wait_note)
+    );
+    h.state_mut().status.clear();
+    h.state_mut().completion = Some(Completion {
+        start: 0,
+        items: vec![Item {
+            label: "zzz".into(),
+            detail: String::new(),
+            insert: "zzz".into(),
+            import: None,
+            template: None,
+        }],
+        selected: 0,
+    });
+    h.state_mut().accept_completion();
+    assert_eq!(
+        (tab(&h).text.clone(), h.state().status.as_str()),
+        (before.clone(), wait_note)
+    );
+    h.state_mut().status.clear();
+    h.state_mut()
+        .run_on_device(crate::device::Launch::App, &ctx);
+    assert_eq!(h.state().status, wait_note, "not: no device");
+    h.state_mut().status.clear();
+    std::fs::write(&card, format!("{CARD_KT}// mine\n")).unwrap();
+    let root = f.root.clone();
+    h.state_mut().revert_file(
+        &root,
+        super::git_ui::Revert::Working {
+            path: card.clone(),
+            untracked: false,
+        },
+    );
+    assert_eq!(h.state().status, wait_note);
+    assert!(
+        std::fs::read_to_string(&card)
+            .unwrap()
+            .ends_with("// mine\n")
+    );
+    std::fs::write(&card, CARD_KT).unwrap();
+    // a file with previews opened now is not drawn
+    open(&mut h, &card);
+    steps(&mut h, 5);
+    assert!(h.state().previews.sent.is_none() && !h.state().previews.busy);
+    // the checkout ends: the deleted file's clean tab closes, editing works again
+    std::fs::write(&go, "").unwrap();
+    wait(&mut h, "checked out", |a| !a.checkout_busy());
+    assert_eq!(
+        h.state().prs.note,
+        Some(("Checked out #7 (pr-7)".to_string(), false))
+    );
+    assert!(
+        h.state().tabs.iter().all(|t| t.path != card),
+        "no ⌘S writes it back"
+    );
+    assert_eq!(tab(&h).path, user);
+    focus_editor(&mut h);
+    type_text(&mut h, "z");
+    assert_ne!(tab(&h).text, before);
+    h.state_mut().tabs[a].text = before.clone();
+    // HEAD moves outside Droid Lite: "● current" follows with the next refresh
+    assert_eq!(h.state().prs.head, crate::git::head_sha(&f.root));
+    git(&["commit", "-q", "--allow-empty", "-m", "outside"]);
+    h.state_mut().git.changes_stale = true;
+    let moved = crate::git::head_sha(&f.root);
+    wait(&mut h, "HEAD refreshed", |a| a.prs.head == moved);
+    // quit during a checkout: gh stops first; edits go to local history, not over the files
+    git(&["checkout", "-q", &start]);
+    let _ = std::fs::remove_file(&go);
+    let _ = std::fs::remove_file(&pid_file);
+    wait(&mut h, "the PR list", |a| {
+        a.prs.lists.contains_key(&crate::git::PrFilter::Mine)
+    });
+    h.state_mut().prs.note = None;
+    click_check_out(&mut h, "#7 Fix login");
+    wait(&mut h, "gh runs", |_| pid_file.exists());
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    h.state_mut().tabs[a].text.push_str("// quit\n");
+    eframe::App::on_exit(h.state_mut());
+    // SAFETY: signal 0 only checks whether the process lives
+    assert!(unsafe { libc::kill(pid, 0) } != 0, "gh was stopped");
+    assert!(!h.state().checkout_busy());
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), USER_KT);
+    let kept = super::comfort::history(&user);
+    assert_eq!(
+        kept.first()
+            .map(|v| std::fs::read_to_string(&v.file).unwrap()),
+        Some(tab(&h).text.clone())
+    );
+    drop(h);
+    let _ = std::fs::remove_dir_all(&bin);
 }
