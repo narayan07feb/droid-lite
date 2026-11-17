@@ -74,12 +74,62 @@ pub(super) struct HiltLink {
 type Task = Box<dyn FnOnce(&State, &dyn Fn() -> bool) + Send>;
 type Queued = (&'static str, Task);
 
+/// The index as a pass starts: its generation, the code files under the project and a digest
+/// of the open file's own entry.
+struct Snapshot {
+    generation: u64,
+    files: Arc<Vec<PathBuf>>,
+    own: u64,
+}
+
+/// A file's size and time on disk.
+type Stamp = (u64, std::time::SystemTime);
+
+fn stamp(p: &Path) -> Option<Stamp> {
+    let m = std::fs::metadata(p).ok()?;
+    Some((m.len(), m.modified().ok()?))
+}
+
+/// The words a text spells, as 4096 bits (two per word): "maybe" or "no".
+type Spelling = [u64; 64];
+
+fn word_bits(word: &str) -> [usize; 2] {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    word.hash(&mut h);
+    let h = h.finish();
+    [(h % 4096) as usize, ((h >> 32) % 4096) as usize]
+}
+
+fn spelling(text: &str) -> Box<Spelling> {
+    let mut bits = Box::new([0u64; 64]);
+    for w in words_of(text) {
+        for b in word_bits(w) {
+            bits[b / 64] |= 1 << (b % 64);
+        }
+    }
+    bits
+}
+
+/// Whether `bits` may spell `name` (a name that is not one plain word always may).
+fn may_spell(bits: &Spelling, name: &str) -> bool {
+    words_of(name).into_iter().ne([name])
+        || word_bits(name)
+            .iter()
+            .all(|&b| bits[b / 64] & (1 << (b % 64)) != 0)
+}
+
 /// What the worker keeps between tasks.
 pub(super) struct State {
     index: Shared,
     graph: RefCell<HiltGraph>,
     /// Finished file results with what they depend on.
     done: RefCell<HashMap<PathBuf, Kept>>,
+    /// Counts uses of kept results, so the least recently used one goes first.
+    uses: Cell<u64>,
+    /// The names each project file on disk spells, with its size and time then: an unchanged
+    /// file that spells none of the names looked for is not read again.
+    spells: RefCell<HashMap<PathBuf, (Stamp, Box<Spelling>)>>,
     ctx: Option<egui::Context>,
     /// How long one chunk may hold the index's read lock.
     budget: Duration,
@@ -94,10 +144,15 @@ pub(super) struct State {
 
 /// A file's names and usages (Hilt links are worked out again each time: the graph moves).
 struct Kept {
-    /// Hash of the text it was worked out for (a reopened tab starts its version count again).
+    /// Hash of the text and the declarations it was worked out for (a reopened tab starts its
+    /// version count again; declarations read from an older text sit at other offsets).
     hash: u64,
     /// The index generation it is known good at.
     generation: u64,
+    /// What the index held for the file itself then ([`own_digest`]).
+    own: u64,
+    /// When it was last used ([`State::uses`]).
+    used: u64,
     /// Files it read: where its names are declared, their types, their supertypes.
     deps: HashSet<PathBuf>,
     /// The file's declaration names: a changed file that spells one may use it.
@@ -115,6 +170,8 @@ impl State {
             index,
             graph: RefCell::default(),
             done: RefCell::default(),
+            uses: Cell::new(0),
+            spells: RefCell::default(),
             ctx,
             budget: CHUNK,
             holds: Cell::new(0),
@@ -124,25 +181,72 @@ impl State {
         }
     }
 
-    /// Runs `f` with a resolver under a short read lock.
+    /// Runs `f` with a resolver under a short read lock. The disk is not read meanwhile: a file
+    /// `f` wants that was not read ahead is noted ([`Texts::missed`]); what `f` worked out from
+    /// then on is to be thrown away and worked out again after [`State::read_missed`].
     fn with<R>(&self, texts: &Texts, cache: &Cache, f: impl FnOnce(&Resolver) -> R) -> R {
         // the editor's queued changes go in first, under a short write lock
         self.index.flush();
         let t = Instant::now();
         let index = self.index.read();
         self.holds.set(self.holds.get() + 1);
+        texts.set_locked(true);
         let r = Resolver::with(&index, texts, cache);
         let out = f(&r);
+        texts.set_locked(false);
         drop(index);
         LONGEST_LOCK.fetch_max(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         out
     }
 
+    /// Reads the files missed under the lock, without it; the types worked out with a file
+    /// missing are dropped.
+    fn read_missed(&self, texts: &Texts, cache: &Cache) -> bool {
+        let missed = texts.read_missed();
+        if missed {
+            cache.forget_types();
+        }
+        missed
+    }
+
+    /// [`State::with`] again until no file was missed.
+    fn resolve<R>(&self, texts: &Texts, cache: &Cache, f: impl Fn(&Resolver) -> R) -> R {
+        loop {
+            let out = self.with(texts, cache, &f);
+            if !self.read_missed(texts, cache) {
+                return out;
+            }
+        }
+    }
+
     /// The project's code files: what the index holds under `root`, sorted (worked out here,
     /// not on the editor's thread).
     pub(super) fn code_files(&self, root: &Path) -> Arc<Vec<PathBuf>> {
+        self.snapshot(root, root).files
+    }
+
+    /// What a pass over `path` starts from, read under one lock: a file added later is newer
+    /// than the generation, so a kept result sees it changed.
+    fn snapshot(&self, root: &Path, path: &Path) -> Snapshot {
         self.index.flush();
-        Arc::new(self.index.read().files_under(root))
+        let index = self.index.read();
+        Snapshot {
+            generation: index.generation,
+            files: Arc::new(index.files_under(root)),
+            own: own_digest(&index, path),
+        }
+    }
+
+    /// Drops what the worker kept of the old project (another one opens).
+    fn forget(&self) {
+        self.done.borrow_mut().clear();
+        self.spells.borrow_mut().clear();
+        self.graph.replace(HiltGraph::default());
+    }
+
+    fn touch(&self) -> u64 {
+        self.uses.set(self.uses.get() + 1);
+        self.uses.get()
     }
 
     /// The next task: one someone waits for first, else the oldest; only the newest of each
@@ -183,7 +287,8 @@ impl State {
 
 /// Runs `step` under the index's read lock until it says it is done, as many steps as fit in
 /// the time budget per hold (at least one), letting the lock go between holds; `None` when
-/// cancelled.
+/// cancelled. A step that missed a file ([`Texts::missed`]) keeps nothing and says it is not
+/// done: it runs again once the file is read.
 fn in_chunks(
     s: &State,
     texts: &Texts,
@@ -200,11 +305,12 @@ fn in_chunks(
         s.with(texts, cache, |r| {
             while !done {
                 done = step(r);
-                if t.elapsed() >= s.budget {
+                if t.elapsed() >= s.budget || texts.missed() {
                     break;
                 }
             }
         });
+        s.read_missed(texts, cache);
         s.serve_waiting();
         std::thread::yield_now();
     }
@@ -223,7 +329,7 @@ fn uses_in_files(
     mut hit: impl FnMut(&Path, &str, usize, usize),
 ) -> Option<()> {
     let names: Vec<String> = s
-        .with(texts, cache, |r| r.names_of(decls))
+        .resolve(texts, cache, |r| r.names_of(decls))
         .into_iter()
         .flatten()
         .collect();
@@ -236,9 +342,19 @@ fn uses_in_files(
         while ready.is_empty() && next < files.len() {
             let end = (next + AHEAD).min(files.len());
             for f in &files[next..end] {
-                if let Some(t) = texts.read(f)
-                    && names.iter().any(|n| t.contains(n.as_str()))
+                let on_disk = (!texts.open.contains_key(f)).then(|| stamp(f)).flatten();
+                if let Some(st) = on_disk
+                    && let Some((was, bits)) = s.spells.borrow().get(f)
+                    && *was == st
+                    && !names.iter().any(|n| may_spell(bits, n))
                 {
+                    continue;
+                }
+                let Some(t) = texts.read(f) else { continue };
+                if let Some(st) = on_disk {
+                    s.spells.borrow_mut().insert(f.clone(), (st, spelling(&t)));
+                }
+                if names.iter().any(|n| t.contains(n.as_str())) {
                     ready.push_back((f, t));
                 }
             }
@@ -250,7 +366,12 @@ fn uses_in_files(
         let t = Instant::now();
         s.with(texts, cache, |r| {
             while let Some((f, text)) = ready.pop_front() {
-                for (ti, at) in r.usages_in(decls, f, &text) {
+                let found = r.usages_in(decls, f, &text);
+                if texts.missed() {
+                    ready.push_front((f, text));
+                    break;
+                }
+                for (ti, at) in found {
                     hit(f, &text, ti, at);
                 }
                 if t.elapsed() >= s.budget {
@@ -258,6 +379,7 @@ fn uses_in_files(
                 }
             }
         });
+        s.read_missed(texts, cache);
         s.serve_waiting();
         std::thread::yield_now();
     }
@@ -321,7 +443,8 @@ impl Xref {
         let _ = self.tx.send((kind, task));
     }
 
-    /// Stops every queued or running task (another project opens): none of them answers.
+    /// Stops every queued or running task (another project opens): none of them answers, and
+    /// what the worker kept of the old project is dropped.
     pub fn cancel_all(&mut self) {
         for latest in self.latest.values() {
             latest.store(0, Ordering::SeqCst);
@@ -329,6 +452,7 @@ impl Xref {
         self.file = None;
         self.file_rx = None;
         self.asked = None;
+        self.submit("forget", |s, _| s.forget());
     }
 
     /// Takes a finished file result.
@@ -390,8 +514,8 @@ impl Xref {
         let path = path.to_path_buf();
         let text: Arc<str> = Arc::from(text);
         self.submit(FILE, move |s, stale| {
-            let files = s.code_files(&root);
-            if let Some(r) = file_pass(s, &path, rev, text, open, &files, &root, &targets, stale) {
+            let snap = s.snapshot(&root, &path);
+            if let Some(r) = file_pass(s, &path, rev, text, open, &snap, &root, &targets, stale) {
                 let _ = tx.send(r);
                 if let Some(c) = &s.ctx {
                     c.request_repaint();
@@ -454,10 +578,10 @@ fn run(state: &State, kind: &str, task: Task) {
     }
 }
 
-fn text_hash(text: &str) -> u64 {
+fn key_hash(text: &str, targets: &[((Option<String>, String), usize)]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut h);
+    (text, targets).hash(&mut h);
     h.finish()
 }
 
@@ -466,6 +590,20 @@ fn words_of(text: &str) -> HashSet<&str> {
     text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .filter(|w| w.starts_with(|c: char| c.is_alphabetic() || c == '_'))
         .collect()
+}
+
+/// A digest of what the index holds for `path`: its package and each declaration's name, place,
+/// container and kind.
+fn own_digest(index: &crate::index::Index, path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if let Some(f) = index.files.get(path) {
+        f.package.hash(&mut h);
+        for d in &f.decls {
+            (&d.name, d.offset, &d.container, d.kind).hash(&mut h);
+        }
+    }
+    h.finish()
 }
 
 /// A digest of the project's declarations named `name`: which files declare it, in which
@@ -490,7 +628,7 @@ fn file_pass(
     rev: u64,
     text: Arc<str>,
     mut open: HashMap<PathBuf, Arc<str>>,
-    files: &[PathBuf],
+    snap: &Snapshot,
     root: &Path,
     targets: &[((Option<String>, String), usize)],
     stale: &dyn Fn() -> bool,
@@ -499,7 +637,7 @@ fn file_pass(
     let texts = Texts::new(open);
     let cache = Cache::default();
     let started = Instant::now();
-    let hash = text_hash(&text);
+    let hash = key_hash(&text, targets);
     let valid = s
         .done
         .borrow()
@@ -510,25 +648,25 @@ fn file_pass(
         let mut done = s.done.borrow_mut();
         let k = done.get_mut(path)?;
         k.generation = generation;
+        k.used = s.touch();
         Some((k.refs.clone(), k.usages.clone()))
     });
     let (refs, usages) = match kept {
         Some(kept) => kept,
         None => {
-            let kept = names_and_usages(
-                s, path, hash, &text, &texts, &cache, files, root, targets, stale,
+            let mut kept = names_and_usages(
+                s, path, hash, &text, &texts, &cache, snap, root, targets, stale,
             )?;
+            kept.used = s.touch();
             let out = (kept.refs.clone(), kept.usages.clone());
             let mut done = s.done.borrow_mut();
             done.insert(path.to_path_buf(), kept);
             if done.len() > 24 {
-                let drop: Vec<PathBuf> = done
-                    .keys()
-                    .filter(|p| *p != path)
-                    .take(4)
-                    .cloned()
-                    .collect();
-                for p in drop {
+                // the least recently used go
+                let mut by_use: Vec<(u64, PathBuf)> =
+                    done.iter().map(|(p, k)| (k.used, p.clone())).collect();
+                by_use.sort();
+                for (_, p) in by_use.into_iter().take(4) {
                     done.remove(&p);
                 }
             }
@@ -559,18 +697,21 @@ fn names_and_usages(
     text: &str,
     texts: &Texts,
     cache: &Cache,
-    files: &[PathBuf],
+    snap: &Snapshot,
     root: &Path,
     targets: &[((Option<String>, String), usize)],
     stale: &dyn Fn() -> bool,
 ) -> Option<Kept> {
-    let generation = s.index.read().generation;
     // what each name in the file means, a step at a time
     let mut refs = Vec::new();
     let mut from = 0;
     in_chunks(s, texts, cache, stale, |r| {
         let to = (from + STEP).min(text.len());
-        refs.extend(r.refs_between(path, from, to));
+        let got = r.refs_between(path, from, to);
+        if texts.missed() {
+            return false;
+        }
+        refs.extend(got);
         from = to;
         from == text.len()
     })?;
@@ -594,17 +735,25 @@ fn names_and_usages(
         .iter()
         .map(|(k, _)| (k.clone(), Vec::new()))
         .collect();
-    uses_in_files(s, texts, cache, stale, files, &decls, |f, text, ti, at| {
-        let l = super::found_line(f, text, at);
-        let rel = f.strip_prefix(root).unwrap_or(f);
-        usages.get_mut(&targets[ti].0).unwrap().push(Hit {
-            name: l.text,
-            detail: format!("{}:{}", rel.display(), l.line),
-            path: f.to_path_buf(),
-            offset: at,
-            score: 0,
-        });
-    })?;
+    uses_in_files(
+        s,
+        texts,
+        cache,
+        stale,
+        &snap.files,
+        &decls,
+        |f, text, ti, at| {
+            let l = super::found_line(f, text, at);
+            let rel = f.strip_prefix(root).unwrap_or(f);
+            usages.get_mut(&targets[ti].0).unwrap().push(Hit {
+                name: l.text,
+                detail: format!("{}:{}", rel.display(), l.line),
+                path: f.to_path_buf(),
+                offset: at,
+                score: 0,
+            });
+        },
+    )?;
     // where its names are declared, and every file read on the way (the type of a receiver,
     // a supertype)
     let mut deps = cache.files_read();
@@ -615,7 +764,9 @@ fn names_and_usages(
     }
     Some(Kept {
         hash,
-        generation,
+        generation: snap.generation,
+        own: snap.own,
+        used: 0,
         deps,
         names,
         words,
@@ -631,11 +782,12 @@ fn still_valid(s: &State, path: &Path, k: &Kept, texts: &Texts) -> Option<u64> {
     // under the lock only lookups; reading the changed files waits until it is let go
     let (now, changed) = {
         let index = s.index.read();
-        let changed: Vec<Arc<Path>> = index
-            .changed_since(k.generation)?
-            .into_iter()
-            .filter(|p| **p != *path)
-            .collect();
+        let changed: Vec<Arc<Path>> = index.changed_since(k.generation)?;
+        // the file's own entry: the declarations it was worked out for
+        let (own, changed): (Vec<_>, Vec<_>) = changed.into_iter().partition(|p| **p == *path);
+        if !own.is_empty() && own_digest(&index, path) != k.own {
+            return None;
+        }
         for p in &changed {
             if k.deps.contains(&**p) {
                 return None;
@@ -684,6 +836,42 @@ enum Want {
     Site(DeclRef, Option<usize>, Vec<DeclRef>),
 }
 
+/// What the graph says about the declarations of `path`; `None` when cancelled.
+fn hilt_wants(graph: &HiltGraph, path: &Path, stale: &dyn Fn() -> bool) -> Option<Vec<Want>> {
+    let mut wants = Vec::new();
+    let Some((_, part)) = graph.files.get(path) else {
+        return Some(wants);
+    };
+    let keys = graph.keys();
+    for b in &part.providers {
+        if stale() {
+            return None;
+        }
+        let sites: Vec<(DeclRef, usize)> = keys
+            .injected_in(b)
+            .iter()
+            .map(|s| (s.owner.clone(), s.at))
+            .collect();
+        if !sites.is_empty() {
+            wants.push(Want::Injected(b.decl.1, sites));
+        }
+    }
+    for site in &part.sites {
+        if stale() {
+            return None;
+        }
+        let providers: Vec<DeclRef> = keys
+            .providers_of(site)
+            .iter()
+            .map(|b| b.decl.clone())
+            .collect();
+        if !providers.is_empty() {
+            wants.push(Want::Site(site.owner.clone(), site.param, providers));
+        }
+    }
+    Some(wants)
+}
+
 /// The Hilt links of one file: the project's graph brought up to date (only changed files are
 /// read again, from disk before the lock is taken), then "injected in N places" on each
 /// binding, and on each injection site the binding it gets. `None` when cancelled.
@@ -706,6 +894,7 @@ fn hilt_pass(
         let finished = s.with(texts, cache, |r| {
             graph.refresh(r, &|| t.elapsed() >= s.budget || stale())
         });
+        s.read_missed(texts, cache);
         s.serve_waiting();
         std::thread::yield_now();
         if finished {
@@ -713,30 +902,9 @@ fn hilt_pass(
         }
     }
     // what the graph says, without the lock
-    let mut wants = Vec::new();
-    if let Some((_, part)) = graph.files.get(path) {
-        for b in &part.providers {
-            let sites: Vec<(DeclRef, usize)> = graph
-                .injected_in(b)
-                .iter()
-                .map(|s| (s.owner.clone(), s.at))
-                .collect();
-            if !sites.is_empty() {
-                wants.push(Want::Injected(b.decl.1, sites));
-            }
-        }
-        for site in &part.sites {
-            let providers: Vec<DeclRef> = graph
-                .providers_of(site)
-                .iter()
-                .map(|b| b.decl.clone())
-                .collect();
-            if !providers.is_empty() {
-                wants.push(Want::Site(site.owner.clone(), site.param, providers));
-            }
-        }
-    }
+    let wants = hilt_wants(&graph, path, stale);
     s.graph.replace(graph);
+    let wants = wants?;
     // their names and types, a few at a time under the lock
     let mut links = Vec::new();
     // one link per declaration: a constructor's sites together, each to its providers
@@ -749,31 +917,36 @@ fn hilt_pass(
         match want {
             Want::Injected(at, sites) => {
                 let n = sites.len();
+                let hits = sites
+                    .iter()
+                    .map(|(owner, at)| {
+                        let mut h = to_hit(r, owner, root);
+                        h.offset = *at;
+                        h
+                    })
+                    .collect();
+                if texts.missed() {
+                    return false;
+                }
                 links.push(HiltLink {
                     at: *at,
                     injected: true,
                     title: format!("Injected in {n} place{}", if n == 1 { "" } else { "s" }),
-                    hits: sites
-                        .iter()
-                        .map(|(owner, at)| {
-                            let mut h = to_hit(r, owner, root);
-                            h.offset = *at;
-                            h
-                        })
-                        .collect(),
+                    hits,
                 });
             }
             Want::Site(owner, param, providers) => {
-                let hits = providers.iter().map(|d| to_hit(r, d, root));
+                let hits: Vec<Hit> = providers.iter().map(|d| to_hit(r, d, root)).collect();
                 let ty = param.and_then(|i| r.param_type(owner, i));
+                if texts.missed() {
+                    return false;
+                }
                 match by_owner.iter_mut().find(|(o, _, _)| o == owner) {
                     Some((_, h, t)) => {
                         h.extend(hits);
                         t.extend(ty);
                     }
-                    None => {
-                        by_owner.push((owner.clone(), hits.collect(), ty.into_iter().collect()))
-                    }
+                    None => by_owner.push((owner.clone(), hits, ty.into_iter().collect())),
                 }
             }
         }
@@ -843,14 +1016,14 @@ mod tests {
                 )
             })
             .collect();
-        let files = s.code_files(Path::new("/p"));
+        let snap = s.snapshot(Path::new("/p"), path);
         file_pass(
             s,
             path,
             rev,
             text,
             open.clone(),
-            &files,
+            &snap,
             Path::new("/p"),
             &targets,
             &|| false,
@@ -1153,11 +1326,305 @@ mod tests {
             let _ = tx.send(1);
         });
         x.cancel_all();
-        gate_tx.send(()).unwrap();
+        // "c" may be cancelled before it starts: then nobody waits at the gate
+        let _ = gate_tx.send(());
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(10)),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
         );
+    }
+
+    /// The declarations of `text` as a tab passes them.
+    fn targets_of(path: &str, text: &str) -> Vec<((Option<String>, String), usize)> {
+        crate::kotlin::scan_file(Path::new(path), text)
+            .decls
+            .iter()
+            .map(|d| {
+                (
+                    (d.container.as_deref().map(String::from), d.name.clone()),
+                    d.offset,
+                )
+            })
+            .collect()
+    }
+
+    fn uses_of_a(x: &FileXref) -> usize {
+        x.usages[&(None, "A".to_string())].len()
+    }
+
+    #[test]
+    fn a_result_for_declarations_of_an_older_text_is_not_kept_for_the_new_ones() {
+        let (u, v) = ("/p/U.kt", "/p/V.kt");
+        let old = "package a\nclass A\n";
+        let new = "package a\n// a line typed above\nclass A\n";
+        let (shared, mut open) = project(&[(u, old), (v, "package a\nfun yy(x: A) = 2\n")]);
+        let s = State::new(shared.clone(), None);
+        change(&shared, &mut open, u, new);
+        // the tab's symbols are still those of the old text (offsets above the typed line)
+        let snap = s.snapshot(Path::new("/p"), Path::new(u));
+        let text = open[Path::new(u)].clone();
+        let stale_targets = targets_of(u, old);
+        let first = file_pass(
+            &s,
+            Path::new(u),
+            1,
+            text,
+            open.clone(),
+            &snap,
+            Path::new("/p"),
+            &stale_targets,
+            &|| false,
+        )
+        .unwrap();
+        assert!(
+            first
+                .usages
+                .get(&(None, "A".to_string()))
+                .is_none_or(|v| v.is_empty())
+        );
+        // then the tab settles: same text, its own declarations
+        assert_eq!(uses_of_a(&pass(&s, u, 2, &open)), 1);
+    }
+
+    #[test]
+    fn a_result_worked_out_before_the_index_had_the_file_is_not_kept() {
+        let (u, v) = ("/p/U.kt", "/p/V.kt");
+        let new = "package a\n// a line typed above\nclass A\n";
+        let (shared, mut open) = project(&[
+            (u, "package a\nclass A\n"),
+            (v, "package a\nfun yy(x: A) = 2\n"),
+        ]);
+        let s = State::new(shared.clone(), None);
+        // the tab's text and symbols changed; the index still has the old place of A
+        open.insert(PathBuf::from(u), Arc::from(new));
+        pass(&s, u, 1, &open);
+        // the index catches up; the text is the same
+        change(&shared, &mut open, u, new);
+        assert_eq!(uses_of_a(&pass(&s, u, 1, &open)), 1);
+    }
+
+    #[test]
+    fn a_file_added_after_the_pass_started_is_seen_by_the_next_pass() {
+        let u = "/p/U.kt";
+        let (shared, mut open) = project(&[(u, "package a\nclass A\n")]);
+        let s = State::new(shared.clone(), None);
+        let snap = s.snapshot(Path::new("/p"), Path::new(u));
+        // created between the file list and the rest of the pass
+        change(
+            &shared,
+            &mut open,
+            "/p/V.kt",
+            "package a\nfun yy(x: A) = 2\n",
+        );
+        let text = open[Path::new(u)].clone();
+        let targets = targets_of(u, &text);
+        let first = file_pass(
+            &s,
+            Path::new(u),
+            1,
+            text,
+            open.clone(),
+            &snap,
+            Path::new("/p"),
+            &targets,
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(uses_of_a(&first), 0, "not in the list it started from");
+        assert_eq!(uses_of_a(&pass(&s, u, 1, &open)), 1);
+    }
+
+    #[test]
+    fn the_least_recently_used_kept_result_goes_first() {
+        let names: Vec<String> = (0..25).map(|n| format!("/p/F{n}.kt")).collect();
+        let texts: Vec<String> = (0..25)
+            .map(|n| format!("package a\nclass C{n}\n"))
+            .collect();
+        let files: Vec<(&str, &str)> = names
+            .iter()
+            .zip(&texts)
+            .map(|(p, t)| (p.as_str(), t.as_str()))
+            .collect();
+        let (shared, open) = project(&files);
+        let s = State::new(shared, None);
+        for p in &names[..24] {
+            pass(&s, p, 1, &open);
+        }
+        // the oldest one is used again, then a 25th comes
+        pass(&s, &names[0], 1, &open);
+        pass(&s, &names[24], 1, &open);
+        let done = s.done.borrow();
+        assert!(done.contains_key(Path::new(&names[0])), "used last but one");
+        assert!(!done.contains_key(Path::new(&names[1])));
+        assert!(done.contains_key(Path::new(&names[24])));
+    }
+
+    #[test]
+    fn a_project_switch_drops_what_the_worker_kept() {
+        let u = "/p/src/main/java/a/U.kt";
+        let text = "package a\nclass U @Inject constructor()\n";
+        let (shared, open) = project(&[(u, text)]);
+        let mut x = Xref::start(shared, None);
+        let (tx, rx) = channel();
+        x.submit("probe", move |s, _| {
+            let snap = s.snapshot(Path::new("/p"), Path::new(u));
+            let text = open[Path::new(u)].clone();
+            let targets = targets_of(u, &text);
+            file_pass(
+                s,
+                Path::new(u),
+                1,
+                text,
+                open.clone(),
+                &snap,
+                Path::new("/p"),
+                &targets,
+                &|| false,
+            );
+            let _ = tx.send((s.done.borrow().len(), s.graph.borrow().files.len()));
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok((1, 1)));
+        x.cancel_all();
+        let (tx, rx) = channel();
+        x.submit("probe", move |s, _| {
+            let _ = tx.send((s.done.borrow().len(), s.graph.borrow().files.len()));
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok((0, 0)));
+    }
+
+    #[test]
+    fn a_file_from_disk_is_read_while_the_editor_can_change_the_index() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("droid-lite-xref-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (b, c, u) = (dir.join("Base.kt"), dir.join("C.kt"), dir.join("U.kt"));
+        let base = "package a\nopen class Base {\n    fun go() = 1\n}\n";
+        let (c_text, u_text) = (
+            "package a\nclass C : Base()\n",
+            "package a\nfun zz(c: C) = c.go()\n",
+        );
+        std::fs::write(&c, c_text).unwrap();
+        // a slow disk: reading Base.kt waits until it is written
+        let fifo = std::ffi::CString::new(b.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let mut index = Index::default();
+        for (p, t) in [(&b, base), (&c, c_text), (&u, u_text)] {
+            index.update(p, t);
+        }
+        let shared = Shared::default();
+        shared.set(index);
+        shared.settle();
+        let open: HashMap<PathBuf, Arc<str>> = [(u.clone(), Arc::from(u_text))].into();
+        let (inner, path) = (shared.clone(), u.clone());
+        let pass = std::thread::spawn(move || {
+            let s = State::new(inner, None);
+            let snap = Snapshot {
+                generation: s.index.read().generation,
+                files: Arc::new(vec![path.clone()]),
+                own: 0,
+            };
+            let text = open[&path].clone();
+            let targets = targets_of(path.to_str().unwrap(), &text);
+            let root = path.parent().unwrap().to_path_buf();
+            let x = file_pass(
+                &s,
+                &path,
+                1,
+                text,
+                open.clone(),
+                &snap,
+                &root,
+                &targets,
+                &|| false,
+            );
+            (x.unwrap(), open)
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        // the editor queues a change while the worker waits for the disk
+        shared.update(&dir.join("D.kt"), "package a\nclass D\n");
+        let free = shared.flush();
+        std::fs::write(&b, base).unwrap();
+        let (x, mut open) = pass.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(free, "the index was locked while the disk was read");
+        open.insert(b.clone(), Arc::from(base));
+        let go = meaning(&x, &open, u.to_str().unwrap(), "go", 1);
+        assert_eq!(go, format!("{}:3", b.display()));
+    }
+
+    #[test]
+    fn hilt_links_stop_when_cancelled() {
+        let h = "/p/src/main/java/a/Holder.kt";
+        let text = "package a\nclass Dep @Inject constructor()\nclass Holder @Inject constructor(val dep: Dep)\n";
+        let (shared, open) = project(&[(h, text)]);
+        let index = shared.read();
+        let texts = Texts::new(open);
+        let r = Resolver::new(&index, &texts);
+        let mut g = HiltGraph::default();
+        while !g.refresh(&r, &|| false) {}
+        assert!(hilt_wants(&g, Path::new(h), &|| false).is_some_and(|w| w.len() == 2));
+        assert!(hilt_wants(&g, Path::new(h), &|| true).is_none());
+    }
+
+    #[test]
+    fn an_unchanged_file_that_spells_none_of_the_names_is_not_read_again() {
+        let dir =
+            std::env::temp_dir().join(format!("droid-lite-xref-spell-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (u, v) = (dir.join("U.kt"), dir.join("V.kt"));
+        let before = "package a\nfun yy(x: Int) = 2\n";
+        std::fs::write(&v, before).unwrap();
+        let shared = Shared::default();
+        let mut index = Index::default();
+        index.update(&v, before);
+        index.update(&u, "package a\nclass A\n");
+        shared.set(index);
+        shared.settle();
+        let s = State::new(shared, None);
+        let root = dir.clone();
+        let pass_u = |text: &str| {
+            let open: HashMap<PathBuf, Arc<str>> = [(u.clone(), Arc::from(text))].into();
+            let snap = s.snapshot(&root, &u);
+            let targets = targets_of(u.to_str().unwrap(), text);
+            file_pass(
+                &s,
+                &u,
+                1,
+                Arc::from(text),
+                open,
+                &snap,
+                &root,
+                &targets,
+                &|| false,
+            )
+            .unwrap()
+        };
+        assert_eq!(uses_of_a(&pass_u("package a\nclass A\n")), 0);
+        // V now uses A, with the same size and time on disk: what was read of it still holds
+        let time = std::fs::metadata(&v).unwrap().modified().unwrap();
+        let after = "package a\nfun yy(x: A)   = 2\n";
+        assert_eq!(after.len(), before.len());
+        std::fs::write(&v, after).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&v)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+        // the open file changes below A: its usages are looked for again
+        let not_read = uses_of_a(&pass_u("package a\nclass A\n// 1\n"));
+        // a changed time: read again
+        std::fs::File::options()
+            .write(true)
+            .open(&v)
+            .unwrap()
+            .set_modified(time + Duration::from_secs(5))
+            .unwrap();
+        let read = uses_of_a(&pass_u("package a\nclass A\n// 2\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!((not_read, read), (0, 1));
     }
 
     /// The pass over the biggest files of a real project: time, and the longest the index's
@@ -1198,7 +1665,6 @@ mod tests {
             copy.len(),
             t.elapsed()
         );
-        let files = Arc::new(files);
         for (_, path) in by_size
             .iter()
             .rev()
@@ -1225,7 +1691,7 @@ mod tests {
                 1,
                 text.clone(),
                 HashMap::new(),
-                &files,
+                &state.snapshot(&root, path),
                 &root,
                 &targets,
                 &|| false,
@@ -1257,7 +1723,7 @@ mod tests {
                 1,
                 text,
                 HashMap::new(),
-                &files,
+                &state.snapshot(&root, path),
                 &root,
                 &targets,
                 &|| false,

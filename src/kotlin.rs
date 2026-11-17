@@ -419,9 +419,10 @@ pub fn scan(src: &str) -> FileSyms {
                         || MODIFIERS.contains(&s.text(s.i))
                         || s.is(s.i, "constructor"))
                 {
-                    // Hilt / Dagger: `@Inject constructor` marks the class as injectable
-                    if s.text(s.i) == "@Inject" {
-                        annotations.push("Inject".into());
+                    // Hilt / Dagger: `@Inject constructor` marks the class as injectable,
+                    // `@AssistedInject constructor` as built by its factory
+                    if matches!(s.text(s.i), "@Inject" | "@AssistedInject") {
+                        annotations.push(s.text(s.i)[1..].into());
                     }
                     s.i += 1; // private constructor / @Inject constructor
                 }
@@ -814,13 +815,16 @@ fn java_members(src: &str, out: &mut FileSyms) {
         // a constructor: `Name(`
         if s.text(j) == class && s.is(j + 1, "(") {
             let params = java_params(&s, j + 1);
-            if annotations.iter().any(|a| &**a == "Inject")
+            let inject = annotations
+                .iter()
+                .find(|a| matches!(&***a, "Inject" | "AssistedInject"));
+            if let Some(a) = inject
                 && let Some(c) = out
                     .decls
                     .iter_mut()
                     .rfind(|d| d.kind.is_type() && d.name == class && d.offset < s.t[j].range.start)
             {
-                c.annotations.push("Inject".into());
+                c.annotations.push(a.clone());
                 c.params = params;
             }
             i = j + 1;

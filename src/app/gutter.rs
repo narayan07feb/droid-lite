@@ -466,7 +466,7 @@ impl App {
 
     /// Takes the worker's finished pass of the active file, and asks for a new one when the
     /// file's text or the index changed. The worker cancels a pass that a newer one replaces.
-    fn count_decl_usages(&mut self) {
+    pub(super) fn count_decl_usages(&mut self) {
         if self.xref.poll()
             && let Some(f) = &self.xref.file
         {
@@ -480,7 +480,10 @@ impl App {
             return;
         };
         let generation = self.index.read().generation;
+        // while typing, the tab's symbols and the index still hold the text before the edit:
+        // a pass now would look for its declarations at old offsets
         if t.readonly
+            || t.dirty_since.is_some()
             || !crate::project::is_code(&t.path)
             || self.xref.asked_for(&t.path, t.rev, generation)
         {

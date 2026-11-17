@@ -943,7 +943,10 @@ impl App {
                         if !self.previews.saved.contains(&d.path) {
                             self.previews.saved.push(d.path.clone());
                         }
-                        self.index.update(&d.path, &d.text);
+                        // typed on since: the index already has (or soon gets) the newer text
+                        if tab.text == d.text {
+                            self.index.update(&d.path, &d.text);
+                        }
                         if let Some(l) = self.lsp.as_mut() {
                             l.did_save(&d.path);
                         }
@@ -974,6 +977,10 @@ impl App {
     }
 
     fn close_tab(&mut self, i: usize) {
+        // ⌘S then ⌘W: the save on its way decides whether edits are left
+        if self.tabs.get(i).is_some_and(Tab::dirty) {
+            self.settle_saves();
+        }
         if i < self.tabs.len() {
             // a deleted file's tab closes like Android Studio's: ⌘S would bring the file back
             if self.tabs[i].dirty() && !self.tabs[i].deleted {
@@ -1018,6 +1025,8 @@ impl App {
 
     /// Drops the active tab's edits; they stay in local history (else they stay in the tab).
     fn revert(&mut self) {
+        // ⌘S then Revert: the save lands first, so it is what the tab goes back to
+        self.settle_saves();
         if let Some(t) = self.tabs.get_mut(self.active) {
             if t.dirty()
                 && let Err(e) = comfort::record_text(&t.path, t.text.as_bytes())

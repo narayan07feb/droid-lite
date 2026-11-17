@@ -70,7 +70,8 @@ impl Shared {
         }
     }
     /// Applies the queued changes if the index is free; returns whether none are left. The
-    /// queue is let go before they run: queueing another never waits for them.
+    /// queue is let go before they run: queueing another never waits for them. A change that
+    /// panics is logged and skipped; the ones after it still go in.
     pub fn flush(&self) -> bool {
         let mut queue = self.1.lock().unwrap_or_else(|e| e.into_inner());
         if queue.is_empty() {
@@ -84,7 +85,10 @@ impl Shared {
         let changes = std::mem::take(&mut *queue);
         drop(queue);
         for f in changes {
-            f(&mut index);
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut index)));
+            if ran.is_err() {
+                eprintln!("droid-lite: an index change failed; the others go on");
+            }
         }
         true
     }
@@ -766,6 +770,18 @@ mod tests {
             shared.read().generation >= 100,
             "the second change went in too"
         );
+    }
+
+    #[test]
+    fn a_change_that_panics_leaves_the_ones_queued_after_it() {
+        let shared = Shared::default();
+        // a reader holds the index: the changes queue up
+        let reading = shared.read();
+        shared.change(|_| panic!("a bug in a change"));
+        shared.update(Path::new("/p/A.kt"), "package a\nclass A\n");
+        drop(reading);
+        shared.settle();
+        assert_eq!(shared.read().named("A").count(), 1);
     }
 
     #[test]

@@ -210,17 +210,32 @@ fn write_version(dir: &Path, text: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// When [`prune_soon`] last started a prune (ms since the epoch; 0 for never).
+static PRUNED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A test holds the next prune here until it sends (a prune that takes long).
+#[cfg(test)]
+static PRUNE_HOLD: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>> =
+    std::sync::Mutex::new(None);
+
 /// [`prune_all`] at most once a minute (it reads every history folder).
 fn prune_soon() {
-    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
-    let last = LAST.load(std::sync::atomic::Ordering::Relaxed);
+    let last = PRUNED_AT.load(std::sync::atomic::Ordering::Relaxed);
     if last == 0 || now.abs_diff(last) > 60_000 {
-        LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+        PRUNED_AT.store(now, std::sync::atomic::Ordering::Relaxed);
         if let Some(root) = history_root() {
+            #[cfg(test)]
+            let hold = PRUNE_HOLD.lock().unwrap_or_else(|e| e.into_inner()).take();
             // it reads every history folder: never on the window's thread, nor on the save
             // thread (a save, quitting and a refactor wait for that one)
-            in_background(move || prune_all(&root, HISTORY_CAP));
+            in_background(move || {
+                #[cfg(test)]
+                if let Some(h) = hold {
+                    let _ = h.recv_timeout(std::time::Duration::from_secs(20));
+                }
+                prune_all(&root, HISTORY_CAP)
+            });
         }
     }
 }
@@ -550,6 +565,9 @@ impl App {
             }
             return;
         }
+        // a save that did not write (failed, changed on disk) asks again: a later fix never
+        // closes the window without a fresh choice
+        self.close_after_saves = false;
         let buttons = ["Keep my version (save)", "Keep a copy and close", "Cancel"];
         match self.unsaved_dialog(ctx, &tabs, buttons) {
             Some(0) => {
@@ -848,13 +866,19 @@ mod tests {
 
     #[test]
     fn a_save_never_waits_behind_pruning() {
+        let _guard = super::super::e2e::config_guard();
         let (gate_tx, gate) = std::sync::mpsc::channel::<()>();
-        let (ran_tx, ran) = std::sync::mpsc::channel();
-        // a prune that takes long
-        in_background(move || {
-            let _ = gate.recv_timeout(std::time::Duration::from_secs(20));
-            let _ = ran_tx.send(());
-        });
+        *PRUNE_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = Some(gate);
+        PRUNED_AT.store(0, std::sync::atomic::Ordering::Relaxed);
+        // keeping a version starts a prune, which takes long
+        record_text(Path::new("/p/A.kt"), b"typed").unwrap();
+        assert!(
+            PRUNE_HOLD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "a prune started"
+        );
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             super::super::saver::wait();
@@ -865,8 +889,7 @@ mod tests {
             Ok(()),
             "the save thread was free"
         );
-        gate_tx.send(()).unwrap();
-        assert_eq!(ran.recv_timeout(std::time::Duration::from_secs(10)), Ok(()));
+        let _ = gate_tx.send(());
     }
 
     #[test]

@@ -308,9 +308,10 @@ impl App {
         self.undo = Some(undo);
     }
 
-    /// Lets saves still on their way land first: one landing after a refactor's write (or a file
-    /// move) would find the file changed, or bring it back at its old name.
-    fn settle_saves(&mut self) {
+    /// Lets saves still on their way land first: one landing after a refactor's write, a file
+    /// move, a revert or a checkout would find the file changed, write over it, or bring it back
+    /// at its old name.
+    pub(super) fn settle_saves(&mut self) {
         if self.saves_pending > 0 {
             self.wait_saves();
         }

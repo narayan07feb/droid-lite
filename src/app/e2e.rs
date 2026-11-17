@@ -6473,3 +6473,181 @@ fn e2e_a_refactor_waits_for_a_save_on_its_way() {
     assert!(person.exists());
     assert!(!user.exists(), "the save landed first, not after the move");
 }
+
+#[test]
+fn e2e_usages_are_not_asked_for_while_typing_only_after_the_pause() {
+    let f = Fixture::new("xref-typing");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    let a = h.state_mut();
+    let i = a.active;
+    a.tabs[i].text.insert_str(0, "// typed above\n");
+    a.tabs[i].mark_edited();
+    let asked = |a: &App| {
+        let t = &a.tabs[a.active];
+        a.xref.asked_for(&t.path, t.rev, a.index.read().generation)
+    };
+    a.count_decl_usages();
+    assert!(!asked(a), "its symbols still sit at the old offsets");
+    a.settle(true);
+    a.count_decl_usages();
+    assert!(asked(a));
+}
+
+/// Keeps the save thread busy for `ms` (a slow disk): saves sent meanwhile wait behind it.
+fn slow_disk(ms: u64) {
+    let (go, gate) = channel::<()>();
+    saver::run(move || {
+        let _ = gate.recv_timeout(Duration::from_secs(5));
+    });
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(ms));
+        let _ = go.send(());
+    });
+}
+
+/// Opens User.kt with auto-save off, types `typed` at its end and presses ⌘S on a slow disk.
+fn save_on_a_slow_disk(f: &Fixture, h: &mut Harness<'static, App>, typed: &str) -> PathBuf {
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(h, &user);
+    let a = h.state_mut();
+    a.settings.autosave = false;
+    let i = a.active;
+    a.tabs[i].text.push_str(typed);
+    slow_disk(300);
+    a.save_tab(false);
+    assert_eq!(a.saves_pending, 1);
+    user
+}
+
+#[test]
+fn e2e_revert_right_after_a_save_keeps_what_was_saved() {
+    let f = Fixture::new("revert-after-save");
+    let mut h = f.harness();
+    let user = save_on_a_slow_disk(&f, &mut h, "// one\n");
+    h.state_mut().revert();
+    h.state_mut().wait_saves();
+    let disk = std::fs::read_to_string(&user).unwrap();
+    assert!(disk.ends_with("// one\n"));
+    assert_eq!(tab(&h).text, disk, "the tab and the disk agree");
+    assert!(!tab(&h).dirty());
+}
+
+#[test]
+fn e2e_a_git_revert_or_checkout_lets_a_save_on_its_way_land_first() {
+    let f = Fixture::new("git-after-save");
+    let mut h = f.harness();
+    let root = f.root.clone();
+    let user = save_on_a_slow_disk(&f, &mut h, "// one\n");
+    h.state_mut().revert_file(
+        &root,
+        git_ui::Revert::Working {
+            path: user.clone(),
+            untracked: false,
+        },
+    );
+    h.state_mut().wait_saves();
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), USER_KT, "reverted");
+    let a = h.state_mut();
+    let i = a.active;
+    a.tabs[i].text.push_str("// two\n");
+    slow_disk(300);
+    a.save_tab(false);
+    assert_eq!(a.saves_pending, 1);
+    a.git_command(&["checkout", "--", "app/src/main/java/com/demo/data/User.kt"]);
+    a.wait_saves();
+    assert_eq!(
+        std::fs::read_to_string(&user).unwrap(),
+        USER_KT,
+        "checked out"
+    );
+}
+
+#[test]
+fn e2e_a_save_that_lands_after_more_typing_keeps_the_newer_symbols_in_the_index() {
+    let f = Fixture::new("save-index");
+    let mut h = f.harness();
+    save_on_a_slow_disk(&f, &mut h, "// one\n");
+    let a = h.state_mut();
+    let i = a.active;
+    a.tabs[i].text.push_str("class Typed\n");
+    a.tabs[i].mark_edited();
+    a.settle(true);
+    a.wait_saves();
+    a.index.settle();
+    assert_eq!(a.index.read().named("Typed").count(), 1);
+}
+
+#[test]
+fn e2e_closing_a_tab_right_after_save_waits_for_the_save() {
+    let f = Fixture::new("close-after-save");
+    let mut h = f.harness();
+    let user = save_on_a_slow_disk(&f, &mut h, "// one\n");
+    let a = h.state_mut();
+    a.close_tab(a.active);
+    assert!(a.tabs.iter().all(|t| t.path != user), "{}", a.status);
+    assert!(
+        std::fs::read_to_string(&user)
+            .unwrap()
+            .ends_with("// one\n")
+    );
+}
+
+#[test]
+fn e2e_a_close_whose_save_did_not_write_needs_a_fresh_choice() {
+    let f = Fixture::new("close-save-failed");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    let a = h.state_mut();
+    a.settings.autosave = false;
+    let i = a.active;
+    a.tabs[i].text.push_str("// typed\n");
+    // "Keep my version (save)" was picked and the save did not write
+    a.close_asked = true;
+    a.close_after_saves = true;
+    steps(&mut h, 2);
+    assert!(
+        h.query_by_label("Keep a copy and close").is_some(),
+        "asked again"
+    );
+    // the edits go away some other way (saved elsewhere, reverted)
+    let a = h.state_mut();
+    let i = a.active;
+    a.tabs[i].saved = a.tabs[i].text.clone();
+    steps(&mut h, 3);
+    assert!(!h.state().close_ok, "no close without a fresh choice");
+}
+
+#[test]
+fn e2e_a_translation_write_lets_a_save_of_its_file_land_first() {
+    let f = Fixture::new("translation-after-save");
+    let hindi = f.path("app/src/main/res/values-hi/strings.xml");
+    for (dir, text) in [("values", "Hi"), ("values-hi", "Namaste")] {
+        let p = f.path(&format!("app/src/main/res/{dir}/strings.xml"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let xml = format!(
+            "<resources>\n    <string name=\"hi\">{text}</string>\n    <string name=\"bye\">{text}</string>\n</resources>\n"
+        );
+        std::fs::write(&p, xml).unwrap();
+    }
+    let mut h = f.harness();
+    wait(&mut h, "resources", |a| {
+        a.res.get("string", "hi").len() == 2
+    });
+    let ctx = h.ctx.clone();
+    h.state_mut().run(Action::Translations, &ctx);
+    steps(&mut h, 3);
+    open(&mut h, &hindi);
+    let a = h.state_mut();
+    a.settings.autosave = false;
+    let i = a.active;
+    a.tabs[i].text = a.tabs[i].text.replacen("Namaste", "Pranam", 1);
+    slow_disk(300);
+    a.save_tab(false);
+    a.write_translation("bye".into(), 1, "Alvida");
+    a.wait_saves();
+    let disk = std::fs::read_to_string(&hindi).unwrap();
+    assert!(disk.contains("Pranam") && disk.contains("Alvida"), "{disk}");
+}

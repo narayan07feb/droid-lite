@@ -556,7 +556,7 @@ fn android_name(header: &str) -> Option<&str> {
         if let Some(v) = after.strip_prefix('=') {
             let v = v.trim_start();
             let q = v.chars().next()?;
-            let v = &v[1..];
+            let v = &v[q.len_utf8()..];
             return Some(&v[..v.find(q)?]);
         }
         rest = &rest[i + 1..];
@@ -572,7 +572,7 @@ pub fn namespace(manifest: &str, build: &str) -> String {
         let p = header.find("package")?;
         let v = header[p + 7..].trim_start().strip_prefix('=')?.trim_start();
         let q = v.chars().next()?;
-        let v = &v[1..];
+        let v = &v[q.len_utf8()..];
         Some(v[..v.find(q)?].to_string())
     });
     attr.or_else(|| quoted_after(build, "namespace").map(String::from))
@@ -1249,6 +1249,19 @@ android {
             "        <activity\n            android:name=\"com.app.ui.HomeActivity\"\n            android:exported=\"false\" />\n    </application>"
         ));
         assert_eq!(add_activity("<manifest/>", "X"), None);
+    }
+
+    #[test]
+    fn a_manifest_attribute_that_starts_with_a_multibyte_letter_does_not_panic() {
+        assert_eq!(namespace("<manifest package=éa.bé>", ""), "a.b");
+        let c = components(
+            "<manifest>\n<application>\n<activity android:name=é.Mainé />\n",
+            "a",
+        );
+        assert_eq!(
+            c.iter().map(|c| c.class.as_str()).collect::<Vec<_>>(),
+            ["a.Main"]
+        );
     }
 
     #[test]

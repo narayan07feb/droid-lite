@@ -768,6 +768,10 @@ pub struct Texts {
     pub open: HashMap<PathBuf, Arc<str>>,
     /// Files read from disk before the index's lock was taken, each taken once.
     ahead: std::sync::Mutex<HashMap<PathBuf, Option<Arc<str>>>>,
+    /// The index's lock is held: the disk is not read, a file wanted is noted in `missed`
+    /// instead (read ahead after the lock is let go, and the step done again).
+    locked: std::sync::atomic::AtomicBool,
+    missed: std::sync::Mutex<Vec<PathBuf>>,
 }
 
 impl Texts {
@@ -779,8 +783,13 @@ impl Texts {
     }
 
     pub fn read(&self, p: &Path) -> Option<Arc<str>> {
+        self.read_or_miss(p).ok().flatten()
+    }
+
+    /// [`Texts::read`]; `Err` while the lock is held and the file was not read ahead.
+    fn read_or_miss(&self, p: &Path) -> Result<Option<Arc<str>>, ()> {
         if let Some(t) = self.open.get(p) {
-            return Some(t.clone());
+            return Ok(Some(t.clone()));
         }
         let ahead = self
             .ahead
@@ -788,9 +797,49 @@ impl Texts {
             .unwrap_or_else(|e| e.into_inner())
             .remove(p);
         match ahead {
-            Some(t) => t,
-            None => std::fs::read_to_string(p).ok().map(Arc::from),
+            Some(t) => Ok(t),
+            None if self.locked.load(std::sync::atomic::Ordering::Relaxed) => {
+                let mut missed = self.missed.lock().unwrap_or_else(|e| e.into_inner());
+                if !missed.iter().any(|m| m == p) {
+                    missed.push(p.to_path_buf());
+                }
+                Err(())
+            }
+            None => Ok(std::fs::read_to_string(p).ok().map(Arc::from)),
         }
+    }
+
+    /// Keeps `text` of `p` for its next [`Texts::read`] (a step to do again).
+    fn keep(&self, p: &Path, text: Arc<str>) {
+        if !self.open.contains_key(p) {
+            self.ahead
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(p.to_path_buf(), Some(text));
+        }
+    }
+
+    /// The index's lock is taken (`true`) or let go: [`Texts::read`] then never reads the disk.
+    pub fn set_locked(&self, locked: bool) {
+        self.locked
+            .store(locked, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a file was wanted under the lock and not read: what was worked out since may be
+    /// wrong.
+    pub fn missed(&self) -> bool {
+        !self
+            .missed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
+    /// Reads the files wanted under the lock (call without it); `false` when none were.
+    pub fn read_missed(&self) -> bool {
+        let missed = std::mem::take(&mut *self.missed.lock().unwrap_or_else(|e| e.into_inner()));
+        self.read_ahead(missed.iter().map(PathBuf::as_path));
+        !missed.is_empty()
     }
 
     /// Reads `paths` from disk now (without the index's lock), for the next [`Texts::read`]
@@ -830,6 +879,11 @@ impl Cache {
     /// Every file this cache's resolvers read.
     pub fn files_read(&self) -> HashSet<PathBuf> {
         self.read.borrow().clone()
+    }
+
+    /// Drops the types worked out (some may have missed a file that was not read yet).
+    pub fn forget_types(&self) {
+        self.types.borrow_mut().clear();
     }
 }
 
@@ -888,7 +942,12 @@ impl<'a> Resolver<'a> {
         if let Some(f) = self.c.files.borrow().get(p) {
             return f.clone();
         }
-        let f = self.texts.read(p).map(|t| Rc::new(FileInfo::new(p, t)));
+        // not read yet (the index's lock is held): not known as missing either
+        let f = self
+            .texts
+            .read_or_miss(p)
+            .ok()?
+            .map(|t| Rc::new(FileInfo::new(p, t)));
         self.c.files.borrow_mut().insert(p.to_path_buf(), f.clone());
         self.c.read.borrow_mut().insert(p.to_path_buf());
         f
@@ -1013,7 +1072,7 @@ impl<'a> Resolver<'a> {
         if let Some(fqns) = f.imports.named.get(name) {
             // an explicit import wins over the package and `*` (a library class too, which
             // the project does not declare)
-            return fqns
+            let mut v: Vec<DeclRef> = fqns
                 .iter()
                 .flat_map(|q| self.by_fqn(q))
                 .filter(|r| {
@@ -1022,17 +1081,23 @@ impl<'a> Resolver<'a> {
                     })
                 })
                 .collect();
+            same_source_set_first(f, &mut v);
+            return v;
         }
         let mut here = Vec::new();
         let mut star = Vec::new();
         for (p, g, d) in self.index.named(name) {
-            if !want(d) || d.container.is_some() && !(types && f.java) {
+            if !want(d) || !visible(f, p, d) {
                 continue;
             }
-            if d.container.is_some() || !visible(f, p, d) {
-                continue;
-            }
-            if g.package == f.syms.package || *p == f.path {
+            if d.container.is_some() {
+                // a member of an object or enum under `import a.Color.*` (Java: `import static`)
+                if !f.imports.stars.is_empty()
+                    && f.imports.stars.contains(&self.qualified_parent(g, d))
+                {
+                    star.push((p.clone(), d.offset));
+                }
+            } else if g.package == f.syms.package || *p == f.path {
                 here.push((p.clone(), d.offset));
             } else if f.imports.stars.contains(&g.package) {
                 star.push((p.clone(), d.offset));
@@ -1053,7 +1118,9 @@ impl<'a> Resolver<'a> {
                     .map(|d| (f.path.clone(), d.offset)),
             );
         }
-        if !here.is_empty() { here } else { star }
+        let mut v = if !here.is_empty() { here } else { star };
+        same_source_set_first(f, &mut v);
+        v
     }
 
     /// A type written as text in file `f` at `at`: `List<User>?`, `Outer.Inner`, `pkg.Type`.
@@ -2130,7 +2197,7 @@ impl<'a> Resolver<'a> {
                 continue;
             }
         }
-        if looks_type || args.is_some_and(|a| a.lambda || a.count > 0) || args.is_some() {
+        if looks_type || args.is_some() {
             let types = self.visible_types(f, name, at);
             let funs = self.top_level(f, name, false);
             let funs: Vec<DeclRef> = funs
@@ -2153,8 +2220,9 @@ impl<'a> Resolver<'a> {
             if !funs.is_empty() {
                 return Res::Decls(funs);
             }
-        } else {
-            // a top-level property or object
+        }
+        if args.is_none() {
+            // a top-level property or object (an upper-case one too: a constant, an enum entry)
             let v: Vec<DeclRef> = self
                 .top_level(f, name, false)
                 .into_iter()
@@ -2847,6 +2915,15 @@ pub fn is_test_path(p: &Path) -> bool {
     })
 }
 
+/// Of declarations in test and in production code, the ones of `f`'s kind (test code sees its
+/// own first, like Hilt; production code never sees test code when it has its own).
+fn same_source_set_first(f: &FileInfo, v: &mut Vec<DeclRef>) {
+    let test = is_test_path(&f.path);
+    if v.iter().any(|r| is_test_path(&r.0) == test) {
+        v.retain(|r| is_test_path(&r.0) == test);
+    }
+}
+
 fn variant(p: &Path) -> String {
     crate::index::source_set(p)
 }
@@ -2926,16 +3003,18 @@ impl Resolver<'_> {
             }
         }
         if f.java {
-            // over the type: `Lazy<Foo> name`
+            // over the type: `Lazy<Foo> name`, `Map<K, V> name`; a comma outside `<…>` ends
+            // the parameter before
+            let mut depth = 0;
             while k > 0
                 && (f.kind(k - 1) == Some(Tok::Ident)
                     || matches!(f.t(k - 1), "." | "<" | ">" | "[" | "]" | "?" | ","))
-                && !matches!(f.t(k - 1), "(")
             {
-                if f.t(k - 1) == ","
-                    && !(k > 1 && f.kind(k - 2) == Some(Tok::Ident) && f.t(k) != ">")
-                {
-                    break;
+                match f.t(k - 1) {
+                    ">" => depth += 1,
+                    "<" => depth -= 1,
+                    "," if depth <= 0 => break,
+                    _ => {}
                 }
                 k -= 1;
             }
@@ -3007,7 +3086,7 @@ impl Resolver<'_> {
     pub fn hilt_file(&self, path: &Path) -> HiltFile {
         let mut out = HiltFile::default();
         let Some(f) = self.file(path) else { return out };
-        for (di, d) in f.syms.decls.iter().enumerate() {
+        for d in &f.syms.decls {
             let r = (f.path.clone(), d.offset);
             let Some(ti) = f.tok_at(d.offset) else {
                 continue;
@@ -3045,10 +3124,8 @@ impl Resolver<'_> {
                     }
                 }
                 _ if d.kind.is_type() => {
-                    let header = f.bodies.get(&di).map_or("", |b| {
-                        &f.text[b.start..b.end.min(b.start + 400 + d.params.len() * 200)]
-                    });
-                    let assisted = header.contains("@AssistedInject");
+                    // the scanner reads `@AssistedInject constructor` off the tokens
+                    let assisted = d.has_annotation("AssistedInject");
                     if d.has_annotation("Inject") || assisted {
                         if !assisted {
                             let key = self.key_of(&Ty::Decl(r.clone()));
@@ -3132,6 +3209,51 @@ fn unwrap_provider(t: Ty) -> Ty {
     match t {
         Ty::Lib(n, a) if matches!(n.as_str(), "Lazy" | "Provider") && a.len() == 1 => a[0].clone(),
         t => t,
+    }
+}
+
+/// A [`HiltGraph`]'s bindings and sites by key: a lookup reads only those of its key.
+#[derive(Default)]
+pub struct HiltKeys<'g> {
+    providers: HashMap<&'g str, Vec<&'g Binding>>,
+    sites: HashMap<&'g str, Vec<&'g Site>>,
+}
+
+impl<'g> HiltKeys<'g> {
+    /// The providers a site gets: test code sees test modules, production code does not; a
+    /// `release` source set gives way to the others.
+    pub fn providers_of(&self, site: &Site) -> Vec<&'g Binding> {
+        let test = is_test_path(&site.owner.0);
+        let mut v: Vec<&Binding> = self
+            .providers
+            .get(site.key.as_str())
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|b| test || !is_test_path(&b.decl.0))
+            .collect();
+        if test && v.iter().any(|b| is_test_path(&b.decl.0)) {
+            v.retain(|b| is_test_path(&b.decl.0));
+        }
+        if v.iter().any(|b| variant(&b.decl.0) != "release") {
+            v.retain(|b| variant(&b.decl.0) != "release");
+        }
+        v.sort_by(|a, b| a.decl.cmp(&b.decl));
+        v
+    }
+
+    /// The sites that get this binding.
+    pub fn injected_in(&self, b: &Binding) -> Vec<&'g Site> {
+        let mut v: Vec<&Site> = self
+            .sites
+            .get(b.key.as_str())
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|s| self.providers_of(s).iter().any(|p| p.decl == b.decl))
+            .collect();
+        v.sort_by(|a, b| (&a.owner, a.at).cmp(&(&b.owner, b.at)));
+        v
     }
 }
 
@@ -3232,8 +3354,14 @@ impl HiltGraph {
                 return false;
             }
             first = false;
-            let Some(text) = r.texts.read(&p) else {
-                continue;
+            let text = match r.texts.read_or_miss(&p) {
+                Ok(Some(t)) => t,
+                Ok(None) => continue,
+                // read ahead first, then again
+                Err(()) => {
+                    self.pending.push(p);
+                    return false;
+                }
             };
             let h = {
                 use std::hash::{Hash, Hasher};
@@ -3248,6 +3376,12 @@ impl HiltGraph {
             r.changed(&p);
             r.file_from(&p, &text);
             let part = r.hilt_file(&p);
+            if r.texts.missed() {
+                // its keys may name a type of a file not read yet
+                r.texts.keep(&p, text);
+                self.pending.push(p);
+                return false;
+            }
             self.files.insert(p, (h, Rc::new(part)));
             r.forget(512);
         }
@@ -3262,32 +3396,26 @@ impl HiltGraph {
         self.files.values().flat_map(|(_, f)| f.sites.iter())
     }
 
-    /// The providers a site gets: test code sees test modules, production code does not; a
-    /// `release` source set gives way to the others.
-    pub fn providers_of(&self, site: &Site) -> Vec<&Binding> {
-        let test = is_test_path(&site.owner.0);
-        let mut v: Vec<&Binding> = self
-            .providers()
-            .filter(|b| b.key == site.key && (test || !is_test_path(&b.decl.0)))
-            .collect();
-        if test && v.iter().any(|b| is_test_path(&b.decl.0)) {
-            v.retain(|b| is_test_path(&b.decl.0));
+    /// The bindings and sites by key, for many lookups in a row.
+    pub fn keys(&self) -> HiltKeys<'_> {
+        let mut k = HiltKeys::default();
+        for b in self.providers() {
+            k.providers.entry(&b.key).or_default().push(b);
         }
-        if v.iter().any(|b| variant(&b.decl.0) != "release") {
-            v.retain(|b| variant(&b.decl.0) != "release");
+        for s in self.sites() {
+            k.sites.entry(&s.key).or_default().push(s);
         }
-        v.sort_by(|a, b| a.decl.cmp(&b.decl));
-        v
+        k
     }
 
-    /// The sites that get this binding.
+    #[cfg(test)]
+    pub fn providers_of(&self, site: &Site) -> Vec<&Binding> {
+        self.keys().providers_of(site)
+    }
+
+    #[cfg(test)]
     pub fn injected_in(&self, b: &Binding) -> Vec<&Site> {
-        let mut v: Vec<&Site> = self
-            .sites()
-            .filter(|s| s.key == b.key && self.providers_of(s).iter().any(|p| p.decl == b.decl))
-            .collect();
-        v.sort_by(|a, b| (&a.owner, a.at).cmp(&(&b.owner, b.at)));
-        v
+        self.keys().injected_in(b)
     }
 
     #[cfg(test)]
@@ -3351,6 +3479,63 @@ mod tests {
                 format!("{}:{}", p.display(), t[..o].matches('\n').count() + 1)
             })
             .collect()
+    }
+
+    #[test]
+    fn a_star_import_of_an_object_or_enum_brings_in_its_members() {
+        let (i, t) = project(&[
+            (
+                "/p/Color.kt",
+                "package c\nenum class Color {\n    RED,\n    GREEN\n}\n",
+            ),
+            (
+                "/p/Keys.kt",
+                "package c\nobject Keys {\n    const val ID = 1\n    fun key() = 2\n}\n",
+            ),
+            (
+                "/p/U.kt",
+                "package a\nimport c.Color.*\nimport c.Keys.*\nfun zz() = RED to ID + key()\n",
+            ),
+            (
+                "/p/Util.java",
+                "package c;\nclass Util {\n    static int max(int a, int b) { return a; }\n}\n",
+            ),
+            (
+                "/p/J.java",
+                "package a;\nimport static c.Util.*;\nclass J {\n    int m() { return max(1, 2); }\n}\n",
+            ),
+        ]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/U.kt", "RED", 1), "/p/Color.kt:3");
+        assert_eq!(at(&r, "/p/U.kt", "ID", 1), "/p/Keys.kt:3");
+        assert_eq!(at(&r, "/p/U.kt", "key", 1), "/p/Keys.kt:4");
+        assert_eq!(at(&r, "/p/J.java", "max", 1), "/p/Util.java:3");
+    }
+
+    #[test]
+    fn a_name_in_test_and_production_code_means_the_one_of_the_same_kind() {
+        let (main, test) = ("/p/src/main/java/a/Fake.kt", "/p/src/test/java/a/Fake.kt");
+        let (i, t) = project(&[
+            (main, "package a\nclass Fake\n"),
+            (test, "package a\n\nclass Fake\n"),
+            (
+                "/p/src/main/java/a/U.kt",
+                "package a\nfun zz(x: Fake) = 1\n",
+            ),
+            (
+                "/p/src/test/java/a/T.kt",
+                "package a\nfun yy(x: Fake) = 1\n",
+            ),
+        ]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(
+            at(&r, "/p/src/main/java/a/U.kt", "Fake", 1),
+            format!("{main}:2")
+        );
+        assert_eq!(
+            at(&r, "/p/src/test/java/a/T.kt", "Fake", 1),
+            format!("{test}:3")
+        );
     }
 
     #[test]
@@ -3691,6 +3876,76 @@ mod tests {
         assert_eq!(providers(&r, &g, vm, 3, Some(0)), [format!("{repo}:5")]);
         let b = g.files[Path::new(repo)].1.providers[0].clone();
         assert_eq!(g.injected_in(&b).len(), 1, "Injected in");
+    }
+
+    #[test]
+    fn hilt_assisted_inject_is_read_from_the_tokens_not_a_cut_of_the_text() {
+        let vm = "/p/src/main/java/a/Vm.kt";
+        let plain = "/p/src/main/java/a/Plain.kt";
+        let java = "/p/src/main/java/a/JVm.java";
+        // a long class with multibyte text where a byte cut of its header could land
+        let pads: Vec<String> = (0..3)
+            .map(|n| {
+                format!(
+                    "package a\nclass Vm{n} @AssistedInject constructor(@Assisted val id: String, val dep: Dep) {{\n{}    // {}\n}}\n",
+                    " ".repeat(n),
+                    "—".repeat(400)
+                )
+            })
+            .collect();
+        let mut files: Vec<(String, String)> = vec![
+            (
+                "/p/src/main/java/a/Dep.kt".into(),
+                "package a\nclass Dep @Inject constructor()\n".into(),
+            ),
+            (
+                vm.into(),
+                "package a\nclass Vm @AssistedInject constructor(@Assisted val id: String, val dep: Dep)\n".into(),
+            ),
+            (
+                plain.into(),
+                "package a\nclass Plain @Inject constructor(val dep: Dep) {\n    // was @AssistedInject once\n    class Inner @AssistedInject constructor()\n}\n".into(),
+            ),
+            (
+                java.into(),
+                "package a;\nclass JVm {\n    @AssistedInject\n    JVm(@Assisted String id, Dep dep) {}\n}\n".into(),
+            ),
+        ];
+        for (n, t) in pads.iter().enumerate() {
+            files.push((format!("/p/src/main/java/a/Long{n}.kt"), t.clone()));
+        }
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, t)| (p.as_str(), t.as_str()))
+            .collect();
+        let (i, t) = project(&refs);
+        let r = Resolver::new(&i, &t);
+        let g = graph(&r);
+        let at = |p: &str, name: &str| (PathBuf::from(p), t.open[Path::new(p)].find(name).unwrap());
+        assert!(
+            g.binding(&at(vm, "Vm @")).is_none(),
+            "its factory builds it"
+        );
+        assert_eq!(
+            providers(&r, &g, vm, 2, Some(1)),
+            ["/p/src/main/java/a/Dep.kt:2"]
+        );
+        assert!(
+            g.binding(&at(plain, "Plain @")).is_some(),
+            "a comment or nested class does not count"
+        );
+        assert!(g.binding(&at(java, "JVm {")).is_none());
+        assert_eq!(
+            providers(&r, &g, java, 4, Some(1)),
+            ["/p/src/main/java/a/Dep.kt:2"]
+        );
+        for n in 0..3 {
+            let p = format!("/p/src/main/java/a/Long{n}.kt");
+            assert_eq!(
+                providers(&r, &g, &p, 2, Some(1)),
+                ["/p/src/main/java/a/Dep.kt:2"]
+            );
+        }
     }
 
     #[test]
