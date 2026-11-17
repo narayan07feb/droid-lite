@@ -16,10 +16,13 @@ pub(super) static SERIAL: Mutex<()> = Mutex::new(());
 const USER_KT: &str = "package com.demo.data\n\ndata class User(val name: String, var age: Int)\n\nclass UserRepository {\n    fun load(): List<User> = emptyList()\n}\n";
 const CARD_KT: &str = "package com.demo.ui\n\nimport com.demo.data.User\n\n@Composable\nfun UserCard(user: User, modifier: Modifier) {\n    val count = mutableStateOf(0)\n    Column(modifier) {\n        Text(user.name)\n    }\n}\n\n@Preview\n@Composable\nprivate fun UserCardPreview() {\n    UserCard(User(\"a\", 1), Modifier)\n}\n";
 
-/// Points the settings folder at a fresh temp folder for a unit test (serialised with the e2e tests).
+/// Points the settings folder at a fresh temp folder for a unit test (serialised with the e2e
+/// tests): one of its own, so work a test left running never touches the next test's.
 pub(super) fn config_guard() -> MutexGuard<'static, ()> {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let lock = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = std::env::temp_dir().join(format!("droid-lite-cfg-unit-{}", std::process::id()));
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("droid-lite-cfg-unit-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     // SAFETY: the SERIAL lock is held, so no other test reads the environment meanwhile.
     unsafe { std::env::set_var("DROID_LITE_CONFIG_DIR", &dir) };
@@ -507,6 +510,8 @@ fn e2e_refactor_rename_preview_apply_file_rename_and_undo() {
     let f = Fixture::new("rename");
     let mut h = f.harness();
     let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    let card_kt = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    open(&mut h, &card_kt);
     open(&mut h, &user);
     place_cursor(&mut h, "class User(", 6);
     key(&mut h, Modifiers::COMMAND | Modifiers::ALT, Key::R); // Eclipse: Rename
@@ -548,6 +553,13 @@ fn e2e_refactor_rename_preview_apply_file_rename_and_undo() {
         "a longer name that starts the same is not touched"
     );
     assert_eq!(tab(&h).path, person, "the open tab follows the file");
+    // the open files' symbols are read once, for their tabs and the index
+    h.state().index.settle();
+    assert!(
+        index_shares_tab_symbols(h.state(), &card_kt),
+        "a rewritten file"
+    );
+    assert!(index_shares_tab_symbols(h.state(), &person), "a moved file");
     // typing since then, which the undo replaces, stays in local history
     let a = h.state().active;
     h.state_mut().tabs[a].text.push_str("// later\n");
@@ -5023,9 +5035,14 @@ fn e2e_closing_with_edits_auto_save_will_not_write_asks_first() {
     watcher_live(&mut h, &user);
     type_text(&mut h, "mine");
     assert!(tab(&h).dirty());
-    // edits auto-save writes on quit: the window just closes
-    assert!(!ask_to_close(&mut h));
-    assert!(!h.state().close_asked);
+    // edits auto-save writes: the window waits for that save without blocking, then closes
+    assert!(ask_to_close(&mut h), "the close waits for the save");
+    wait(&mut h, "closed once saved", |a| a.close_ok);
+    assert!(std::fs::read_to_string(&user).unwrap().contains("mine"));
+    // (a test window stays open) typing goes on
+    h.state_mut().close_ok = false;
+    type_text(&mut h, "more");
+    assert!(tab(&h).dirty());
     // the file changed on disk meanwhile: the close waits for a choice
     let theirs = "package com.demo.data\n\nclass Theirs\n";
     std::fs::write(&user, theirs).unwrap();
@@ -5706,7 +5723,7 @@ fn e2e_a_late_watcher_event_for_a_save_keeps_the_typed_symbols_in_the_index() {
 }
 
 #[test]
-fn e2e_a_stuck_save_stops_a_revert_with_a_message_instead_of_freezing_the_window() {
+fn e2e_a_stuck_save_never_freezes_the_window_and_a_revert_runs_once_it_lands() {
     let f = Fixture::new("stucksave");
     let mut h = f.harness();
     let user = f.path("app/src/main/java/com/demo/data/User.kt");
@@ -5722,18 +5739,78 @@ fn e2e_a_stuck_save_stops_a_revert_with_a_message_instead_of_freezing_the_window
     h.state_mut().tabs[a].text.push_str("// more\n");
     h.state_mut().revert();
     assert!(
-        h.state().status.starts_with("A save is still running"),
+        h.state()
+            .status
+            .starts_with("Revert runs when the save on its way is done"),
         "{}",
         h.state().status
     );
-    assert!(tab(&h).text.ends_with("// more\n"), "not reverted");
+    assert!(tab(&h).text.ends_with("// more\n"), "not reverted yet");
+    unstick.send(()).unwrap();
+    h.state_mut().wait_saves();
+    let disk = std::fs::read_to_string(&user).unwrap();
+    assert!(disk.ends_with("// typed\n"));
+    assert_eq!(tab(&h).text, disk, "reverted to what was saved");
+}
+
+#[test]
+fn e2e_an_action_waiting_for_a_save_does_not_run_after_more_typing() {
+    let f = Fixture::new("stucksave-typed");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    let (unstick, stuck) = channel::<()>();
+    saver::run(move || {
+        let _ = stuck.recv_timeout(Duration::from_secs(30));
+    });
+    let a = h.state().active;
+    h.state_mut().tabs[a].text.push_str("// typed\n");
+    h.state_mut().save_tab(false);
+    h.state_mut().revert();
+    h.state_mut().tabs[a]
+        .text
+        .push_str("// typed after the revert\n");
     unstick.send(()).unwrap();
     h.state_mut().wait_saves();
     assert!(
-        std::fs::read_to_string(&user)
-            .unwrap()
-            .ends_with("// typed\n")
+        tab(&h).text.ends_with("// typed after the revert\n"),
+        "not reverted"
     );
+    assert!(
+        h.state()
+            .status
+            .starts_with("Revert did not run: a text changed meanwhile"),
+        "{}",
+        h.state().status
+    );
+}
+
+#[test]
+fn e2e_a_close_waits_for_a_stuck_save_and_a_second_close_quits_now() {
+    let f = Fixture::new("close-stuck");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    let (unstick, stuck) = channel::<()>();
+    saver::run(move || {
+        let _ = stuck.recv_timeout(Duration::from_secs(30));
+    });
+    let a = h.state().active;
+    h.state_mut().tabs[a].text.push_str("// typed\n");
+    assert!(
+        ask_to_close(&mut h),
+        "the close waits for auto-save's write"
+    );
+    assert!(!h.state().close_ok && !h.state().quit_now);
+    assert!(
+        h.state().status.starts_with("Closing when"),
+        "{}",
+        h.state().status
+    );
+    assert!(!ask_to_close(&mut h), "asked again: it closes now");
+    assert!(h.state().close_ok && h.state().quit_now);
+    unstick.send(()).unwrap();
+    h.state_mut().wait_saves();
 }
 
 #[test]
@@ -6668,6 +6745,79 @@ fn e2e_a_save_that_lands_after_more_typing_keeps_the_newer_symbols_in_the_index(
     assert_eq!(a.index.read().named("Typed").count(), 1);
 }
 
+/// Whether the index holds the very symbols the tab of `path` read (not a copy, not a second
+/// read of the text).
+fn index_shares_tab_symbols(a: &App, path: &Path) -> bool {
+    let t = a.tabs.iter().find(|t| t.path == path).unwrap();
+    let index = a.index.read();
+    let (tab, indexed): (&crate::kotlin::FileSyms, &crate::kotlin::FileSyms) =
+        (&t.syms, &index.files[path]);
+    std::ptr::eq(tab, indexed)
+}
+
+#[test]
+fn e2e_a_typing_pause_gives_the_index_the_tabs_symbols_not_a_copy() {
+    let f = Fixture::new("settle-shares");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    let a = h.state_mut();
+    let i = a.active;
+    a.tabs[i].text.push_str("class Typed\n");
+    a.tabs[i].mark_edited();
+    a.settle(true);
+    a.index.settle();
+    assert_eq!(a.index.read().named("Typed").count(), 1);
+    assert!(index_shares_tab_symbols(a, &user));
+}
+
+#[test]
+fn e2e_a_disk_event_with_the_tabs_own_text_keeps_the_tabs_symbols_in_the_index() {
+    let f = Fixture::new("disk-shares");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    // the file is written again with the tab's text (a save of it, a tool touching it)
+    watcher_live(&mut h, &user);
+    h.state().index.settle();
+    assert!(index_shares_tab_symbols(h.state(), &user));
+}
+
+#[test]
+fn e2e_a_project_index_ready_after_a_tab_opened_takes_the_tabs_symbols() {
+    let f = Fixture::new("ready-shares");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    // the project's index arrives from its worker while the tab is open
+    let project = crate::project::Project::open(&f.root);
+    let index = Index::build(&project.files);
+    let ctx = h.ctx.clone();
+    let a = h.state_mut();
+    a.project_ready(project, index, None, &ctx);
+    a.index.settle();
+    assert!(index_shares_tab_symbols(a, &user));
+}
+
+#[test]
+fn e2e_a_save_keeps_the_symbols_read_at_the_typing_pause_without_reading_again() {
+    let f = Fixture::new("save-no-rescan");
+    let mut h = f.harness();
+    let user = save_on_a_slow_disk(&f, &mut h, "class Saved\n");
+    let a = h.state_mut();
+    let i = a.active;
+    a.tabs[i].mark_edited();
+    a.settle(true);
+    a.index.settle();
+    a.wait_saves();
+    a.index.settle();
+    assert_eq!(a.index.read().named("Saved").count(), 1);
+    assert!(
+        index_shares_tab_symbols(a, &user),
+        "the save read the text again"
+    );
+}
+
 #[test]
 fn e2e_closing_a_tab_right_after_save_waits_for_the_save() {
     let f = Fixture::new("close-after-save");
@@ -6675,6 +6825,11 @@ fn e2e_closing_a_tab_right_after_save_waits_for_the_save() {
     let user = save_on_a_slow_disk(&f, &mut h, "// one\n");
     let a = h.state_mut();
     a.close_tab(a.active);
+    assert!(
+        a.tabs.iter().any(|t| t.path == user),
+        "it closes once the save landed"
+    );
+    a.wait_saves();
     assert!(a.tabs.iter().all(|t| t.path != user), "{}", a.status);
     assert!(
         std::fs::read_to_string(&user)

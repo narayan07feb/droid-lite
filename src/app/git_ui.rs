@@ -248,7 +248,9 @@ impl App {
         if self.refuse_during_checkout() {
             return;
         }
-        if !self.settle_saves() {
+        if self.saves_pending > 0 {
+            let root = root.to_path_buf();
+            self.settle_saves("Revert", move |a| a.revert_file(&root, r));
             return;
         }
         let (path, res) = match r {
@@ -285,7 +287,10 @@ impl App {
         let Some(root) = self.project.as_ref().map(|p| p.root.clone()) else {
             return;
         };
-        if !self.settle_saves() {
+        let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let again =
+            move |a: &mut App| a.git_command(&owned.iter().map(String::as_str).collect::<Vec<_>>());
+        if !self.settle_saves(&format!("git {}", args.join(" ")), again) {
             return;
         }
         match git::run(&root, args) {

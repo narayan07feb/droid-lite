@@ -43,7 +43,7 @@ pub struct Param {
     pub has_default: bool,
     /// `Some(true)` for a `var` constructor parameter, `Some(false)` for `val`.
     pub mutable: Option<bool>,
-    /// A Kotlin `vararg` parameter.
+    /// A Kotlin `vararg` parameter, or a Java `T...` one.
     pub vararg: bool,
     /// Byte offset of the name (fits the padding after the three flags: no extra memory).
     pub offset: u32,
@@ -717,9 +717,17 @@ pub fn scan(src: &str) -> FileSyms {
     out
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many files this thread scanned (tests: where and when scans happen).
+    pub static SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Declarations of a file by its language: a Java file also gets its fields, methods and
 /// `@Inject` constructors (the Kotlin scanner finds only its classes).
 pub fn scan_file(path: &std::path::Path, src: &str) -> FileSyms {
+    #[cfg(test)]
+    SCANS.with(|n| n.set(n.get() + 1));
     let mut f = scan(src);
     if path.extension().is_some_and(|e| e == "java") {
         java_members(src, &mut f);
@@ -946,12 +954,13 @@ fn java_params(s: &Scanner, open: usize) -> Vec<Param> {
         }
         let last = k.saturating_sub(1);
         if last > a && s.kind(last) == Some(Tok::Ident) {
+            let ty = s.join(a, last);
             out.push(Param {
                 name: s.text(last).to_string(),
-                ty: s.join(a, last).replace(" ...", "...").replace("...", "[]"),
+                vararg: ty.contains("..."),
+                ty: ty.replace(" ...", "...").replace("...", "[]"),
                 has_default: false,
                 mutable: None,
-                vararg: false,
                 offset: s.t[last].range.start as u32,
             });
         }

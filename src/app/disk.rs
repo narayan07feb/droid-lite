@@ -125,6 +125,12 @@ impl App {
                         && !edited
                         && project.files.binary_search(&path).is_ok()
                     {
+                        // a tab analysed with this text shares its symbols, not a second copy
+                        let syms = self
+                            .tabs
+                            .iter()
+                            .find(|t| t.path == path && t.text == text && t.dirty_since.is_none())
+                            .map_or_else(|| std::sync::Arc::new(syms), |t| t.syms.clone());
                         let p = path.clone();
                         self.index.change(move |i| i.insert_scanned(p, syms));
                     }

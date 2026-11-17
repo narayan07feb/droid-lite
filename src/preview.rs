@@ -122,9 +122,8 @@ fn own_code(pk: &crate::preview_src::Packages, open: &Path) -> Result<Own, Strin
     let (files, rs) = pk.closure(open, &text, 1500)?;
     let mut h = fnv("own");
     for f in &files {
-        let m = std::fs::metadata(f).ok();
-        let stamp = m.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
-        h ^= fnv(&format!("{}|{:?}|{:?}", f.display(), stamp, m.map(|m| m.len())));
+        let stamp = std::fs::metadata(f).ok().map(|m| crate::project::stamp(&m));
+        h ^= fnv(&format!("{}|{stamp:?}", f.display()));
         h = h.wrapping_mul(0x100000001b3);
     }
     let _ = rs; // the modules' R classes are built once per project (project_r), on the classpath
@@ -1125,8 +1124,8 @@ impl ProjectRuntime {
             };
             for f in &listing.2 {
                 let Ok(m) = std::fs::symlink_metadata(f) else { continue };
-                let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
-                *h = (*h ^ fnv(&format!("{}|{t:?}|{}", f.display(), m.len()))).wrapping_mul(0x100000001b3);
+                let t = crate::project::stamp(&m);
+                *h = (*h ^ fnv(&format!("{}|{t:?}", f.display()))).wrapping_mul(0x100000001b3);
             }
             for s in &listing.1 {
                 walk(s, h, w);

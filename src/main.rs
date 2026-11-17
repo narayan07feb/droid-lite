@@ -223,11 +223,18 @@ fn bench(dir: &std::path::Path) {
         runs[12],
         big.file_name().unwrap_or_default().to_string_lossy()
     );
-    let any = idx.files.keys().next().cloned().unwrap_or_default();
+    // the same file every run (a map's order changes per process): the largest one
+    let any = idx
+        .files
+        .keys()
+        .filter_map(|p| Some((std::fs::metadata(p).ok()?.len(), p.clone())))
+        .max()
+        .map(|(_, p)| p)
+        .unwrap_or_default();
     let src = std::fs::read_to_string(&any).unwrap_or_default();
-    let mut idx = idx;
-    time("re-index one file (per keystroke)", &mut || {
-        idx.update(&any, &src);
+    let idx = std::cell::RefCell::new(idx);
+    median("re-index one file (per keystroke)", &|| {
+        idx.borrow_mut().update(&any, &src);
         src.len()
     });
 }

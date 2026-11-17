@@ -1,6 +1,6 @@
 //! Rename (with a preview), optimize imports, extract variable, and undo of the last refactoring.
 
-use super::{App, SAVE_WAIT, saver, tree, word_bounds};
+use super::{AfterSaves, App, tree, word_bounds};
 use crate::lsp;
 use crate::project::is_code;
 use crate::refactor;
@@ -262,8 +262,9 @@ impl App {
         if self.refuse_during_checkout() {
             return;
         }
-        if !self.settle_saves() {
-            self.refactor = Some(Refactor::Preview(p));
+        if self.saves_pending > 0 {
+            let what = format!("Rename {} → {}", p.old, p.new);
+            self.settle_saves(&what, move |a| a.apply_preview(p));
             return;
         }
         let mut undo = Undo {
@@ -313,27 +314,33 @@ impl App {
 
     /// Lets saves still on their way land first: one landing after a refactor's write, a file
     /// move, a revert or a checkout would find the file changed, write over it, or bring it back
-    /// at its old name.
-    /// Waits [`SAVE_WAIT`] at most: when a save is still running then, it says so and returns
-    /// false, and the caller changes nothing (the user can run it again, or not).
-    pub(super) fn settle_saves(&mut self) -> bool {
+    /// at its old name. The window never waits for them: with one on its way this returns false
+    /// (the caller changes nothing now) and `again` runs once they all landed, unless an open
+    /// tab's text changed meanwhile ([`App::poll_saves`]).
+    pub(super) fn settle_saves(
+        &mut self,
+        what: &str,
+        again: impl FnOnce(&mut App) + 'static,
+    ) -> bool {
         if self.saves_pending == 0 {
             return true;
         }
-        let done = saver::wait_for(SAVE_WAIT);
-        self.poll_saves();
-        if !done {
-            self.status = "A save is still running (a slow or stuck disk?): nothing was \
-                           changed. Try again when it is done"
-                .into();
-        }
-        done
+        self.status = format!("{what} runs when the save on its way is done");
+        let texts = self.texts_digest();
+        self.after_saves.push(AfterSaves {
+            what: what.to_string(),
+            texts,
+            run: Box::new(again),
+        });
+        false
     }
 
     /// Writes a file and keeps the open tab, the index and kotlin-lsp in step.
     /// What is on disk and typing it replaces go to local history first, else nothing is written.
     fn write_file(&mut self, path: &Path, text: &str) -> bool {
-        if !self.settle_saves() {
+        // its callers ran after the saves on their way: none started since
+        if self.saves_pending > 0 {
+            self.status = format!("A save is on its way: {} was not changed", path.display());
             return false;
         }
         let typed = self
@@ -353,12 +360,15 @@ impl App {
             self.status = format!("Cannot write {}: {e}", path.display());
             return false;
         }
-        self.index.update(path, text);
+        // an open file's symbols are read once, for its tab and the index
         if let Some(t) = self.tabs.iter_mut().find(|t| t.path == path) {
             t.text = text.to_string();
             t.saved = text.to_string();
             t.cursor = t.cursor.min(text.len());
             t.reanalyse();
+            self.index.put(path.to_path_buf(), t.syms.clone());
+        } else {
+            self.index.update(path, text);
         }
         if let Some(l) = self.lsp.as_mut().filter(|_| is_code(path)) {
             l.did_change(path, text);
@@ -380,7 +390,15 @@ impl App {
         }
         let p = from.to_owned();
         self.index.change(move |i| i.remove(&p));
-        if let Ok(text) = std::fs::read_to_string(to) {
+        // an open, analysed tab already read the moved text (as the same kind of file)
+        if let Some(t) = self
+            .tabs
+            .iter()
+            .find(|t| t.path == to && !t.dirty() && t.dirty_since.is_none())
+            && from.extension() == to.extension()
+        {
+            self.index.put(to.to_path_buf(), t.syms.clone());
+        } else if let Ok(text) = std::fs::read_to_string(to) {
             self.index.update(to, &text);
         }
     }
@@ -389,7 +407,7 @@ impl App {
         if self.refuse_during_checkout() {
             return;
         }
-        if !self.settle_saves() {
+        if !self.settle_saves("Undo", |a| a.undo_refactor()) {
             return;
         }
         let Some(u) = self.undo.take() else { return };

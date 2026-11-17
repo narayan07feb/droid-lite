@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 #[derive(Default)]
 pub struct Index {
-    pub files: HashMap<PathBuf, FileSyms>,
+    /// Each file's symbols, shared with the tab that read them (no copy per typing pause).
+    pub files: HashMap<PathBuf, Arc<FileSyms>>,
     /// Each name's declarations (file and place in its list), so a lookup never scans a file's
     /// other declarations (lenses of a file with 20k declarations look up each one).
     by_name: HashMap<String, Vec<(Arc<Path>, u32)>>,
@@ -42,7 +43,8 @@ pub struct Shared(
     Arc<std::sync::Mutex<Vec<Change>>>,
 );
 
-type Change = Box<dyn FnOnce(&mut Index) + Send>;
+/// A change, with the file it changes (a change of one file that fails takes that file out).
+type Change = (Option<PathBuf>, Box<dyn FnOnce(&mut Index) + Send>);
 
 impl Shared {
     pub fn read(&self) -> std::sync::RwLockReadGuard<'_, Index> {
@@ -50,10 +52,13 @@ impl Shared {
     }
     /// Queues a change and applies it now when nothing reads the index.
     pub fn change(&self, f: impl FnOnce(&mut Index) + Send + 'static) {
+        self.queue(None, Box::new(f));
+    }
+    fn queue(&self, file: Option<PathBuf>, f: Box<dyn FnOnce(&mut Index) + Send>) {
         self.1
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(Box::new(f));
+            .push((file, f));
         self.flush();
     }
     /// A file's text changed: its symbols are read here, before queueing, so the index's lock
@@ -64,14 +69,17 @@ impl Shared {
         }
     }
     /// [`Shared::update`] with the symbols already read (a tab read them for its own use).
-    pub fn put(&self, path: PathBuf, syms: FileSyms) {
+    pub fn put(&self, path: PathBuf, syms: impl Into<Arc<FileSyms>>) {
+        let syms = syms.into();
         if is_code(&path) {
-            self.change(move |i| i.insert_scanned(path, syms));
+            let file = Some(path.clone());
+            self.queue(file, Box::new(move |i| i.insert_scanned(path, syms)));
         }
     }
     /// Applies the queued changes if the index is free; returns whether none are left. The
     /// queue is let go before they run: queueing another never waits for them. A change that
-    /// panics is logged and skipped; the ones after it still go in.
+    /// panics is logged and skipped; the ones after it still go in. What a change of one file
+    /// left half done is taken out with the file, which comes back with its next change.
     pub fn flush(&self) -> bool {
         let mut queue = self.1.lock().unwrap_or_else(|e| e.into_inner());
         if queue.is_empty() {
@@ -84,10 +92,18 @@ impl Shared {
         };
         let changes = std::mem::take(&mut *queue);
         drop(queue);
-        for f in changes {
+        for (file, f) in changes {
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut index)));
             if ran.is_err() {
                 eprintln!("droid-lite: an index change failed; the others go on");
+                if let Some(p) = file {
+                    let purged =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| index.purge(&p)));
+                    if purged.is_err() {
+                        let p = p.display();
+                        eprintln!("droid-lite: {p} could not be taken out of the index");
+                    }
+                }
             }
         }
         true
@@ -155,7 +171,8 @@ impl Index {
     }
 
     /// Adds a file whose symbols were already scanned (e.g. on a worker thread).
-    pub fn insert_scanned(&mut self, path: PathBuf, syms: FileSyms) {
+    pub fn insert_scanned(&mut self, path: PathBuf, syms: impl Into<Arc<FileSyms>>) {
+        let syms = syms.into();
         self.remove(&path);
         let shared: Arc<Path> = Arc::from(path.as_path());
         for (i, d) in syms.decls.iter().enumerate() {
@@ -229,6 +246,23 @@ impl Index {
         self.generation += 1;
     }
 
+    /// Drops every trace of `path`, also what a change cut short left in (a name that points to
+    /// a file not in `files`): every name is looked at, so only for that.
+    fn purge(&mut self, path: &Path) {
+        self.files.remove(path);
+        self.shared.remove(path);
+        self.by_name.retain(|_, v| {
+            v.retain(|(p, _)| **p != *path);
+            !v.is_empty()
+        });
+        self.subtypes.retain(|_, v| {
+            v.retain(|p| **p != *path);
+            !v.is_empty()
+        });
+        self.generation += 1;
+        self.log_change(Arc::from(path));
+    }
+
     /// Drops every file under `dir` (a deleted folder): one range of the sorted paths, not a scan
     /// of every file.
     pub fn remove_under(&mut self, dir: &Path) {
@@ -250,7 +284,7 @@ impl Index {
     pub fn decls(&self) -> impl Iterator<Item = (&PathBuf, &FileSyms, &Decl)> {
         self.files
             .iter()
-            .flat_map(|(p, f)| f.decls.iter().map(move |d| (p, f, d)))
+            .flat_map(|(p, f)| f.decls.iter().map(move |d| (p, &**f, d)))
     }
 
     /// Declarations named exactly `name`, without scanning the whole project.
@@ -264,7 +298,7 @@ impl Index {
             .flatten()
             .filter_map(move |(p, i)| {
                 let (p, f) = self.files.get_key_value(&**p)?;
-                Some((p, f, f.decls.get(*i as usize)?))
+                Some((p, &**f, f.decls.get(*i as usize)?))
             })
     }
 
@@ -785,10 +819,49 @@ mod tests {
     }
 
     #[test]
-    fn put_takes_symbols_read_before_queueing() {
+    fn a_file_change_that_fails_halfway_leaves_nothing_of_that_file() {
         let shared = Shared::default();
+        shared.update(Path::new("/p/A.kt"), "package a\nclass A\n");
+        let reading = shared.read();
+        // a change of B that dies after putting in one of B's names
+        let b = PathBuf::from("/p/B.kt");
+        shared.queue(
+            Some(b.clone()),
+            Box::new(move |i: &mut Index| {
+                i.by_name
+                    .entry("B".into())
+                    .or_default()
+                    .push((Arc::from(b.as_path()), 0));
+                panic!("cut short");
+            }),
+        );
+        drop(reading);
+        shared.settle();
+        let i = shared.read();
+        assert_eq!(i.named("A").count(), 1, "other files stay");
+        assert!(
+            !i.by_name.contains_key("B"),
+            "a name of a file not in the index"
+        );
+    }
+
+    #[test]
+    fn update_reads_symbols_before_queueing_never_under_the_lock() {
+        let shared = Shared::default();
+        let scans = || crate::kotlin::SCANS.with(|n| n.get());
         let p = Path::new("/p/A.kt");
-        shared.put(p.to_path_buf(), scan_file(p, "package a\nclass A\n"));
+        // a reader holds the index: a change can only queue
+        let reading = shared.read();
+        let before = scans();
+        shared.update(p, "package a\nclass A\n");
+        assert_eq!(
+            scans(),
+            before + 1,
+            "read while the index could not be changed"
+        );
+        drop(reading);
+        shared.settle();
+        assert_eq!(scans(), before + 1, "putting it in reads nothing again");
         shared.update(Path::new("/p/notes.txt"), "class B\n");
         shared.settle();
         assert_eq!(shared.read().named("A").count(), 1);

@@ -364,7 +364,7 @@ pub(super) struct Sel<'a> {
     pub locate: Option<&'a Path>,
     pub status: &'a StatusMap,
     /// Declarations by file, for the Activity / ViewModel / Composable icons.
-    pub syms: &'a HashMap<PathBuf, crate::kotlin::FileSyms>,
+    pub syms: &'a HashMap<PathBuf, std::sync::Arc<crate::kotlin::FileSyms>>,
     /// Right-click → New file in this folder.
     pub new_in: &'a std::cell::Cell<Option<PathBuf>>,
 }
@@ -396,7 +396,7 @@ fn file_row(ui: &mut Ui, f: &Path, sel: Sel, open: &mut Option<PathBuf>) {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let (icon, color) = super::assist::kind_icon(f, sel.syms.get(f));
+    let (icon, color) = super::assist::kind_icon(f, sel.syms.get(f).map(|s| &**s));
     let mut job = egui::text::LayoutJob::default();
     let fmt = |color| egui::TextFormat {
         font_id: egui::FontId::proportional(13.0),

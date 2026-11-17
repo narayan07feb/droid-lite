@@ -286,6 +286,16 @@ fn in_background(job: impl FnOnce() + Send + 'static) {
     }
 }
 
+/// Waits until every job sent to [`in_background`] before has run, `limit` at most (tests).
+#[cfg(test)]
+fn background_done(limit: std::time::Duration) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    in_background(move || {
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(limit).is_ok()
+}
+
 /// Drops the oldest versions of all files under `root` until they take `cap` bytes at most. A
 /// version from a clock set ahead counts as the newest, so it goes last.
 pub(super) fn prune_all(root: &Path, cap: u64) {
@@ -564,12 +574,29 @@ impl App {
     /// waits for a choice, "Keep my version (save)", "Keep a copy and close" (in local history)
     /// or "Cancel".
     pub(super) fn guard_close(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().close_requested())
-            && !self.close_ok
-            && !self.unwritten_edits().is_empty()
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.close_asked = true;
+        if ctx.input(|i| i.viewport().close_requested()) && !self.close_ok {
+            if self.close_after_saves && self.saves_pending > 0 {
+                // asked again while saves are on their way: quit now, unsaved text is kept in
+                // local history
+                self.quit_now = true;
+                self.close_ok = true;
+                return;
+            }
+            // auto-save's writes land before the window goes, without blocking it
+            if self.settings.autosave {
+                self.autosave();
+            }
+            let unwritten = !self.unwritten_edits().is_empty();
+            if unwritten || self.saves_pending > 0 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.close_asked = true;
+                if !unwritten {
+                    self.close_after_saves = true;
+                    self.status =
+                        "Closing when the saves on their way are done (close again to quit now)"
+                            .into();
+                }
+            }
         }
         // the choice waits for saves on their way (it may have started them)
         if !self.close_asked || self.saves_pending > 0 {
@@ -902,6 +929,22 @@ mod tests {
             "the save thread was free"
         );
         let _ = gate_tx.send(());
+        // the prune ends inside this test, not in the next one's folder
+        assert!(
+            background_done(std::time::Duration::from_secs(10)),
+            "the prune ended"
+        );
+    }
+
+    #[test]
+    fn each_test_gets_its_own_settings_folder() {
+        let dir = || std::env::var_os("DROID_LITE_CONFIG_DIR");
+        let first = {
+            let _guard = super::super::e2e::config_guard();
+            dir()
+        };
+        let _guard = super::super::e2e::config_guard();
+        assert_ne!(first, dir());
     }
 
     #[test]
@@ -934,6 +977,11 @@ mod tests {
             "the other thread started a prune"
         );
         assert!(PRUNE_HOLD.take().is_some(), "the hold is still this test's");
+        // the other thread's prune ends inside this test
+        assert!(
+            background_done(std::time::Duration::from_secs(10)),
+            "the prune ended"
+        );
     }
 
     #[test]

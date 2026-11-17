@@ -82,13 +82,20 @@ struct Snapshot {
     own: u64,
 }
 
-/// A file's size and time on disk.
-type Stamp = (u64, std::time::SystemTime);
+use crate::project::Stamp;
 
-fn stamp(p: &Path) -> Option<Stamp> {
-    let m = std::fs::metadata(p).ok()?;
-    Some((m.len(), m.modified().ok()?))
+/// A file's [`Stamp`] on disk, and whether it can be trusted to tell a later change: not when the
+/// file was modified within [`RACY`] of now, as a same-size edit in the same tick of a coarse
+/// clock (FAT, exFAT) would keep every time the same (like git's "racily clean").
+fn stamp(p: &Path) -> Option<(Stamp, bool)> {
+    let now = std::time::SystemTime::now();
+    let st = crate::project::stamp(&std::fs::metadata(p).ok()?);
+    let trusted = st.1.is_some_and(|t| t + RACY <= now);
+    Some((st, trusted))
 }
+
+/// The coarsest file time a disk may keep (FAT's two seconds).
+const RACY: Duration = Duration::from_secs(2);
 
 /// The words a text spells, as 4096 bits (two per word): "maybe" or "no".
 type Spelling = [u64; 64];
@@ -138,8 +145,9 @@ pub(super) struct State {
     /// Where tasks arrive, and the ones that arrived and wait.
     inbox: Option<Receiver<Queued>>,
     waiting: RefCell<VecDeque<Queued>>,
-    /// A waiting task runs between chunks now (no task inside another inside another).
-    serving: Cell<bool>,
+    /// The kinds of the tasks running now, outermost first: a waiting task of another kind
+    /// runs between their chunks (one of a running kind waits: the running one is stale).
+    running: RefCell<Vec<&'static str>>,
 }
 
 /// A file's names and usages (Hilt links are worked out again each time: the graph moves).
@@ -177,7 +185,7 @@ impl State {
             holds: Cell::new(0),
             inbox: None,
             waiting: RefCell::default(),
-            serving: Cell::new(false),
+            running: RefCell::default(),
         }
     }
 
@@ -250,7 +258,8 @@ impl State {
     }
 
     /// The next task: one someone waits for first, else the oldest; only the newest of each
-    /// kind is kept. `block` waits for one; else `None` when none of those waits.
+    /// kind is kept. `block` waits for one; else `None` when none of those waits (one of a
+    /// kind running now does not count).
     fn next(&self, block: bool) -> Option<Queued> {
         let inbox = self.inbox.as_ref()?;
         let mut waiting = self.waiting.borrow_mut();
@@ -264,7 +273,11 @@ impl State {
         if waiting.is_empty() && block {
             add(&mut waiting, inbox.recv().ok()?);
         }
-        let at = match waiting.iter().position(|(k, _)| *k != FILE) {
+        let running = self.running.borrow();
+        let at = match waiting
+            .iter()
+            .position(|(k, _)| *k != FILE && !running.contains(k))
+        {
             Some(i) => i,
             None if block => 0,
             None => return None,
@@ -273,15 +286,11 @@ impl State {
     }
 
     /// Runs the tasks someone waits for that arrived meanwhile (between two chunks of a long
-    /// pass).
+    /// pass, or of a task run that way: each waiting kind gets its turn).
     fn serve_waiting(&self) {
-        if self.serving.replace(true) {
-            return;
-        }
         while let Some((kind, task)) = self.next(false) {
             run(self, kind, task);
         }
-        self.serving.set(false);
     }
 }
 
@@ -343,16 +352,21 @@ fn uses_in_files(
             let end = (next + AHEAD).min(files.len());
             for f in &files[next..end] {
                 let on_disk = (!texts.open.contains_key(f)).then(|| stamp(f)).flatten();
-                if let Some(st) = on_disk
+                if let Some((st, _)) = &on_disk
                     && let Some((was, bits)) = s.spells.borrow().get(f)
-                    && *was == st
+                    && was == st
                     && !names.iter().any(|n| may_spell(bits, n))
                 {
                     continue;
                 }
                 let Some(t) = texts.read(f) else { continue };
-                if let Some(st) = on_disk {
-                    s.spells.borrow_mut().insert(f.clone(), (st, spelling(&t)));
+                match on_disk {
+                    Some((st, true)) => {
+                        s.spells.borrow_mut().insert(f.clone(), (st, spelling(&t)));
+                    }
+                    _ => {
+                        s.spells.borrow_mut().remove(f);
+                    }
                 }
                 if names.iter().any(|n| t.contains(n.as_str())) {
                     ready.push_back((f, t));
@@ -385,6 +399,19 @@ fn uses_in_files(
     }
 }
 
+/// Puts the calling thread below the editor's: its chunks never compete with a frame. Not
+/// background priority, which also slows its disk reads a lot (hover and Find wait on them).
+fn below_the_editor() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, 10);
+    }
+}
+
 /// The handle the editor keeps: sends tasks to the worker thread.
 pub(super) struct Xref {
     tx: Sender<Queued>,
@@ -405,6 +432,7 @@ impl Xref {
             // name resolution recurses through receivers and supertypes
             .stack_size(64 << 20)
             .spawn(move || {
+                below_the_editor();
                 let mut state = State::new(index, ctx);
                 state.inbox = Some(rx);
                 while let Some((kind, task)) = state.next(true) {
@@ -569,8 +597,10 @@ impl Xref {
 
 /// Runs one task; a panic is logged and the task dropped (its reply channel closes, so whoever
 /// waits sees it ended), and the worker goes on with the next.
-fn run(state: &State, kind: &str, task: Task) {
+fn run(state: &State, kind: &'static str, task: Task) {
+    state.running.borrow_mut().push(kind);
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(state, &|| false)));
+    state.running.borrow_mut().pop();
     if ran.is_err() {
         eprintln!("droid-lite: a code insight task ({kind}) failed; the worker goes on");
         // a pass cut short may have left the graph half taken
@@ -1231,6 +1261,85 @@ mod tests {
     }
 
     #[test]
+    fn a_second_request_runs_between_chunks_of_one_served_inside_a_long_pass() {
+        use std::sync::atomic::AtomicBool;
+        let mut x = Xref::start(Shared::default(), None);
+        let (hovered, found) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (pass_tx, pass_rx) = channel();
+        let (find_tx, find_rx) = channel();
+        let (done_tx, done_rx) = channel();
+        let flag = found.clone();
+        x.submit(FILE, move |s, stale| {
+            let (texts, cache) = (Texts::default(), Cache::default());
+            let t = Instant::now();
+            let _ = in_chunks(s, &texts, &cache, stale, |_| {
+                let _ = pass_tx.send(());
+                flag.load(Ordering::SeqCst) || t.elapsed() > Duration::from_secs(20)
+            });
+        });
+        assert_eq!(
+            pass_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(()),
+            "the pass started"
+        );
+        // a long Find, served between the pass's chunks
+        let (flag, done) = (hovered.clone(), found.clone());
+        x.submit("find", move |s, stale| {
+            let (texts, cache) = (Texts::default(), Cache::default());
+            let t = Instant::now();
+            let _ = in_chunks(s, &texts, &cache, stale, |_| {
+                let _ = find_tx.send(());
+                flag.load(Ordering::SeqCst) || t.elapsed() > Duration::from_secs(10)
+            });
+            done.store(true, Ordering::SeqCst);
+            let _ = done_tx.send(flag.load(Ordering::SeqCst));
+        });
+        assert_eq!(
+            find_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(()),
+            "the find started"
+        );
+        let (tx, rx) = channel();
+        let flag = hovered.clone();
+        x.submit("hover", move |_, _| {
+            flag.store(true, Ordering::SeqCst);
+            let _ = tx.send(());
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(()),
+            "answered before the find ended"
+        );
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(15)),
+            Ok(true),
+            "the find went on after it"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_worker_runs_below_the_editors_priority() {
+        let mut x = Xref::start(Shared::default(), None);
+        let (tx, rx) = channel();
+        x.submit("qos", move |_, _| {
+            let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+            let mut rel = 0;
+            unsafe {
+                libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut rel);
+            }
+            let _ = tx.send(class as u32);
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(libc::qos_class_t::QOS_CLASS_UTILITY as u32)
+        );
+    }
+
+    #[test]
     fn a_kept_result_gets_the_hilt_links_of_now() {
         let (m, h) = ("/p/src/main/java/a/Mod.kt", "/p/src/main/java/a/Holder.kt");
         let module = |q: &str| {
@@ -1590,64 +1699,96 @@ mod tests {
         assert!(hilt_wants(&g, Path::new(h), &|| true).is_none());
     }
 
-    #[test]
-    fn an_unchanged_file_that_spells_none_of_the_names_is_not_read_again() {
+    /// A project folder with V.kt (`before`, its time set back ten seconds) and U.kt, a
+    /// worker state over it, and a pass over U with the open text given.
+    fn spell_project(name: &str, before: &str, old: bool) -> (PathBuf, PathBuf, PathBuf, State) {
         let dir =
-            std::env::temp_dir().join(format!("droid-lite-xref-spell-{}", std::process::id()));
+            std::env::temp_dir().join(format!("droid-lite-xref-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (u, v) = (dir.join("U.kt"), dir.join("V.kt"));
-        let before = "package a\nfun yy(x: Int) = 2\n";
         std::fs::write(&v, before).unwrap();
+        if old {
+            let back = std::time::SystemTime::now() - Duration::from_secs(10);
+            let f = std::fs::File::options().write(true).open(&v).unwrap();
+            f.set_modified(back).unwrap();
+        }
         let shared = Shared::default();
         let mut index = Index::default();
         index.update(&v, before);
         index.update(&u, "package a\nclass A\n");
         shared.set(index);
         shared.settle();
-        let s = State::new(shared, None);
-        let root = dir.clone();
-        let pass_u = |text: &str| {
-            let open: HashMap<PathBuf, Arc<str>> = [(u.clone(), Arc::from(text))].into();
-            let snap = s.snapshot(&root, &u);
-            let targets = targets_of(u.to_str().unwrap(), text);
-            file_pass(
-                &s,
-                &u,
-                1,
-                Arc::from(text),
-                open,
-                &snap,
-                &root,
-                &targets,
-                &|| false,
-            )
-            .unwrap()
-        };
-        assert_eq!(uses_of_a(&pass_u("package a\nclass A\n")), 0);
-        // V now uses A, with the same size and time on disk: what was read of it still holds
+        (dir, u, v, State::new(shared, None))
+    }
+
+    fn pass_u(s: &State, root: &Path, u: &Path, text: &str) -> usize {
+        let open: HashMap<PathBuf, Arc<str>> = [(u.to_path_buf(), Arc::from(text))].into();
+        let snap = s.snapshot(root, u);
+        let targets = targets_of(u.to_str().unwrap(), text);
+        let x = file_pass(
+            s,
+            u,
+            1,
+            Arc::from(text),
+            open,
+            &snap,
+            root,
+            &targets,
+            &|| false,
+        );
+        uses_of_a(&x.unwrap())
+    }
+
+    /// The spelling kept for `v`, by address: a file read again gets a new one.
+    fn kept_spelling(s: &State, v: &Path) -> Option<usize> {
+        s.spells
+            .borrow()
+            .get(v)
+            .map(|(_, b)| &**b as *const Spelling as usize)
+    }
+
+    #[test]
+    fn an_unchanged_file_that_spells_none_of_the_names_is_not_read_again() {
+        let (dir, u, v, s) = spell_project("unchanged", "package a\nfun yy(x: Int) = 2\n", true);
+        assert_eq!(pass_u(&s, &dir, &u, "package a\nclass A\n"), 0);
+        let first = kept_spelling(&s, &v);
+        assert!(first.is_some(), "an old file's spelling is kept");
+        // the open file changes below A: its usages are looked for again, V is not read
+        assert_eq!(pass_u(&s, &dir, &u, "package a\nclass A\n// 1\n"), 0);
+        assert_eq!(kept_spelling(&s, &v), first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_same_size_edit_that_keeps_the_file_time_is_read_again() {
+        let before = "package a\nfun yy(x: Int) = 2\n";
+        let (dir, u, v, s) = spell_project("same-time", before, true);
+        assert_eq!(pass_u(&s, &dir, &u, "package a\nclass A\n"), 0);
+        // V now uses A, with the same size and modification time on disk
         let time = std::fs::metadata(&v).unwrap().modified().unwrap();
         let after = "package a\nfun yy(x: A)   = 2\n";
         assert_eq!(after.len(), before.len());
         std::fs::write(&v, after).unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&v)
-            .unwrap()
-            .set_modified(time)
-            .unwrap();
-        // the open file changes below A: its usages are looked for again
-        let not_read = uses_of_a(&pass_u("package a\nclass A\n// 1\n"));
-        // a changed time: read again
-        std::fs::File::options()
-            .write(true)
-            .open(&v)
-            .unwrap()
-            .set_modified(time + Duration::from_secs(5))
-            .unwrap();
-        let read = uses_of_a(&pass_u("package a\nclass A\n// 2\n"));
+        let f = std::fs::File::options().write(true).open(&v).unwrap();
+        f.set_modified(time).unwrap();
+        drop(f);
+        assert_eq!(std::fs::metadata(&v).unwrap().modified().unwrap(), time);
+        let found = pass_u(&s, &dir, &u, "package a\nclass A\n// 1\n");
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!((not_read, read), (0, 1));
+        assert_eq!(found, 1);
+    }
+
+    #[test]
+    fn a_file_modified_just_now_is_not_trusted_to_be_unchanged_later() {
+        let (dir, u, v, s) = spell_project("racy", "package a\nfun yy(x: Int) = 2\n", false);
+        assert_eq!(pass_u(&s, &dir, &u, "package a\nclass A\n"), 0);
+        let kept = kept_spelling(&s, &v);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            kept, None,
+            "its time may not move with the next same-size edit"
+        );
     }
 
     /// The pass over the biggest files of a real project: time, and the longest the index's

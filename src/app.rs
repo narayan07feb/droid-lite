@@ -42,6 +42,7 @@ use egui::text::{CCursor, CCursorRange};
 use egui::{Align, Align2, Color32, FontId, Key, Modifiers, RichText, TextEdit, Ui};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Instant, SystemTime};
 
@@ -60,7 +61,8 @@ struct Tab {
     path: PathBuf,
     text: String,
     saved: String,
-    syms: FileSyms,
+    /// Shared with the index (no copy per typing pause).
+    syms: Arc<FileSyms>,
     lints: Vec<Lint>,
     diagnostics: Vec<(usize, u8, String)>,
     /// Laid-out text, reused until the text, the problem marks or the zoom change.
@@ -108,7 +110,7 @@ impl Tab {
             path: path.to_path_buf(),
             saved: text.clone(),
             text,
-            syms: FileSyms::default(),
+            syms: Arc::default(),
             lints: Vec::new(),
             diagnostics: Vec::new(),
             cache: None,
@@ -142,7 +144,7 @@ impl Tab {
 
     fn reanalyse(&mut self) {
         self.rev = new_rev();
-        self.syms = crate::kotlin::scan_file(&self.path, &self.text);
+        self.syms = Arc::new(crate::kotlin::scan_file(&self.path, &self.text));
         self.lints = if is_code(&self.path) {
             compose::lint(&self.text, &self.syms)
         } else {
@@ -209,11 +211,18 @@ struct EditorCache {
 
 /// Analysis waits this long after the last keystroke, so typing in big files stays smooth.
 const SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
-/// How long an action that must come after the saves on their way (a revert, a refactor, a git
-/// command) waits for them before it says a save is still running and does nothing.
-const SAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-/// How long quitting waits for them: then what is still unsaved is kept in local history.
+/// How long quitting waits for saves on their way (unless asked twice): then what is still
+/// unsaved is kept in local history. The window waits for them without blocking first
+/// ([`App::guard_close`]), so this is for saves the quit itself started.
 const SAVE_WAIT_ON_QUIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// An action that must come after the saves on their way (a revert, a refactor, a git command):
+/// it runs once they landed, unless an open tab's text changed meanwhile.
+struct AfterSaves {
+    what: String,
+    texts: u64,
+    run: Box<dyn FnOnce(&mut App)>,
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SearchKind {
@@ -509,6 +518,10 @@ pub struct App {
     close_ok: bool,
     /// "Keep my version (save)" was chosen: the window closes once those saves are written.
     close_after_saves: bool,
+    /// The window was asked to close twice while saves were on their way: it quits now.
+    quit_now: bool,
+    /// Actions waiting for the saves on their way ([`App::settle_saves`]).
+    after_saves: Vec<AfterSaves>,
     /// Results of saves the save thread ([`saver`]) wrote, and how many are still on their way.
     save_tx: Sender<saver::SaveDone>,
     save_rx: Receiver<saver::SaveDone>,
@@ -635,6 +648,8 @@ impl App {
             close_asked: false,
             close_ok: false,
             close_after_saves: false,
+            quit_now: false,
+            after_saves: Vec::new(),
             save_tx,
             save_rx,
             saves_pending: 0,
@@ -772,8 +787,9 @@ impl App {
     ) {
         remember_project(&project.root);
         self.index.set(index);
-        for t in &self.tabs {
-            self.index.update(&t.path, &t.text);
+        // the tabs' own symbols; one with text not analysed yet gets in when typing pauses
+        for t in self.tabs.iter().filter(|t| t.dirty_since.is_none()) {
+            self.index.put(t.path.clone(), t.syms.clone());
         }
         self.branch = branch;
         self.reload_stability(&project, ctx);
@@ -953,9 +969,11 @@ impl App {
                         if !self.previews.saved.contains(&d.path) {
                             self.previews.saved.push(d.path.clone());
                         }
-                        // typed on since: the index already has (or soon gets) the newer text
-                        if tab.text == d.text {
-                            self.index.update(&d.path, &d.text);
+                        // the tab's symbols, read when typing paused, are those of the saved text:
+                        // no second read here. Typed on since (or not analysed yet): the index
+                        // gets the newer text when typing pauses.
+                        if tab.text == d.text && tab.dirty_since.is_none() {
+                            self.index.put(d.path.clone(), tab.syms.clone());
                         }
                         if let Some(l) = self.lsp.as_mut() {
                             l.did_save(&d.path);
@@ -978,6 +996,26 @@ impl App {
                 saver::Outcome::Failed(s) => self.status = s,
             }
         }
+        if self.saves_pending == 0 && !self.after_saves.is_empty() {
+            let texts = self.texts_digest();
+            for a in std::mem::take(&mut self.after_saves) {
+                if a.texts == texts {
+                    (a.run)(self);
+                } else {
+                    self.status = format!("{} did not run: a text changed meanwhile", a.what);
+                }
+            }
+        }
+    }
+
+    /// A digest of the open tabs' paths and texts.
+    fn texts_digest(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for t in &self.tabs {
+            (&t.path, &t.text).hash(&mut h);
+        }
+        h.finish()
     }
 
     /// Waits for every save sent so far and applies them (tests).
@@ -989,8 +1027,16 @@ impl App {
 
     fn close_tab(&mut self, i: usize) {
         // ⌘S then ⌘W: the save on its way decides whether edits are left
-        if self.tabs.get(i).is_some_and(Tab::dirty) && !self.settle_saves() {
-            return;
+        if let Some(t) = self.tabs.get(i).filter(|t| t.dirty()) {
+            let p = t.path.clone();
+            let again = move |a: &mut App| {
+                if let Some(i) = a.tabs.iter().position(|t| t.path == p) {
+                    a.close_tab(i);
+                }
+            };
+            if !self.settle_saves("Close", again) {
+                return;
+            }
         }
         if i < self.tabs.len() {
             // a deleted file's tab closes like Android Studio's: ⌘S would bring the file back
@@ -1037,7 +1083,17 @@ impl App {
     /// Drops the active tab's edits; they stay in local history (else they stay in the tab).
     fn revert(&mut self) {
         // ⌘S then Revert: the save lands first, so it is what the tab goes back to
-        if !self.settle_saves() {
+        let Some(p) = self.tabs.get(self.active).map(|t| t.path.clone()) else {
+            return;
+        };
+        let again = move |a: &mut App| {
+            if let Some(i) = a.tabs.iter().position(|t| t.path == p) {
+                let active = std::mem::replace(&mut a.active, i);
+                a.revert();
+                a.active = active;
+            }
+        };
+        if !self.settle_saves("Revert", again) {
             return;
         }
         if let Some(t) = self.tabs.get_mut(self.active) {
@@ -2623,7 +2679,7 @@ impl App {
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    let (icon, tint) = assist::kind_icon(f, index.files.get(f));
+                    let (icon, tint) = assist::kind_icon(f, index.files.get(f).map(|s| &**s));
                     let mut job = egui::text::LayoutJob::default();
                     let fmt = |color| egui::TextFormat {
                         font_id: FontId::proportional(13.0),
@@ -4292,7 +4348,12 @@ impl eframe::App for App {
             self.autosave();
         }
         // a save stuck on a slow disk does not hold the quit: its tab is still unsaved below
-        if !saver::wait_for(SAVE_WAIT_ON_QUIT) {
+        let wait = if self.quit_now {
+            std::time::Duration::ZERO
+        } else {
+            SAVE_WAIT_ON_QUIT
+        };
+        if !saver::wait_for(wait) {
             eprintln!("droid-lite: a save was still running at quit; its tab's text is kept");
         }
         self.poll_saves();

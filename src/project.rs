@@ -3,6 +3,23 @@
 use crate::lexer::{Tok, lex};
 use std::path::{Path, PathBuf};
 
+/// What tells a file's content changed without reading it: its size, modification time and,
+/// on unix, inode and change time. A same-size edit that keeps the modification time (one
+/// restored by a tool, or within one tick of a coarse clock) still moves the change time, and a
+/// file saved by rename gets another inode.
+pub type Stamp = (u64, Option<std::time::SystemTime>, [i64; 3]);
+
+pub fn stamp(m: &std::fs::Metadata) -> Stamp {
+    #[cfg(unix)]
+    let more = {
+        use std::os::unix::fs::MetadataExt;
+        [m.ino() as i64, m.ctime(), m.ctime_nsec()]
+    };
+    #[cfg(not(unix))]
+    let more = [0; 3];
+    (m.len(), m.modified().ok(), more)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Module {
     /// Gradle path, e.g. `:feature:home`. The root project is `:`.
