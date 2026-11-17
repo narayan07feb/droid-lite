@@ -261,7 +261,7 @@ impl App {
         if self.refuse_during_checkout() {
             return;
         }
-        if self.saves_pending > 0 {
+        if self.waits_for_saves() {
             let text = text.to_string();
             let folder = self
                 .translations
@@ -270,7 +270,10 @@ impl App {
                 .and_then(|(_, t)| t.folders.get(col).cloned())
                 .unwrap_or_default();
             let what = format!("Translation of {key} in {folder}");
-            self.settle_saves(&what, move |a| a.write_translation(key, col, &text));
+            // the same key and folder in another project is another action
+            let root = self.project.as_ref().map(|p| p.root.clone()).unwrap_or_default();
+            let id = format!("translation {key} in {folder} of {}", root.display());
+            self.settle_saves_keyed(&id, &what, move |a| a.write_translation(key, col, &text));
             return;
         }
         let Some((_, table)) = &self.translations.table else {

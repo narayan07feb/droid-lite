@@ -2101,19 +2101,32 @@ impl<'a> Resolver<'a> {
                 continue;
             }
             let p = open - 1;
+            // `x.apply { }`, `x.run { }`, `x.runCatching { }`, `with(x) { }`: x is `this`; one
+            // whose members are not known here may own a call in the lambda
+            let mut of_x = |t: Option<Ty>| {
+                let known = match &t {
+                    Some(Ty::Decl(_)) => true,
+                    Some(Ty::Lib(n, _)) => known_members(n).is_some(),
+                    _ => false,
+                };
+                if !known && unknown.is_none() {
+                    unknown = Some(out.len());
+                }
+                t
+            };
             let t = match f.t(p) {
-                "apply" | "run" if p > 0 && f.t(p - 1) == "." => {
+                "apply" | "run" | "runCatching" if p > 0 && f.t(p - 1) == "." => {
                     let mut e = p - 1;
                     if e > 0 && f.t(e - 1) == "?" {
                         e -= 1;
                     }
-                    self.type_of_expr(f, f.expr_start(e), e)
+                    of_x(self.type_of_expr(f, f.expr_start(e), e))
                 }
                 ")" => {
                     let o = f.pair(p).unwrap_or(p);
                     if o > 0 && f.t(o - 1) == "with" {
                         let a = split_args_tokens(f, o);
-                        a.first().and_then(|&(s, e)| self.type_of_expr(f, s, e))
+                        of_x(a.first().and_then(|&(s, e)| self.type_of_expr(f, s, e)))
                     } else {
                         None
                     }
@@ -2794,8 +2807,10 @@ impl<'a> Resolver<'a> {
         {
             receivers.push(t);
         }
-        // in a library DSL lambda a call may be its receiver's: unresolved beats wrong
-        let class_calls = !(unknown.is_some() && args.is_some());
+        // in a library DSL lambda a name may be its receiver's member, which kotlinc picks
+        // before the class's, an outer receiver's and a top-level one: unresolved beats wrong.
+        // A type in a type position (`x: T`, `as T`, `List<T>`) is never a member.
+        let class_calls = unknown.is_none() || type_position(f, i);
         for (k, t) in receivers.iter().enumerate() {
             // a member of a library receiver (`append` in `buildString { }`)
             if let Ty::Lib(n, _) = t
@@ -2829,7 +2844,7 @@ impl<'a> Resolver<'a> {
                 if let Ty::Decl(t) = t {
                     let v = self.static_of(&t, name, args);
                     if !v.is_empty() {
-                        return if class_calls || looks_type {
+                        return if class_calls {
                             Res::Decls(v)
                         } else {
                             Res::None
@@ -2868,6 +2883,9 @@ impl<'a> Resolver<'a> {
         // ...) on it beats a top-level project function of that name
         if args.is_some() && any_receiver_scope_fn(name) && (unknown.is_some() || !this.is_empty())
         {
+            return Res::None;
+        }
+        if !class_calls {
             return Res::None;
         }
         if looks_type || args.is_some() {
@@ -3755,12 +3773,43 @@ fn no_receiver_lambda(name: &str) -> bool {
         )
 }
 
+/// Whether the name at token `i` stands where only a type can (`x: T`, `as T`, `is T`, `@T`,
+/// `List<T>`), so no lambda receiver's member can be meant.
+fn type_position(f: &FileInfo, i: usize) -> bool {
+    if i == 0 {
+        return false;
+    }
+    match f.t(i - 1) {
+        ":" => !(i > 1 && f.t(i - 2) == ":"),
+        "as" | "is" | "@" => true,
+        "?" => i > 1 && f.t(i - 2) == "as",
+        "<" | "," => {
+            // inside type arguments: back to an unmatched `<` after a name
+            let mut depth = 0;
+            let mut k = i;
+            while k > 0 {
+                k -= 1;
+                match f.t(k) {
+                    ">" => depth += 1,
+                    "<" if depth == 0 => return k > 0 && f.ident(k - 1),
+                    "<" => depth -= 1,
+                    "," | "." | "?" | "*" | "out" | "in" => {}
+                    _ if f.ident(k) => {}
+                    _ => return false,
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 /// Library extensions on any `T` that take a lambda: called with no `x.` where there is an
 /// implicit receiver, kotlinc picks them over a top-level project function of the same name.
 fn any_receiver_scope_fn(name: &str) -> bool {
     matches!(
         name,
-        "run" | "apply" | "let" | "also" | "takeIf" | "takeUnless"
+        "run" | "apply" | "let" | "also" | "takeIf" | "takeUnless" | "runCatching"
     )
 }
 
@@ -5856,5 +5905,132 @@ fun f(state: State, other: State) {
         let found = r.usages_in(&[go], Path::new("/p/U.kt"), &newer);
         let names: Vec<&str> = found.iter().map(|(_, o)| &newer[*o..*o + 2]).collect();
         assert_eq!(names, ["go"]);
+    }
+
+    /// kotlinc 2.x on:
+    /// ```text
+    /// class A { fun foo() = "A.foo" }
+    /// class B { fun foo() = "B.foo"
+    ///   fun f(a: A) = listOf("runCatching:" + a.runCatching { foo() }.getOrNull(), "apply:" + a.apply { println("apply:" + foo()) }.let { "" },
+    ///     "run:" + a.run { foo() }, "let:" + a.let { foo() }, "also:" + a.also { println("also:" + foo()) }.let { "" },
+    ///     "takeIf:" + a.takeIf { println("takeIf:" + foo()); true }.let { "" }, "with:" + with(a) { foo() }, "plainRunCatching:" + runCatching { foo() }.getOrNull()) }
+    /// class Lib { fun show() = "Lib.show" }
+    /// class Page { fun show() = "Page.show"; fun viaNull(l: Lib?) = l?.runCatching { show() }?.getOrNull() }
+    /// ```
+    /// prints apply:A.foo, also:B.foo, takeIf:B.foo, runCatching:A.foo, run:A.foo, let:B.foo,
+    /// with:A.foo, plainRunCatching:B.foo, and Lib.show for `?.runCatching`: `x.runCatching { }`
+    /// gives its lambda `x` as `this`, like `x.run { }` and `x.apply { }`.
+    #[test]
+    fn a_dotted_run_catching_gives_its_lambda_the_receiver_like_kotlinc() {
+        let (i, t) = project(&[(
+            "/p/R.kt",
+            "package a\nclass A {\n    fun foo() {}\n}\nclass B {\n    fun foo() {}\n    fun f(a: A) = a.runCatching { foo() }\n    fun g(a: A?) = a?.runCatching { foo() }\n    fun h(a: A) = a.let { foo() }\n    fun i() = runCatching { foo() }\n}\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/R.kt", "foo", 3), "/p/R.kt:3", "a.runCatching");
+        assert_eq!(at(&r, "/p/R.kt", "foo", 4), "/p/R.kt:3", "a?.runCatching");
+        assert_eq!(at(&r, "/p/R.kt", "foo", 5), "/p/R.kt:6", "a.let");
+        assert_eq!(at(&r, "/p/R.kt", "foo", 6), "/p/R.kt:6", "no receiver");
+    }
+
+    /// kotlinc 2.x on:
+    /// ```text
+    /// class Pipeline { fun stage(s: String) = "Pipeline.stage" }
+    /// fun runCatching(block: Pipeline.() -> String) = Pipeline().block()
+    /// class Job { fun stage(s: String) = "Job.stage"; fun go() = runCatching { stage("a") } }
+    /// fun main() { println(Job().go()); println(runCatching { stage("top") }) }
+    /// ```
+    /// prints Success(Job.stage) and Pipeline.stage: with an implicit receiver the library's
+    /// `T.runCatching` beats a top-level project function of that name.
+    #[test]
+    fn the_library_run_catching_beats_a_top_level_project_one_with_a_receiver_like_kotlinc() {
+        let (i, t) = project(&[(
+            "/p/P.kt",
+            "package a\nclass Pipeline {\n    fun stage(s: String) {}\n}\nfun runCatching(block: Pipeline.() -> Unit) {}\nclass Job {\n    fun stage(s: String) {}\n    fun go() = runCatching { stage(\"a\") }\n}\nfun main() = runCatching { stage(\"top\") }\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/P.kt", "stage", 3), "/p/P.kt:7", "in a class");
+        assert_eq!(at(&r, "/p/P.kt", "runCatching", 2), "-", "the library's");
+        assert_eq!(at(&r, "/p/P.kt", "stage", 4), "/p/P.kt:3", "no receiver");
+        assert_eq!(at(&r, "/p/P.kt", "runCatching", 3), "/p/P.kt:5");
+    }
+
+    /// kotlinc 2.x on:
+    /// ```text
+    /// class Lib { fun show() = "Lib.show" }
+    /// class Page { fun show() = "Page.show"
+    ///   fun go() = "apply-show:" + Lib().run { show() }; fun viaWith(l: Lib) = with(l) { show() } }
+    /// ```
+    /// prints apply-show:Lib.show and Lib.show: the receiver's member beats the class's. A
+    /// receiver from a library whose members are not known here (`dialog.apply { show() }`)
+    /// leaves the call unresolved.
+    #[test]
+    fn a_scope_lambda_on_a_receiver_of_unknown_members_leaves_calls_unresolved_like_kotlinc() {
+        let (i, t) = project(&[(
+            "/p/D.kt",
+            "package a\nclass Page {\n    fun show() {}\n    fun go(d: Dialog) = d.apply { show() }\n    fun go2(d: Dialog) = d.run { show() }\n    fun go3(d: Dialog) = with(d) { show() }\n    fun go4(d: Dialog?) = d?.runCatching { show() }\n    fun go5(p: Page) = p.apply { show() }\n}\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/D.kt", "show", 2), "-", "apply");
+        assert_eq!(at(&r, "/p/D.kt", "show", 3), "-", "run");
+        assert_eq!(at(&r, "/p/D.kt", "show", 4), "-", "with");
+        assert_eq!(at(&r, "/p/D.kt", "show", 5), "-", "?.runCatching");
+        assert_eq!(
+            at(&r, "/p/D.kt", "show", 6),
+            "/p/D.kt:3",
+            "a project receiver"
+        );
+    }
+
+    /// kotlinc 2.x on:
+    /// ```text
+    /// class Lib { fun show() = "Lib.show"; fun title(s: String) = "Lib.title"; val id = "Lib.id"
+    ///     fun Item(s: String) = "Lib.Item"; val Thing = Holder("Lib.Thing"); val count = "Lib.count" }
+    /// class Holder(val s: String)
+    /// fun title(s: String) = "top.title"
+    /// class Item(val s: String) { override fun toString() = "top.Item" }
+    /// object Thing { val s = "top.Thing" }
+    /// val count = "top.count"
+    /// fun head(b: Lib.() -> String) = Lib().b()
+    /// class Page { fun show() = "Page.show"; val id = "Page.id"
+    ///   fun go() = listOf("head-title:" + head { title("x") }, "head-id:" + head { id },
+    ///     "head-Item:" + head { Item("x").toString() }, "head-Thing:" + head { Thing.s },
+    ///     "head-count:" + head { count }) }
+    /// ```
+    /// prints head-title:Lib.title, head-id:Lib.id, head-Item:Lib.Item, head-Thing:Lib.Thing,
+    /// head-count:Lib.count. And on:
+    /// ```text
+    /// class Lib { fun Item(s: String) = "Lib.Item"; val LIMIT = "Lib.LIMIT"; val id = "Lib.id" }
+    /// fun head(b: Lib.() -> String) = Lib().b()
+    /// class Page {
+    ///   class Item(val s: String) { override fun toString() = "Page.Item" }
+    ///   companion object { const val LIMIT = "Page.LIMIT" }
+    ///   fun go() = listOf("nested-ctor:" + head { Item("x").toString() }, "companion-const:" + head { LIMIT },
+    ///     "type-pos:" + head { val i: Item? = null; "type ok " + (i == null) }) }
+    /// ```
+    /// prints nested-ctor:Lib.Item, companion-const:Lib.LIMIT, type-pos:type ok true. In a
+    /// library lambda the receiver's members beat top-level functions, properties,
+    /// constructors and objects, and the class's properties, nested classes and companion
+    /// members. Its receiver is not known here, so each stays unresolved; a type in a type
+    /// position is never a member.
+    #[test]
+    fn an_unknown_library_receiver_lambda_leaves_top_level_and_bare_names_unresolved_like_kotlinc()
+    {
+        let (i, t) = project(&[(
+            "/p/H.kt",
+            "package a\nfun title(s: String) {}\nval count = 1\nclass Item(val s: String)\nobject Thing {\n    val s = \"\"\n}\nclass Page {\n    val id = \"\"\n    class Nested(val s: String)\n    companion object {\n        const val LIMIT = 1\n    }\n    fun go() = head { title(\"x\") }\n    fun go2() = head { id }\n    fun go3() = head { Item(\"x\") }\n    fun go4() = head { Thing.s }\n    fun go5() = head { count }\n    fun go6() = head { Nested(\"x\") }\n    fun go7() = head { LIMIT }\n    fun go8() = head { val i: Item? = null }\n    fun go9() = head { listOf<Item>() }\n    fun out() = title(id)\n}\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/H.kt", "title", 2), "-", "a top-level function");
+        assert_eq!(at(&r, "/p/H.kt", "id", 2), "-", "a class property read");
+        assert_eq!(at(&r, "/p/H.kt", "Item", 2), "-", "a constructor");
+        assert_eq!(at(&r, "/p/H.kt", "Thing", 2), "-", "an object");
+        assert_eq!(at(&r, "/p/H.kt", "count", 2), "-", "a top-level property");
+        assert_eq!(at(&r, "/p/H.kt", "Nested", 2), "-", "a nested class");
+        assert_eq!(at(&r, "/p/H.kt", "LIMIT", 2), "-", "a companion constant");
+        assert_eq!(at(&r, "/p/H.kt", "Item", 3), "/p/H.kt:4", "`x: T`");
+        assert_eq!(at(&r, "/p/H.kt", "Item", 4), "/p/H.kt:4", "`listOf<T>`");
+        assert_eq!(at(&r, "/p/H.kt", "title", 3), "/p/H.kt:2", "outside");
+        assert_eq!(at(&r, "/p/H.kt", "id", 3), "/p/H.kt:9", "outside");
     }
 }

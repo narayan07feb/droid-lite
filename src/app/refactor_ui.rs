@@ -93,6 +93,28 @@ impl Preview {
     }
 }
 
+impl App {
+    /// Asks for a rename of `old` to `new` with no edits in `files` (tests).
+    #[cfg(test)]
+    pub(super) fn ask_rename(&mut self, old: &str, new: &str, files: &[PathBuf]) {
+        let files = files
+            .iter()
+            .map(|p| FileEdits {
+                path: p.clone(),
+                text: String::new(),
+                edits: Vec::new(),
+            })
+            .collect();
+        self.apply_preview(Preview {
+            old: old.into(),
+            new: new.into(),
+            files,
+            rename_file: None,
+            source: "test",
+        });
+    }
+}
+
 fn edit_line(text: &str, range: Range<usize>, new_text: String) -> EditLine {
     let ls = text[..range.start].rfind('\n').map_or(0, |i| i + 1);
     let le = text[range.end..]
@@ -262,9 +284,16 @@ impl App {
         if self.refuse_during_checkout() {
             return;
         }
-        if self.saves_pending > 0 {
+        if self.waits_for_saves() {
             let what = format!("Rename {} → {}", p.old, p.new);
-            self.settle_saves(&what, move |a| a.apply_preview(p));
+            // the same rename elsewhere is another action
+            let places: Vec<String> = p
+                .files
+                .iter()
+                .map(|f| format!("{}", f.path.display()))
+                .collect();
+            let key = format!("rename {} → {} in {}", p.old, p.new, places.join(", "));
+            self.settle_saves_keyed(&key, &what, move |a| a.apply_preview(p));
             return;
         }
         let mut undo = Undo {
@@ -356,10 +385,14 @@ impl App {
         git: Option<&Path>,
         again: impl FnOnce(&mut App) + 'static,
     ) -> bool {
-        if self.saves_pending == 0 {
+        if !self.waits_for_saves() {
             return true;
         }
-        self.status = format!("{what} runs when the save on its way is done");
+        self.status = if self.saves_pending > 0 {
+            format!("{what} runs when the save on its way is done")
+        } else {
+            format!("{what} runs after the actions waiting before it")
+        };
         // a typing pause due now is taken first: from here a version changes only with a text
         self.settle(true);
         // the repository's state now, worked out off this thread
@@ -378,6 +411,13 @@ impl App {
             run: Box::new(again),
         });
         false
+    }
+
+    /// Whether an action asked for now waits ([`App::settle_saves`]): a save is on its way, or
+    /// actions asked for before it still wait (they run first, in order). One of them running
+    /// does not wait for the ones behind it.
+    pub(super) fn waits_for_saves(&self) -> bool {
+        self.saves_pending > 0 || (!self.after_saves.is_empty() && !self.running_after_saves)
     }
 
     /// Takes the action `key` out of those waiting for the saves.

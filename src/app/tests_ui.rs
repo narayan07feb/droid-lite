@@ -175,6 +175,16 @@ struct Room {
 }
 
 impl Plugin {
+    /// Nothing of it is on its way: no OK being saved, no folder check, no command waiting for
+    /// one, no listing (tests).
+    #[cfg(test)]
+    pub(super) fn settled(&self) -> bool {
+        self.allowing.is_none()
+            && self.check.is_none()
+            && self.pending.is_empty()
+            && self.loading.is_none()
+    }
+
     fn new(m: Manifest) -> Plugin {
         Plugin {
             m,

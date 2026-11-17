@@ -51,6 +51,9 @@ pub struct Shared {
     /// A failed change may have left names without their file: the name maps are rebuilt from
     /// the files on the worker ([`Shared::rescan`]), never under the lock on the editor's thread.
     repair: Arc<std::sync::atomic::AtomicBool>,
+    /// When that rebuild may start: after one lost to a newer change (typing) or failed, it waits
+    /// instead of starting a full rebuild every frame.
+    repair_wait: Arc<std::sync::Mutex<RepairWait>>,
     /// Asks the editor for a frame ([`Shared::on_wake`]): this thread cannot apply the queued
     /// changes at the editor's priority, its next frame does.
     wake: Arc<std::sync::Mutex<Option<Wake>>>,
@@ -58,6 +61,21 @@ pub struct Shared {
 
 /// What [`Shared::on_wake`] calls.
 type Wake = Box<dyn Fn() + Send>;
+
+/// The pause before a rebuild of the name maps after one that lost or failed
+/// ([`Shared::repair`]); it doubles with each loss in a row, up to 16 times.
+const REPAIR_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// When the next rebuild of the name maps may start.
+#[derive(Default)]
+struct RepairWait {
+    not_before: Option<std::time::Instant>,
+    /// Rebuilds in a row a newer change made useless.
+    lost: u32,
+    /// The last rebuild failed: it is tried once more, then left (lookups skip names without
+    /// their file).
+    failed: bool,
+}
 
 /// What a change changes, which says what to do when it fails halfway.
 enum Of {
@@ -142,7 +160,7 @@ impl Shared {
                 continue;
             }
             eprintln!("droid-lite: an index change failed; the others go on");
-            // what is cheap now: the file out; the name maps are rebuilt on the worker
+            // the file out with its names; the name maps are rebuilt on the worker
             if let Of::File(p) | Of::Rescan(p) = &of {
                 index.take_out(p);
             }
@@ -167,14 +185,31 @@ impl Shared {
     pub fn on_wake(&self, wake: impl Fn() + Send + 'static) {
         *self.wake.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(wake));
     }
-    /// Whether the worker has files to read again or name maps to rebuild ([`Shared::rescan`]).
+    /// Whether the worker has files to read again or name maps to rebuild now
+    /// ([`Shared::rescan`]).
     pub fn rescan_due(&self) -> bool {
-        self.repair.load(std::sync::atomic::Ordering::SeqCst)
+        (self.repair.load(std::sync::atomic::Ordering::SeqCst) && self.repair_wait().is_none())
             || !self
                 .rescan
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty()
+    }
+    /// How long a rebuild of the name maps that is due waits yet, after one that lost or failed.
+    pub fn repair_wait(&self) -> Option<std::time::Duration> {
+        if !self.repair.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        let w = self.repair_wait.lock().unwrap_or_else(|e| e.into_inner());
+        w.not_before?.checked_duration_since(std::time::Instant::now())
+    }
+    /// Ends the wait before the next rebuild of the name maps (tests: no sleeping).
+    #[cfg(test)]
+    pub fn skip_repair_wait(&self) {
+        self.repair_wait
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .not_before = None;
     }
     /// On the worker, never the editor's thread: reads the files a failed change took out again
     /// from disk and puts each back (unless a newer change put it in meanwhile, or another index
@@ -207,18 +242,23 @@ impl Shared {
         self.repair();
     }
     /// Rebuilds the name maps from the files, off the lock; they go in only when nothing
-    /// changed the index meanwhile (else they are rebuilt again next time). A rebuild that
-    /// fails keeps the maps the index has.
+    /// changed the index meanwhile (else they are rebuilt again after a pause, longer with each
+    /// loss in a row). A rebuild that fails keeps the maps the index has and is tried once more
+    /// after a pause.
     fn repair(&self) {
         use std::sync::atomic::Ordering::SeqCst;
-        if !self.repair.swap(false, SeqCst) {
+        if self.repair_wait().is_some() || !self.repair.swap(false, SeqCst) {
             return;
         }
         self.flush();
-        let (files, generation) = {
+        let (files, generation, epoch) = {
             let i = self.read();
-            (i.files.clone(), i.generation)
+            (i.files.clone(), i.generation, i.epoch)
         };
+        #[cfg(test)]
+        if let Some(f) = test_hooks::WHILE_REBUILDING.take() {
+            f();
+        }
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut n = Index::default();
             for (p, f) in files {
@@ -227,15 +267,35 @@ impl Shared {
             n
         }));
         let Ok(n) = built else {
-            eprintln!("droid-lite: the index's names could not be rebuilt; they stay as they are");
+            let mut w = self.repair_wait.lock().unwrap_or_else(|e| e.into_inner());
+            if w.failed {
+                eprintln!(
+                    "droid-lite: the index's names could not be rebuilt; they stay as they are"
+                );
+                *w = RepairWait::default();
+            } else {
+                w.failed = true;
+                w.not_before = Some(std::time::Instant::now() + REPAIR_PAUSE);
+                self.repair.store(true, SeqCst);
+            }
             return;
         };
         let due = self.repair.clone();
+        let wait = self.repair_wait.clone();
         self.change(move |i| {
+            // another index replaced that one ([`Shared::set`]): nothing to repair in it
+            if i.epoch != epoch {
+                return;
+            }
+            let mut w = wait.lock().unwrap_or_else(|e| e.into_inner());
             if i.generation != generation {
+                w.lost = (w.lost + 1).min(5);
+                w.not_before =
+                    Some(std::time::Instant::now() + REPAIR_PAUSE * (1 << (w.lost - 1)));
                 due.store(true, SeqCst);
                 return;
             }
+            *w = RepairWait::default();
             i.by_name = n.by_name;
             i.subtypes = n.subtypes;
             i.shared = n.shared;
@@ -252,6 +312,9 @@ impl Shared {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        // its name maps are built from its files: nothing to rebuild
+        self.repair.store(false, std::sync::atomic::Ordering::SeqCst);
+        *self.repair_wait.lock().unwrap_or_else(|e| e.into_inner()) = RepairWait::default();
         self.change(move |i| {
             index.generation += i.generation + 1;
             index.floor = index.generation;
@@ -359,6 +422,8 @@ pub(crate) mod test_hooks {
             const { RefCell::new(None) };
         /// Runs in [`super::Shared::rescan`] after the files were read, before they are put in.
         pub static WHILE_READING_AGAIN: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
+        /// Runs in [`super::Shared::repair`] after the files were read, before the rebuild.
+        pub static WHILE_REBUILDING: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
     }
 
     pub(super) fn boost_refused() -> bool {
@@ -504,11 +569,20 @@ impl Index {
         self.generation += 1;
     }
 
-    /// Takes `path` out of the files after a change of it failed halfway; names it left behind
-    /// stay until the name maps are rebuilt ([`Shared::rescan`]), and lookups skip them.
+    /// Takes `path` out of the files after a change of it failed halfway, with every name and
+    /// supertype entry of it (the ones the failed change put in too): putting the file back
+    /// later adds each of its names once. A scan of the maps, only when a change failed.
     fn take_out(&mut self, path: &Path) {
         self.files.remove(path);
         self.shared.remove(path);
+        self.by_name.retain(|_, v| {
+            v.retain(|(p, _)| **p != *path);
+            !v.is_empty()
+        });
+        self.subtypes.retain(|_, v| {
+            v.retain(|p| **p != *path);
+            !v.is_empty()
+        });
         self.generation += 1;
         self.log_change(Arc::from(path));
     }
@@ -1294,6 +1368,81 @@ mod tests {
         let i = shared.read();
         assert_eq!(i.named("Typed").count(), 1);
         assert_eq!(i.named("B").count(), 0, "the disk's older text stayed out");
+    }
+
+    #[test]
+    fn a_file_put_back_after_its_change_failed_halfway_has_each_name_once() {
+        let shared = Shared::default();
+        let b = PathBuf::from("/p/B.kt");
+        let reading = shared.read();
+        let q = b.clone();
+        shared.queue(
+            Of::File(b.clone()),
+            Box::new(move |i: &mut Index| {
+                i.by_name
+                    .entry("B".into())
+                    .or_default()
+                    .push((Arc::from(q.as_path()), 0));
+                panic!("cut short");
+            }),
+        );
+        drop(reading);
+        shared.settle();
+        // the tab's text goes in before the worker rebuilds the names
+        shared.update(&b, "package a\nclass B\n");
+        assert_eq!(shared.read().named("B").count(), 1);
+    }
+
+    #[test]
+    fn a_rebuild_of_the_names_lost_to_a_newer_change_waits_before_the_next() {
+        let shared = Shared::default();
+        shared.update(Path::new("/p/A.kt"), "package a\nclass A\n");
+        shared.change(|_| panic!("cut short"));
+        shared.settle();
+        // typing changes the index while the worker rebuilds
+        let typing = shared.clone();
+        test_hooks::WHILE_REBUILDING.set(Some(Box::new(move || {
+            typing.update(Path::new("/p/B.kt"), "package a\nclass B\n")
+        })));
+        shared.rescan();
+        shared.settle();
+        assert!(!shared.rescan_due(), "not again on the next frame");
+        assert!(shared.repair_wait().is_some());
+        shared.skip_repair_wait();
+        assert!(shared.rescan_due(), "again after the pause");
+        shared.rescan();
+        shared.settle();
+        assert!(!shared.rescan_due(), "done");
+        assert_eq!(shared.read().named("B").count(), 1);
+    }
+
+    #[test]
+    fn a_rebuild_of_the_names_that_fails_is_tried_once_more_after_a_pause() {
+        let shared = Shared::default();
+        shared.update(Path::new("/p/A.kt"), "package a\nclass A\n");
+        test_hooks::PANIC_ON_INSERT.set(true);
+        shared.change(|_| panic!("cut short"));
+        shared.settle();
+        shared.rescan();
+        assert!(!shared.rescan_due(), "not again at once");
+        shared.skip_repair_wait();
+        assert!(shared.rescan_due(), "once more after the pause");
+        shared.rescan();
+        shared.skip_repair_wait();
+        test_hooks::PANIC_ON_INSERT.set(false);
+        assert!(!shared.rescan_due(), "then left");
+        assert_eq!(shared.read().named("A").count(), 1);
+    }
+
+    #[test]
+    fn another_index_set_leaves_no_rebuild_of_the_names_due() {
+        let shared = Shared::default();
+        shared.change(|_| panic!("cut short"));
+        shared.settle();
+        assert!(shared.rescan_due());
+        shared.set(Index::default());
+        shared.settle();
+        assert!(!shared.rescan_due());
     }
 
     #[test]

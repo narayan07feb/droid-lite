@@ -424,12 +424,15 @@ impl App {
     /// Why Check out must wait: a build, test run or preview of this project is running (a
     /// branch switch under it breaks it), or editor tabs have unsaved edits (they would end up on
     /// the other branch, or be lost when the files reload).
-    fn checkout_refusal(&self, root: &Path) -> Option<String> {
+    pub(super) fn checkout_refusal(&self, root: &Path) -> Option<String> {
         if let Some(r) = self.prs.running_in(root) {
             return Some(format!("Wait for the check out of #{} to stop", r.number));
         }
         let running = if self.saves_pending > 0 {
             Some("the save")
+        } else if !self.after_saves.is_empty() {
+            // they were asked for on this branch, and run first
+            Some("the actions waiting for a save")
         } else if self.gradle.is_some() {
             Some("the Gradle build")
         } else if self.tests.running() {

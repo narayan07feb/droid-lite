@@ -808,6 +808,7 @@ pub fn checkout_pr(
     timeout: std::time::Duration,
     ctl: &Ctl,
 ) -> Result<(String, bool), String> {
+    let _writing = Writing::start(root);
     let changes = status_with(root, &["--ignore-submodules=untracked"])?;
     if let Some(op) = operation_in_progress(root) {
         return Err(format!("Finish or abort the {op} first"));
@@ -1370,9 +1371,44 @@ pub fn renamed_from(top: &Path, sha: &str, rel: &str) -> Option<String> {
     None
 }
 
+/// Per repository: counts each git command of this process that changes it ([`run`],
+/// [`checkout_pr`]) once when it starts and once when it ends, so a state worked out meanwhile
+/// ([`state_stamp`]) can tell it may be from before or after one.
+static WRITES: std::sync::Mutex<std::collections::BTreeMap<PathBuf, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The count of [`WRITES`] for the repository at `root`.
+pub fn writes(root: &Path) -> u64 {
+    let w = WRITES.lock().unwrap_or_else(|e| e.into_inner());
+    w.get(root).copied().unwrap_or(0)
+}
+
+/// Counted in [`WRITES`] while it lives.
+struct Writing(PathBuf);
+
+impl Writing {
+    fn start(root: &Path) -> Writing {
+        let w = Writing(root.to_path_buf());
+        w.count();
+        w
+    }
+
+    fn count(&self) {
+        let mut w = WRITES.lock().unwrap_or_else(|e| e.into_inner());
+        *w.entry(self.0.clone()).or_default() += 1;
+    }
+}
+
+impl Drop for Writing {
+    fn drop(&mut self) {
+        self.count();
+    }
+}
+
 /// Runs a git command that changes the repository (stage, unstage, commit, checkout).
 /// Returns git's error text when it fails.
 pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
+    let _writing = Writing::start(root);
     let out = git(root)
         .args(args)
         .stderr(Stdio::piped())

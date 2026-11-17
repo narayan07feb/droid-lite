@@ -3115,7 +3115,7 @@ fn e2e_a_project_plugin_changed_after_the_ok_runs_nothing_and_asks_again() {
     .unwrap();
     std::fs::write(
         dir.join("list.sh"),
-        "echo '[{\"id\":\"a\",\"label\":\"Case A\"}]'\n",
+        "touch \"$DROID_LITE_PROJECT/listed\"\necho '[{\"id\":\"a\",\"label\":\"Case A\"}]'\n",
     )
     .unwrap();
     std::fs::write(dir.join("run.sh"), "touch \"$DROID_LITE_PROJECT/ran\"\n").unwrap();
@@ -3146,10 +3146,14 @@ fn e2e_a_project_plugin_changed_after_the_ok_runs_nothing_and_asks_again() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(!f.path("pwned").exists() && !f.path("ran").exists());
-    // Allow covers the folder as it is now: the case runs again
+    // Allow covers the folder as it is now: the case runs again, once the cases were listed
+    // again (maybe after a check of the folder) and the list stopped moving
+    let listed = f.path("listed");
+    let _ = std::fs::remove_file(&listed);
     h.get_by_label("Allow").click();
     wait(&mut h, "listed again", |a| {
-        a.tests.plugins[0].m.allowed && a.tests.plugins[0].loading.is_none()
+        let p = &a.tests.plugins[0];
+        p.m.allowed && listed.exists() && p.settled()
     });
     steps(&mut h, 3);
     click_in_row(&mut h, "Case A", ic::PLAY);
@@ -5877,6 +5881,8 @@ fn e2e_a_git_action_waiting_for_a_save_is_dropped_when_head_moved_meanwhile() {
             untracked: false,
         },
     );
+    // the state it was asked in is read before the commit below
+    h.state_mut().wait_asked();
     // a commit made outside Droid Lite while the disk is stuck
     let made = std::process::Command::new("git")
         .args(["commit", "-q", "--allow-empty", "-m", "elsewhere"])
@@ -5911,10 +5917,16 @@ fn e2e_an_action_waiting_for_a_save_shows_and_can_be_cancelled() {
     h.state_mut().tabs[i].mark_edited();
     h.state_mut().revert();
     steps(&mut h, 2);
-    assert!(h.query_by_label("Waiting for save: Revert User.kt").is_some());
+    assert!(
+        h.query_by_label("Waiting for save: Revert User.kt")
+            .is_some()
+    );
     h.get_by_label("Cancel Revert User.kt").click();
     steps(&mut h, 2);
-    assert!(h.query_by_label("Waiting for save: Revert User.kt").is_none());
+    assert!(
+        h.query_by_label("Waiting for save: Revert User.kt")
+            .is_none()
+    );
     unstick.send(()).unwrap();
     h.state_mut().wait_saves();
     assert!(tab(&h).text.ends_with("// more\n"), "not reverted");
@@ -5935,14 +5947,326 @@ fn e2e_an_edit_undone_while_an_action_waits_for_a_save_still_counts_as_a_change(
     a.settle_saves("git stash", counted(&runs));
     let i = a.active;
     // typed and typed away again: the same text, a newer version
-    a.tabs[i].text.push_str("x");
+    a.tabs[i].text.push('x');
     a.tabs[i].mark_edited();
     a.tabs[i].text.pop();
     a.tabs[i].mark_edited();
     unstick.send(()).unwrap();
     a.wait_saves();
     assert_eq!(runs.get(), 0);
-    assert!(a.status.contains("a text changed meanwhile"), "{}", a.status);
+    assert!(
+        a.status.contains("a text changed meanwhile"),
+        "{}",
+        a.status
+    );
+}
+
+/// The repository state ([`App::stamp`]) a test holds back: its root, how many more are
+/// worked out for it before that one, whether it is read before or after the hold, "held" and
+/// "go on".
+#[allow(clippy::type_complexity)]
+static HELD: Mutex<Option<(PathBuf, usize, bool, std::sync::mpsc::Sender<()>, Receiver<()>)>> =
+    Mutex::new(None);
+
+/// [`crate::git::state_stamp`], except the one [`hold_stamp`] holds back until the test's go.
+fn held_stamp(root: &Path) -> Option<String> {
+    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let due = match held.as_mut() {
+        Some((r, n, ..)) if r.as_path() == root => {
+            *n -= 1;
+            *n == 0
+        }
+        _ => false,
+    };
+    let gate = if due { held.take() } else { None };
+    drop(held);
+    let Some((_, _, read_first, held, go)) = gate else {
+        return crate::git::state_stamp(root);
+    };
+    let s = read_first.then(|| crate::git::state_stamp(root));
+    let _ = held.send(());
+    let _ = go.recv_timeout(Duration::from_secs(30));
+    s.unwrap_or_else(|| crate::git::state_stamp(root))
+}
+
+/// Holds back the `nth` (from 1) repository state the app works out from now on, read from git
+/// before the hold when `read_first`, else after it: (it is held, go on).
+fn hold_stamp(
+    a: &mut App,
+    nth: usize,
+    read_first: bool,
+) -> (Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let root = a.project.as_ref().unwrap().root.clone();
+    let (held_tx, held) = channel();
+    let (go, go_rx) = channel();
+    *HELD.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((root, nth, read_first, held_tx, go_rx));
+    a.stamp = held_stamp;
+    (held, go)
+}
+
+/// What git prints in `root`.
+fn git_out(root: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Lets the stuck save land and applies it, without running anything that waits on a git state.
+fn land_saves(a: &mut App) {
+    while a.saves_pending > 0 {
+        saver::wait();
+        a.poll_saves();
+    }
+}
+
+#[test]
+fn e2e_git_add_then_commit_queued_behind_a_save_both_run() {
+    let f = Fixture::new("after-saves-add-commit");
+    let mut h = f.harness();
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    let a = h.state_mut();
+    a.git_command(&["add", "app/src/main/java/com/demo/data/User.kt"]);
+    a.git_command(&["commit", "-q", "-m", "typed"]);
+    assert_eq!(a.after_saves.len(), 2);
+    unstick.send(()).unwrap();
+    a.wait_saves();
+    assert_eq!(git_out(&f.root, &["log", "-1", "--format=%s"]), "typed\n", "{}", a.status);
+    assert!(
+        git_out(&f.root, &["show", "--name-only", "--format=", "HEAD"]).contains("User.kt"),
+        "the commit has the file the add staged"
+    );
+}
+
+#[test]
+fn e2e_actions_on_same_named_files_or_of_two_kinds_wait_side_by_side() {
+    let f = Fixture::new("after-saves-same-name");
+    let other = f.path("app/src/main/java/com/demo/other/User.kt");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    std::fs::write(&other, "package com.demo.other\n").unwrap();
+    let mut h = f.harness();
+    let (user, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    open(&mut h, &other);
+    let a = h.state_mut();
+    let o = a.active;
+    a.tabs[o].text.push_str("// typed\n");
+    a.tabs[o].mark_edited();
+    let u = a.tabs.iter().position(|t| t.path == user).unwrap();
+    a.active = u;
+    a.revert();
+    a.active = o;
+    a.revert();
+    a.close_tab(u);
+    let keys: Vec<&str> = a.after_saves.iter().map(|w| w.key.as_str()).collect();
+    assert_eq!(keys.len(), 3, "{keys:?}");
+    unstick.send(()).unwrap();
+    a.wait_saves();
+    assert!(a.tabs.iter().all(|t| t.path != user), "closed: {}", a.status);
+    let t = a.tabs.iter().find(|t| t.path == other).unwrap();
+    assert_eq!(t.text, "package com.demo.other\n", "reverted");
+}
+
+#[test]
+fn e2e_a_git_action_waiting_for_a_save_is_dropped_when_files_were_staged_meanwhile() {
+    let f = Fixture::new("after-saves-staged");
+    let mut h = f.harness();
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    std::fs::write(f.path("notes.txt"), "notes\n").unwrap();
+    let a = h.state_mut();
+    a.git_command(&["commit", "-q", "--allow-empty", "-m", "mine"]);
+    a.wait_asked();
+    // staged outside Droid Lite while the disk is stuck
+    git_out(&f.root, &["add", "notes.txt"]);
+    unstick.send(()).unwrap();
+    a.wait_saves();
+    assert_ne!(git_out(&f.root, &["log", "-1", "--format=%s"]), "mine\n");
+    assert!(
+        a.status.starts_with(
+            "git commit -q --allow-empty -m mine did not run: the branch or the staged files changed meanwhile"
+        ),
+        "{}",
+        a.status
+    );
+}
+
+#[test]
+fn e2e_an_action_asked_for_while_others_wait_runs_after_them() {
+    let f = Fixture::new("after-saves-order");
+    let mut h = f.harness();
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    std::fs::write(f.path("notes.txt"), "notes\n").unwrap();
+    let a = h.state_mut();
+    // the commit's state when it is to run: read, then held back
+    let (read, go) = hold_stamp(a, 2, true);
+    a.git_command(&["commit", "-q", "--allow-empty", "-m", "first"]);
+    a.wait_asked();
+    unstick.send(()).unwrap();
+    land_saves(a);
+    read.recv_timeout(Duration::from_secs(30)).unwrap();
+    // no save on its way, the commit still waits: a new click waits behind it
+    a.git_command(&["add", "notes.txt"]);
+    assert_eq!(a.after_saves.len(), 2, "{}", a.status);
+    assert_eq!(git_out(&f.root, &["diff", "--cached", "--name-only"]), "");
+    go.send(()).unwrap();
+    a.wait_saves();
+    assert_eq!(git_out(&f.root, &["log", "-1", "--format=%s"]), "first\n", "{}", a.status);
+    assert!(!git_out(&f.root, &["show", "--name-only", "--format=", "HEAD"]).contains("notes"));
+    assert_eq!(
+        git_out(&f.root, &["diff", "--cached", "--name-only"]),
+        "notes.txt\n",
+        "the add ran after"
+    );
+}
+
+#[test]
+fn e2e_a_git_state_worked_out_while_git_ran_is_worked_out_again() {
+    let f = Fixture::new("after-saves-moved");
+    let mut h = f.harness();
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    std::fs::write(f.path("notes.txt"), "notes\n").unwrap();
+    let a = h.state_mut();
+    let (read, go) = hold_stamp(a, 2, true);
+    a.git_command(&["commit", "-q", "--allow-empty", "-m", "first"]);
+    a.wait_asked();
+    unstick.send(()).unwrap();
+    land_saves(a);
+    read.recv_timeout(Duration::from_secs(30)).unwrap();
+    // git run by this app after that state was read
+    crate::git::run(&f.root, &["add", "notes.txt"]).unwrap();
+    go.send(()).unwrap();
+    a.wait_saves();
+    assert_ne!(git_out(&f.root, &["log", "-1", "--format=%s"]), "first\n");
+    assert!(
+        a.status.ends_with("did not run: the branch or the staged files changed meanwhile"),
+        "{}",
+        a.status
+    );
+}
+
+#[test]
+fn e2e_a_git_action_whose_asked_state_was_read_while_git_ran_is_dropped() {
+    let f = Fixture::new("after-saves-asked-moved");
+    let mut h = f.harness();
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    std::fs::write(f.path("notes.txt"), "notes\n").unwrap();
+    let a = h.state_mut();
+    // the commit's state when asked: read only after the add below
+    let (held, go) = hold_stamp(a, 1, false);
+    a.git_command(&["commit", "-q", "-m", "first"]);
+    held.recv_timeout(Duration::from_secs(30)).unwrap();
+    crate::git::run(&f.root, &["add", "notes.txt"]).unwrap();
+    go.send(()).unwrap();
+    unstick.send(()).unwrap();
+    a.wait_saves();
+    assert_ne!(git_out(&f.root, &["log", "-1", "--format=%s"]), "first\n");
+    assert!(a.status.ends_with("did not run: git ran meanwhile"), "{}", a.status);
+}
+
+#[test]
+fn e2e_an_action_ahead_of_a_git_action_runs_while_the_git_state_is_worked_out() {
+    let f = Fixture::new("after-saves-ahead");
+    let mut h = f.harness();
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    let runs = std::rc::Rc::new(std::cell::Cell::new(0));
+    let a = h.state_mut();
+    // the commit's state when asked: read, then held back
+    let (read, go) = hold_stamp(a, 1, true);
+    a.settle_saves("Rename A → B", counted(&runs));
+    a.git_command(&["commit", "-q", "--allow-empty", "-m", "first"]);
+    read.recv_timeout(Duration::from_secs(30)).unwrap();
+    unstick.send(()).unwrap();
+    land_saves(a);
+    assert_eq!(runs.get(), 1, "{}", a.status);
+    assert_eq!(a.after_saves.len(), 1, "the commit waits");
+    go.send(()).unwrap();
+    a.wait_saves();
+    assert_eq!(git_out(&f.root, &["log", "-1", "--format=%s"]), "first\n", "{}", a.status);
+}
+
+#[test]
+fn e2e_an_action_behind_one_that_changed_a_text_still_runs() {
+    let f = Fixture::new("after-saves-revert-then");
+    let mut h = f.harness();
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    let runs = std::rc::Rc::new(std::cell::Cell::new(0));
+    let a = h.state_mut();
+    let i = a.active;
+    a.tabs[i].text.push_str("// more\n");
+    a.tabs[i].mark_edited();
+    a.revert();
+    a.settle_saves("git stash", counted(&runs));
+    unstick.send(()).unwrap();
+    a.wait_saves();
+    assert!(!a.tabs[i].text.ends_with("// more\n"), "reverted");
+    assert_eq!(runs.get(), 1, "{}", a.status);
+}
+
+#[test]
+fn e2e_every_action_dropped_in_a_round_stays_in_the_notices() {
+    let f = Fixture::new("after-saves-notices");
+    let mut h = f.harness();
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    let runs = std::rc::Rc::new(std::cell::Cell::new(0));
+    let a = h.state_mut();
+    a.settle_saves("Rename A → B", counted(&runs));
+    a.settle_saves("Rename C → D", counted(&runs));
+    let i = a.active;
+    a.tabs[i].text.push_str("// more\n");
+    a.tabs[i].mark_edited();
+    unstick.send(()).unwrap();
+    a.wait_saves();
+    assert_eq!(runs.get(), 0);
+    assert_eq!(
+        a.notices,
+        [
+            "Rename A → B did not run: a text changed meanwhile",
+            "Rename C → D did not run: a text changed meanwhile"
+        ]
+    );
+}
+
+#[test]
+fn e2e_waiting_actions_are_told_apart_by_their_place() {
+    let f = Fixture::new("after-saves-keys");
+    let mut h = f.harness();
+    let (user, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    let a = h.state_mut();
+    a.ask_rename("name", "title", std::slice::from_ref(&user));
+    a.ask_rename("name", "title", std::slice::from_ref(&card));
+    a.git_command(&["status"]);
+    a.write_translation("app_name".into(), 0, "Demo");
+    let keys: Vec<String> = a.after_saves.iter().map(|w| w.key.clone()).collect();
+    assert_eq!(keys.len(), 4, "{keys:?}");
+    let root = f.root.display().to_string();
+    assert!(keys[2].ends_with(&root), "{}", keys[2]);
+    assert!(keys[3].ends_with(&root), "{}", keys[3]);
+    unstick.send(()).unwrap();
+    a.wait_saves();
+}
+
+#[test]
+fn e2e_a_pr_check_out_waits_for_the_actions_waiting_for_a_save() {
+    let f = Fixture::new("after-saves-pr");
+    let mut h = f.harness();
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    let a = h.state_mut();
+    let (read, go) = hold_stamp(a, 1, true);
+    a.git_command(&["commit", "-q", "--allow-empty", "-m", "first"]);
+    read.recv_timeout(Duration::from_secs(30)).unwrap();
+    unstick.send(()).unwrap();
+    land_saves(a);
+    assert_eq!(
+        a.checkout_refusal(&f.root).as_deref(),
+        Some("Wait for the actions waiting for a save to finish")
+    );
+    go.send(()).unwrap();
+    a.wait_saves();
+    assert_eq!(a.checkout_refusal(&f.root), None);
 }
 
 #[test]

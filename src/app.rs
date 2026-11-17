@@ -226,13 +226,15 @@ const SAVE_WAIT_ON_QUIT: std::time::Duration = std::time::Duration::from_secs(10
 
 /// An action that must come after the saves on their way (a revert, a refactor, a git command):
 /// it runs once they landed, unless an open tab's text changed meanwhile, or for a git action
-/// the branch or the git index moved. One per `key`: asking again replaces it.
+/// the branch or the git index moved. One per `key`: asking again replaces it. Actions run in
+/// the order asked, also one asked for once the saves landed while others still wait.
 struct AfterSaves {
     /// What it says in the status bar ("Revert User.kt").
     what: String,
     /// What it is: its kind and the file's full path ("revert /p/a/User.kt").
     key: String,
-    /// The open tabs' text versions when it was asked for ([`App::tab_revs`]).
+    /// The open tabs' text versions when it was asked for ([`App::tab_revs`]), or as the action
+    /// before it left them.
     revs: Vec<u64>,
     /// A git action: the repository, its state then and its state when it is to run.
     git: Option<GitCheck>,
@@ -251,9 +253,11 @@ struct GitCheck {
 type StampFn = fn(&Path) -> Option<String>;
 
 enum Stamp {
-    Waiting(Receiver<Option<String>>),
-    /// `None`: git did not answer.
-    Got(Option<String>),
+    Waiting(Receiver<(Option<String>, bool)>),
+    /// The state (`None`: git did not answer), and whether a git command of this app changed the
+    /// repository while it was worked out ([`crate::git::writes`]): then it may be the state
+    /// from before that command or after it.
+    Got(Option<String>, bool),
 }
 
 impl Stamp {
@@ -262,8 +266,10 @@ impl Stamp {
     fn start(root: &Path, ctx: Option<egui::Context>, stamp: StampFn) -> Stamp {
         let (tx, rx) = channel();
         let root = root.to_path_buf();
+        let writes = crate::git::writes(&root);
         std::thread::spawn(move || {
-            let _ = tx.send(stamp(&root));
+            let s = stamp(&root);
+            let _ = tx.send((s, crate::git::writes(&root) != writes));
             if let Some(c) = ctx {
                 c.request_repaint();
             }
@@ -275,22 +281,30 @@ impl Stamp {
     fn poll(&mut self) -> Option<&Option<String>> {
         if let Stamp::Waiting(rx) = self {
             match rx.try_recv() {
-                Ok(s) => *self = Stamp::Got(s),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => *self = Stamp::Got(None),
+                Ok((s, moved)) => *self = Stamp::Got(s, moved),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => *self = Stamp::Got(None, false),
                 Err(std::sync::mpsc::TryRecvError::Empty) => return None,
             }
         }
         match self {
-            Stamp::Got(s) => Some(s),
+            Stamp::Got(s, _) => Some(s),
             Stamp::Waiting(_) => None,
         }
+    }
+
+    /// A git command of this app ran while the state was worked out.
+    fn moved(&self) -> bool {
+        matches!(self, Stamp::Got(_, true))
     }
 
     /// Waits until the state is in (tests).
     #[cfg(test)]
     fn wait(&mut self) {
         if let Stamp::Waiting(rx) = self {
-            *self = Stamp::Got(rx.recv().ok().flatten());
+            *self = match rx.recv() {
+                Ok((s, moved)) => Stamp::Got(s, moved),
+                Err(_) => Stamp::Got(None, false),
+            };
         }
     }
 }
@@ -536,8 +550,8 @@ pub struct App {
     shift_down: bool,
     last_shift: Option<Instant>,
     status: String,
-    /// Why actions that waited for a save did not run: stays in the status bar until dismissed.
-    notice: Option<String>,
+    /// Why actions that waited for a save did not run: stay in the status bar until dismissed.
+    notices: Vec<String>,
     /// Works out a repository's state for git actions waiting for a save, off this thread.
     stamp: StampFn,
     /// Dev check: `DROID_LITE_SHOT=out.png` saves a screenshot once indexing is done, then quits.
@@ -597,6 +611,8 @@ pub struct App {
     quit_now: bool,
     /// Actions waiting for the saves on their way ([`App::settle_saves`]).
     after_saves: Vec<AfterSaves>,
+    /// One of them runs now: asking for itself again goes through.
+    running_after_saves: bool,
     /// Results of saves the save thread ([`saver`]) wrote, and how many are still on their way.
     save_tx: Sender<saver::SaveDone>,
     save_rx: Receiver<saver::SaveDone>,
@@ -692,7 +708,7 @@ impl App {
             shift_down: false,
             last_shift: None,
             status: String::new(),
-            notice: None,
+            notices: Vec::new(),
             stamp: crate::git::state_stamp,
             shot: std::env::var_os("DROID_LITE_SHOT").map(|p| (PathBuf::from(p), 0)),
             refactor: None,
@@ -730,6 +746,7 @@ impl App {
             close_after_saves: false,
             quit_now: false,
             after_saves: Vec::new(),
+            running_after_saves: false,
             save_tx,
             save_rx,
             saves_pending: 0,
@@ -1083,47 +1100,57 @@ impl App {
     /// Runs the first action waiting for the saves once they all landed, checked against the
     /// texts and the repository as they are now, after the action before it ran. One per call:
     /// the next frame takes the next. A git action waits for the repository's state, worked out
-    /// off this thread; a state moved by the git action that ran just before it counts as its
-    /// own (`git add .` then `git commit`).
+    /// off this thread; a state moved by the action that ran just before it counts as its own
+    /// (`git add .` then `git commit`), and so do texts it changed (a revert). Order wins over
+    /// speed: an action behind a git action waits until that one ran or was dropped, also when
+    /// it is not a git action itself.
     fn run_after_saves(&mut self) {
         if self.saves_pending > 0 {
             return;
         }
         let ctx = self.ctx.clone();
-        // the states the git actions were asked for in, all in first: one that runs moves on
-        // those asked for in the state it ran in
-        let asked_in = self
-            .after_saves
-            .iter_mut()
-            .filter_map(|a| a.git.as_mut())
-            .all(|g| g.asked.poll().is_some());
-        if !asked_in {
-            return; // a frame is asked for when it is in
-        }
-        let Some(a) = self.after_saves.first_mut() else {
+        let Some(front) = self.after_saves.first() else {
             return;
         };
+        // a git action that runs moves on those asked for in the state it ran in: theirs are
+        // all in first. Only a git action waits for them.
+        if front.git.is_some()
+            && !self
+                .after_saves
+                .iter_mut()
+                .filter_map(|a| a.git.as_mut())
+                .all(|g| g.asked.poll().is_some())
+        {
+            return; // a frame is asked for when they are in
+        }
+        let a = &mut self.after_saves[0];
         let mut state = None;
         if let Some(g) = &mut a.git {
             let stamp = self.stamp;
             let now = g
                 .now
                 .get_or_insert_with(|| Stamp::start(&g.root, ctx.clone(), stamp));
-            let Some(now) = now.poll().cloned() else {
+            if now.poll().is_none() {
                 return; // a frame is asked for when it is in
-            };
-            let Some(asked) = g.asked.poll().cloned() else {
+            }
+            // a git command ran while it was worked out: worked out again
+            if now.moved() {
+                g.now = Some(Stamp::start(&g.root, ctx.clone(), stamp));
                 return;
-            };
+            }
+            let now = now.poll().cloned().flatten();
+            let asked = (!g.asked.moved()).then(|| g.asked.poll().cloned().flatten());
             state = Some((asked, now));
         }
         let a = self.after_saves.remove(0);
-        let why = if a.revs != self.tab_revs() {
+        let revs = self.tab_revs();
+        let why = if a.revs != revs {
             Some("a text changed meanwhile")
         } else {
             match &state {
-                Some((None, _) | (_, None)) => Some("git did not answer"),
-                Some((asked, now)) if asked != now => {
+                Some((None, _)) => Some("git ran meanwhile"),
+                Some((Some(None), _) | (_, None)) => Some("git did not answer"),
+                Some((Some(Some(asked)), Some(now))) if asked != now => {
                     Some("the branch or the staged files changed meanwhile")
                 }
                 _ => None,
@@ -1133,18 +1160,30 @@ impl App {
             Some(why) => {
                 let line = format!("{} did not run: {why}", a.what);
                 self.status = line.clone();
-                self.notice = Some(line);
+                self.notices.push(line);
             }
             None => {
                 let root = a.git.as_ref().map(|g| g.root.clone());
+                self.running_after_saves = true;
                 (a.run)(self);
+                self.running_after_saves = false;
+                // texts it changed count as the ones those after it were asked for with
+                let left = self.tab_revs();
+                if left != revs {
+                    for b in &mut self.after_saves {
+                        if b.revs == revs {
+                            b.revs = left.clone();
+                        }
+                    }
+                }
                 // a git action asked for in the state this one ran in is checked against the
                 // state it left
-                if let (Some(root), Some((_, ran_in))) = (root, state) {
+                if let (Some(root), Some((_, Some(ran_in)))) = (root, state) {
                     for b in &mut self.after_saves {
                         if let Some(g) = &mut b.git
                             && g.root == root
-                            && g.asked.poll() == Some(&ran_in)
+                            && !g.asked.moved()
+                            && g.asked.poll().is_some_and(|s| s.as_ref() == Some(&ran_in))
                         {
                             g.asked = Stamp::start(&root, ctx.clone(), self.stamp);
                         }
@@ -1174,7 +1213,7 @@ impl App {
         }
         let names: Vec<String> = self.after_saves.drain(..).map(|a| a.what).collect();
         self.status = format!("{} will not run: {why}", names.join(", "));
-        self.notice = Some(self.status.clone());
+        self.notices.push(self.status.clone());
     }
 
     /// Waits until the states the waiting git actions were asked for in are in (tests: before
@@ -2697,11 +2736,11 @@ impl App {
             }
             ui.label(RichText::new(&self.status).color(weak));
             // why actions that waited for a save did not run, until dismissed
-            if let Some(n) = &self.notice {
+            for n in &self.notices {
                 ui.label(RichText::new(n).color(WARN));
-                if ui.small_button("Dismiss").clicked() {
-                    self.notice = None;
-                }
+            }
+            if !self.notices.is_empty() && ui.small_button("Dismiss").clicked() {
+                self.notices.clear();
             }
             // actions waiting for a save on its way, each with a way out
             let mut cancel = None;
@@ -4592,6 +4631,8 @@ impl eframe::App for App {
         // a file a failed change took out is read again from disk, on the worker
         if self.index.rescan_due() {
             self.xref.submit("rescan", |s, _| s.rescan());
+        } else if let Some(wait) = self.index.repair_wait() {
+            ui.ctx().request_repaint_after(wait);
         }
         self.poll_usages();
         self.poll_logcat(&ctx);

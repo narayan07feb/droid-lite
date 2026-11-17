@@ -248,7 +248,7 @@ impl App {
         if self.refuse_during_checkout() {
             return;
         }
-        if self.saves_pending > 0 {
+        if self.waits_for_saves() {
             let (path, kind) = match &r {
                 Revert::Working { path, .. } => (path, "working"),
                 Revert::Branch { path, .. } => (path, "branch"),
@@ -297,7 +297,8 @@ impl App {
         let again =
             move |a: &mut App| a.git_command(&owned.iter().map(String::as_str).collect::<Vec<_>>());
         let what = format!("git {}", args.join(" "));
-        if !self.settle_git_saves(&what, &what, &root, again) {
+        let key = format!("{what} in {}", root.display());
+        if !self.settle_git_saves(&key, &what, &root, again) {
             return;
         }
         match git::run(&root, args) {
