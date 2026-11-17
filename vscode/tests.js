@@ -487,6 +487,9 @@ function location(project, file, line) {
 }
 
 // projectOf(): the project folder, read again on each load
+// a test item's id: VS Code refuses ids with a NUL character, so folder and case go as JSON
+const caseId = (folder, id) => JSON.stringify([folder, String(id)]);
+
 function setup(ctx, projectOf) {
   let project = projectOf();
   const ctrl = vscode.tests.createTestController('droidLite.tests', 'Droid Lite tests');
@@ -504,7 +507,7 @@ function setup(ctx, projectOf) {
 
   const addCases = (plugin, parent, cases) => {
     for (const c of cases || []) {
-      const id = `${plugin.folder}\u0000${c.id ?? c.label}`;
+      const id = caseId(plugin.folder, c.id ?? c.label);
       const loc = location(project, c.file, c.line);
       const item = ctrl.createTestItem(id, c.label || c.id, loc?.uri);
       if (loc) item.range = new vscode.Range(loc.range.start, loc.range.start);
@@ -908,4 +911,5 @@ function setup(ctx, projectOf) {
   return { load, readPlugins, loaded };
 }
 
-module.exports = { setup, readPlugins, argv, json, findPluginJson, location, limits, procs, treeHash, treeStat, settled, changed, approve, removeStale, utf8Name };
+module.exports = {
+  caseId, setup, readPlugins, argv, json, findPluginJson, location, limits, procs, treeHash, treeStat, settled, changed, approve, removeStale, utf8Name };

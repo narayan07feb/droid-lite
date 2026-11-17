@@ -113,7 +113,11 @@ const fake = {
       };
       ctrl = {
         items: coll(),
-        createTestItem: (id, label, uri) => { const i = { id, label, uri, children: coll() }; items.set(id, i); return i; },
+        // like VS Code: an id with a NUL character is refused (0.5.7 shipped such ids, no tests loaded)
+        createTestItem: (id, label, uri) => {
+          if (id.includes('\0')) throw new Error(`Test IDs may not include the "${id}" symbol`);
+          const i = { id, label, uri, children: coll() }; items.set(id, i); return i;
+        },
         createRunProfile: (_n, _k, run) => { profile = run; },
         createTestRun: () => {
           const ev = [];
@@ -202,9 +206,9 @@ const later = async (f) => {
   const ex = idOf('example');
   const root = ctrl.items.get(`plugin:${ex}`);
   assert.ok(root && !root.error && root.label === 'Example tests', 'example plugin listed');
-  const login = root.children.get(`${ex}\u0000Login`);
-  const ok = login.children.get(`${ex}\u0000ok`);
-  const bad = login.children.get(`${ex}\u0000bad`);
+  const login = root.children.get(tests.caseId(ex, 'Login'));
+  const ok = login.children.get(tests.caseId(ex, 'ok'));
+  const bad = login.children.get(tests.caseId(ex, 'bad'));
   assert.strictEqual(ok.uri.fsPath, path.join(project, 'flows/login.yaml'), 'file relative to the project');
   assert.strictEqual(ok.range.start.line, 1, '1-based line 2 -> 0-based 1');
   assert.ok(ctrl.items.get(`plugin:${idOf('broken')}`).error, 'broken plugin shows its error');
@@ -249,7 +253,7 @@ const later = async (f) => {
   check('Remove without a user plugins folder says it comes with the project', /comes with the project/.test(fake.info));
 
   const tools = ctrl.items.get(`plugin:${idOf('tools')}`);
-  const toolCase = (id) => tools.children.get(`${idOf('tools')}\u0000${id}`);
+  const toolCase = (id) => tools.children.get(tests.caseId(idOf('tools'), id));
   const quiet = (ev) => ev.filter((e) => e[0] !== 'out');
 
   // garbage file/line: no place, no throw
@@ -305,7 +309,7 @@ const later = async (f) => {
     && outs.includes('after'));
 
   // a missing command: reported once (errored, not also failed), nothing throws
-  const missing = ctrl.items.get(`plugin:${idOf('missing')}`).children.get(`${idOf('missing')}\u0000m`);
+  const missing = ctrl.items.get(`plugin:${idOf('missing')}`).children.get(tests.caseId(idOf('missing'), 'm'));
   ev = await go([missing]);
   check('a missing command is reported once', JSON.stringify(quiet(ev).slice(1, -1).map((e) => e[0])) === '["errored"]');
   const rowsOf = async () => tree.getChildren();
@@ -464,7 +468,7 @@ const later = async (f) => {
   check('a load reads the project again', !roots().some((i) => i.label === 'Tools')
     && roots().filter((i) => i.label === 'Dup').length === 2);
   check('same-name plugins get their own test items', [userDup, projectDup].every((f) =>
-    ctrl.items.get(`plugin:${f}`)?.children.get(`${f}\u0000c`)?.label === f));
+    ctrl.items.get(`plugin:${f}`)?.children.get(tests.caseId(f, 'c'))?.label === f));
   const dupRows = (await tree.getChildren()).filter((r) => r.label === 'Dup');
   visibility({ visible: true });
   const rowOf = async (r) => tree.getChildren(r);
@@ -512,7 +516,7 @@ const later = async (f) => {
   await api3.load();
   await api3.loaded;
   const raceId = fs.realpathSync(raceDir);
-  const raceCase = ctrl.items.get(`plugin:${raceId}`)?.children.get(`${raceId}\u0000c`);
+  const raceCase = ctrl.items.get(`plugin:${raceId}`)?.children.get(tests.caseId(raceId, 'c'));
   ev = await go([raceCase]);
   check('an older load that ends last does not win: the run uses the newest plugin.json', raceCase?.label === 'new'
     && fs.readFileSync(raceOut, 'utf8').trim() === 'new' && quiet(ev).some((e) => e[0] === 'passed'));
@@ -544,7 +548,7 @@ const later = async (f) => {
     && modal.detail.includes(JSON.stringify(gateSpec.views[0].run)) && modal.detail.includes(JSON.stringify(gateSpec.actions[0].run)));
   await until('the list to run', () => fs.existsSync(marks), 3000).catch(() => {});
   check('Allow runs list', fs.existsSync(marks) && fs.readFileSync(marks, 'utf8').includes('list')
-    && ctrl.items.get(`plugin:${gateId}`)?.children.get(`${gateId}\u0000g`));
+    && ctrl.items.get(`plugin:${gateId}`)?.children.get(tests.caseId(gateId, 'g')));
   const saved = readStore();
   check('the store (v2, 0600) keeps other entries, holds the tree hash per project, no temp or lock file left',
     saved.version === 2 && saved.approved['/some/app']['/some/app/.droid-lite/plugins/p'] === 'abc123'
@@ -565,7 +569,7 @@ const later = async (f) => {
   check('a broken store is not overwritten', fs.readFileSync(store, 'utf8') === 'not json' && /could not save the OK/.test(fake.err));
   fs.writeFileSync(store, JSON.stringify(saved));
   // the user's own plugins need no OK
-  check('a user plugin needs no OK', !JSON.stringify(readStore()).includes(userDup) && ctrl.items.get(`plugin:${userDup}`)?.children.get(`${userDup}\u0000c`));
+  check('a user plugin needs no OK', !JSON.stringify(readStore()).includes(userDup) && ctrl.items.get(`plugin:${userDup}`)?.children.get(tests.caseId(userDup, 'c')));
   const allowGate = async () => {
     fake.answer = 'Allow';
     await commands['droidLite.allowTestPlugin']((await tree.getChildren()).find((r) => r.label === 'Gate' && r.pending).pending);
@@ -594,7 +598,7 @@ const later = async (f) => {
   const gatePlugin = async () => (await tree.getChildren()).find((r) => r.label === 'Gate' && r.plugin)?.plugin;
   const refusedBy = {
     list: async (p) => { try { await tests.json(tests.argv(p.spec.list, p, project3), p, project3); } catch (e) { return e.message; } },
-    run: async () => (await go([ctrl.items.get(`plugin:${gateId}`).children.get(`${gateId}\u0000g`)])).find((e) => e[0] === 'errored')?.[2],
+    run: async () => (await go([ctrl.items.get(`plugin:${gateId}`).children.get(tests.caseId(gateId, 'g'))])).find((e) => e[0] === 'errored')?.[2],
     watch: async () => { visibility({ visible: false }); visibility({ visible: true }); await sleep(300); return ctrl.items.get(`needs-ok:${gateId}`)?.error; },
     view: async (p) => {
       const row = (await tree.getChildren()).find((r) => r.plugin === p);
@@ -962,7 +966,7 @@ const t = require(process.argv[2]);
   const apiW = tests.setup(ctxW, () => projectW);
   await apiW.loaded;
   const wId = real(wDir);
-  check('a project plugin\'s commands get PYTHONDONTWRITEBYTECODE=1', ctrl.items.get(`plugin:${wId}`)?.children.get(`${wId}\u0000c`)?.label === 'py=1');
+  check('a project plugin\'s commands get PYTHONDONTWRITEBYTECODE=1', ctrl.items.get(`plugin:${wId}`)?.children.get(tests.caseId(wId, 'c'))?.label === 'py=1');
   visibility({ visible: true });
   await until('the W watch', () => pidsIn(wPid).length === 1);
   const wWatch = pidsIn(wPid)[0];
