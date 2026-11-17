@@ -245,6 +245,11 @@ impl State {
         }
     }
 
+    /// [`Shared::rescan`] on this thread.
+    pub(super) fn rescan(&self) {
+        self.index.rescan();
+    }
+
     /// Drops what the worker kept of the old project (another one opens).
     fn forget(&self) {
         self.done.borrow_mut().clear();
@@ -1217,31 +1222,50 @@ mod tests {
         assert!(Arc::ptr_eq(&one.usages, &two.usages));
     }
 
+    /// Set when the test that holds it ends (passed or failed): a long pass it started stops
+    /// then, on that signal, not after a guessed time.
+    struct EndOfTest(Arc<std::sync::atomic::AtomicBool>);
+
+    impl EndOfTest {
+        fn new() -> EndOfTest {
+            EndOfTest(Arc::default())
+        }
+        fn flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+            self.0.clone()
+        }
+    }
+
+    impl Drop for EndOfTest {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// How long a test waits for a signal before it fails: long, so a loaded machine does not
+    /// fail it; a passing test never waits it out.
+    const SIGNAL: Duration = Duration::from_secs(60);
+
     #[test]
     fn a_request_someone_waits_for_runs_between_chunks_of_a_long_pass() {
         use std::sync::atomic::AtomicBool;
+        let end = EndOfTest::new();
         let mut x = Xref::start(Shared::default(), None);
         let served = Arc::new(AtomicBool::new(false));
         let (done_tx, done_rx) = channel();
         let (started_tx, started_rx) = channel();
-        let flag = served.clone();
+        let (flag, ended) = (served.clone(), end.flag());
         x.submit(FILE, move |s, stale| {
             let (texts, cache) = (Texts::default(), Cache::default());
-            let t = Instant::now();
-            // chunk after chunk until the request ran (or ten seconds went by)
+            // chunk after chunk until the request ran (or the test ended)
             let _ = in_chunks(s, &texts, &cache, stale, |_| {
                 let _ = started_tx.send(());
                 std::thread::sleep(Duration::from_millis(1));
-                flag.load(Ordering::SeqCst) || t.elapsed() > Duration::from_secs(10)
+                flag.load(Ordering::SeqCst) || ended.load(Ordering::SeqCst)
             });
             let _ = done_tx.send(flag.load(Ordering::SeqCst));
         });
         // the request is sent only once the pass is in its chunks
-        assert_eq!(
-            started_rx.recv_timeout(Duration::from_secs(5)),
-            Ok(()),
-            "the pass started"
-        );
+        assert_eq!(started_rx.recv_timeout(SIGNAL), Ok(()), "the pass started");
         let (tx, rx) = channel();
         let flag = served.clone();
         x.submit("find", move |_, _| {
@@ -1249,12 +1273,12 @@ mod tests {
             let _ = tx.send(());
         });
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(5)),
+            rx.recv_timeout(SIGNAL),
             Ok(()),
             "answered before the pass ended"
         );
         assert_eq!(
-            done_rx.recv_timeout(Duration::from_secs(15)),
+            done_rx.recv_timeout(SIGNAL),
             Ok(true),
             "the pass went on after it"
         );
@@ -1263,6 +1287,7 @@ mod tests {
     #[test]
     fn a_second_request_runs_between_chunks_of_one_served_inside_a_long_pass() {
         use std::sync::atomic::AtomicBool;
+        let end = EndOfTest::new();
         let mut x = Xref::start(Shared::default(), None);
         let (hovered, found) = (
             Arc::new(AtomicBool::new(false)),
@@ -1271,37 +1296,27 @@ mod tests {
         let (pass_tx, pass_rx) = channel();
         let (find_tx, find_rx) = channel();
         let (done_tx, done_rx) = channel();
-        let flag = found.clone();
+        let (flag, ended) = (found.clone(), end.flag());
         x.submit(FILE, move |s, stale| {
             let (texts, cache) = (Texts::default(), Cache::default());
-            let t = Instant::now();
             let _ = in_chunks(s, &texts, &cache, stale, |_| {
                 let _ = pass_tx.send(());
-                flag.load(Ordering::SeqCst) || t.elapsed() > Duration::from_secs(20)
+                flag.load(Ordering::SeqCst) || ended.load(Ordering::SeqCst)
             });
         });
-        assert_eq!(
-            pass_rx.recv_timeout(Duration::from_secs(5)),
-            Ok(()),
-            "the pass started"
-        );
+        assert_eq!(pass_rx.recv_timeout(SIGNAL), Ok(()), "the pass started");
         // a long Find, served between the pass's chunks
-        let (flag, done) = (hovered.clone(), found.clone());
+        let (flag, done, ended) = (hovered.clone(), found.clone(), end.flag());
         x.submit("find", move |s, stale| {
             let (texts, cache) = (Texts::default(), Cache::default());
-            let t = Instant::now();
             let _ = in_chunks(s, &texts, &cache, stale, |_| {
                 let _ = find_tx.send(());
-                flag.load(Ordering::SeqCst) || t.elapsed() > Duration::from_secs(10)
+                flag.load(Ordering::SeqCst) || ended.load(Ordering::SeqCst)
             });
             done.store(true, Ordering::SeqCst);
             let _ = done_tx.send(flag.load(Ordering::SeqCst));
         });
-        assert_eq!(
-            find_rx.recv_timeout(Duration::from_secs(5)),
-            Ok(()),
-            "the find started"
-        );
+        assert_eq!(find_rx.recv_timeout(SIGNAL), Ok(()), "the find started");
         let (tx, rx) = channel();
         let flag = hovered.clone();
         x.submit("hover", move |_, _| {
@@ -1309,12 +1324,12 @@ mod tests {
             let _ = tx.send(());
         });
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(5)),
+            rx.recv_timeout(SIGNAL),
             Ok(()),
             "answered before the find ended"
         );
         assert_eq!(
-            done_rx.recv_timeout(Duration::from_secs(15)),
+            done_rx.recv_timeout(SIGNAL),
             Ok(true),
             "the find went on after it"
         );
@@ -1334,7 +1349,7 @@ mod tests {
             let _ = tx.send(class as u32);
         });
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(5)),
+            rx.recv_timeout(SIGNAL),
             Ok(libc::qos_class_t::QOS_CLASS_UTILITY as u32)
         );
     }

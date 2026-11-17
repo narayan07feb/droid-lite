@@ -131,8 +131,7 @@ impl App {
                             .iter()
                             .find(|t| t.path == path && t.text == text && t.dirty_since.is_none())
                             .map_or_else(|| std::sync::Arc::new(syms), |t| t.syms.clone());
-                        let p = path.clone();
-                        self.index.change(move |i| i.insert_scanned(p, syms));
+                        self.index.put(path.clone(), syms);
                     }
                     if let Some(t) = self.tabs.iter_mut().find(|t| t.path == path) {
                         t.deleted = false;

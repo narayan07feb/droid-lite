@@ -97,6 +97,14 @@ struct Tab {
     rev: u64,
 }
 
+/// A file's name for the status bar.
+fn short_name(p: &Path) -> String {
+    p.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// A text version no tab had before: a tab opened again never repeats one, so a result worked
 /// out for an older text of its file is never taken for this one.
 fn new_rev() -> u64 {
@@ -217,10 +225,14 @@ const SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
 const SAVE_WAIT_ON_QUIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// An action that must come after the saves on their way (a revert, a refactor, a git command):
-/// it runs once they landed, unless an open tab's text changed meanwhile.
+/// it runs once they landed, unless an open tab's text changed meanwhile, or for a git action
+/// the branch or the git index moved. One per `what`: asking again replaces it.
 struct AfterSaves {
     what: String,
-    texts: u64,
+    /// The open tabs' text versions when it was asked for ([`App::tab_revs`]).
+    revs: Vec<u64>,
+    /// A git action: the repository and its state then ([`crate::git::state_stamp`]).
+    git: Option<(PathBuf, Option<String>)>,
     run: Box<dyn FnOnce(&mut App)>,
 }
 
@@ -730,6 +742,7 @@ impl App {
         }
         self.switch_to = None;
         self.copy_error = None;
+        self.drop_after_saves("another project opened");
         self.backups_kept(&[]);
         for t in std::mem::take(&mut self.tabs) {
             self.forget_tab(&t);
@@ -996,26 +1009,43 @@ impl App {
                 saver::Outcome::Failed(s) => self.status = s,
             }
         }
-        if self.saves_pending == 0 && !self.after_saves.is_empty() {
-            let texts = self.texts_digest();
-            for a in std::mem::take(&mut self.after_saves) {
-                if a.texts == texts {
-                    (a.run)(self);
-                } else {
-                    self.status = format!("{} did not run: a text changed meanwhile", a.what);
-                }
+        if self.saves_pending > 0 || self.after_saves.is_empty() {
+            return;
+        }
+        // the texts they were asked for against, before any of them ran
+        let revs = self.tab_revs();
+        // one at a time: one that runs may drop the rest (a checkout)
+        while self.saves_pending == 0 && !self.after_saves.is_empty() {
+            let a = self.after_saves.remove(0);
+            if a.revs != revs {
+                self.status = format!("{} did not run: a text changed meanwhile", a.what);
+            } else if let Some((root, stamp)) = &a.git
+                && crate::git::state_stamp(root) != *stamp
+            {
+                self.status = format!(
+                    "{} did not run: the branch or the staged files changed meanwhile",
+                    a.what
+                );
+            } else {
+                (a.run)(self);
             }
         }
     }
 
-    /// A digest of the open tabs' paths and texts.
-    fn texts_digest(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        for t in &self.tabs {
-            (&t.path, &t.text).hash(&mut h);
+    /// The open tabs' text versions, in order. Read after [`App::settle`]: a version then
+    /// changes only when a text does.
+    fn tab_revs(&self) -> Vec<u64> {
+        self.tabs.iter().map(|t| t.rev).collect()
+    }
+
+    /// Drops every action waiting for the saves (another project, a branch checked out), with
+    /// `why` in the status bar.
+    pub(super) fn drop_after_saves(&mut self, why: &str) {
+        if self.after_saves.is_empty() {
+            return;
         }
-        h.finish()
+        let names: Vec<String> = self.after_saves.drain(..).map(|a| a.what).collect();
+        self.status = format!("{} will not run: {why}", names.join(", "));
     }
 
     /// Waits for every save sent so far and applies them (tests).
@@ -1034,7 +1064,8 @@ impl App {
                     a.close_tab(i);
                 }
             };
-            if !self.settle_saves("Close", again) {
+            let what = format!("Close {}", short_name(&t.path));
+            if !self.settle_saves(&what, again) {
                 return;
             }
         }
@@ -1086,6 +1117,7 @@ impl App {
         let Some(p) = self.tabs.get(self.active).map(|t| t.path.clone()) else {
             return;
         };
+        let what = format!("Revert {}", short_name(&p));
         let again = move |a: &mut App| {
             if let Some(i) = a.tabs.iter().position(|t| t.path == p) {
                 let active = std::mem::replace(&mut a.active, i);
@@ -1093,7 +1125,7 @@ impl App {
                 a.active = active;
             }
         };
-        if !self.settle_saves("Revert", again) {
+        if !self.settle_saves(&what, again) {
             return;
         }
         if let Some(t) = self.tabs.get_mut(self.active) {
@@ -2509,6 +2541,21 @@ impl App {
                     );
             }
             ui.label(RichText::new(&self.status).color(weak));
+            // actions waiting for a save on its way, each with a way out
+            let mut cancel = None;
+            for a in &self.after_saves {
+                ui.label(RichText::new(format!("Waiting for save: {}", a.what)).color(WARN));
+                if ui
+                    .small_button(format!("Cancel {}", a.what))
+                    .on_hover_text("Do not run it when the save is done")
+                    .clicked()
+                {
+                    cancel = Some(a.what.clone());
+                }
+            }
+            if let Some(what) = cancel {
+                self.cancel_after_saves(&what);
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 14.0;
                 if let Some(t) = self.tabs.get(self.active) {
@@ -4378,6 +4425,10 @@ impl eframe::App for App {
         // index changes an edit queued while the worker was reading go in now
         if !self.index.flush() {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(10));
+        }
+        // a file a failed change took out is read again from disk, on the worker
+        if self.index.rescan_due() {
+            self.xref.submit("rescan", |s, _| s.rescan());
         }
         self.poll_usages();
         self.poll_logcat(&ctx);

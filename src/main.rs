@@ -223,20 +223,30 @@ fn bench(dir: &std::path::Path) {
         runs[12],
         big.file_name().unwrap_or_default().to_string_lossy()
     );
-    // the same file every run (a map's order changes per process): the largest one
-    let any = idx
-        .files
-        .keys()
-        .filter_map(|p| Some((std::fs::metadata(p).ok()?.len(), p.clone())))
-        .max()
-        .map(|(_, p)| p)
-        .unwrap_or_default();
+    let any = keystroke_file(&idx, std::env::var_os("DROID_LITE_BENCH_FILE"));
+    println!("  keystroke file: {}", any.display());
     let src = std::fs::read_to_string(&any).unwrap_or_default();
     let idx = std::cell::RefCell::new(idx);
     median("re-index one file (per keystroke)", &|| {
         idx.borrow_mut().update(&any, &src);
         src.len()
     });
+}
+
+/// The file the per-keystroke bench re-indexes, the same every run (a map's order changes per
+/// process): `pinned` (the perf check names one for both builds it compares), else the largest.
+fn keystroke_file(idx: &index::Index, pinned: Option<std::ffi::OsString>) -> std::path::PathBuf {
+    pinned
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file())
+        .or_else(|| {
+            idx.files
+                .keys()
+                .filter_map(|p| Some((std::fs::metadata(p).ok()?.len(), p.clone())))
+                .max()
+                .map(|(_, p)| p)
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(all(test, unix))]
@@ -276,6 +286,114 @@ mod script_tests {
         let result = (String::from_utf8_lossy(&out.stderr).into_owned(), ran.exists());
         let _ = std::fs::remove_dir_all(&bin);
         result
+    }
+
+    #[test]
+    fn the_keystroke_bench_takes_the_pinned_file_else_the_largest() {
+        let dir = std::env::temp_dir().join(format!("droid-lite-bench-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (small, big) = (dir.join("A.kt"), dir.join("B.kt"));
+        std::fs::write(&small, "class A\n").unwrap();
+        std::fs::write(&big, "class B\n// a longer file\n").unwrap();
+        let idx = crate::index::Index::build(&[small.clone(), big.clone()]);
+        let pick = |p: Option<&Path>| super::keystroke_file(&idx, p.map(|p| p.into()));
+        let (pinned, largest, gone) = (
+            pick(Some(&small)),
+            pick(None),
+            pick(Some(&dir.join("C.kt"))),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(pinned, small);
+        assert_eq!(largest, big);
+        assert_eq!(gone, big, "a pinned file that is gone");
+    }
+
+    /// Runs `scripts/perf_check.py old new` with fake bench builds (shell scripts, `old` and
+    /// `new`): (its output, whether it passed, what each run of the old one was asked to pin).
+    fn perf_check(name: &str, old: &str, new: &str) -> (String, bool, String) {
+        let dir =
+            std::env::temp_dir().join(format!("droid-lite-perf-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("project")).unwrap();
+        let script = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            let exe = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+            std::fs::set_permissions(&p, exe).unwrap();
+            p
+        };
+        let log = dir.join("old-pins");
+        let (old, new) = (
+            script(
+                "old",
+                &format!("echo \"$DROID_LITE_BENCH_FILE\" >> {log:?}\n{old}"),
+            ),
+            script("new", new),
+        );
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let driver = format!(
+            "import sys\nsys.path.insert(0, {scripts:?})\nimport perf_check as p\n\
+             p.git = lambda *a: a[1].split('^')[0]\n\
+             p.build = lambda sha: {{'old': {old:?}, 'new': {new:?}}}[sha]\n\
+             sys.argv = ['perf_check', 'old', 'new', '--project', {project:?}, '--rounds', '2']\n\
+             p.main()\n",
+            scripts = repo.join("scripts").display().to_string(),
+            old = old.display().to_string(),
+            new = new.display().to_string(),
+            project = dir.join("project").display().to_string(),
+        );
+        let out = std::process::Command::new("python3")
+            .args(["-I", "-c", &driver])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        let pins = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        (text, out.status.success(), pins)
+    }
+
+    /// A fake bench: the per-keystroke step at `ms`, and the file it re-indexed when `says`.
+    fn bench_output(ms: &str, says: bool) -> String {
+        let file = if says {
+            "echo \"  keystroke file: ${DROID_LITE_BENCH_FILE:-/its/own/largest}\"\n"
+        } else {
+            ""
+        };
+        format!(
+            "{file}printf '%-34s %8.2f ms  %+8.1f MB heap\\n' 're-index one file (per keystroke)' {ms} 0"
+        )
+    }
+
+    #[test]
+    fn the_perf_check_pins_one_keystroke_file_for_both_builds() {
+        let (out, ok, pins) = perf_check(
+            "pin",
+            &bench_output("0.10", true),
+            &bench_output("0.10", true),
+        );
+        assert!(ok, "{out}");
+        let pins: Vec<&str> = pins.lines().collect();
+        assert_eq!(pins.len(), 3, "a warm-up and two rounds: {out}");
+        assert!(pins.iter().all(|p| *p == "/its/own/largest"), "{pins:?}");
+        assert!(
+            out.contains("per-keystroke file (both): /its/own/largest"),
+            "{out}"
+        );
+        assert!(!out.contains("not compared"), "{out}");
+    }
+
+    #[test]
+    fn the_perf_check_does_not_compare_keystroke_times_of_an_old_build_that_picks_its_own_file() {
+        let (out, ok, _) = perf_check(
+            "own",
+            &bench_output("0.10", false),
+            &bench_output("9.40", true),
+        );
+        assert!(ok, "a different file is no slowdown: {out}");
+        assert!(out.contains("not compared"), "{out}");
     }
 
     #[test]

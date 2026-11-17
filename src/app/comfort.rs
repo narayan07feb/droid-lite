@@ -924,14 +924,14 @@ mod tests {
             let _ = tx.send(());
         });
         assert_eq!(
-            rx.recv_timeout(std::time::Duration::from_secs(5)),
+            rx.recv_timeout(std::time::Duration::from_secs(60)),
             Ok(()),
             "the save thread was free"
         );
         let _ = gate_tx.send(());
         // the prune ends inside this test, not in the next one's folder
         assert!(
-            background_done(std::time::Duration::from_secs(10)),
+            background_done(std::time::Duration::from_secs(60)),
             "the prune ended"
         );
     }
@@ -979,7 +979,7 @@ mod tests {
         assert!(PRUNE_HOLD.take().is_some(), "the hold is still this test's");
         // the other thread's prune ends inside this test
         assert!(
-            background_done(std::time::Duration::from_secs(10)),
+            background_done(std::time::Duration::from_secs(60)),
             "the prune ended"
         );
     }

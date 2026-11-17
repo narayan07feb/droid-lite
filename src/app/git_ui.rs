@@ -249,8 +249,12 @@ impl App {
             return;
         }
         if self.saves_pending > 0 {
-            let root = root.to_path_buf();
-            self.settle_saves("Revert", move |a| a.revert_file(&root, r));
+            let path = match &r {
+                Revert::Working { path, .. } | Revert::Branch { path, .. } => path,
+            };
+            let what = format!("Git revert {}", super::short_name(path));
+            let at = root.to_path_buf();
+            self.settle_git_saves(&what, root, move |a| a.revert_file(&at, r));
             return;
         }
         let (path, res) = match r {
@@ -290,7 +294,7 @@ impl App {
         let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
         let again =
             move |a: &mut App| a.git_command(&owned.iter().map(String::as_str).collect::<Vec<_>>());
-        if !self.settle_saves(&format!("git {}", args.join(" ")), again) {
+        if !self.settle_git_saves(&format!("git {}", args.join(" ")), &root, again) {
             return;
         }
         match git::run(&root, args) {
@@ -300,6 +304,8 @@ impl App {
         self.git.changes_stale = true;
         if args[0] == "checkout" {
             self.branch = git::branch(&root);
+            // what waited was asked for on the old branch
+            self.drop_after_saves("a checkout ran first");
         }
     }
 

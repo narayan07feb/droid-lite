@@ -263,7 +263,14 @@ impl App {
         }
         if self.saves_pending > 0 {
             let text = text.to_string();
-            self.settle_saves("Translation", move |a| a.write_translation(key, col, &text));
+            let folder = self
+                .translations
+                .table
+                .as_ref()
+                .and_then(|(_, t)| t.folders.get(col).cloned())
+                .unwrap_or_default();
+            let what = format!("Translation of {key} in {folder}");
+            self.settle_saves(&what, move |a| a.write_translation(key, col, &text));
             return;
         }
         let Some((_, table)) = &self.translations.table else {

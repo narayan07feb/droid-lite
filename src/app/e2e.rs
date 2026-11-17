@@ -5741,7 +5741,7 @@ fn e2e_a_stuck_save_never_freezes_the_window_and_a_revert_runs_once_it_lands() {
     assert!(
         h.state()
             .status
-            .starts_with("Revert runs when the save on its way is done"),
+            .starts_with("Revert User.kt runs when the save on its way is done"),
         "{}",
         h.state().status
     );
@@ -5770,6 +5770,7 @@ fn e2e_an_action_waiting_for_a_save_does_not_run_after_more_typing() {
     h.state_mut().tabs[a]
         .text
         .push_str("// typed after the revert\n");
+    h.state_mut().tabs[a].mark_edited();
     unstick.send(()).unwrap();
     h.state_mut().wait_saves();
     assert!(
@@ -5779,9 +5780,178 @@ fn e2e_an_action_waiting_for_a_save_does_not_run_after_more_typing() {
     assert!(
         h.state()
             .status
-            .starts_with("Revert did not run: a text changed meanwhile"),
+            .starts_with("Revert User.kt did not run: a text changed meanwhile"),
         "{}",
         h.state().status
+    );
+}
+
+/// Hangs the save thread (a stuck network disk) until the returned sender sends or is dropped
+/// (a test that fails first lets it go as it unwinds).
+fn stuck_disk() -> std::sync::mpsc::Sender<()> {
+    let (unstick, stuck) = channel::<()>();
+    saver::run(move || {
+        let _ = stuck.recv_timeout(Duration::from_secs(30));
+    });
+    unstick
+}
+
+/// Opens User.kt, types at its end and saves it behind a stuck disk: (User.kt, the sender that
+/// lets the disk go).
+fn save_on_a_stuck_disk(
+    f: &Fixture,
+    h: &mut Harness<'static, App>,
+) -> (PathBuf, std::sync::mpsc::Sender<()>) {
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(h, &user);
+    let unstick = stuck_disk();
+    let a = h.state_mut();
+    a.settings.autosave = false;
+    let i = a.active;
+    a.tabs[i].text.push_str("// typed\n");
+    a.tabs[i].mark_edited();
+    a.save_tab(false);
+    (user, unstick)
+}
+
+/// An action that counts its runs.
+fn counted(n: &std::rc::Rc<std::cell::Cell<u32>>) -> impl FnOnce(&mut App) + 'static {
+    let n = n.clone();
+    move |_| n.set(n.get() + 1)
+}
+
+#[test]
+fn e2e_an_action_asked_for_twice_while_a_save_is_on_its_way_runs_once() {
+    let f = Fixture::new("after-saves-twice");
+    let mut h = f.harness();
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    let runs = std::rc::Rc::new(std::cell::Cell::new(0));
+    let a = h.state_mut();
+    assert!(!a.settle_saves("git stash", counted(&runs)));
+    assert!(!a.settle_saves("git stash", counted(&runs)));
+    unstick.send(()).unwrap();
+    a.wait_saves();
+    assert_eq!(runs.get(), 1);
+}
+
+#[test]
+fn e2e_actions_waiting_for_a_save_are_dropped_when_another_project_opens() {
+    let f = Fixture::new("after-saves-switch");
+    let mut h = f.harness();
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    let runs = std::rc::Rc::new(std::cell::Cell::new(0));
+    h.state_mut().settle_saves("git stash", counted(&runs));
+    let (other, ctx) = (f.path("app"), h.ctx.clone());
+    h.state_mut().switch_project(&other, &ctx);
+    assert!(h.state().after_saves.is_empty());
+    unstick.send(()).unwrap();
+    h.state_mut().wait_saves();
+    assert_eq!(runs.get(), 0);
+}
+
+#[test]
+fn e2e_a_checkout_that_waited_for_a_save_drops_the_actions_queued_after_it() {
+    let f = Fixture::new("after-saves-checkout");
+    let mut h = f.harness();
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    let runs = std::rc::Rc::new(std::cell::Cell::new(0));
+    let a = h.state_mut();
+    a.git_command(&["checkout", "-q", "-b", "other"]);
+    a.settle_saves("Rename A → B", counted(&runs));
+    unstick.send(()).unwrap();
+    a.wait_saves();
+    assert_eq!(a.branch.as_deref(), Some("other"), "the checkout ran");
+    assert_eq!(runs.get(), 0, "asked for on the old branch");
+}
+
+#[test]
+fn e2e_a_git_action_waiting_for_a_save_is_dropped_when_head_moved_meanwhile() {
+    let f = Fixture::new("after-saves-head");
+    let mut h = f.harness();
+    let (user, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    let root = f.root.clone();
+    h.state_mut().revert_file(
+        &root,
+        git_ui::Revert::Working {
+            path: user.clone(),
+            untracked: false,
+        },
+    );
+    // a commit made outside Droid Lite while the disk is stuck
+    let made = std::process::Command::new("git")
+        .args(["commit", "-q", "--allow-empty", "-m", "elsewhere"])
+        .current_dir(&root)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    unstick.send(()).unwrap();
+    h.state_mut().wait_saves();
+    assert!(
+        std::fs::read_to_string(&user)
+            .unwrap()
+            .ends_with("// typed\n"),
+        "not reverted"
+    );
+    assert!(
+        h.state().status.starts_with(
+            "Git revert User.kt did not run: the branch or the staged files changed meanwhile"
+        ),
+        "{}",
+        h.state().status
+    );
+}
+
+#[test]
+fn e2e_an_action_waiting_for_a_save_shows_and_can_be_cancelled() {
+    let f = Fixture::new("after-saves-cancel");
+    let mut h = f.harness();
+    let (user, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    let i = h.state().active;
+    h.state_mut().tabs[i].text.push_str("// more\n");
+    h.state_mut().tabs[i].mark_edited();
+    h.state_mut().revert();
+    steps(&mut h, 2);
+    assert!(
+        h.query_by_label("Waiting for save: Revert User.kt")
+            .is_some()
+    );
+    h.get_by_label("Cancel Revert User.kt").click();
+    steps(&mut h, 2);
+    assert!(
+        h.query_by_label("Waiting for save: Revert User.kt")
+            .is_none()
+    );
+    unstick.send(()).unwrap();
+    h.state_mut().wait_saves();
+    assert!(tab(&h).text.ends_with("// more\n"), "not reverted");
+    assert!(
+        std::fs::read_to_string(&user)
+            .unwrap()
+            .ends_with("// typed\n")
+    );
+}
+
+#[test]
+fn e2e_an_edit_undone_while_an_action_waits_for_a_save_still_counts_as_a_change() {
+    let f = Fixture::new("after-saves-revs");
+    let mut h = f.harness();
+    let (_, unstick) = save_on_a_stuck_disk(&f, &mut h);
+    let runs = std::rc::Rc::new(std::cell::Cell::new(0));
+    let a = h.state_mut();
+    a.settle_saves("git stash", counted(&runs));
+    let i = a.active;
+    // typed and typed away again: the same text, a newer version
+    a.tabs[i].text.push('x');
+    a.tabs[i].mark_edited();
+    a.tabs[i].text.pop();
+    a.tabs[i].mark_edited();
+    unstick.send(()).unwrap();
+    a.wait_saves();
+    assert_eq!(runs.get(), 0);
+    assert!(
+        a.status.contains("a text changed meanwhile"),
+        "{}",
+        a.status
     );
 }
 
@@ -6545,6 +6715,18 @@ fn e2e_save_never_waits_for_the_disk_and_two_quick_saves_land_in_order() {
     );
     assert_eq!(h.state().status, format!("Saved {}", user.display()));
     assert_eq!(h.state().saves_pending, 0);
+}
+
+#[test]
+fn e2e_a_file_a_failed_index_change_took_out_is_read_again_without_opening_it() {
+    let f = Fixture::new("index-rescan");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    h.state().index.fail_change_of(&user);
+    assert_eq!(h.state().index.read().named("User").count(), 0, "taken out");
+    wait(&mut h, "User.kt read again", |a| {
+        a.index.read().named("User").count() == 1
+    });
 }
 
 #[test]

@@ -43,6 +43,8 @@ enum Ty {
     Lib(String, Vec<Ty>),
     /// A type parameter or anything: matches every receiver.
     Any,
+    /// A type parameter with more than one bound (`where T : A, T : B`): has the members of each.
+    All(Vec<Ty>),
 }
 
 impl Ty {
@@ -829,9 +831,9 @@ impl FileInfo {
         out
     }
 
-    /// Bounds from the `where T : A, U : B` clause of the declaration named at token `name`,
-    /// for the type parameters in `out` that have none yet.
-    fn where_bounds(&self, name: usize, out: &mut [(String, String)]) {
+    /// Bounds from the `where T : A, T : B` clause of the declaration named at token `name`, for
+    /// the type parameters in `out`: the first fills an empty bound, each other is one more entry.
+    fn where_bounds(&self, name: usize, out: &mut Vec<(String, String)>) {
         let mut k = name + 1;
         let mut depth = 0i32;
         while k < self.toks.len() {
@@ -863,10 +865,12 @@ impl FileInfo {
                 e += 1;
             }
             let name = self.name(k);
-            if e > a
-                && let Some(p) = out.iter_mut().find(|p| p.0 == name && p.1.is_empty())
-            {
-                p.1 = self.text[self.start(a)..self.end(e - 1)].to_string();
+            if e > a && out.iter().any(|p| p.0 == name) {
+                let bound = self.text[self.start(a)..self.end(e - 1)].to_string();
+                match out.iter_mut().find(|p| p.0 == name && p.1.is_empty()) {
+                    Some(p) => p.1 = bound,
+                    None => out.push((name.to_string(), bound)),
+                }
             }
             if self.t(e) != "," {
                 break;
@@ -945,6 +949,102 @@ fn fits(d: &Decl, args: &Args) -> bool {
 
 fn is_vararg(p: &crate::kotlin::Param) -> bool {
     p.vararg
+}
+
+/// A function-typed parameter a lambda goes to ([`Resolver::fun_param_inputs`]).
+struct FunParam {
+    /// The file that spells the function type, where it does and its type parameters.
+    file: Rc<FileInfo>,
+    at: usize,
+    tparams: Vec<(String, String)>,
+    /// `T` of `T.(A) -> R`.
+    receiver: Option<String>,
+    /// `A, B` of `(A, B) -> R`; empty for none.
+    params: String,
+}
+
+/// The receiver and the parameter list of a function type: `T.(A, B) -> R` gives `T` and
+/// `A, B`. Annotations, `suspend`, outer parentheses and `?` are read through
+/// (`(@Composable T.() -> Unit)?`). `None` for a type that is not a function type.
+fn fun_type_parts(ty: &str) -> Option<(Option<&str>, &str)> {
+    // the `)` that closes the `(` at byte `open` of `t`
+    let close = |t: &str, open: usize| {
+        let mut depth = 0;
+        for (i, c) in t.bytes().enumerate().skip(open) {
+            match c {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    let mut t = ty.trim();
+    loop {
+        if let Some(rest) = t.strip_prefix('@') {
+            t = rest.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_' || c == '.');
+            t = t.trim_start();
+        } else if let Some(rest) = t.strip_prefix("suspend ") {
+            t = rest.trim_start();
+        } else if let Some(rest) = t.strip_suffix('?') {
+            t = rest.trim_end();
+        } else if t.starts_with('(') && close(t, 0) == Some(t.len() - 1) {
+            t = t[1..t.len() - 1].trim();
+        } else {
+            break;
+        }
+    }
+    // the first `->` outside parentheses and angle brackets
+    let b = t.as_bytes();
+    let mut depth = 0i32;
+    let mut arrow = None;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'-' if depth == 0 && b.get(i + 1) == Some(&b'>') => {
+                arrow = Some(i);
+                break;
+            }
+            b'-' if b.get(i + 1) == Some(&b'>') => i += 1,
+            b'(' | b'<' => depth += 1,
+            b')' | b'>' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    let inputs = t[..arrow?].trim();
+    if !inputs.ends_with(')') {
+        return None;
+    }
+    let mut open = None;
+    let mut depth = 0;
+    for (i, c) in inputs.bytes().enumerate().rev() {
+        match c {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    open = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let open = open?;
+    let params = inputs[open + 1..inputs.len() - 1].trim();
+    let before = inputs[..open].trim();
+    let receiver = if before.is_empty() {
+        None
+    } else {
+        Some(before.strip_suffix('.')?.trim())
+    };
+    Some((receiver, params))
 }
 
 /// Like Kotlin, overloads that need no `vararg` win over ones that do.
@@ -1370,11 +1470,20 @@ impl<'a> Resolver<'a> {
                 }
             })
             .collect();
-        // a type parameter: what its bound is, when that is a project type
-        if let Some((_, bound)) = tparams.iter().find(|(p, _)| p == base) {
-            return Some(match self.type_text(f, bound, at, &[]) {
-                Some(t @ Ty::Decl(_)) => t,
-                _ => Ty::Any,
+        // a type parameter: what its bounds are, when they are project types
+        if tparams.iter().any(|(p, _)| p == base) {
+            let mut bounds: Vec<Ty> = tparams
+                .iter()
+                .filter(|(p, _)| p == base)
+                .filter_map(|(_, b)| match self.type_text(f, b, at, &[]) {
+                    Some(t @ Ty::Decl(_)) => Some(t),
+                    _ => None,
+                })
+                .collect();
+            return Some(match bounds.len() {
+                0 => Ty::Any,
+                1 => bounds.remove(0),
+                _ => Ty::All(bounds),
             });
         }
         let segs: Vec<&str> = base.split('.').map(str::trim).collect();
@@ -1457,7 +1566,10 @@ impl<'a> Resolver<'a> {
 
     /// The type and every type above it, nearest first.
     fn hierarchy_up(&self, t: &Ty) -> Vec<Ty> {
-        let mut out = vec![t.clone()];
+        let mut out = match t {
+            Ty::All(v) => v.clone(),
+            _ => vec![t.clone()],
+        };
         let mut i = 0;
         while i < out.len() && out.len() < 64 {
             if let Ty::Decl(r) = out[i].clone() {
@@ -1618,6 +1730,8 @@ impl<'a> Resolver<'a> {
     fn conforms(&self, t: &Ty, want: &Ty) -> bool {
         match (t, want) {
             (_, Ty::Any) | (Ty::Any, _) => true,
+            (Ty::All(v), _) => v.iter().any(|t| self.conforms(t, want)),
+            (_, Ty::All(v)) => v.iter().all(|w| self.conforms(t, w)),
             (Ty::Lib(a, _), Ty::Lib(b, _)) => {
                 a == b
                     || matches!(b.as_str(), "Any" | "Iterable" | "Collection")
@@ -1746,7 +1860,7 @@ impl<'a> Resolver<'a> {
                 let p = d.params.get(n)?;
                 self.type_text(&g, &p.ty, p.offset as usize, &g.type_params(d))
             }
-            Ty::Any => None,
+            Ty::Any | Ty::All(_) => None,
         }
     }
 
@@ -1772,7 +1886,12 @@ impl<'a> Resolver<'a> {
                 None
             }
         };
-        let t = match name {
+        // a trailing lambda of a project function (one named like a library call too): its
+        // last parameter's type
+        if let Some(t) = self.fun_lambda_param(f, callee, None, None, pos) {
+            return Some(t);
+        }
+        match name {
             "let" | "also" | "takeIf" | "takeUnless" => recv(),
             "forEachIndexed" | "mapIndexed" | "filterIndexed" if pos == 1 => {
                 recv().as_ref().and_then(iter_elem)
@@ -1796,9 +1915,7 @@ impl<'a> Resolver<'a> {
             | "minByOrNull" | "distinctBy" | "partition" | "indexOfFirst" | "takeWhile"
             | "dropWhile" | "mapTo" | "onSuccess" => recv().as_ref().and_then(iter_elem),
             _ => None,
-        };
-        // a trailing lambda of a project function: its last parameter's type
-        t.or_else(|| self.fun_lambda_param(f, callee, None, None, pos))
+        }
     }
 
     /// The `pos`-th input type of a function-typed parameter (`update: (ChatData) -> ChatData`)
@@ -1811,29 +1928,25 @@ impl<'a> Resolver<'a> {
         index: Option<usize>,
         pos: usize,
     ) -> Option<Ty> {
-        let (g, gi, p, inputs) = self.fun_param_inputs(f, callee, name, index)?;
-        let tp = g.type_params(&g.syms.decls[gi]);
-        // `T.() -> R`: no parameters, a receiver
-        let inner = inputs.strip_prefix('(')?.strip_suffix(')')?;
-        let part = split_top(inner).into_iter().nth(pos)?;
+        let p = self.fun_param_inputs(f, callee, name, index)?;
+        let part = split_top(&p.params).into_iter().nth(pos)?;
         let part = part
             .rsplit_once(':')
             .map_or(part.as_str(), |(_, t)| t)
             .trim()
             .to_string();
-        self.type_text(&g, &part, p.offset as usize, &tp)
+        self.type_text(&p.file, &part, p.at, &p.tparams)
     }
 
-    /// The function called at token `callee` (a project one) and the input part of the
-    /// function-typed parameter a lambda goes to (`(A, B)` of `(A, B) -> R`, `T.()` of
-    /// `T.() -> R`): by name, by position, or the last one.
+    /// The function-typed parameter a lambda goes to, of the function called at token `callee`
+    /// (a project one): by name, by position, or the last one. A typealias is read through.
     fn fun_param_inputs(
         &self,
         f: &FileInfo,
         callee: usize,
         name: Option<&str>,
         index: Option<usize>,
-    ) -> Option<(Rc<FileInfo>, usize, crate::kotlin::Param, String)> {
+    ) -> Option<FunParam> {
         if !f.ident(callee) {
             return None;
         }
@@ -1846,17 +1959,38 @@ impl<'a> Resolver<'a> {
             (Some(n), _) => d.params.iter().find(|p| p.name == n)?,
             (None, Some(i)) => d.params.get(i)?,
             (None, None) => d.params.last()?,
+        };
+        let at = p.offset as usize;
+        if let Some((receiver, params)) = fun_type_parts(&p.ty) {
+            let (receiver, params) = (receiver.map(str::to_string), params.to_string());
+            return Some(FunParam {
+                tparams: g.type_params(d),
+                file: g.clone(),
+                at,
+                receiver,
+                params,
+            });
         }
-        .clone();
-        let mut ty = p.ty.trim();
-        // `@Composable RowScope.() -> Unit`, `suspend T.() -> R`
-        while let Some(rest) = ty.strip_prefix('@') {
-            ty = rest.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_' || c == '.');
-            ty = ty.trim_start();
+        // `b: Body` with `typealias Body = Html.() -> Unit`, nullable or not
+        let alias = p.ty.trim().trim_end_matches('?').trim();
+        let r = self.visible_types(&g, alias, at).into_iter().next()?;
+        let (a, ai) = self.decl(&r)?;
+        if a.syms.decls[ai].kind != Kind::TypeAlias {
+            return None;
         }
-        let ty = ty.strip_prefix("suspend ").unwrap_or(ty).trim();
-        let inputs = ty.split_once("->")?.0.trim().to_string();
-        Some((g, gi, p, inputs))
+        let k = a.tok_at(r.1)?;
+        let eq = (k..a.toks.len()).find(|&e| a.t(e) == "=")?;
+        let from = a.end(eq);
+        let to = a.text[from..].find('\n').map_or(a.text.len(), |n| from + n);
+        let (receiver, params) = fun_type_parts(&a.text[from..to])?;
+        let (receiver, params) = (receiver.map(str::to_string), params.to_string());
+        Some(FunParam {
+            file: a,
+            at: r.1,
+            tparams: Vec::new(),
+            receiver,
+            params,
+        })
     }
 
     /// Implicit `this` receivers at `at` from `apply` / `run` / `with(x)` / `buildX` / `T.() -> R`
@@ -1865,9 +1999,9 @@ impl<'a> Resolver<'a> {
         self.receivers_at(f, ti).0
     }
 
-    /// [`Resolver::lambda_receivers`], and whether one of them is a lambda of a library call
-    /// whose receiver is not known (`html { … }` from a library): a call in it may be that
-    /// receiver's member, so it is not taken for the enclosing class's.
+    /// [`Resolver::lambda_receivers`], and whether one of them has a receiver whose members are
+    /// not known (`fun page(b: Html.() -> Unit)` with `Html` from a library): a call in it may
+    /// be that receiver's member, so it is not taken for the enclosing class's.
     fn receivers_at(&self, f: &FileInfo, ti: usize) -> (Vec<Ty>, bool) {
         let mut out = Vec::new();
         let mut unknown = false;
@@ -1916,7 +2050,7 @@ impl<'a> Resolver<'a> {
 
     /// The receiver of the lambda at `{` token `open` when it goes to a `T.() -> R` parameter
     /// of a project function, or to a known library call (`buildString`, `LazyColumn`).
-    /// Sets `unknown` for a trailing lambda of a library call not known here.
+    /// Sets `unknown` when that receiver's members are not known here.
     fn dsl_receiver(&self, f: &FileInfo, open: usize, unknown: &mut bool) -> Option<Ty> {
         let key = (f.path.clone(), f.start(open));
         if let Some((t, u)) = self.c.lambdas.borrow().get(&key) {
@@ -1939,32 +2073,20 @@ impl<'a> Resolver<'a> {
             return None;
         }
         let call = lambda_call(f, open)?;
-        let name = f.name(call.callee);
-        if call.trailing
-            && let Some(k) = known_lambda_call(name)
-        {
-            return k.receiver.map(|r| Ty::Lib(r.into(), Vec::new()));
+        // a project function first, also one named like a library call (`run`)
+        if let Some(p) = self.fun_param_inputs(f, call.callee, call.name.as_deref(), call.index) {
+            let t = self.type_text(&p.file, p.receiver.as_deref()?, p.at, &p.tparams);
+            // a receiver whose members are not known here: a call in the lambda may be its
+            *unknown |= match &t {
+                Some(Ty::Decl(_)) => false,
+                Some(Ty::Lib(n, _)) => known_members(n).is_none(),
+                _ => true,
+            };
+            return t;
         }
-        match self.fun_param_inputs(f, call.callee, call.name.as_deref(), call.index) {
-            Some((g, gi, p, inputs)) => {
-                let recv = inputs.strip_suffix("()")?.trim().strip_suffix('.')?;
-                let tp = g.type_params(&g.syms.decls[gi]);
-                self.type_text(&g, recv, p.offset as usize, &tp)
-            }
-            None => {
-                // a library call: `html { … }`, not `x.html { … }` nor `{ a -> … }`
-                let plain = call.trailing
-                    && !(call.callee > 0 && matches!(f.t(call.callee - 1), "." | ":" | ","))
-                    && !matches!(name, "get" | "set" | "init" | "field" | "by")
-                    && !f
-                        .locals
-                        .iter()
-                        .any(|l| l.lambda.is_some_and(|(o, _)| o == open))
-                    && matches!(self.resolve_tok(f, call.callee), Res::None);
-                *unknown |= plain;
-                None
-            }
-        }
+        // a library call whose lambda has no receiver, or one not known here, keeps the class
+        let k = known_lambda_call(f.name(call.callee)).filter(|_| call.trailing)?;
+        k.receiver.map(|r| Ty::Lib(r.into(), Vec::new()))
     }
 
     /// `this` at a place: the innermost lambda receiver, else the enclosing class.
@@ -2272,21 +2394,11 @@ impl<'a> Resolver<'a> {
             // a library call known to give no `it` (`launch`, `remember`, `Column`)
             return known_lambda_call(f.name(callee)).is_none_or(|k| k.it);
         };
-        let Some((g, gi)) = v.first().and_then(|r| self.decl(r)) else {
+        if v.is_empty() {
             return true;
-        };
-        let Some(p) = g.syms.decls[gi].params.last() else {
-            return true;
-        };
-        let ty = p.ty.trim();
-        let ty = ty.strip_prefix("suspend ").unwrap_or(ty).trim();
-        match ty.split_once("->") {
-            Some((inputs, _)) => {
-                let inputs = inputs.trim();
-                inputs.starts_with('(') && inputs != "()"
-            }
-            None => true,
         }
+        self.fun_param_inputs(f, callee, None, None)
+            .is_none_or(|p| !p.params.is_empty())
     }
 
     // ---------------------------------------------------------------- resolution
@@ -3656,7 +3768,7 @@ impl Resolver<'_> {
                     .collect::<Vec<_>>()
                     .join(",")
             ),
-            Ty::Any => "*".into(),
+            Ty::Any | Ty::All(_) => "*".into(),
         }
     }
 
@@ -4410,7 +4522,7 @@ mod tests {
             ),
             (
                 "/p/U.kt",
-                "package a\nval x = J.join(\"a\", \"b\")\nval y = J.cat(\"a\", \"b\")\nval z = J.cat(\"a\", \"b\", \"c\")\n",
+                "package a\nval x = J.join(\"a\", \"b\")\nval y = J.cat(\"a\", \"b\")\nval z = J.cat(\"a\", \"b\", \"c\")\nval w = J.cat()\n",
             ),
         ]);
         let r = Resolver::new(&i, &t);
@@ -4428,6 +4540,11 @@ mod tests {
             at(&r, "/p/U.kt", "cat", 2),
             "/p/J.java:5",
             "`...` takes three"
+        );
+        assert_eq!(
+            at(&r, "/p/U.kt", "cat", 3),
+            "/p/J.java:5",
+            "`...` takes none"
         );
     }
 
@@ -5195,7 +5312,11 @@ fun f(state: State, other: State) {
         assert_eq!(at(&r, "/p/S.kt", "append", 2), "-", "StringBuilder.append");
         assert_eq!(at(&r, "/p/S.kt", "item", 2), "-", "LazyListScope.item");
         assert_eq!(at(&r, "/p/S.kt", "add", 2), "-", "MutableList.add");
-        assert_eq!(at(&r, "/p/S.kt", "title", 3), "-", "an unknown library DSL");
+        assert_eq!(
+            at(&r, "/p/S.kt", "title", 3),
+            "/p/S.kt:3",
+            "a library call not known here may give no receiver: the class's"
+        );
         assert_eq!(
             at(&r, "/p/S.kt", "title", 4),
             "/p/S.kt:3",
@@ -5231,6 +5352,81 @@ fun f(state: State, other: State) {
             at(&r, "/p/S.kt", "label", 3),
             "/p/S.kt:3",
             "a class's where clause"
+        );
+    }
+
+    #[test]
+    fn a_project_function_with_a_library_name_gives_its_own_lambda_receiver() {
+        let (i, t) = project(&[(
+            "/p/P.kt",
+            "package a\nclass Pipeline {\n    fun stage(s: String) {}\n}\nfun run(block: Pipeline.() -> Unit) {}\nclass Job {\n    fun stage(s: String) {}\n    fun go() = run { stage(\"a\") }\n}\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/P.kt", "stage", 3), "/p/P.kt:3");
+    }
+
+    #[test]
+    fn a_nullable_aliased_or_parameter_taking_receiver_lambda_keeps_its_receiver() {
+        let (i, t) = project(&[
+            (
+                "/p/H.kt",
+                "package a\nclass HtmlBuilder {\n    fun title(s: String) {}\n}\ntypealias B = HtmlBuilder.() -> Unit\nfun html(b: (HtmlBuilder.() -> Unit)? = null) {}\nfun page(b: B) {}\nfun table(b: HtmlBuilder.(Int) -> Unit) {}\nfun plain(b: (() -> Unit)?) {}\n",
+            ),
+            (
+                "/p/S.kt",
+                "package a\nclass Item(val name: String)\nclass Screen {\n    fun title(s: String) {}\n    fun a() = html { title(\"1\") }\n    fun b() = page { title(\"2\") }\n    fun c() = table { title(\"3\") }\n    fun d() = table { it.inc() }\n    fun e(items: List<Item>) = items.forEach { plain { it.name } }\n}\n",
+            ),
+        ]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/S.kt", "title", 2), "/p/H.kt:3", "`(T.() -> R)?`");
+        assert_eq!(at(&r, "/p/S.kt", "title", 3), "/p/H.kt:3", "a typealias");
+        assert_eq!(at(&r, "/p/S.kt", "title", 4), "/p/H.kt:3", "`T.(Int) -> R`");
+        let s = r.file(Path::new("/p/S.kt")).unwrap();
+        let it = s.tok_at(s.text.find("it.inc").unwrap()).unwrap();
+        assert_eq!(
+            r.it_type(&s, it),
+            Some(Ty::Lib("Int".into(), Vec::new())),
+            "`T.(Int)` gives an `it`"
+        );
+        assert_eq!(
+            at(&r, "/p/S.kt", "name", 2),
+            "/p/S.kt:2",
+            "`(() -> Unit)?` gives no `it`: the outer lambda's"
+        );
+    }
+
+    #[test]
+    fn a_plain_library_lambda_keeps_the_class_and_an_unknown_receiver_hides_it() {
+        let (i, t) = project(&[(
+            "/p/R.kt",
+            "package a\nfun scoped(b: Remote.() -> Unit) {}\nclass Repo {\n    fun load() = 1\n    fun t() = measureTime { load() }\n    fun u() = trace(\"x\") { load() }\n    fun v() = scoped { load() }\n}\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/R.kt", "load", 2), "/p/R.kt:4", "measureTime");
+        assert_eq!(at(&r, "/p/R.kt", "load", 3), "/p/R.kt:4", "trace(\"x\")");
+        assert_eq!(
+            at(&r, "/p/R.kt", "load", 4),
+            "-",
+            "a receiver whose members are not known"
+        );
+    }
+
+    #[test]
+    fn every_where_clause_bound_of_a_type_parameter_counts() {
+        let (i, t) = project(&[(
+            "/p/W.kt",
+            "package a\ninterface Named {\n    val label: String\n}\ninterface Sized {\n    val size: Int\n}\nfun <T> show(x: T) where T : Named, T : Sized = x.label + x.size\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(
+            at(&r, "/p/W.kt", "label", 2),
+            "/p/W.kt:3",
+            "the first bound"
+        );
+        assert_eq!(
+            at(&r, "/p/W.kt", "size", 2),
+            "/p/W.kt:6",
+            "the second bound"
         );
     }
 

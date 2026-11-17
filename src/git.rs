@@ -349,6 +349,25 @@ pub fn branch(dir: &Path) -> Option<String> {
     (out.status.success() && !b.is_empty()).then_some(b)
 }
 
+/// Where the repository at `dir` stands: HEAD's commit and ref, and what is staged (by blob, so
+/// a `git status` that only refreshes the index's file times leaves it). Two equal stamps: no
+/// commit, checkout, stash or staging between them.
+pub fn state_stamp(dir: &Path) -> Option<String> {
+    let head = git(dir)
+        .args(["rev-parse", "HEAD", "--symbolic-full-name", "HEAD"])
+        .output()
+        .ok()?;
+    let staged = git(dir)
+        .args(["diff", "--cached", "--raw", "--no-renames", "-z"])
+        .output()
+        .ok()?;
+    Some(format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&head.stdout),
+        String::from_utf8_lossy(&staged.stdout)
+    ))
+}
+
 /// The commit HEAD points at, or `None` outside a repository or before the first commit.
 pub fn head_sha(dir: &Path) -> Option<String> {
     let out = git(dir).args(["rev-parse", "HEAD"]).output().ok()?;
@@ -1549,6 +1568,37 @@ mod tests {
             )
             .is_none()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_state_stamp_moves_with_staging_commits_and_branches_not_with_status() {
+        let dir = std::env::temp_dir().join(format!("droid-lite-git-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = |args: &[&str]| run(&dir, args).unwrap();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.name", "T"]);
+        g(&["config", "user.email", "t@example.com"]);
+        std::fs::write(dir.join("A.kt"), "a\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "base"]);
+        let base = state_stamp(&dir);
+        // a save, then `git status` refreshing the index's file times: nothing staged moved
+        std::fs::write(dir.join("A.kt"), "a2\n").unwrap();
+        status(&dir).unwrap();
+        assert_eq!(state_stamp(&dir), base, "a save and a status");
+        g(&["add", "A.kt"]);
+        let staged = state_stamp(&dir);
+        assert_ne!(staged, base, "staged");
+        g(&["checkout", "-q", "-b", "other"]);
+        assert_ne!(
+            state_stamp(&dir),
+            staged,
+            "another branch at the same commit"
+        );
+        g(&["commit", "-q", "-m", "two"]);
+        assert_ne!(state_stamp(&dir), staged, "a commit");
         std::fs::remove_dir_all(&dir).ok();
     }
 

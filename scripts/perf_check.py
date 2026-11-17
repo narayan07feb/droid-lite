@@ -25,6 +25,9 @@ ROOT = subprocess.run(
 ).stdout.strip()
 PERF = os.path.join(ROOT, "target", "perf")
 LINE = re.compile(r"^(.{34}) +(-?[\d.]+) ms(?: +([+-][\d.]+) MB heap)?")
+# the file the per-keystroke step re-indexes (builds from before 2026-11-18 do not print it)
+KEYSTROKE_FILE = re.compile(r"^  keystroke file: (.*)$")
+KEYSTROKE = "re-index one file (per keystroke)"
 # a step fails when it is both this much slower in ratio and in absolute time
 SLOWER_RATIO, SLOWER_MS = 1.15, 2.0
 # and when it keeps both this much more memory in ratio and in MB
@@ -60,15 +63,22 @@ def build(sha):
     return exe
 
 
-def run(exe, project, cache):
+def run(exe, project, cache, pinned=None):
+    """The steps of one bench run, and the file its per-keystroke step used (None: not said)."""
     env = {**os.environ, "DROID_LITE_CACHE_DIR": cache}
+    if pinned:
+        # both builds re-index the same file, so their per-keystroke times compare
+        env["DROID_LITE_BENCH_FILE"] = pinned
     out = subprocess.run([exe, "--bench", project], capture_output=True, text=True, env=env, check=True).stdout
-    steps = {}
+    steps, used = {}, None
     for line in out.splitlines():
         m = LINE.match(line)
         if m:
             steps[m.group(1).strip()] = (float(m.group(2)), float(m.group(3) or 0))
-    return steps
+        m = KEYSTROKE_FILE.match(line)
+        if m:
+            used = m.group(1)
+    return steps, used
 
 
 def main():
@@ -89,13 +99,24 @@ def main():
     caches = {k: os.path.join(PERF, "cache-" + k) for k in exes}
     for k in exes:
         shutil.rmtree(caches[k], ignore_errors=True)
-        run(exes[k], project, caches[k])  # warm-up
+    # warm-ups; the new build's says which file the per-keystroke step pins, then both use it
+    _, pinned = run(exes["new"], project, caches["new"])
+    used = {"new": {pinned}, "old": set()}
+    used["old"].add(run(exes["old"], project, caches["old"], pinned)[1])
     rows = {"old": [], "new": []}
     for i in range(a.rounds):
         order = ["old", "new"] if i % 2 == 0 else ["new", "old"]
         for k in order:
-            rows[k].append(run(exes[k], project, caches[k]))
+            steps, f = run(exes[k], project, caches[k], pinned)
+            rows[k].append(steps)
+            used[k].add(f)
         print(f"round {i + 1}/{a.rounds}", flush=True)
+    # an old build that does not say its file picked its own: the step may not compare
+    same_input = used["old"] == used["new"] == {pinned} and pinned is not None
+    if not same_input:
+        print(f"note: the per-keystroke step re-indexed different or unknown files "
+              f"(old {sorted(map(str, used['old']))}, new {sorted(map(str, used['new']))}): "
+              f"not compared")
 
     def median(k, step, field):
         vals = [r[step][field] for r in rows[k] if step in r]
@@ -109,6 +130,8 @@ def main():
         flag = ""
         if o_ms is None:
             flag = "  new step"
+        elif step == KEYSTROKE and not same_input:
+            flag = "  not compared"
         else:
             if n_ms > o_ms * SLOWER_RATIO and n_ms - o_ms > SLOWER_MS:
                 flag += "  SLOWER"
@@ -119,6 +142,8 @@ def main():
         fmt = lambda v, w, p: f"{v:>{w}.{p}f}" if v is not None else " " * (w - 1) + "-"
         print(f"{step:<34} {fmt(o_ms, 9, 2)} {fmt(n_ms, 9, 2)} {fmt(o_mb, 8, 1)} {fmt(n_mb, 8, 1)}{flag}")
     print(f"\nold {old[:8]}, new {new[:8]}, {a.rounds} rounds, medians")
+    if pinned:
+        print(f"per-keystroke file (both): {pinned}")
     if failed:
         print(f"perf check FAILED: {', '.join(failed)}")
         sys.exit(1)

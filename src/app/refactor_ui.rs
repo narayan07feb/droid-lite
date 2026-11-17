@@ -316,23 +316,55 @@ impl App {
     /// move, a revert or a checkout would find the file changed, write over it, or bring it back
     /// at its old name. The window never waits for them: with one on its way this returns false
     /// (the caller changes nothing now) and `again` runs once they all landed, unless an open
-    /// tab's text changed meanwhile ([`App::poll_saves`]).
+    /// tab's text changed meanwhile ([`App::poll_saves`]). It waits in the status bar, where it
+    /// can be cancelled; asking again for the same `what` replaces it.
     pub(super) fn settle_saves(
         &mut self,
         what: &str,
+        again: impl FnOnce(&mut App) + 'static,
+    ) -> bool {
+        self.settle_saves_of(what, None, again)
+    }
+
+    /// [`App::settle_saves`] for a git action in the repository at `root`: it is dropped when
+    /// the branch, HEAD or the staged files move before it runs.
+    pub(super) fn settle_git_saves(
+        &mut self,
+        what: &str,
+        root: &Path,
+        again: impl FnOnce(&mut App) + 'static,
+    ) -> bool {
+        self.settle_saves_of(what, Some(root), again)
+    }
+
+    fn settle_saves_of(
+        &mut self,
+        what: &str,
+        git: Option<&Path>,
         again: impl FnOnce(&mut App) + 'static,
     ) -> bool {
         if self.saves_pending == 0 {
             return true;
         }
         self.status = format!("{what} runs when the save on its way is done");
-        let texts = self.texts_digest();
+        // a typing pause due now is taken first: from here a version changes only with a text
+        self.settle(true);
+        let git = git.map(|r| (r.to_path_buf(), crate::git::state_stamp(r)));
+        // asked again (a second click): the newer one replaces it
+        self.after_saves.retain(|a| a.what != what);
         self.after_saves.push(AfterSaves {
             what: what.to_string(),
-            texts,
+            revs: self.tab_revs(),
+            git,
             run: Box::new(again),
         });
         false
+    }
+
+    /// Takes the action `what` out of those waiting for the saves.
+    pub(super) fn cancel_after_saves(&mut self, what: &str) {
+        self.after_saves.retain(|a| a.what != what);
+        self.status = format!("{what} will not run");
     }
 
     /// Writes a file and keeps the open tab, the index and kotlin-lsp in step.
@@ -388,8 +420,7 @@ impl App {
             p.files.sort();
             self.tree = tree::build(p, self.tree_view);
         }
-        let p = from.to_owned();
-        self.index.change(move |i| i.remove(&p));
+        self.index.remove(from.to_owned());
         // an open, analysed tab already read the moved text (as the same kind of file)
         if let Some(t) = self
             .tabs
