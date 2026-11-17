@@ -9,7 +9,9 @@ use crate::plugins::{self, Case, Entry, Live, Manifest, Status, Trust};
 use egui::{Align, Color32, Layout, RichText, Ui};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 /// Log lines kept per plugin.
@@ -18,8 +20,27 @@ const KEEP_LOG: usize = 5000;
 const RECHECK: Duration = Duration::from_secs(3);
 /// The longest pause before a `watch` that ended is started again (it doubles from 1 s).
 const WATCH_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// How long a `list` or a view may take before its process group is killed.
+const FETCH_LIMIT: Duration = Duration::from_secs(120);
 
-type Fetch = Receiver<Result<String, String>>;
+/// A `list` or a view running on a thread. Dropping it (a refused plugin, a reload) kills its
+/// process group.
+pub(super) struct Fetch {
+    rx: Receiver<Result<String, String>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Fetch {
+    fn try_recv(&self) -> Result<Result<String, String>, TryRecvError> {
+        self.rx.try_recv()
+    }
+}
+
+impl Drop for Fetch {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
 /// A saved OK: the trust it covers, and whether it was saved.
 type Allowing = Receiver<(Option<Trust>, Result<(), String>)>;
 /// A folder check: the trust it checked, the plugin as read again, and whether it is unchanged.
@@ -40,11 +61,14 @@ pub(super) struct Tests {
     pub(super) plugins: Vec<Plugin>,
     /// Broken manifests.
     errors: Vec<String>,
-    active: usize,
+    pub(super) active: usize,
     filter: String,
     /// Marks a gutter ▶ picked when its line has several cases; the list shows only these.
     pub(super) only: Vec<usize>,
     pub(super) marks: Vec<Mark>,
+    /// Runs asked to stop (a watch no longer shown, a refused plugin's watch): kept until they
+    /// end, so the SIGKILL after SIGTERM still comes ([`Run::terminate`]).
+    stopping: Vec<Run>,
 }
 
 #[derive(Default)]
@@ -61,8 +85,10 @@ pub(super) struct Plugin {
     pub(super) watch: Option<Run>,
     /// When the running `watch` started; the pause before starting an ended one again, and when.
     watch_started: Option<Instant>,
-    watch_backoff: Duration,
-    watch_next: Option<Instant>,
+    pub(super) watch_backoff: Duration,
+    pub(super) watch_next: Option<Instant>,
+    /// Why the `watch` could not start (it is tried again after the pause).
+    watch_error: Option<String>,
     pub(super) live: Option<Live>,
     /// The OK being saved on a thread (the lock may make it wait): for the trust it covers.
     allowing: Option<Allowing>,
@@ -90,46 +116,118 @@ impl Plugin {
             self.log.drain(..KEEP_LOG / 5);
         }
     }
+
+    /// The `watch` ended or could not start: it starts again after a pause that doubles (1 s up
+    /// to [`WATCH_BACKOFF_MAX`]) while it keeps ending soon, so it never starts every frame.
+    fn watch_ended(&mut self) {
+        let lived = self
+            .watch_started
+            .take()
+            .map_or(Duration::ZERO, |t| t.elapsed());
+        self.watch_backoff = if lived >= WATCH_BACKOFF_MAX {
+            Duration::ZERO
+        } else {
+            (self.watch_backoff * 2).clamp(Duration::from_secs(1), WATCH_BACKOFF_MAX)
+        };
+        self.watch_next = Some(Instant::now() + self.watch_backoff);
+    }
 }
 
-/// Runs `cmd` to the end on a thread: its stdout, or an error with the end of its stderr.
-fn fetch(mut cmd: std::process::Command, ctx: &egui::Context) -> Fetch {
+/// Runs `cmd` to the end on a thread ([`fetch_run`]).
+fn fetch(cmd: std::process::Command, ctx: &egui::Context) -> Fetch {
     let (tx, rx) = channel();
-    let ctx = ctx.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (stop, ctx) = (cancel.clone(), ctx.clone());
     std::thread::spawn(move || {
-        let r = match cmd.output() {
-            Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
-            Ok(o) => {
-                let err = String::from_utf8_lossy(&o.stderr);
-                let tail: Vec<&str> = err.lines().rev().take(3).collect();
-                Err(format!(
-                    "exit {}: {}",
-                    o.status.code().unwrap_or(-1),
-                    tail.into_iter().rev().collect::<Vec<_>>().join(" ")
-                ))
-            }
-            Err(e) => Err(e.to_string()),
-        };
-        let _ = tx.send(r);
+        let _ = tx.send(fetch_run(cmd, &stop, FETCH_LIMIT));
         ctx.request_repaint();
     });
-    rx
+    Fetch { rx, cancel }
 }
 
-/// SIGTERM to the run's process group, so the tools it started stop too.
-fn stop(run: &mut Run) {
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &format!("-{}", run.id())])
-            .status();
+/// Runs `cmd` (the leader of its own process group) to the end: its stdout, or an error with the
+/// end of its stderr. Past `limit`, or once `cancel` is set, its whole group gets SIGKILL. It is
+/// reaped only after its pipes closed, so until then its group id cannot be another's.
+fn fetch_run(
+    mut cmd: std::process::Command,
+    cancel: &AtomicBool,
+    limit: Duration,
+) -> Result<String, String> {
+    use std::io::Read;
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let read = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut v = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut v);
+            }
+            v
+        })
+    };
+    let out = read(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err = read(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let end = Instant::now() + limit;
+    let status = loop {
+        if out.is_finished()
+            && err.is_finished()
+            && let Some(status) = child.try_wait().map_err(|e| e.to_string())?
+        {
+            break status;
+        }
+        let why = if cancel.load(Ordering::Relaxed) {
+            Some("stopped".to_owned())
+        } else if Instant::now() >= end {
+            Some(format!("no answer in {} s", limit.as_secs()))
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(why);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let (out, err) = (
+        out.join().unwrap_or_default(),
+        err.join().unwrap_or_default(),
+    );
+    if status.success() {
+        return Ok(String::from_utf8_lossy(&out).into_owned());
     }
-    #[cfg(not(unix))]
-    run.stop();
+    let err = String::from_utf8_lossy(&err);
+    let tail: Vec<&str> = err.lines().rev().take(3).collect();
+    Err(format!(
+        "exit {}: {}",
+        status.code().unwrap_or(-1),
+        tail.into_iter().rev().collect::<Vec<_>>().join(" ")
+    ))
 }
 
-/// Opens a link in the browser named in the `browser` setting file, else the system default.
+/// Opens a web link (`http`, `https`: [`plugins::is_web_link`]; nothing else) in the browser
+/// named in the `browser` setting file, else the system default.
 pub(super) fn open_link(url: &str) {
+    if !plugins::is_web_link(url) {
+        return;
+    }
     let browser = super::load_setting("browser").map(|b| b.trim().to_owned());
     #[cfg(target_os = "macos")]
     {
@@ -235,9 +333,10 @@ impl App {
             return;
         };
         match plugins::add(&home, picked) {
-            Ok(name) => {
+            Ok((name, real)) => {
                 self.load_plugins(ctx);
-                if let Some(i) = self.tests.plugins.iter().position(|p| p.m.name == name) {
+                // by folder: two plugins may share a name
+                if let Some(i) = self.tests.plugins.iter().position(|p| p.m.real == real) {
                     self.tests.active = i;
                 }
                 self.bottom = Bottom::Tests;
@@ -292,12 +391,16 @@ impl App {
     fn refused(&mut self, i: usize, why: String) {
         if let Some(p) = self.tests.plugins.get_mut(i) {
             if let Some(mut w) = p.watch.take() {
-                stop(&mut w);
+                w.terminate();
+                self.tests.stopping.push(w);
             }
             p.live = None;
             if let Some((_, _, run)) = p.run.as_mut() {
-                stop(run);
+                run.terminate();
             }
+            // a list or view still running: its group is killed (Fetch's Drop)
+            p.loading = None;
+            p.rows_rx = None;
             p.error = Some(why.clone());
         }
         self.status = why;
@@ -351,12 +454,15 @@ impl App {
                 && let Ok((trust, m, r)) = rx.try_recv()
             {
                 p.check = None;
-                if let Err(e) = r
-                    && p.m.allowed
-                    && trust == p.m.trust
-                {
-                    p.m = m;
-                    refused.push((i, e));
+                if p.m.allowed && trust == p.m.trust {
+                    match r {
+                        // unchanged: how it looks now, so the next check needs no full read
+                        Ok(()) => p.m.seen = m.seen,
+                        Err(e) => {
+                            p.m = m;
+                            refused.push((i, e));
+                        }
+                    }
                 }
             }
             let busy = p.watch.is_some() || p.run.is_some();
@@ -433,7 +539,7 @@ impl App {
         };
         p.results.clear();
         p.log.clear();
-        match Run::spawn(cmd, ctx.clone()) {
+        match Run::spawn_group(cmd, ctx.clone()) {
             Ok(run) => {
                 if action.is_none() {
                     p.status.insert(id.to_owned(), Status::Running);
@@ -451,6 +557,9 @@ impl App {
     /// Reads every plugin's finished lists and new run, watch and view output. Called each frame.
     pub(super) fn poll_tests(&mut self) {
         let root = self.project.as_ref().map(|p| p.root.clone());
+        self.tests
+            .stopping
+            .retain_mut(|r| !r.poll().iter().any(|l| matches!(l, Line::Done(_))));
         let mut lists_changed = false;
         let mut ended_runs = Vec::new();
         for p in &mut self.tests.plugins {
@@ -489,18 +598,7 @@ impl App {
                         }
                         Line::Done(_) => {
                             p.watch = None;
-                            // one that ends at once is not started again every frame
-                            let lived = p
-                                .watch_started
-                                .take()
-                                .map_or(Duration::ZERO, |t| t.elapsed());
-                            p.watch_backoff = if lived >= WATCH_BACKOFF_MAX {
-                                Duration::ZERO
-                            } else {
-                                (p.watch_backoff * 2)
-                                    .clamp(Duration::from_secs(1), WATCH_BACKOFF_MAX)
-                            };
-                            p.watch_next = Some(Instant::now() + p.watch_backoff);
+                            p.watch_ended();
                         }
                     }
                 }
@@ -569,6 +667,9 @@ impl App {
     /// ([`App::poll_oks`]).
     pub(super) fn keep_watch(&mut self, ctx: &egui::Context) {
         self.poll_oks(ctx);
+        if !self.tests.stopping.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
         let root = self.project.as_ref().map(|p| p.root.clone());
         let shown = self.bottom == Bottom::Tests;
         let mut refused = None;
@@ -584,18 +685,27 @@ impl App {
                 // not allowed (or refused once): nothing to start, no check each frame
                 (None, Some(w)) if want && p.m.allowed => {
                     let w = w.clone();
-                    p.watch = match p.m.command(&w, root.as_deref(), "") {
-                        Ok(c) => Run::spawn(c, ctx.clone()).ok(),
-                        Err(e) => {
-                            refused = Some((i, e));
-                            None
-                        }
-                    };
                     p.watch_started = Some(Instant::now());
+                    match p.m.command(&w, root.as_deref(), "") {
+                        Ok(c) => match Run::spawn_group(c, ctx.clone()) {
+                            Ok(run) => {
+                                p.watch = Some(run);
+                                p.watch_error = None;
+                            }
+                            // tried again after the pause, not every frame
+                            Err(e) => {
+                                p.watch_error =
+                                    Some(format!("watch: could not start {}: {e}", w[0]));
+                                p.watch_ended();
+                            }
+                        },
+                        Err(e) => refused = Some((i, e)),
+                    }
                 }
                 (Some(_), _) if !want => {
                     if let Some(mut w) = p.watch.take() {
-                        stop(&mut w);
+                        w.terminate();
+                        self.tests.stopping.push(w);
                     }
                     p.live = None;
                     p.watch_started = None;
@@ -707,7 +817,9 @@ impl App {
                         click = Some(Click::Add);
                     }
                 }
-                for (name, url) in p.m.links.iter().rev() {
+                // a project plugin not allowed shows nothing of its own to click
+                let links = if p.m.allowed { &p.m.links[..] } else { &[] };
+                for (name, url) in links.iter().rev() {
                     if ui.link(name).on_hover_text(url).clicked() {
                         click = Some(Click::Link(url.clone()));
                     }
@@ -751,7 +863,7 @@ impl App {
             Some(Click::Action(a)) => self.run_case(active, "", Some(a), &ctx),
             Some(Click::Stop) => {
                 if let Some((_, _, run)) = self.tests.plugins[active].run.as_mut() {
-                    stop(run);
+                    run.terminate();
                 }
             }
             Some(Click::View(v)) => {
@@ -767,7 +879,8 @@ impl App {
                     .ok();
                 self.open_file(&f, offset);
             }
-            Some(Click::Link(u)) => open_link(&u),
+            Some(Click::Link(u)) if self.tests.plugins[active].m.allowed => open_link(&u),
+            Some(Click::Link(_)) => {}
             Some(Click::Add) => self.pick_plugin(&ctx),
             Some(Click::Allow) => self.allow_plugin(active, &ctx),
             Some(Click::Remove) => {
@@ -1038,6 +1151,9 @@ fn rows_list(ui: &mut Ui, p: &Plugin) -> Option<Click> {
 /// Right side: the live state, the run's results, then its log.
 fn output(ui: &mut Ui, p: &Plugin) -> Option<Click> {
     let mut click = None;
+    if let Some(e) = &p.watch_error {
+        ui.colored_label(crate::highlight::ERROR, e);
+    }
     if let Some(l) = &p.live {
         ui.horizontal(|ui| {
             let (icon, color) = status_look(l.status);
@@ -1075,4 +1191,88 @@ fn output(ui: &mut Ui, p: &Plugin) -> Option<Click> {
             }
         });
     click
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alive(pid: &str) -> bool {
+        unsafe { libc::kill(pid.trim().parse().unwrap(), 0) == 0 }
+    }
+
+    /// `sh -c script` as a plugin command runs it: the leader of its own process group.
+    fn group(script: &str, dir: &Path) -> std::process::Command {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", script]).current_dir(dir);
+        std::os::unix::process::CommandExt::process_group(&mut c, 0);
+        c
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("droid-lite-fetch-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn pid_in(f: &Path) -> String {
+        for _ in 0..250 {
+            if let Ok(p) = std::fs::read_to_string(f)
+                && !p.trim().is_empty()
+            {
+                return p;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("no pid in {}", f.display());
+    }
+
+    #[test]
+    fn a_list_past_its_time_ends_with_its_whole_group() {
+        let d = temp("limit");
+        let t0 = Instant::now();
+        let r = fetch_run(
+            group("sleep 30 & echo $! > child.pid; wait", &d),
+            &AtomicBool::new(false),
+            Duration::from_millis(500),
+        );
+        assert_eq!(r, Err("no answer in 0 s".into()));
+        assert!(t0.elapsed() < Duration::from_secs(3));
+        let child = pid_in(&d.join("child.pid"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!alive(&child), "the tool it started ended too");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_dropped_fetch_kills_its_group_and_a_finished_one_gives_its_output() {
+        let d = temp("drop");
+        let f = fetch(
+            group("sleep 30 & echo $! > child.pid; wait", &d),
+            &egui::Context::default(),
+        );
+        let child = pid_in(&d.join("child.pid"));
+        assert!(alive(&child));
+        drop(f);
+        let t0 = Instant::now();
+        while alive(&child) && t0.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!alive(&child), "a refused plugin's list stops");
+        let ok = fetch_run(
+            group("echo '[1]'; echo oops >&2", &d),
+            &AtomicBool::new(false),
+            FETCH_LIMIT,
+        );
+        assert_eq!(ok, Ok("[1]\n".into()));
+        let bad = fetch_run(
+            group("echo a >&2; echo b >&2; exit 3", &d),
+            &AtomicBool::new(false),
+            FETCH_LIMIT,
+        );
+        assert_eq!(bad, Err("exit 3: a b".into()));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

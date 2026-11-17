@@ -3080,7 +3080,9 @@ fn e2e_a_running_watch_stops_when_its_folder_changes_and_one_that_cannot_be_chec
     wait(&mut h, "the check", |a| !a.tests.plugins[0].m.allowed);
     assert!(h.state().tests.plugins[0].watch.is_none() && h.state().tests.plugins[0].live.is_none());
     assert_eq!(h.state().status, "Live changed since you allowed it; allow it again");
+    // the stopped watch is reaped by the next frames (it is a zombie until then)
     for _ in 0..100 {
+        h.step();
         if !alive(&pid) {
             break;
         }
@@ -3146,6 +3148,115 @@ fn e2e_allow_waits_for_the_lock_off_the_ui_thread() {
     std::fs::remove_file(&lock).unwrap();
     wait(&mut h, "allowed and listed", |a| a.tests.plugins[0].cases.len() == 1);
     assert!(h.state().tests.plugins[0].m.allowed);
+}
+
+#[test]
+fn e2e_a_project_plugin_not_allowed_shows_no_links_and_only_web_links_ever_show() {
+    let f = Fixture::new("plugin-links");
+    let dir = f.path(".droid-lite/plugins/linky");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.json"),
+        r#"{"name":"Linky","list":["sh","-c","echo []"],"links":[{"name":"PluginWebLink","url":"https://example.com"},
+            {"name":"PluginFileLink","url":"file:///etc/passwd"},{"name":"PluginShareLink","url":"smb://evil/share"}]}"#,
+    )
+    .unwrap();
+    let mut h = f.harness();
+    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    steps(&mut h, 3);
+    h.get_by_label_contains("Needs your OK: runs ");
+    for name in ["PluginWebLink", "PluginFileLink", "PluginShareLink"] {
+        assert!(h.query_by_label(name).is_none(), "{name} shows before the OK");
+    }
+    h.get_by_label("Allow").click();
+    wait(&mut h, "allowed", |a| a.tests.plugins[0].m.allowed);
+    steps(&mut h, 3);
+    h.get_by_label("PluginWebLink");
+    assert!(h.query_by_label("PluginFileLink").is_none());
+    assert!(h.query_by_label("PluginShareLink").is_none());
+}
+
+#[test]
+fn e2e_a_watch_that_cannot_start_waits_before_trying_again_and_says_why() {
+    let f = Fixture::new("plugin-watch-spawn");
+    let dir = f.config.join("plugins/nowatch");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.json"),
+        r#"{"name":"No watch","watch":["/nonexistent/droid-lite-watch"]}"#,
+    )
+    .unwrap();
+    let mut h = f.harness();
+    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < Duration::from_millis(1300) {
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let p = &h.state().tests.plugins[0];
+    assert!(p.watch.is_none());
+    assert!(p.watch_backoff >= Duration::from_secs(1), "{:?}", p.watch_backoff);
+    assert!(p.watch_next.is_some_and(|t| t > std::time::Instant::now()));
+    h.get_by_label_contains("watch: could not start /nonexistent/droid-lite-watch");
+}
+
+#[test]
+fn e2e_a_refused_plugin_stops_its_list_and_kills_a_watch_that_ignores_sigterm() {
+    let f = Fixture::new("plugin-refused-kill");
+    let dir = f.path(".droid-lite/plugins/hang");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.json"),
+        r#"{"name":"Hang","list":["sh","-c","sleep 30 & echo $! > \"$DROID_LITE_PROJECT/list.pid\"; wait"],
+            "watch":["sh","-c","trap '' TERM; echo $$ > \"$DROID_LITE_PROJECT/watch.pid\"; while :; do echo '{\"title\":\"t\"}'; sleep 0.2; done"]}"#,
+    )
+    .unwrap();
+    let alive = |pid: &str| unsafe { libc::kill(pid.trim().parse().unwrap(), 0) } == 0;
+    let mut h = f.harness();
+    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    steps(&mut h, 3);
+    h.get_by_label("Allow").click();
+    wait(&mut h, "the list and the watch", |a| {
+        a.tests.plugins[0].live.is_some() && f.path("list.pid").exists()
+    });
+    let list = std::fs::read_to_string(f.path("list.pid")).unwrap();
+    let watch = std::fs::read_to_string(f.path("watch.pid")).unwrap();
+    assert!(alive(&list) && alive(&watch));
+    // a new file in its folder: the check while the watch runs refuses it
+    std::fs::write(dir.join("notes.txt"), "new").unwrap();
+    wait(&mut h, "the check", |a| !a.tests.plugins[0].m.allowed);
+    let refused = std::time::Instant::now();
+    let mut list_gone = None;
+    while refused.elapsed() < Duration::from_secs(9) && (list_gone.is_none() || alive(&watch)) {
+        h.step();
+        if list_gone.is_none() && !alive(&list) {
+            list_gone = Some(refused.elapsed());
+        }
+        if refused.elapsed() > Duration::from_millis(2500) && refused.elapsed() < Duration::from_secs(3) {
+            assert!(alive(&watch), "SIGTERM is ignored: still there before its 5 s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(list_gone.is_some_and(|t| t < Duration::from_secs(2)), "the list's group was killed: {list_gone:?}");
+    assert!(!alive(&watch), "SIGKILL after 5 s");
+    assert!(refused.elapsed() >= Duration::from_secs(4));
+}
+
+#[test]
+fn e2e_add_plugin_selects_the_added_folder_not_the_first_of_that_name() {
+    let f = Fixture::new("plugin-add-same-name");
+    let own = f.config.join("plugins/aaa");
+    std::fs::create_dir_all(&own).unwrap();
+    std::fs::write(own.join("plugin.json"), r#"{"name":"Same"}"#).unwrap();
+    let tool = f.path("tool");
+    std::fs::create_dir_all(&tool).unwrap();
+    std::fs::write(tool.join("plugin.json"), r#"{"name":"Same"}"#).unwrap();
+    let mut h = f.harness();
+    let ctx = h.ctx.clone();
+    h.state_mut().add_plugin(&tool, &ctx);
+    let t = &h.state().tests;
+    assert_eq!(t.plugins.len(), 2);
+    assert_eq!(t.plugins[t.active].m.real, tool.canonicalize().unwrap());
 }
 
 #[test]

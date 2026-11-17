@@ -20,7 +20,11 @@ const userDir = () => path.join(configDir(), 'plugins');
 const storeFile = () => path.join(configDir(), 'approved-plugins.json');
 const realpath = (p) => fs.realpathSync.native(p); // the on-disk case, like the app
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
-const inside = (dir, p) => { const r = path.relative(dir, p); return !!r && !r.startsWith('..') && !path.isAbsolute(r); };
+// `p` is below `dir`, by path components as in the app (a folder named `..x` is inside)
+const inside = (dir, p) => {
+  const r = path.relative(dir, p);
+  return !!r && !path.isAbsolute(r) && r.split(path.sep)[0] !== '..';
+};
 // what a trust OK covers (the Allow modal and "Needs your OK")
 const TRUST = "Allowing trusts this plugin's folder. Commands may also run project code outside it (for example a script in the repo); changes to that code do not ask again.";
 const MAX_TREE_FILES = 2000;
@@ -33,34 +37,26 @@ function utf8Name(n) {
   return n;
 }
 
-// at most `max` bytes of the open file `fd` (a file that grew since the walk is never read whole)
-function readUpTo(fd, max) {
-  const chunks = [];
-  const buf = Buffer.alloc(Math.min(max, 64 << 10));
-  let n = 0;
-  for (let r; n < max && (r = fs.readSync(fd, buf, 0, Math.min(buf.length, max - n), null)) > 0; n += r) {
-    chunks.push(Buffer.from(buf.subarray(0, r)));
-  }
-  return Buffer.concat(chunks, n);
-}
+// an error that means the folder changed while it was read (not that it can never be checked)
+const changedError = (message) => Object.assign(new Error(message), { changed: true });
+// a file gone or locked for a moment (an atomic save, a git checkout) is a change, as in the app
+const isChange = (e) => e.changed || e.code === 'ENOENT' || e.code === 'EACCES';
 
-// the tree hash of a plugin folder (shared with the app, byte for byte): SHA-256 over every regular
-// file under it, sorted by relative path ('/' separators) compared as UTF-8 bytes; per file its
-// path, one 0 byte, its length (8 bytes, big-endian), its permission bits (mode & 0o777, 2 bytes,
-// big-endian) and its bytes. Lowercase hex. A link anywhere inside, a name that is not UTF-8, or
-// more than 2000 files or 8 MiB, throws. Also gives the plugin.json bytes it hashed, so what the
-// user sees is what the OK covers.
-function treeHash(folder) {
-  const files = []; // [relative path, absolute path], as bytes
+// the files of a plugin folder without reading any: { files: [[relative path, absolute path]] (as
+// bytes, sorted as UTF-8 bytes), sig }, `sig` a digest of what lstat says of each file (its path,
+// size, times, inode, device and mode): the same sig later means the same bytes, without reading
+// them. A link anywhere inside, a name that is not UTF-8, or more than 2000 files or 8 MiB, throws.
+function treeStat(folder) {
+  const files = []; // [relative path, absolute path, lstat]
   let total = 0;
   const walk = (abs, rel) => {
     for (const n of fs.readdirSync(abs, { encoding: 'buffer' }).map(utf8Name)) {
       const a = Buffer.concat([abs, Buffer.from(path.sep), n]);
       const r = rel ? Buffer.concat([rel, Buffer.from('/'), n]) : n;
-      const st = fs.lstatSync(a);
+      const st = fs.lstatSync(a, { bigint: true });
       if (st.isSymbolicLink()) throw new Error('contains links');
       if (st.isDirectory()) walk(a, r);
-      else if (st.isFile() && (files.push([r, a]) > MAX_TREE_FILES || (total += st.size) > MAX_TREE_BYTES)) {
+      else if (st.isFile() && (files.push([r, a, st]) > MAX_TREE_FILES || (total += Number(st.size)) > MAX_TREE_BYTES)) {
         throw new Error('too big to check');
       }
     }
@@ -68,27 +64,52 @@ function treeHash(folder) {
   walk(Buffer.from(folder), null);
   files.sort(([a], [b]) => Buffer.compare(a, b));
   const h = crypto.createHash('sha256');
+  for (const [r, , st] of files) {
+    h.update(r).update(Buffer.of(0)).update(`${[st.size, st.mtimeNs, st.ctimeNs, st.ino, st.dev, st.mode].join(',')}\n`);
+  }
+  return { files: files.map(([r, a]) => [r, a]), sig: h.digest('hex') };
+}
+
+// the tree hash of a plugin folder (shared with the app, byte for byte): SHA-256 over every regular
+// file under it, sorted by relative path ('/' separators) compared as UTF-8 bytes; per file its
+// path, one 0 byte, its length (8 bytes, big-endian), its permission bits (mode & 0o777, 2 bytes,
+// big-endian) and its bytes. Lowercase hex. Read a piece at a time (no copy of the files is kept).
+// Throws what treeStat throws; a file grown past 8 MiB is too big; one that is no longer a regular
+// file (a FIFO opens without waiting) or whose length changed while it was read is a change. Also
+// gives the plugin.json bytes it hashed, so what the user sees is what the OK covers, and the sig.
+function treeHash(folder) {
+  const { files, sig } = treeStat(folder);
+  const h = crypto.createHash('sha256');
+  const buf = Buffer.alloc(64 << 10);
   let manifest;
-  total = 0;
+  let total = 0;
   for (const [r, a] of files) {
     let fd;
-    try { fd = fs.openSync(a, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); } catch (e) {
+    try { fd = fs.openSync(a, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); } catch (e) {
       throw e.code === 'ELOOP' ? new Error('contains links') : e;
     }
-    let bytes;
-    let mode;
     try {
-      mode = fs.fstatSync(fd).mode & 0o777;
-      bytes = readUpTo(fd, MAX_TREE_BYTES - total + 1);
+      const st = fs.fstatSync(fd);
+      if (!st.isFile()) throw changedError(`${r} is no longer a file`);
+      const len = st.size;
+      if ((total += len) > MAX_TREE_BYTES) throw new Error('too big to check'); // grew since the walk
+      const head = Buffer.alloc(10);
+      head.writeBigUInt64BE(BigInt(len));
+      head.writeUInt16BE(st.mode & 0o777, 8);
+      h.update(r).update(Buffer.of(0)).update(head);
+      const keep = r.toString() === 'plugin.json' ? [] : undefined;
+      let n = 0;
+      for (let k; n <= len && (k = fs.readSync(fd, buf, 0, Math.min(buf.length, len + 1 - n), null)) > 0;) {
+        n += k;
+        if (n > len) break;
+        h.update(buf.subarray(0, k));
+        keep?.push(Buffer.from(buf.subarray(0, k)));
+      }
+      if (n !== len) throw changedError(`${r} changed while it was read`);
+      if (keep) manifest = Buffer.concat(keep);
     } finally { fs.closeSync(fd); }
-    if ((total += bytes.length) > MAX_TREE_BYTES) throw new Error('too big to check'); // grew since the walk
-    const head = Buffer.alloc(10);
-    head.writeBigUInt64BE(BigInt(bytes.length));
-    head.writeUInt16BE(mode, 8);
-    h.update(r).update(Buffer.of(0)).update(head).update(bytes);
-    if (r.toString() === 'plugin.json') manifest = bytes;
   }
-  return { hash: h.digest('hex'), manifest };
+  return { hash: h.digest('hex'), manifest, sig };
 }
 
 // the store: {"version":2,"approved":{"<project real path>":{"<plugin folder real path>":"<tree hash>"}}}.
@@ -110,26 +131,42 @@ function readStore(strict = false) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-// takes away the stale lock file `lock` that `seen` (an lstat with bigint) described: renamed to a
-// name of its own first, then deleted only when what was renamed is still that file. Another
-// process may have taken the stale one away and made a fresh lock meanwhile: that one is put back
-// (unless a newer lock already took its place), so two processes taking away one stale lock never
-// delete a fresh one. A new file may get a freed inode number again: its time tells it apart.
-function removeStale(lock, seen) {
+// a lock file left by a process that died: its time is more than 30 s away from now, in the past or
+// (a clock set back, a copied file) in the future
+const isStale = (st) => st.isFile() && Math.abs(Date.now() - Number(st.mtimeMs)) > 30000;
+const sameFile = (a, b) => a.dev === b.dev && a.ino === b.ino && a.mtimeNs === b.mtimeNs;
+// takes away the stale lock file `lock` that `seen` (an lstat with bigint) described: looked at
+// again right before (a fresh lock in its place is left alone), renamed to a name of its own, then
+// deleted only when what was renamed is still that file. Another process may have taken the stale
+// one away and made a fresh lock meanwhile: that one is put back; when it cannot be put back (a newer
+// lock took its place), it stays under its aside name and is never deleted (someone may hold it).
+// A new file may get a freed inode number again: its time tells it apart. `step('rename')` and
+// `step('put back')` run before those, where a test plays the other process.
+function removeStale(lock, seen, step = () => {}) {
+  let still;
+  try { still = fs.lstatSync(lock, { bigint: true }); } catch { return; /* gone */ }
+  if (!sameFile(still, seen) || !isStale(still)) return;
   const aside = `${lock}.stale.${process.pid}.${crypto.randomBytes(8).toString('hex')}`;
+  step('rename');
   try { fs.renameSync(lock, aside); } catch { return; }
   let now;
-  try { now = fs.lstatSync(aside, { bigint: true }); } catch { /* gone */ }
-  if (!(now && now.dev === seen.dev && now.ino === seen.ino && now.mtimeNs === seen.mtimeNs)) {
-    try { fs.linkSync(aside, lock); } catch { /* a newer lock took its place */ }
+  try { now = fs.lstatSync(aside, { bigint: true }); } catch { return; /* gone */ }
+  if (sameFile(now, seen)) {
+    try { fs.unlinkSync(aside); } catch { /* gone */ }
+    return;
+  }
+  step('put back');
+  try { fs.linkSync(aside, lock); } catch (e) {
+    console.error(`Droid Lite: left a lock taken by mistake at ${aside} (${e.message})`);
+    return;
   }
   try { fs.unlinkSync(aside); } catch { /* gone */ }
 }
 
 // runs `f` holding <store>.lock (created with 'wx', holding this holder's token: its pid and a
 // random number; the app takes the same lock), waiting up to limits.lock ms. Every try that fails
-// waits and checks the time, whatever is in the way: a lock file older than 30 s is from a process
-// that died and is taken away (removeStale); anything else (a fresh lock, a folder, a link, a stale
+// waits and checks the time, whatever is in the way: a lock file more than 30 s old (or ahead) is
+// from a process that died and is taken away (removeStale); anything else (a fresh lock, a folder, a link, a stale
 // lock that could not be taken away) is held. The lock is removed after only while it holds this
 // token.
 async function locked(f) {
@@ -150,7 +187,7 @@ async function locked(f) {
     }
     let st;
     try { st = fs.lstatSync(lock, { bigint: true }); } catch { /* gone meanwhile */ }
-    if (st?.isFile() && Date.now() - Number(st.mtimeMs) > 30000) removeStale(lock, st);
+    if (st && isStale(st)) removeStale(lock, st);
     if (Date.now() > end) throw new Error(`${lock} is held by another Droid Lite; try again`);
     await sleep(wait);
   }
@@ -160,13 +197,13 @@ async function locked(f) {
 }
 
 // allows the plugin folder `folder` of project `project` (both real paths) with this tree hash,
-// keeping every other entry: read, changed and written under the lock, through a 0600 temp file
-// and a rename, so a reader (the app) never sees half a file
+// keeping every other entry (and any other top-level key, as the app does): read, changed and
+// written under the lock, through a 0600 temp file and a rename, so a reader (the app) never sees
+// half a file
 function approve(project, folder, hash) {
   return locked(() => {
     const file = storeFile();
-    const store = readStore(true);
-    const out = { version: 2, approved: store.approved };
+    const out = readStore(true);
     if (!isObject(out.approved[project])) out.approved[project] = {};
     out.approved[project][folder] = hash;
     const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
@@ -180,27 +217,43 @@ function approve(project, folder, hash) {
   });
 }
 
-// a project plugin as it is on disk now: { real, hash, manifest } or a thrown reason it can never
-// run (its real folder is not inside the project's real .droid-lite/plugins, a link inside it, too big)
-function inspect(project, folder) {
+// the real path of a project plugin's folder, or a throw when it is not inside the project's real
+// .droid-lite/plugins (itself inside the real project)
+function placed(project, folder) {
   const real = realpath(folder);
   const plugins = realpath(path.join(project, '.droid-lite', 'plugins'));
   if (!inside(realpath(project), plugins) || !inside(plugins, real)) throw new Error('links outside the project');
+  return real;
+}
+
+// a project plugin as it is on disk now: { real, hash, manifest, sig } or a thrown reason it
+// cannot run (placed, treeHash)
+function inspect(project, folder) {
+  const real = placed(project, folder);
   return { real, ...treeHash(real) };
 }
 
 // why a loaded project plugin may not run now: its folder (read again, the same checks) is not the
 // one allowed at load, as in the app: { why }, or { why, broken: true } when it can no longer be
 // checked at all (links outside, too big) and so never run or be allowed; undefined when it is
-// unchanged, and for the user's own plugins
+// unchanged, and for the user's own plugins. A folder whose every file looks as it did at the last
+// full read (plugin.sig) is not read again; a file gone or locked for a moment is a change.
 function changed(plugin) {
   if (!plugin.hash) return undefined;
   try {
-    if (inspect(plugin.project, plugin.folder).hash === plugin.hash) return undefined;
+    if (plugin.sig && placed(plugin.project, plugin.folder) === plugin.folder
+      && treeStat(plugin.folder).sig === plugin.sig) return undefined;
+  } catch { /* read in full below */ }
+  const again = { why: `${plugin.name} changed since you allowed it; allow it again` };
+  try {
+    const now = inspect(plugin.project, plugin.folder);
+    if (now.hash !== plugin.hash) return again;
+    plugin.sig = now.sig;
+    return undefined;
   } catch (e) {
+    if (isChange(e)) return again;
     return { why: `${plugin.name} changed since you allowed it and cannot run now (${e.message})`, broken: true };
   }
-  return { why: `${plugin.name} changed since you allowed it; allow it again` };
 }
 const MAX_LOG = 20000; // lines kept per run in the test output
 const MAX_LOG_CHARS = 8 << 20; // and characters (about 8 MB) in all
@@ -269,6 +322,7 @@ function readPlugins(project) {
         let ok = own;
         let key;
         let hash;
+        let sig;
         if (own) bytes = fs.readFileSync(file);
         else {
           key = realpath(project);
@@ -276,6 +330,7 @@ function readPlugins(project) {
           bytes = seen.manifest;
           if (!bytes) throw new Error('not a file');
           hash = seen.hash;
+          sig = seen.sig;
           ok = approved[key]?.[real] === hash;
         }
         const spec = JSON.parse(bytes.toString('utf8'));
@@ -286,8 +341,10 @@ function readPlugins(project) {
           continue;
         }
         const dir = spec.dir ? spec.dir.replace(/^~\//, `${os.homedir()}/`) : '.';
-        // a project plugin keeps what it was allowed under: spawn checks it before every command
-        out.push({ name: spec.name, folder: real, cwd: path.resolve(real, dir), spec, ...(hash && { project: key, hash }) });
+        // a project plugin keeps what it was allowed under (and how its folder looked when it was
+        // read, so the spawn of its list right after the load reads nothing again): spawn checks
+        // it before every command
+        out.push({ name: spec.name, folder: real, cwd: path.resolve(real, dir), spec, ...(hash && { project: key, hash, sig }) });
       } catch (e) {
         out.push({ error: `${file}: ${e.message}`, folder: real });
       }
@@ -302,7 +359,8 @@ function argv(cmd, plugin, project, id = '') {
     .replaceAll('{id}', id));
 }
 
-// runs a command in its own process group (Stop reaches the tools it started), stdin empty.
+// runs a command in its own process group (Stop reaches the tools it started), stdin empty;
+// `~/` at the start of the program is the home folder, as in the app.
 // `onEnd(code, error)` runs once: after the exit plus a short grace for the last output (a tool
 // it left running may hold the pipes), or when it could not start. A project plugin whose folder
 // changed since it was allowed (`changed`) starts nothing: it fails like a missing command and
@@ -317,7 +375,7 @@ function spawn(cmd, plugin, project, onEnd = () => {}) {
       plugin.revoke?.(change);
       throw new Error(change.why);
     }
-    proc = cp.spawn(bin, args, {
+    proc = cp.spawn(bin.replace(/^~\//, `${os.homedir()}/`), args, {
       cwd: plugin.cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, DROID_LITE_PROJECT: project || '', ...(plugin.hash && { PYTHONDONTWRITEBYTECODE: '1' }) },
     });
@@ -687,7 +745,9 @@ function setup(ctx, projectOf) {
           return entries.map((e) => {
             const icon = { failed: 'error', passed: 'pass', skipped: 'circle-slash', running: 'sync' }[e.status] || 'circle-small';
             const loc = location(project, e.file, e.line);
-            const args = loc ? [loc.uri, { selection: loc.range }] : e.url ? [vscode.Uri.parse(e.url)] : undefined;
+            // a row's link opens only an http(s) page, as the plugin's links
+            const web = typeof e.url === 'string' && /^https?:\/\//i.test(e.url);
+            const args = loc ? [loc.uri, { selection: loc.range }] : web ? [vscode.Uri.parse(e.url)] : undefined;
             const i = item(e.label || '', icon, args ? 'vscode.open' : undefined, args, e.message);
             i.tooltip = [e.label, e.message, e.url].filter(Boolean).join('\n');
             return i;
@@ -808,4 +868,4 @@ function setup(ctx, projectOf) {
   return { load, readPlugins, loaded };
 }
 
-module.exports = { setup, readPlugins, argv, json, findPluginJson, location, limits, procs, treeHash, approve, removeStale, readUpTo, utf8Name };
+module.exports = { setup, readPlugins, argv, json, findPluginJson, location, limits, procs, treeHash, treeStat, changed, approve, removeStale, utf8Name };

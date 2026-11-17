@@ -724,19 +724,61 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   try { tests.utf8Name(Buffer.from([0x61, 0xff, 0x62, 0xe2, 0x82])); } catch (e) { notUtf8 = e.message; }
   check('a name that is not UTF-8 is refused', notUtf8 === 'a\ufffdb\ufffd is not a UTF-8 name'
     && tests.utf8Name(Buffer.from('plugin.json')).toString() === 'plugin.json');
-  // a file that grew since the walk is read only up to the limit (+1 byte), then refused
+  // a file that grew past the limit since the walk is refused before any byte of it is read
   const grown = path.join(tmp, 'grown');
   fs.mkdirSync(grown);
   fs.writeFileSync(path.join(grown, 'plugin.json'), '{"name":"G"}');
   fs.closeSync(fs.openSync(path.join(grown, 'blob'), 'w'));
   fs.truncateSync(path.join(grown, 'blob'), 32 << 20); // sparse: no disk
-  const [realLstat, realReadSync] = [fs.lstatSync, fs.readSync];
+  const [realLstat, realReadSync, realFstat] = [fs.lstatSync, fs.readSync, fs.fstatSync];
   let readBytes = 0;
-  fs.lstatSync = (...a) => { const st = realLstat(...a); if (String(a[0]).endsWith('/blob')) st.size = 1; return st; };
+  fs.lstatSync = (...a) => { const st = realLstat(...a); if (String(a[0]).endsWith('/blob')) st.size = 1n; return st; };
   fs.readSync = (...a) => { const n = realReadSync(...a); readBytes += n; return n; };
   let grew;
   try { tests.treeHash(real(grown)); } catch (e) { grew = e.message; } finally { [fs.lstatSync, fs.readSync] = [realLstat, realReadSync]; }
-  check('a file that grew is read up to the limit only, then refused', grew === 'too big to check' && readBytes === (8 << 20) + 1);
+  check('a file that grew past the limit is refused unread', grew === 'too big to check' && readBytes < 100);
+  // a file whose length changes while it is read is a change (it may be allowed again), and is read
+  // only one byte past the length it had
+  fs.truncateSync(path.join(grown, 'blob'), 4 << 20);
+  readBytes = 0;
+  fs.fstatSync = (...a) => { const st = realFstat(...a); if (st.size === 4 << 20) st.size = 1000; return st; };
+  fs.readSync = (...a) => { const n = realReadSync(...a); readBytes += n; return n; };
+  let moved;
+  try { tests.treeHash(real(grown)); } catch (e) { moved = e; } finally { [fs.fstatSync, fs.readSync] = [realFstat, realReadSync]; }
+  check('a length that changes while read is a change', moved?.message === 'blob changed while it was read' && moved.changed && readBytes < 1100);
+  // the hash reads a piece at a time: no update is a whole file
+  let biggest = 0;
+  const realCreateHash = crypto.createHash;
+  crypto.createHash = (...a) => {
+    const h = realCreateHash(...a);
+    const update = h.update.bind(h);
+    h.update = (d) => { biggest = Math.max(biggest, d.length); update(d); return h; };
+    return h;
+  };
+  try { tests.treeHash(real(grown)); } finally { crypto.createHash = realCreateHash; }
+  check('the tree hash is fed a piece at a time', biggest > 0 && biggest <= 64 << 10);
+  // a FIFO swapped in for a file after the walk never makes the hash wait for a writer: a change
+  // (a child process: a wait would freeze this one)
+  const fifoDir = path.join(tmp, 'fifo');
+  fs.mkdirSync(fifoDir);
+  fs.writeFileSync(path.join(fifoDir, 'plugin.json'), '{"name":"F"}');
+  fs.writeFileSync(path.join(fifoDir, 'plain'), 'x');
+  require('child_process').execFileSync('mkfifo', [path.join(fifoDir, 'x')]);
+  const fifoChild = path.join(tmp, 'fifo-child.js');
+  fs.writeFileSync(fifoChild, `const Module = require('module');
+const fs = require('fs');
+const load = Module._load;
+Module._load = function (r, ...a) { return r === 'vscode' ? {} : load.call(this, r, ...a); };
+const t = require(process.argv[2]);
+const lstat = fs.lstatSync;
+// the walk saw a file there; the FIFO took its place since
+fs.lstatSync = (p, ...a) => lstat(String(p).endsWith('/x') ? process.argv[3] + '/plain' : p, ...a);
+try { t.treeHash(process.argv[3]); console.log('hashed'); } catch (e) { console.log(e.message, !!e.changed); }
+`);
+  const fifoRun = require('child_process').spawnSync(process.execPath, [fifoChild, path.join(__dirname, '..', 'tests.js'), real(fifoDir)],
+    { timeout: 5000, encoding: 'utf8' });
+  check('a FIFO in place of a file is a change and never waits', (fifoRun.stdout || '').trim() === 'x is no longer a file true'
+    || assert.fail(JSON.stringify([fifoRun.stdout, fifoRun.stderr, fifoRun.signal])));
   // keys are real paths with the on-disk case (a project opened as /x/caseproj is /x/CaseProj)
   const caseDir = path.join(tmp, 'CaseProj');
   fs.mkdirSync(path.join(caseDir, '.droid-lite', 'plugins', 'Cased'), { recursive: true });
@@ -782,6 +824,45 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   check('two takers of one stale lock never delete the fresh one', firstTook && fs.readFileSync(lock, 'utf8') === '7 fresh'
     && fs.readdirSync(path.dirname(lock)).every((n) => !n.includes('.stale.')));
   fs.unlinkSync(lock);
+  // the stale lock is looked at again right before it is taken away: a fresh lock in its place is
+  // never renamed (another process could lock in the gap)
+  const oldLock = () => {
+    fs.writeFileSync(lock, '1 old');
+    fs.utimesSync(lock, new Date(Date.now() - 60000), new Date(Date.now() - 60000));
+    return fs.lstatSync(lock, { bigint: true });
+  };
+  let seenOld = oldLock();
+  fs.unlinkSync(lock);
+  fs.writeFileSync(lock, '2 fresh');
+  const steps = [];
+  tests.removeStale(lock, seenOld, (st) => { steps.push(st); if (st === 'put back') fs.writeFileSync(lock, '3 third'); });
+  check('a stale lock made fresh meanwhile is not touched', steps.length === 0 && fs.readFileSync(lock, 'utf8') === '2 fresh');
+  fs.unlinkSync(lock);
+  // renamed aside, it turns out to be another's fresh lock and a newer one took its place: it cannot
+  // be put back, so it stays aside, never deleted
+  seenOld = oldLock();
+  const realError = console.error;
+  console.error = () => {};
+  try {
+    tests.removeStale(lock, seenOld, (st) => {
+      if (st === 'rename') { fs.unlinkSync(lock); fs.writeFileSync(lock, '2 fresh'); } else fs.writeFileSync(lock, '3 third');
+    });
+  } finally { console.error = realError; }
+  const asideLocks = fs.readdirSync(path.dirname(lock)).filter((n) => n.includes('.stale.'));
+  check('a fresh lock that cannot be put back is never deleted', fs.readFileSync(lock, 'utf8') === '3 third' && asideLocks.length === 1
+    && fs.readFileSync(path.join(path.dirname(lock), asideLocks[0]), 'utf8') === '2 fresh');
+  asideLocks.forEach((n) => fs.unlinkSync(path.join(path.dirname(lock), n)));
+  fs.unlinkSync(lock);
+  // a lock dated far in the future (a clock set back) is stale too
+  fs.writeFileSync(lock, '1 skewed');
+  fs.utimesSync(lock, new Date(Date.now() + 120000), new Date(Date.now() + 120000));
+  const aheadT0 = Date.now();
+  await tests.approve(P, '/x/ahead', 'hf');
+  check('a lock 2 minutes ahead is stale', Date.now() - aheadT0 < 2000 && readStore().approved[P]['/x/ahead'] === 'hf' && !fs.existsSync(lock));
+  // the store's other top-level keys are kept, as in the app
+  writeStore({ ...readStore(), note: 'keep me' });
+  await tests.approve(P, '/x/keys', 'hk');
+  check('Allow keeps the store\'s other top-level keys', readStore().note === 'keep me' && readStore().approved[P]['/x/keys'] === 'hk');
   // whatever is in the way of the lock (an old folder that cannot be removed, a dangling link)
   // waits and gives up in time, never spins (a child process: a spin would freeze this one), and
   // is left alone
@@ -912,6 +993,72 @@ const t = require(process.argv[2]);
   ctxW.subscriptions.forEach((d) => d.dispose?.());
   await until('no tracked process', () => tests.procs.size === 0, 8000).catch(() => {});
   check('no plugin process left after the watch checks', tests.procs.size === 0);
+
+  // an allowed plugin whose folder looks as it did at the last full read is not read again: the
+  // load hashes it once (the spawn of its list right after reads nothing), and a check reads it
+  // again only when a file looks changed
+  const projectS = path.join(tmp, 'projectS');
+  const sDir = path.join(projectS, '.droid-lite', 'plugins', 's');
+  fs.mkdirSync(sDir, { recursive: true });
+  fs.writeFileSync(path.join(sDir, 'plugin.json'), JSON.stringify({ name: 'S', list: ['sh', '-c', 'echo []'] }));
+  fs.writeFileSync(path.join(sDir, 'l.sh'), 'echo []\n');
+  approve(sDir);
+  let reads = 0;
+  const countReads = (f) => {
+    const before = fs.readSync;
+    reads = 0;
+    fs.readSync = (...a) => { reads++; return before(...a); };
+    try { return f(); } finally { fs.readSync = before; }
+  };
+  const sPlugin = tests.readPlugins(projectS).find((x) => x.name === 'S');
+  const oneHash = (countReads(() => tests.treeHash(real(sDir))), reads);
+  countReads(() => [1, 2, 3].map(() => tests.changed(sPlugin)));
+  const unchangedReads = reads;
+  fs.writeFileSync(path.join(sDir, 'l.sh'), 'echo []\n'); // the same bytes again
+  const same = countReads(() => tests.changed(sPlugin));
+  const sameReads = reads;
+  countReads(() => tests.changed(sPlugin));
+  const afterReads = reads;
+  check('a check reads the folder again only when a file looks changed', oneHash > 0 && unchangedReads === 0 && same === undefined
+    && sameReads === oneHash && afterReads === 0);
+  fs.writeFileSync(path.join(sDir, 'l.sh'), 'rm -r ~\n');
+  check('and other bytes are refused', /S changed since you allowed it; allow it again/.test(tests.changed(sPlugin)?.why));
+  fs.writeFileSync(path.join(sDir, 'l.sh'), 'echo []\n');
+  approve(sDir);
+  const ctxS = { subscriptions: [] };
+  const realReadSync2 = fs.readSync;
+  let loadReads = 0;
+  fs.readSync = (...a) => { loadReads++; return realReadSync2(...a); };
+  try {
+    const apiS = tests.setup(ctxS, () => projectS);
+    await apiS.loaded;
+  } finally { fs.readSync = realReadSync2; }
+  countReads(() => tests.readPlugins(projectS));
+  const readOnly = reads; // the plugins read (one hash of S), and no list spawned
+  check('a load hashes an allowed plugin once', (loadReads === readOnly && readOnly < 2 * oneHash)
+    || assert.fail(`${loadReads} reads; reading the plugins alone is ${readOnly}, one hash ${oneHash}`));
+  ctxS.subscriptions.forEach((d) => d.dispose?.());
+  // a file gone or locked for a moment is a change that may be allowed again, never broken
+  fs.chmodSync(path.join(sDir, 'l.sh'), 0o000);
+  const locked = tests.changed(tests.readPlugins(projectS).find((x) => x.name === 'S') || sPlugin);
+  fs.chmodSync(path.join(sDir, 'l.sh'), 0o644);
+  const sNow = tests.readPlugins(projectS).find((x) => x.name === 'S');
+  fs.renameSync(sDir, `${sDir}-away`);
+  const gone = tests.changed(sNow);
+  fs.renameSync(`${sDir}-away`, sDir);
+  check('a file locked or a folder gone for a moment asks again, not broken', /allow it again$/.test(locked?.why) && !locked.broken
+    && /allow it again$/.test(gone?.why) && !gone.broken && tests.changed(sNow) === undefined);
+  // a plugin folder named `..x` is inside the plugins folder (path components, as in the app)
+  const projectD = path.join(tmp, 'projectD');
+  fs.mkdirSync(path.join(projectD, '.droid-lite', 'plugins', '..x'), { recursive: true });
+  fs.writeFileSync(path.join(projectD, '.droid-lite', 'plugins', '..x', 'plugin.json'), JSON.stringify({ name: 'Dots' }));
+  const dots = tests.readPlugins(projectD).find((x) => x.folder.endsWith('..x'));
+  check('a plugin folder named ..x is inside', dots?.needsOk && dots.name === 'Dots' || assert.fail(JSON.stringify(dots)));
+  // ~/ at the start of a command is the home folder, as in the app
+  fs.writeFileSync(path.join(home, 'droid-lite-list.sh'), '#!/bin/sh\necho \'[{"id":"h","label":"from home"}]\'\n', { mode: 0o755 });
+  const tilde = { name: 'T', folder: tmp, cwd: tmp, spec: {} };
+  const homeCases = await tests.json(['~/droid-lite-list.sh'], tilde, project);
+  check('~/ in a command is the home folder', homeCases?.[0]?.id === 'h');
 
   fs.rmSync(tmp, { recursive: true, force: true });
   console.log(`ok: test plugins, ${checks} checks`);
