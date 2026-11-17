@@ -2342,6 +2342,66 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         let _ = std::fs::remove_dir_all(d);
     }
 
+    /// Draws `previews` of `file` (class `class`) with the real worker in the preview folder `pv`,
+    /// on a cold worker: any worker already running there is stopped first, and the one this starts
+    /// is stopped after. `d` is the project root and is deleted after.
+    fn real_draw(pv: &Path, d: &Path, file: &Path, class: &str, previews: &[&str], files: Vec<PathBuf>) -> Result<crate::preview_cache::Cards, String> {
+        let stop_all = || {
+            for e in std::fs::read_dir(pv).into_iter().flatten().flatten() {
+                if e.path().extension().is_some_and(|x| x == "sock") {
+                    stop_worker(&e.path(), None, Duration::from_secs(2));
+                }
+            }
+        };
+        stop_all();
+        let vars = ["DROID_LITE_PREVIEW_DIR", "DROID_LITE_PREVIEW_WORKER", "DROID_LITE_PREVIEW_IDLE_SECS"];
+        let old: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        // SAFETY: the caller holds the test lock, so no other test reads the environment meanwhile.
+        unsafe {
+            std::env::set_var(vars[0], pv);
+            std::env::remove_var(vars[1]);
+            std::env::set_var(vars[2], "60");
+        }
+        let _ = std::fs::remove_dir_all(pv.join("cache")); // drawn by the worker, not a cached answer
+        let r = Request {
+            file: file.to_path_buf(),
+            class: class.into(),
+            previews: previews.iter().map(|p| p.to_string()).collect(),
+            seq: 1,
+            project: Some(ProjectRef { root: d.to_path_buf(), scripts: vec![], files: std::sync::Arc::new(files), changed: vec![] }),
+        };
+        let got = std::cell::RefCell::new(None);
+        State::default().draw(&r, &|e| match e {
+            Event::Done { cards, .. } => *got.borrow_mut() = Some(Ok(cards)),
+            Event::Failed { error, .. } => *got.borrow_mut() = Some(Err(error)),
+            _ => {}
+        });
+        stop_all();
+        for (k, v) in vars.iter().zip(old) {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        let _ = std::fs::remove_dir_all(d);
+        got.into_inner().expect("an answer")
+    }
+
+    /// Writes the files of a small project under `d`: `rel` and its text.
+    fn write_project(d: &Path, files: &[(&str, &str)]) -> Vec<PathBuf> {
+        files
+            .iter()
+            .map(|(rel, text)| {
+                let p = d.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, text).unwrap();
+                p
+            })
+            .collect()
+    }
+
+    const REAL_VERSIONS: &str = "[versions]\nkotlin = \"2.4.21\"\n\n[libraries]\nfoundation = { module = \"androidx.compose.foundation:foundation-android\", version = \"1.10.4\" }\ntooling = { module = \"androidx.compose.ui:ui-tooling-preview-android\", version = \"1.10.4\" }\n";
+
     /// The real worker on a small project (not run by default: it needs the Gradle cache's Kotlin
     /// 2.4.21 and Compose 1.10.4, and starts a JVM): `DROID_LITE_REAL_PREVIEW_DIR=/tmp/x/p cargo test
     /// --release real_worker -- --ignored`. A @PreviewParameter provider in another package gives one
@@ -2352,50 +2412,12 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         let Some(pv) = std::env::var_os("DROID_LITE_REAL_PREVIEW_DIR").map(PathBuf::from) else { return };
         let _lock = crate::app::test_lock();
         let d = tmp("realparam");
-        let w = |rel: &str, text: &str| {
-            let p = d.join(rel);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(&p, text).unwrap();
-            p
-        };
-        w("gradle/libs.versions.toml", "[versions]\nkotlin = \"2.4.21\"\n\n[libraries]\nfoundation = { module = \"androidx.compose.foundation:foundation-android\", version = \"1.10.4\" }\ntooling = { module = \"androidx.compose.ui:ui-tooling-preview-android\", version = \"1.10.4\" }\n");
-        let cards = w("app/src/main/kotlin/demo/ui/Cards.kt", "package demo.ui\n\nimport androidx.compose.foundation.text.BasicText\nimport androidx.compose.runtime.Composable\nimport androidx.compose.ui.tooling.preview.Preview\nimport androidx.compose.ui.tooling.preview.PreviewLightDark\nimport androidx.compose.ui.tooling.preview.PreviewParameter\nimport demo.ui.preview.Boom\nimport demo.ui.preview.Names\n\n@Preview\n@Composable\nfun NamePreview(@PreviewParameter(Names::class) name: String) { BasicText(name) }\n\n@Preview\n@Composable\nfun FirstOnly(@PreviewParameter(Names::class, limit = 1) name: String) { BasicText(name) }\n\n@Preview\n@Composable\nfun BoomPreview(@PreviewParameter(Boom::class) n: Int) { BasicText(\"$n\") }\n\n@PreviewLightDark\n@Composable\nprivate fun Both(@PreviewParameter(Names::class) name: String) { BasicText(name) }\n\n@Preview\n@Composable\nfun Plain() { BasicText(\"plain\") }\n");
-        let providers = w("app/src/main/kotlin/demo/ui/preview/Providers.kt", "package demo.ui.preview\n\nimport androidx.compose.ui.tooling.preview.PreviewParameterProvider\n\nclass Names : PreviewParameterProvider<String> {\n    override val values = sequenceOf(\"Ana\", \"Bo\")\n}\n\nclass Boom : PreviewParameterProvider<Int> {\n    override val values: Sequence<Int> get() = error(\"no data\")\n}\n");
-        let vars = ["DROID_LITE_PREVIEW_DIR", "DROID_LITE_PREVIEW_WORKER", "DROID_LITE_PREVIEW_IDLE_SECS"];
-        let old: Vec<_> = vars.iter().map(std::env::var_os).collect();
-        // SAFETY: the test lock is held, so no other test reads the environment meanwhile.
-        unsafe {
-            std::env::set_var(vars[0], &pv);
-            std::env::remove_var(vars[1]);
-            std::env::set_var(vars[2], "60");
-        }
-        let _ = std::fs::remove_dir_all(pv.join("cache")); // drawn by the worker, not a cached answer
-        let r = Request {
-            file: cards.clone(),
-            class: "demo.ui.CardsKt".into(),
-            previews: ["NamePreview", "FirstOnly", "BoomPreview", "Both", "Plain"].map(String::from).to_vec(),
-            seq: 1,
-            project: Some(ProjectRef { root: d.clone(), scripts: vec![], files: std::sync::Arc::new(vec![cards, providers]), changed: vec![] }),
-        };
-        let got = std::cell::RefCell::new(None);
-        State::default().draw(&r, &|e| match e {
-            Event::Done { cards, .. } => *got.borrow_mut() = Some(Ok(cards)),
-            Event::Failed { error, .. } => *got.borrow_mut() = Some(Err(error)),
-            _ => {}
-        });
-        for e in std::fs::read_dir(&pv).unwrap().flatten() {
-            if e.path().extension().is_some_and(|x| x == "sock") {
-                stop_worker(&e.path(), None, Duration::from_secs(2));
-            }
-        }
-        for (k, v) in vars.iter().zip(old) {
-            match v {
-                Some(v) => unsafe { std::env::set_var(k, v) },
-                None => unsafe { std::env::remove_var(k) },
-            }
-        }
-        let _ = std::fs::remove_dir_all(&d);
-        let cards = got.into_inner().expect("an answer").expect("drawn");
+        let files = write_project(&d, &[
+            ("gradle/libs.versions.toml", REAL_VERSIONS),
+            ("app/src/main/kotlin/demo/ui/Cards.kt", "package demo.ui\n\nimport androidx.compose.foundation.text.BasicText\nimport androidx.compose.runtime.Composable\nimport androidx.compose.ui.tooling.preview.Preview\nimport androidx.compose.ui.tooling.preview.PreviewLightDark\nimport androidx.compose.ui.tooling.preview.PreviewParameter\nimport demo.ui.preview.Boom\nimport demo.ui.preview.Names\n\n@Preview\n@Composable\nfun NamePreview(@PreviewParameter(Names::class) name: String) { BasicText(name) }\n\n@Preview\n@Composable\nfun FirstOnly(@PreviewParameter(Names::class, limit = 1) name: String) { BasicText(name) }\n\n@Preview\n@Composable\nfun BoomPreview(@PreviewParameter(Boom::class) n: Int) { BasicText(\"$n\") }\n\n@PreviewLightDark\n@Composable\nprivate fun Both(@PreviewParameter(Names::class) name: String) { BasicText(name) }\n\n@Preview\n@Composable\nfun Plain() { BasicText(\"plain\") }\n"),
+            ("app/src/main/kotlin/demo/ui/preview/Providers.kt", "package demo.ui.preview\n\nimport androidx.compose.ui.tooling.preview.PreviewParameterProvider\n\nclass Names : PreviewParameterProvider<String> {\n    override val values = sequenceOf(\"Ana\", \"Bo\")\n}\n\nclass Boom : PreviewParameterProvider<Int> {\n    override val values: Sequence<Int> get() = error(\"no data\")\n}\n"),
+        ]);
+        let cards = real_draw(&pv, &d, &files[1], "demo.ui.CardsKt", &["NamePreview", "FirstOnly", "BoomPreview", "Both", "Plain"], files[1..].to_vec()).expect("drawn");
         let names: Vec<&str> = cards.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["NamePreview (1)", "NamePreview (2)", "FirstOnly (1)", "BoomPreview", "Both - Light (1)", "Both - Light (2)", "Both - Dark (1)", "Both - Dark (2)", "Plain"]);
         for (n, c) in &cards {
@@ -2409,5 +2431,27 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         // the two values are two different pictures
         let png = |i: usize| cards[i].1.as_ref().unwrap().png.clone();
         assert_ne!(png(0), png(1));
+    }
+
+    /// The first picture of a cold worker runs at API 34 like the others (the real worker, not run by
+    /// default: see above). Paparazzi forces `Build.VERSION.SDK_INT` before the first picture without
+    /// running the class's static initializer; when the picture then ran it, the SDK stub put 0 back,
+    /// and Compose took its pre-API 23 paths for that one picture (a graphics layer then failed with
+    /// `NoClassDefFoundError: android/view/HardwareCanvas`, which layoutlib does not have).
+    #[test]
+    #[ignore]
+    fn real_worker_draws_the_first_picture_of_a_cold_worker_at_api_34() {
+        let Some(pv) = std::env::var_os("DROID_LITE_REAL_PREVIEW_DIR").map(PathBuf::from) else { return };
+        let _lock = crate::app::test_lock();
+        let d = tmp("realcold");
+        let files = write_project(&d, &[
+            ("gradle/libs.versions.toml", REAL_VERSIONS),
+            ("app/src/main/kotlin/demo/ui/Layer.kt", "package demo.ui\n\nimport android.os.Build\nimport androidx.compose.foundation.text.BasicText\nimport androidx.compose.runtime.Composable\nimport androidx.compose.ui.graphics.rememberGraphicsLayer\nimport androidx.compose.ui.tooling.preview.Preview\n\n@Preview\n@Composable\nfun First() {\n    rememberGraphicsLayer()\n    check(Build.VERSION.SDK_INT == 34) { \"SDK_INT ${Build.VERSION.SDK_INT}\" }\n    BasicText(\"first\")\n}\n\n@Preview\n@Composable\nfun Second() {\n    rememberGraphicsLayer()\n    check(Build.VERSION.SDK_INT == 34) { \"SDK_INT ${Build.VERSION.SDK_INT}\" }\n    BasicText(\"second\")\n}\n"),
+        ]);
+        let cards = real_draw(&pv, &d, &files[1], "demo.ui.LayerKt", &["First", "Second"], files[1..].to_vec()).expect("drawn");
+        assert_eq!(cards.len(), 2);
+        for (n, c) in &cards {
+            assert!(c.is_ok(), "{n}: {:?}", c.as_ref().err());
+        }
     }
 }

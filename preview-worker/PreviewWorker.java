@@ -687,13 +687,18 @@ public class PreviewWorker {
         } catch (IOException ignored) {}
     }
 
-    /** The SDK's android.jar stub leaves Build.FINGERPRINT null; Compose reads it ("robolectric" = a host JVM). */
+    /** The SDK's android.jar stub leaves Build.FINGERPRINT null; Compose reads it ("robolectric" = a host JVM).
+     *  Build.VERSION is initialized here too: Paparazzi's prepare() writes SDK_INT (34) with Unsafe, which
+     *  does not run the class's static initializer, so on a fresh worker the first picture ran it and the
+     *  stub's set SDK_INT back to 0 for that picture (Compose then took its pre-API 23 graphics layer,
+     *  which needs android.view.HardwareCanvas: NoClassDefFoundError). */
     static void hostBuildFingerprint() throws Exception {
         java.lang.reflect.Field u = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
         u.setAccessible(true);
         sun.misc.Unsafe unsafe = (sun.misc.Unsafe) u.get(null);
         java.lang.reflect.Field f = Class.forName("android.os.Build").getField("FINGERPRINT");
         unsafe.putObject(unsafe.staticFieldBase(f), unsafe.staticFieldOffset(f), "robolectric");
+        Class.forName("android.os.Build$VERSION");
     }
 
     static String trace(Throwable e) {
