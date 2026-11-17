@@ -189,6 +189,7 @@ impl App {
         }
         let mut fqs: Vec<(String, String)> = self
             .index
+            .read()
             .named(word)
             .filter(|(_, _, d)| d.container.is_none() && (d.kind.is_type() || d.kind == Kind::Fun))
             .map(|(_, f, d)| (crate::index::qualified(f, d), f.package.clone()))
@@ -276,7 +277,8 @@ impl App {
         t.text = text;
         t.goto = Some(cursor.min(t.text.len()));
         t.reanalyse();
-        self.index.update(&path, &self.tabs[self.active].text);
+        let (ip, it) = ((path).to_owned(), (self.tabs[self.active].text).to_owned());
+        self.index.change(move |i| i.update(&ip, &it));
         if let Some(l) = self.lsp.as_mut() {
             l.did_change(&path, &self.tabs[self.active].text);
         }
@@ -352,7 +354,8 @@ impl App {
         tab.goto = Some(cursor);
         tab.reanalyse();
         let path = tab.path.clone();
-        self.index.update(&path, &self.tabs[self.active].text);
+        let (ip, it) = ((path).to_owned(), (self.tabs[self.active].text).to_owned());
+        self.index.change(move |i| i.update(&ip, &it));
         if let Some(l) = self.lsp.as_mut() {
             l.did_change(&path, &self.tabs[self.active].text);
         }

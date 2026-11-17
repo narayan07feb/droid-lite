@@ -43,6 +43,8 @@ pub struct Param {
     pub has_default: bool,
     /// `Some(true)` for a `var` constructor parameter, `Some(false)` for `val`.
     pub mutable: Option<bool>,
+    /// Byte offset of the name (fits the padding after the two flags: no extra memory).
+    pub offset: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -305,6 +307,7 @@ impl<'a> Scanner<'a> {
             }
             if self.is_name(m) {
                 p.name = self.text(m).trim_matches('`').to_string();
+                p.offset = self.t[m].range.start as u32;
                 let eq = (m..k).find(|&q| self.is(q, "=") && !self.is(q + 1, ">"));
                 if self.is(m + 1, ":") {
                     p.ty = self.join(m + 2, eq.unwrap_or(k));
@@ -409,7 +412,9 @@ pub fn scan(src: &str) -> FileSyms {
                     s.i = s.skip_balanced(s.i);
                 }
                 // `private constructor(` / `@Inject constructor(` on the header line
-                while !s.newline_before(s.i)
+                // also on the next line: `class Vm\n@Inject constructor(`
+                let ctor_ahead = (s.i..s.i + 3).any(|k| s.is(k, "constructor"));
+                while (!s.newline_before(s.i) || ctor_ahead)
                     && (s.kind(s.i) == Some(Tok::Annotation)
                         || MODIFIERS.contains(&s.text(s.i))
                         || s.is(s.i, "constructor"))
@@ -436,7 +441,7 @@ pub fn scan(src: &str) -> FileSyms {
                         name: p.name.clone(),
                         kind: Kind::Property,
                         container: Some(name.as_str().into()),
-                        offset,
+                        offset: p.offset as usize,
                         annotations: Vec::new(),
                         modifiers: Vec::new(),
                         params: Vec::new(),
@@ -708,6 +713,245 @@ pub fn scan(src: &str) -> FileSyms {
     out
 }
 
+/// Declarations of a file by its language: a Java file also gets its fields, methods and
+/// `@Inject` constructors (the Kotlin scanner finds only its classes).
+pub fn scan_file(path: &std::path::Path, src: &str) -> FileSyms {
+    let mut f = scan(src);
+    if path.extension().is_some_and(|e| e == "java") {
+        java_members(src, &mut f);
+    }
+    f
+}
+
+const JAVA_MODIFIERS: &[&str] = &[
+    "public",
+    "private",
+    "protected",
+    "static",
+    "final",
+    "abstract",
+    "synchronized",
+    "native",
+    "transient",
+    "volatile",
+    "default",
+    "strictfp",
+];
+
+/// Fields, methods and `@Inject` constructors directly inside Java class bodies.
+fn java_members(src: &str, out: &mut FileSyms) {
+    let t: Vec<Token> = lex(src)
+        .into_iter()
+        .filter(|t| t.kind != Tok::Comment)
+        .collect();
+    let s = Scanner { src, t, i: 0 };
+    // Some(class) for a class body, None for any other block
+    let mut frames: Vec<Option<String>> = Vec::new();
+    let mut header: Option<String> = None;
+    let mut start = true;
+    let mut i = 0;
+    let mut found = Vec::new();
+    while i < s.t.len() {
+        let w = s.text(i);
+        match w {
+            "{" => {
+                frames.push(header.take());
+                start = true;
+                i += 1;
+                continue;
+            }
+            "}" | ";" => {
+                if w == "}" {
+                    frames.pop();
+                }
+                start = true;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if matches!(w, "class" | "interface" | "enum")
+            && s.kind(i + 1) == Some(Tok::Ident)
+            && (i == 0 || !s.is(i - 1, "."))
+        {
+            header = Some(s.text(i + 1).to_string());
+            i += 2;
+            continue;
+        }
+        let class = match frames.last() {
+            Some(Some(c)) if header.is_none() && start => c.clone(),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        start = false;
+        let (mut annotations, mut modifiers): (Vec<Atom>, Vec<Atom>) = (Vec::new(), Vec::new());
+        let mut j = i;
+        loop {
+            if s.kind(j) == Some(Tok::Annotation) {
+                let a = s.text(j).trim_start_matches('@');
+                annotations.push(a.rsplit('.').next().unwrap_or(a).into());
+                j += 1;
+                if s.is(j, "(") {
+                    j = s.skip_balanced(j);
+                }
+            } else if JAVA_MODIFIERS.contains(&s.text(j)) {
+                modifiers.push(s.text(j).into());
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        if matches!(s.text(j), "class" | "interface" | "enum") {
+            i = j;
+            start = true;
+            continue;
+        }
+        if s.is(j, "<") {
+            j = s.skip_balanced(j);
+        }
+        // a constructor: `Name(`
+        if s.text(j) == class && s.is(j + 1, "(") {
+            let params = java_params(&s, j + 1);
+            if annotations.iter().any(|a| &**a == "Inject")
+                && let Some(c) = out
+                    .decls
+                    .iter_mut()
+                    .rfind(|d| d.kind.is_type() && d.name == class && d.offset < s.t[j].range.start)
+            {
+                c.annotations.push("Inject".into());
+                c.params = params;
+            }
+            i = j + 1;
+            continue;
+        }
+        if !matches!(s.kind(j), Some(Tok::Ident | Tok::Keyword)) {
+            i = j.max(i + 1);
+            continue;
+        }
+        // the type: `a.b.C<D>[]` or `int...`
+        let ty_start = j;
+        j += 1;
+        while s.is(j, ".") && s.kind(j + 1) == Some(Tok::Ident) {
+            j += 2;
+        }
+        if s.is(j, "<") {
+            j = s.skip_balanced(j);
+        }
+        while s.is(j, "[") && s.is(j + 1, "]") {
+            j += 2;
+        }
+        if s.kind(j) != Some(Tok::Ident) {
+            i = j.max(i + 1);
+            continue;
+        }
+        let ty = s.join(ty_start, j);
+        let name_at = j;
+        let mut decl = Decl {
+            name: s.text(j).to_string(),
+            kind: Kind::Property,
+            container: Some(class.as_str().into()),
+            offset: s.t[j].range.start,
+            annotations,
+            modifiers,
+            params: Vec::new(),
+            ty,
+            mutable: false,
+            body: None,
+            supers: Vec::new(),
+        };
+        if s.is(j + 1, "(") {
+            decl.kind = Kind::Fun;
+            decl.params = java_params(&s, j + 1);
+            let mut k = s.skip_balanced(j + 1);
+            while k < s.t.len() && !s.is(k, "{") && !s.is(k, ";") {
+                k += 1;
+            }
+            if s.is(k, "{") {
+                let a = s.t[k].range.start;
+                k = s.skip_balanced(k);
+                decl.body = Some(a..s.t[k - 1].range.end);
+            }
+            found.push(decl);
+            i = k;
+            start = true;
+            continue;
+        }
+        if !matches!(s.text(j + 1), "=" | ";" | ",") {
+            i = name_at + 1;
+            continue;
+        }
+        decl.mutable = !decl.has_modifier("final");
+        // more declarators of the same type (`int a, b;`), up to the `;`
+        let mut k = j + 1;
+        let mut depth = 0;
+        let mut extra = Vec::new();
+        while k < s.t.len() {
+            match s.text(k) {
+                "(" | "{" | "[" => depth += 1,
+                ")" | "}" | "]" => depth -= 1,
+                ";" if depth == 0 => break,
+                "," if depth == 0 && s.kind(k + 1) == Some(Tok::Ident) && !s.is(k + 2, "(") => {
+                    extra.push(k + 1)
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        for e in extra {
+            let mut d = decl.clone();
+            d.name = s.text(e).to_string();
+            d.offset = s.t[e].range.start;
+            found.push(d);
+        }
+        found.push(decl);
+        i = k;
+    }
+    out.decls.extend(found);
+    out.decls.sort_by_key(|d| d.offset);
+}
+
+/// Parameters of a Java method whose `(` is at `open`: `final @A Type<X> name`.
+fn java_params(s: &Scanner, open: usize) -> Vec<Param> {
+    let end = s.skip_balanced(open);
+    let mut out = Vec::new();
+    let mut j = open + 1;
+    while j + 1 < end {
+        let mut k = j;
+        let mut depth = 0;
+        while k + 1 < end {
+            match s.text(k) {
+                "(" | "<" | "[" => depth += 1,
+                ")" | ">" | "]" => depth -= 1,
+                "," if depth == 0 => break,
+                _ => {}
+            }
+            k += 1;
+        }
+        let mut a = j;
+        while a < k && (s.kind(a) == Some(Tok::Annotation) || s.is(a, "final")) {
+            a = if s.kind(a) == Some(Tok::Annotation) && s.is(a + 1, "(") {
+                s.skip_balanced(a + 1)
+            } else {
+                a + 1
+            };
+        }
+        let last = k.saturating_sub(1);
+        if last > a && s.kind(last) == Some(Tok::Ident) {
+            out.push(Param {
+                name: s.text(last).to_string(),
+                ty: s.join(a, last).replace(" ...", "...").replace("...", "[]"),
+                has_default: false,
+                mutable: None,
+                offset: s.t[last].range.start as u32,
+            });
+        }
+        j = k + 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -818,7 +1062,8 @@ typealias Users = List<User>
                 name: "modifier".into(),
                 ty: "Modifier".into(),
                 has_default: true,
-                mutable: None
+                mutable: None,
+                offset: SAMPLE.find("modifier: Modifier").unwrap() as u32,
             }
         );
         assert_eq!(card.params[2].ty, "() -> Unit");

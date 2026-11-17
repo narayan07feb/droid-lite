@@ -76,7 +76,7 @@ impl App {
 
     /// Collects finished usage counts for ⌘-hover.
     pub(super) fn poll_usages(&mut self) {
-        let index_gen = self.index.generation;
+        let index_gen = self.index.read().generation;
         let mut done = Vec::new();
         self.usages_rx.retain(|rx| match rx.try_recv() {
             Ok(v) => {
@@ -98,11 +98,11 @@ impl App {
 
     /// Usages of `word` for the hover card; starts counting in the background the first time.
     pub(super) fn usages_of(&mut self, word: &str, at: usize) -> Option<&Vec<FoundLine>> {
-        let index_gen = self.index.generation;
+        let index_gen = self.index.read().generation;
         let target = self.hover_target(at);
         // one count per declaration: two `insert`s in different classes are counted apart
         let key = match &target {
-            Some(t) => format!("{word}\u{0}{}:{}", t.path.display(), t.offset),
+            Some((p, o)) => format!("{word}\u{0}{}:{o}", p.display()),
             None => word.to_string(),
         };
         // an answer from before the last edit or disk change is stale
@@ -114,58 +114,52 @@ impl App {
                 .map(|p| p.files.iter().filter(|f| is_code(f)).cloned().collect())
                 .unwrap_or_default();
             // open tabs count as they are now, saved or not
-            let open: HashMap<PathBuf, String> = self
+            let open: HashMap<PathBuf, std::sync::Arc<str>> = self
                 .tabs
                 .iter()
-                .map(|t| (t.path.clone(), t.text.clone()))
+                .map(|t| (t.path.clone(), std::sync::Arc::from(t.text.as_str())))
                 .collect();
             let (tx, rx) = channel();
-            let (w, k, c) = (word.to_string(), key.clone(), self.ctx.clone());
-            std::thread::spawn(move || {
-                let mut found = Vec::new();
-                for f in files {
-                    let Some(text) = open
-                        .get(&f)
-                        .cloned()
-                        .or_else(|| std::fs::read_to_string(&f).ok())
-                    else {
-                        continue;
-                    };
-                    let hits = crate::refactor::occurrences(&text, &w);
-                    let syms =
-                        (target.is_some() && !hits.is_empty()).then(|| crate::kotlin::scan(&text));
-                    for r in hits {
-                        if let (Some(t), Some(s)) = (&target, &syms)
-                            && !t.is_use(&f, &text, s, r.start)
-                        {
-                            continue;
+            let (w, k) = (word.to_string(), key.clone());
+            match target {
+                Some(t) => self.xref.find_usages(
+                    "hover",
+                    t,
+                    open,
+                    std::sync::Arc::new(files),
+                    move |found| {
+                        let _ = tx.send((k, index_gen, found));
+                    },
+                ),
+                // not known (yet): every place that spells the name
+                None => self.xref.submit("hover", move |_, stale| {
+                    let mut found = Vec::new();
+                    for f in files {
+                        if stale() {
+                            return;
                         }
-                        found.push(found_line(&f, &text, r.start));
+                        let Some(text) = open
+                            .get(&f)
+                            .map(|t| t.to_string())
+                            .or_else(|| std::fs::read_to_string(&f).ok())
+                        else {
+                            continue;
+                        };
+                        for r in crate::refactor::occurrences(&text, &w) {
+                            found.push(found_line(&f, &text, r.start));
+                        }
                     }
-                }
-                let _ = tx.send((k, index_gen, found));
-                if let Some(c) = c {
-                    c.request_repaint();
-                }
-            });
+                    let _ = tx.send((k, index_gen, found));
+                }),
+            }
             self.usages_rx.push(rx);
         }
         self.usages.get(&key).and_then(|(_, f)| f.as_ref())
     }
 
-    /// `usage_target` for the hovered name, worked out once per place and text version (it reads
-    /// files and walks class hierarchies: too slow for every frame).
-    fn hover_target(&mut self, at: usize) -> Option<crate::usage::Target> {
-        let t = self.tabs.get(self.active)?;
-        let key = (t.path.clone(), at, t.rev, self.index.generation);
-        if let Some((k, target)) = &self.hover_target
-            && *k == key
-        {
-            return target.clone();
-        }
-        let target = self.usage_target(at);
-        self.hover_target = Some((key, target.clone()));
-        target
+    /// The declaration the hovered name means, from the worker's pass over the file.
+    fn hover_target(&mut self, at: usize) -> Option<crate::resolve::DeclRef> {
+        self.ref_target(at)
     }
 
     /// The card shown while ⌘ (or Ctrl) is held over a name: where it is declared and its usages.
@@ -175,10 +169,15 @@ impl App {
             .get(self.active)
             .map(|t| t.path.clone())
             .unwrap_or_default();
-        let mut defs = self.index.definitions(word, &path);
+        let mut defs = self.index.read().definitions(word, &path);
         // the one declaration this place means, when that is known
-        if let Some(t) = self.hover_target(at) {
-            defs.retain(|d| d.path == t.path && d.offset == t.offset);
+        if let Some((tp, to)) = self.hover_target(at) {
+            defs.retain(|d| d.path == tp && d.offset == to);
+            if defs.is_empty()
+                && let Some(h) = self.decl_hit(&(tp, to))
+            {
+                defs.push(h);
+            }
         }
         let root = self
             .project

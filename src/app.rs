@@ -25,6 +25,7 @@ mod translations;
 mod tree;
 mod typing;
 mod usage_filter;
+mod xref;
 
 use crate::compose::{self, Lint, Severity, Stability};
 use crate::edit;
@@ -106,7 +107,7 @@ impl Tab {
 
     fn reanalyse(&mut self) {
         self.rev += 1;
-        self.syms = scan(&self.text);
+        self.syms = crate::kotlin::scan_file(&self.path, &self.text);
         self.lints = if is_code(&self.path) {
             compose::lint(&self.text, &self.syms)
         } else {
@@ -352,7 +353,6 @@ fn preview_request(tab: &Tab, project: Option<&crate::project::Project>) -> Opti
 
 /// The ⌘-hovered name, a resource reference it may be (kind, name), and its response.
 type HoverWord = (String, usize, Option<(String, String)>, egui::Response);
-type HoverTarget = ((PathBuf, usize, u64, u64), Option<crate::usage::Target>);
 
 /// A project opened on a worker thread: files, index, git branch and the tree.
 type Opened = (
@@ -371,7 +371,9 @@ pub struct App {
     tree_filter: String,
     /// File to show in the Project tree, and the frames left to keep it scrolled into view.
     locate: Option<(PathBuf, u8)>,
-    index: Index,
+    index: crate::index::Shared,
+    /// The one background worker for what names mean, usages and Hilt links.
+    xref: xref::Xref,
     indexing: Option<Receiver<Opened>>,
     /// kotlin-lsp was started (or found missing) for this project.
     lsp_tried: bool,
@@ -422,7 +424,6 @@ pub struct App {
     outputs_gen: u64,
     /// Usage counts of the open file's declarations, for the links above them.
     decl_usages: Option<gutter::DeclUsages>,
-    decl_usages_rx: Option<Receiver<gutter::DeclUsages>>,
     decl_usages_gen: u64,
     /// Android resources of the project (values, files, ids).
     res: crate::resources::Resources,
@@ -494,7 +495,6 @@ pub struct App {
     /// The declaration a rename started from, for the text search fallback.
     rename_target: Option<crate::usage::Target>,
     /// The ⌘-hover card's declaration: (file, offset, text version, index version) → target.
-    hover_target: Option<HoverTarget>,
     /// Virtual devices for the device picker, read in the background on open and when it opens.
     avds: Vec<String>,
     avds_rx: Option<Receiver<Vec<String>>>,
@@ -511,13 +511,15 @@ impl App {
         let (save_tx, save_rx) = channel();
         settings.apply(&cc.egui_ctx);
         crate::theme::style(&cc.egui_ctx);
+        let index = crate::index::Shared::default();
         let mut app = App {
+            xref: xref::Xref::start(index.clone(), Some(cc.egui_ctx.clone())),
             project: None,
             tree: Vec::new(),
             tree_view: tree::View::default(),
             tree_filter: String::new(),
             locate: None,
-            index: Index::default(),
+            index,
             indexing: None,
             lsp_tried: false,
             stability: HashMap::new(),
@@ -558,7 +560,6 @@ impl App {
             branch: None,
             outputs_gen: 0,
             decl_usages: None,
-            decl_usages_rx: None,
             decl_usages_gen: 0,
             res: Default::default(),
             res_rx: None,
@@ -607,7 +608,6 @@ impl App {
             variants: Vec::new(),
             translations: Default::default(),
             rename_target: None,
-            hover_target: None,
             avds: Vec::new(),
             avds_rx: None,
             deep_link: None,
@@ -670,7 +670,7 @@ impl App {
         self.history.clear();
         self.forward.clear();
         self.recent.clear();
-        self.index = Index::default();
+        self.index.set(Index::default());
         self.gradle = None; // Drop stops a running build of the old project
         self.compose_view = None;
         self.textures.clear();
@@ -711,9 +711,10 @@ impl App {
         ctx: &egui::Context,
     ) {
         remember_project(&project.root);
-        self.index = index;
+        self.index.set(index);
         for t in &self.tabs {
-            self.index.update(&t.path, &t.text);
+            let (ip, it) = ((t.path).to_owned(), (t.text).to_owned());
+            self.index.change(move |i| i.update(&ip, &it));
         }
         self.branch = branch;
         self.reload_stability(&project, ctx);
@@ -723,7 +724,7 @@ impl App {
             project.name,
             project.modules.len(),
             project.files.len(),
-            self.index.symbol_count(),
+            self.index.read().symbol_count(),
             self.res.len()
         );
         self.project = Some(project);
@@ -917,7 +918,8 @@ impl App {
                         if !self.previews.saved.contains(&d.path) {
                             self.previews.saved.push(d.path.clone());
                         }
-                        self.index.update(&d.path, &d.text);
+                        let (ip, it) = ((d.path).to_owned(), (d.text).to_owned());
+                        self.index.change(move |i| i.update(&ip, &it));
                         if let Some(l) = self.lsp.as_mut() {
                             l.did_save(&d.path);
                         }
@@ -1019,7 +1021,16 @@ impl App {
         if self.goto_android_reference(&word, at) {
             return;
         }
-        let defs = self.index.definitions(&word, &path);
+        // what the name means here, from the worker's reading of the file; until that is ready,
+        // the declarations of that name, imported and nearby ones first
+        let defs = match self.resolved_at(at) {
+            Some(crate::resolve::Res::Decls(v)) => v.iter().filter_map(|d| self.decl_hit(d)).collect(),
+            Some(crate::resolve::Res::Local(o)) => {
+                self.open_file(&path, Some(o));
+                return;
+            }
+            _ => self.index.read().definitions(&word, &path),
+        };
         // ⌘-click on the declaration itself lists where it is used, like Android Studio
         if defs.iter().any(|d| d.path == path && d.offset == at)
             && let Some(ctx) = self.ctx.clone()
@@ -1083,13 +1094,94 @@ impl App {
         self.lsp_found = None;
         // The project search always runs: kotlin-lsp answers empty or with one file while it
         // still imports a big Gradle project. Its answer is merged in when it comes.
-        let target = self.usage_target(at);
-        self.search_project(word, true, target, ctx);
+        match self.ref_target(at) {
+            Some(t) => self.search_usages(word, t, ctx),
+            None => {
+                let target = self.usage_target(at);
+                self.search_project(word, true, target, ctx);
+            }
+        }
         if let Some(l) = self.lsp.as_mut().filter(|l| l.ready) {
             let t = &self.tabs[self.active];
             let (line, col) = lsp::position(&t.text, at);
             l.references(&t.path, line, col);
         }
+    }
+
+    /// What the name at byte `at` of the active file means, when the worker's pass over this
+    /// version of the file is done.
+    fn resolved_at(&self, at: usize) -> Option<crate::resolve::Res> {
+        let t = self.tabs.get(self.active)?;
+        self.xref.for_file(&t.path, t.rev)?.at(at).cloned()
+    }
+
+    /// The one declaration the name at `at` means, when that is known.
+    fn ref_target(&self, at: usize) -> Option<crate::resolve::DeclRef> {
+        match self.resolved_at(at)? {
+            crate::resolve::Res::Decls(v) if v.len() == 1 => v.into_iter().next(),
+            _ => None,
+        }
+    }
+
+    /// A declaration as a search hit (name, signature, place).
+    fn decl_hit(&self, d: &crate::resolve::DeclRef) -> Option<Hit> {
+        let index = self.index.read();
+        let f = index.files.get(&d.0)?;
+        let x = f.decls.iter().find(|x| x.offset == d.1)?;
+        Some(Hit {
+            name: x.name.clone(),
+            detail: index::describe(f, x),
+            path: d.0.clone(),
+            offset: d.1,
+            score: 0,
+        })
+    }
+
+    /// Find References of one declaration, on the worker: the places that mean it, plus layouts
+    /// and the manifest for a class.
+    fn search_usages(&mut self, word: String, target: crate::resolve::DeclRef, ctx: &egui::Context) {
+        let Some(p) = &self.project else { return };
+        let code: Vec<PathBuf> = p.files.iter().filter(|f| is_code(f)).cloned().collect();
+        let is_type = self
+            .index
+            .read()
+            .files
+            .get(&target.0)
+            .and_then(|f| f.decls.iter().find(|d| d.offset == target.1))
+            .is_some_and(|d| d.kind.is_type());
+        let other: Vec<PathBuf> = if is_type {
+            p.files.iter().filter(|f| !is_code(f)).cloned().collect()
+        } else {
+            Vec::new()
+        };
+        let open: HashMap<PathBuf, std::sync::Arc<str>> = self
+            .tabs
+            .iter()
+            .map(|t| (t.path.clone(), std::sync::Arc::from(t.text.as_str())))
+            .collect();
+        let (tx, rx) = channel();
+        let c = ctx.clone();
+        self.status = format!("Searching for `{word}`…");
+        self.xref
+            .find_usages("find", target, open, std::sync::Arc::new(code), move |mut found| {
+                // layouts and the manifest name classes
+                for f in other {
+                    let Ok(text) = std::fs::read_to_string(&f) else { continue };
+                    if !text.contains(&word) {
+                        continue;
+                    }
+                    found.extend(
+                        text.match_indices(&word)
+                            .map(|(o, _)| o)
+                            .filter(|&o| word_bounds(&text, o) == (o, o + word.len()))
+                            .map(|o| found_line(&f, &text, o)),
+                    );
+                }
+                let _ = tx.send(found);
+                c.request_repaint();
+            });
+        self.find_rx = Some(rx);
+        self.bottom = Bottom::Find;
     }
 
     /// Searches every project file (open tabs use their unsaved text) in the background.
@@ -1107,7 +1199,7 @@ impl App {
             .find(|d| d.offset == a && d.name == word)
         {
             return Some(crate::usage::Target::new(
-                &self.index,
+                &self.index.read(),
                 &t.path,
                 &t.syms,
                 d,
@@ -1115,16 +1207,16 @@ impl App {
             ));
         }
         // from a use: the one declaration this place can mean
-        let mut fits = self
-            .index
+        let index = self.index.read();
+        let mut fits = index
             .definitions(word, &t.path)
             .into_iter()
             .take(12)
             .filter_map(|h| {
-                let f = self.index.files.get(&h.path)?;
+                let f = index.files.get(&h.path)?;
                 let d = f.decls.iter().find(|d| d.offset == h.offset)?;
                 let text = self.current_text(&h.path)?;
-                Some(crate::usage::Target::new(&self.index, &h.path, f, d, &text))
+                Some(crate::usage::Target::new(&index, &h.path, f, d, &text))
             })
             .filter(|target| target.is_use(&t.path, &t.text, &t.syms, a));
         let one = fits.next()?;
@@ -1148,9 +1240,12 @@ impl App {
         let (tx, rx) = channel();
         let c = ctx.clone();
         self.status = format!("Searching for `{word}`…");
-        std::thread::spawn(move || {
+        self.xref.submit("find", move |_, stale| {
             let mut out = Vec::new();
             for f in files {
+                if stale() {
+                    return;
+                }
                 let Some(text) = open
                     .get(&f)
                     .cloned()
@@ -1531,7 +1626,8 @@ impl App {
                 continue;
             }
             t.reanalyse();
-            self.index.update(&t.path, &t.text);
+            let (ip, it) = ((t.path).to_owned(), (t.text).to_owned());
+            self.index.change(move |i| i.update(&ip, &it));
             if let Some(l) = self.lsp.as_mut() {
                 l.did_change(&t.path, &t.text);
             }
@@ -1754,7 +1850,8 @@ impl App {
         t.caret = Some(cursor.min(t.text.len()));
         t.reanalyse();
         let (path, text) = (t.path.clone(), t.text.clone());
-        self.index.update(&path, &text);
+        let (ip, it) = ((path).to_owned(), (text).to_owned());
+        self.index.change(move |i| i.update(&ip, &it));
         if let Some(l) = self.lsp.as_mut() {
             l.did_change(&path, &text);
         }
@@ -2014,14 +2111,14 @@ impl App {
         };
         match kind {
             SearchKind::Class => {
-                let mut v = self.index.search(q, true, 60);
+                let mut v = self.index.read().search(q, true, 60);
                 v.extend(self.lib_hits(q, true, 30));
                 v.sort_by_key(|h| std::cmp::Reverse(h.score));
                 v.truncate(60);
                 v
             }
             SearchKind::Symbol => {
-                let mut v = self.index.search(q, false, 60);
+                let mut v = self.index.read().search(q, false, 60);
                 v.extend(self.lib_hits(q, false, 30));
                 v.sort_by_key(|h| std::cmp::Reverse(h.score));
                 v.truncate(60);
@@ -2030,7 +2127,7 @@ impl App {
             SearchKind::File => files(q, &mut self.project.iter().flat_map(|p| p.files.iter()), 60),
             SearchKind::Recent => files(q, &mut self.recent.iter(), 60),
             SearchKind::Everywhere => {
-                let mut v = self.index.search(q, false, 30);
+                let mut v = self.index.read().search(q, false, 30);
                 v.extend(self.lib_hits(q, false, 10));
                 v.extend(files(
                     q,
@@ -2327,7 +2424,7 @@ impl App {
                 };
                 if self.indexing.is_none() {
                     ui.label(
-                        RichText::new(format!("{} symbols", self.index.symbol_count())).color(weak),
+                        RichText::new(format!("{} symbols", self.index.read().symbol_count())).color(weak),
                     );
                 }
             });
@@ -2437,11 +2534,14 @@ impl App {
         let active = self.tabs.get(self.active).map(|t| t.path.clone());
         let locate = self.locate.as_ref().map(|(f, _)| f.clone());
         let new_in = std::cell::Cell::new(None);
+        // the guard borrows a handle, not `self`; it ends with the tree, before files open
+        let shared = self.index.clone();
+        let index = shared.read();
         let sel = tree::Sel {
             active: active.as_deref(),
             locate: locate.as_deref(),
             status: &status,
-            syms: &self.index.files,
+            syms: &index.files,
             new_in: &new_in,
         };
         let root = self.root();
@@ -2471,7 +2571,7 @@ impl App {
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    let (icon, tint) = assist::kind_icon(f, self.index.files.get(f));
+                    let (icon, tint) = assist::kind_icon(f, index.files.get(f));
                     let mut job = egui::text::LayoutJob::default();
                     let fmt = |color| egui::TextFormat {
                         font_id: FontId::proportional(13.0),
@@ -2490,6 +2590,7 @@ impl App {
                     }
                 }
             });
+        drop(index);
         // the folders open with an animation, so keep scrolling to the file until it ends
         if let Some((_, frames)) = &mut self.locate {
             *frames = frames.saturating_sub(1);
@@ -3206,8 +3307,8 @@ impl App {
         let mut items: Vec<Item> = Vec::new();
         if !after_dot {
             let imported: Vec<&str> = t.syms.imports.iter().map(|s| &**s).collect();
-            for h in self.index.complete(prefix, 40) {
-                let fq = self.index.import_for(&h.name);
+            for h in self.index.read().complete(prefix, 40) {
+                let fq = self.index.read().import_for(&h.name);
                 let pkg = fq
                     .as_deref()
                     .and_then(|f| f.rsplit_once('.'))
@@ -3339,7 +3440,8 @@ impl App {
         t.goto = Some(cursor);
         t.reanalyse();
         let path = t.path.clone();
-        self.index.update(&path, &self.tabs[self.active].text);
+        let (ip, it) = ((path).to_owned(), (self.tabs[self.active].text).to_owned());
+        self.index.change(move |i| i.update(&ip, &it));
         if let Some(l) = self.lsp.as_mut() {
             l.did_change(&path, &self.tabs[self.active].text);
         }
@@ -3636,12 +3738,12 @@ impl App {
                 let key = (
                     tab.path.clone(),
                     tab.rev,
-                    self.index.generation,
+                    self.index.read().generation,
                     self.outputs_gen,
                     d.name.clone(),
                 );
                 if self.compose_view.as_ref().is_none_or(|v| v.key != key) {
-                    let is_ui = |n: &str| compose::is_ui_call(n, &self.index, &self.libs);
+                    let is_ui = |n: &str| compose::is_ui_call(n, &self.index.read(), &self.libs);
                     self.compose_view = Some(ComposeView {
                         key,
                         tree: compose::tree(&tab.text, d, &is_ui),
@@ -4156,6 +4258,10 @@ impl eframe::App for App {
         watch.stage("analysis", || self.settle(false));
         watch.stage("git blame", || self.poll_git(&ctx));
         self.poll_diff(&ctx);
+        // index changes an edit queued while the worker was reading go in now
+        if !self.index.flush() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(10));
+        }
         self.poll_usages();
         self.poll_logcat(&ctx);
         self.poll_launch();

@@ -236,7 +236,7 @@ impl App {
         source: &'static str,
     ) {
         // a class in a file of the same name: offer to rename the file too
-        let rename_file = self.index.files.iter().find_map(|(path, syms)| {
+        let rename_file = self.index.read().files.iter().find_map(|(path, syms)| {
             let stem = path.file_stem()?.to_str()?;
             let ext = path.extension()?.to_str()?;
             (stem == old && syms.decls.iter().any(|d| d.name == old && d.kind.is_type())).then(
@@ -327,7 +327,8 @@ impl App {
             self.status = format!("Cannot write {}: {e}", path.display());
             return false;
         }
-        self.index.update(path, text);
+        let (ip, it) = (path.to_owned(), text.to_owned());
+        self.index.change(move |i| i.update(&ip, &it));
         if let Some(t) = self.tabs.iter_mut().find(|t| t.path == path) {
             t.text = text.to_string();
             t.saved = text.to_string();
@@ -352,9 +353,11 @@ impl App {
             p.files.sort();
             self.tree = tree::build(p, self.tree_view);
         }
-        self.index.remove(from);
+        let p = from.to_owned();
+        self.index.change(move |i| i.remove(&p));
         if let Ok(text) = std::fs::read_to_string(to) {
-            self.index.update(to, &text);
+            let (ip, it) = (to.to_owned(), (text).to_owned());
+            self.index.change(move |i| i.update(&ip, &it));
         }
     }
 
@@ -405,7 +408,8 @@ impl App {
                 t.goto = Some(t.cursor);
                 t.reanalyse();
                 let (path, text) = (t.path.clone(), t.text.clone());
-                self.index.update(&path, &text);
+                let (ip, it) = ((path).to_owned(), (text).to_owned());
+                self.index.change(move |i| i.update(&ip, &it));
                 if let Some(l) = self.lsp.as_mut() {
                     l.did_change(&path, &text);
                 }
@@ -597,7 +601,8 @@ impl App {
                 if done {
                     let t = &self.tabs[self.active];
                     let (path, text) = (t.path.clone(), t.text.clone());
-                    self.index.update(&path, &text);
+                    let (ip, it) = ((path).to_owned(), (text).to_owned());
+                    self.index.change(move |i| i.update(&ip, &it));
                     if let Some(l) = self.lsp.as_mut() {
                         l.did_change(&path, &text);
                     }

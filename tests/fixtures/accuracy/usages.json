@@ -1,0 +1,926 @@
+{
+ "commit": "82e2bb5cf53bdff8b960cb42fcd2409ec83e0edd",
+ "symbols": [
+  {
+   "name": "OtpVerificationRequested",
+   "file": "feature/lending/add-contact-number/presentation/src/main/kotlin/co/branch/feature/lending/add_contact_number/ui/AddContactPhoneNumberUiEvent.kt",
+   "line": 10,
+   "usages": [
+    "feature/lending/add-contact-number/presentation/src/main/kotlin/co/branch/feature/lending/add_contact_number/ui/AddContactPhoneNumberViewModel.kt:72:1",
+    "feature/lending/add-contact-number/presentation/src/main/kotlin/co/branch/feature/lending/add_contact_number/ui/compose/AddContactPhoneNumberScreen.kt:67:1",
+    "feature/lending/add-contact-number/presentation/src/test/kotlin/co/branch/feature/lending/add_contact_number/ui/AddContactPhoneNumberViewModelTest.kt:105:1",
+    "feature/lending/add-contact-number/presentation/src/test/kotlin/co/branch/feature/lending/add_contact_number/ui/AddContactPhoneNumberViewModelTest.kt:125:1",
+    "feature/lending/add-contact-number/presentation/src/test/kotlin/co/branch/feature/lending/add_contact_number/ui/AddContactPhoneNumberViewModelTest.kt:328:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "PaymentsBlockedRequested",
+   "file": "feature/billpay/airtime-data/presentation/src/main/kotlin/co/branch/feature/billpay/airtimedata/presentation/fragment/v2/billpayment/BillPaymentUiEvent.kt",
+   "line": 26,
+   "usages": [
+    "feature/billpay/airtime-data/presentation/src/main/kotlin/co/branch/feature/billpay/airtimedata/presentation/fragment/v1/BillPaymentFragment.kt:180:1",
+    "feature/billpay/airtime-data/presentation/src/main/kotlin/co/branch/feature/billpay/airtimedata/presentation/fragment/v2/billpayment/BillPaymentViewModel.kt:216:1",
+    "feature/billpay/airtime-data/presentation/src/test/kotlin/co/branch/feature/billpay/airtimedata/presentation/fragment/v2/billpayment/BillPaymentViewModelTest.kt:345:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "BackToLoansClicked",
+   "file": "feature/lending/repaid-loan/presentation/src/main/kotlin/co/branch/feature/lending/repaid_loan/ui/RepaidLoanUserEvent.kt",
+   "line": 10,
+   "usages": [
+    "feature/lending/repaid-loan/presentation/src/main/kotlin/co/branch/feature/lending/repaid_loan/ui/RepaidLoanViewModel.kt:57:1",
+    "feature/lending/repaid-loan/presentation/src/main/kotlin/co/branch/feature/lending/repaid_loan/ui/composables/RepaidLoanScreenContent.kt:77:1",
+    "feature/lending/repaid-loan/presentation/src/test/kotlin/co/branch/feature/lending/repaid_loan/RepaidLoanViewModelTest.kt:93:1",
+    "feature/lending/repaid-loan/presentation/src/test/kotlin/co/branch/feature/lending/repaid_loan/RepaidLoanViewModelTest.kt:105:1",
+    "feature/lending/repaid-loan/presentation/src/test/kotlin/co/branch/feature/lending/repaid_loan/RepaidLoanViewModelTest.kt:118:1",
+    "feature/lending/repaid-loan/presentation/src/test/kotlin/co/branch/feature/lending/repaid_loan/RepaidLoanViewModelTest.kt:133:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "InterestData",
+   "file": "feature/investment/p2p/data/src/main/kotlin/co/branch/feature/investment/p2p/data/model/InterestData.kt",
+   "line": 5,
+   "usages": [
+    "feature/investment/p2p/data/src/main/kotlin/co/branch/feature/investment/p2p/data/model/PageData.kt:7:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "TextItem",
+   "file": "library/home/domain/src/main/java/co/branch/library/home/domain/model/HomeContributionModels.kt",
+   "line": 26,
+   "usages": [
+    "library/home/domain/src/main/java/co/branch/library/home/domain/model/HomeContributionModels.kt:10:1",
+    "library/home/domain/src/main/java/co/branch/library/home/domain/model/HomeContributionModels.kt:11:1",
+    "feature/home/src/main/kotlin/co/branch/feature/home/ui/mapper/HomeContributionsAdapter.kt:238:1",
+    "feature/home/src/main/kotlin/co/branch/feature/home/ui/mapper/HomeContributionsAdapter.kt:239:1",
+    "feature/home/src/test/kotlin/co/branch/feature/home/ui/HomeViewModelTest.kt:845:1",
+    "feature/home/src/test/kotlin/co/branch/feature/home/ui/HomeViewModelTest.kt:894:1",
+    "feature/home/src/test/kotlin/co/branch/feature/home/ui/HomeViewModelTest.kt:953:1",
+    "feature/home/src/test/kotlin/co/branch/feature/home/ui/HomeViewModelTest.kt:1027:1",
+    "feature/home/src/test/kotlin/co/branch/feature/home/ui/HomeViewModelTest.kt:1066:1",
+    "feature/home/src/test/kotlin/co/branch/feature/home/ui/HomeViewModelTest.kt:1294:1",
+    "feature/home/src/test/kotlin/co/branch/feature/home/ui/HomeViewModelTest.kt:1335:1",
+    "feature/home/src/test/kotlin/co/branch/feature/home/ui/HomeViewModelTest.kt:1373:1",
+    "library/home/data/src/main/java/co/branch/library/home/data/mapper/HomeContributionWireMappers.kt:49:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "ApiMethod",
+   "file": "library/serialized-view/data/src/main/kotlin/co/branch/library/serializedview/data/model/ButtonAction.kt",
+   "line": 85,
+   "usages": [
+    "library/serialized-view/data/src/main/kotlin/co/branch/library/serializedview/data/model/ButtonAction.kt:32:1",
+    "feature/lending/loan-status/data/src/main/kotlin/co/branch/feature/lending/loan_status/data/action/LendingLoanStatusActionMapper.kt:23:1",
+    "feature/platform/serialized-views/src/main/java/co/branch/feature/platform/serializedviews/DataInitializedSerializedViewFragment.kt:1336:1",
+    "feature/platform/serialized-views/src/main/java/co/branch/feature/platform/serializedviews/DataInitializedSerializedViewFragment.kt:1344:1",
+    "feature/platform/serialized-views/src/main/java/co/branch/feature/platform/serializedviews/SerializedViewPresenter.kt:63:1",
+    "feature/platform/serialized-views/src/main/java/co/branch/feature/platform/serializedviews/SerializedViewPresenter.kt:224:1",
+    "feature/platform/serialized-views/src/main/java/co/branch/feature/platform/serializedviews/SerializedViewPresenter.kt:238:1",
+    "feature/platform/serialized-views/src/main/java/co/branch/feature/platform/serializedviews/SerializedViewViewModel.kt:137:1",
+    "feature/platform/serialized-views/src/main/java/co/branch/feature/platform/serializedviews/SerializedViewViewModel.kt:141:1",
+    "feature/platform/serialized-views/src/test/kotlin/co/branch/feature/platform/serializedviews/SerializedViewPresenterV3PostTest.kt:127:1",
+    "feature/platform/serialized-views/src/test/kotlin/co/branch/feature/platform/serializedviews/navigation/SerializedViewViewModelTest.kt:90:1",
+    "library/serialized-view/data/src/main/kotlin/co/branch/library/serializedview/data/model/ButtonActionEnumSerializers.kt:49:1",
+    "library/serialized-view/data/src/main/kotlin/co/branch/library/serializedview/data/model/ButtonActionEnumSerializers.kt:49:2",
+    "library/serialized-view/data/src/test/kotlin/co/branch/library/serializedview/data/model/ButtonActionEnumDeserializationTest.kt:20:1",
+    "library/serialized-view/data/src/test/kotlin/co/branch/library/serializedview/data/model/ButtonActionEnumDeserializationTest.kt:61:1",
+    "library/serialized-views/src/main/java/co/branch/library/serialized/views/mapper/ButtonActionMapper.kt:71:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "Attributes",
+   "file": "library/core/jwt-auth-android/src/main/java/co/branch/library/core/jwtauthandroid/remote/JwtRefreshResponse.kt",
+   "line": 22,
+   "usages": [
+    "library/core/jwt-auth-android/src/main/java/co/branch/library/core/jwtauthandroid/remote/JwtRefreshResponse.kt:17:1",
+    "library/core/jwt-auth-android/src/test/java/co/branch/library/core/jwtauthandroid/repository/DefaultJwtRepositoryTest.kt:5:1",
+    "library/core/jwt-auth-android/src/test/java/co/branch/library/core/jwtauthandroid/repository/DefaultJwtRepositoryTest.kt:68:1",
+    "library/core/jwt-auth-android/src/test/java/co/branch/library/core/jwtauthandroid/repository/DefaultJwtRepositoryTest.kt:81:1",
+    "library/core/jwt-auth-android/src/test/java/co/branch/library/core/jwtauthandroid/repository/DefaultJwtRepositoryTest.kt:82:1",
+    "library/core/jwt-auth-android/src/test/java/co/branch/library/core/jwtauthandroid/repository/DefaultJwtRepositoryTest.kt:113:1",
+    "library/core/jwt-auth-android/src/test/java/co/branch/library/core/jwtauthandroid/repository/DefaultJwtRepositoryTest.kt:126:1",
+    "library/core/jwt-auth-android/src/test/java/co/branch/library/core/jwtauthandroid/repository/DefaultJwtRepositoryTest.kt:139:1",
+    "library/core/jwt-auth-android/src/test/java/co/branch/library/core/jwtauthandroid/repository/DefaultJwtRepositoryTest.kt:153:1",
+    "library/core/jwt-auth-android/src/test/java/co/branch/library/core/jwtauthandroid/repository/DefaultJwtRepositoryTest.kt:167:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "Shortcut",
+   "file": "library/account-details/data/src/main/kotlin/co/branch/library/accountdetails/data/model/HomeOverviewContribution.kt",
+   "line": 50,
+   "usages": [
+    "library/account-details/data/src/main/kotlin/co/branch/library/accountdetails/data/model/HomeOverviewContribution.kt:24:1",
+    "library/home/data-test/src/main/java/co/branch/library/home/data/test/utils/HomeTestUtils.kt:16:1",
+    "library/home/data-test/src/main/java/co/branch/library/home/data/test/utils/HomeTestUtils.kt:136:1",
+    "library/home/data/src/main/java/co/branch/library/home/data/mapper/HomeContributionWireMappers.kt:11:1",
+    "library/home/data/src/main/java/co/branch/library/home/data/mapper/HomeContributionWireMappers.kt:110:1",
+    "library/home/data/src/test/java/co/branch/library/home/data/mapper/HomeContributionWireMappersTest.kt:9:1",
+    "library/home/data/src/test/java/co/branch/library/home/data/mapper/HomeContributionWireMappersTest.kt:36:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "uploadFile",
+   "file": "library/chat/domain/src/main/java/co/branch/library/chat/domain/repository/ChatRepository.kt",
+   "line": 23,
+   "usages": [
+    "library/chat/domain/src/main/java/co/branch/library/chat/domain/usecase/UploadFileUseCase.kt:11:1",
+    "library/chat/domain/src/test/java/co/branch/library/chat/domain/usercase/UploadFileUseCaseTest.kt:31:1",
+    "library/chat/domain/src/test/java/co/branch/library/chat/domain/usercase/UploadFileUseCaseTest.kt:45:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "getPendingCapture",
+   "file": "feature/kyc/verify-identity/domain/src/main/java/co/branch/feature/kyc/verifyidentity/domain/repository/HyperKycRepository.kt",
+   "line": 23,
+   "usages": [
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:270:1",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:280:1",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:291:1",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:304:1",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:312:1",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:320:1",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:327:1",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:335:1",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:345:1",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:364:1",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:372:1",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:373:1",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:380:1",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:381:1",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:389:1",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:399:1",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:410:1",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:417:1",
+    "feature/kyc/verify-identity/domain/src/main/java/co/branch/feature/kyc/verifyidentity/domain/usecase/GetPendingHyperKycCaptureUseCase.kt:12:1",
+    "feature/kyc/verify-identity/domain/src/test/java/co/branch/feature/kyc/verifyidentity/domain/usecase/HyperKycUseCasesTest.kt:92:1",
+    "feature/kyc/verify-identity/domain/src/test/java/co/branch/feature/kyc/verifyidentity/domain/usecase/HyperKycUseCasesTest.kt:99:1"
+   ],
+   "jump": {
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:270:1": "feature/kyc/verify-identity/data/src/main/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepository.kt:88",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:280:1": "feature/kyc/verify-identity/data/src/main/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepository.kt:88",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:291:1": "feature/kyc/verify-identity/data/src/main/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepository.kt:88",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:304:1": "feature/kyc/verify-identity/data/src/main/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepository.kt:88",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:312:1": "feature/kyc/verify-identity/data/src/main/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepository.kt:88",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:320:1": "feature/kyc/verify-identity/data/src/main/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepository.kt:88",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:327:1": "feature/kyc/verify-identity/data/src/main/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepository.kt:88",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:335:1": "feature/kyc/verify-identity/data/src/main/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepository.kt:88",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:345:1": "feature/kyc/verify-identity/data/src/main/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepository.kt:88",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:364:1": "feature/kyc/verify-identity/data/src/main/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepository.kt:88",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:372:1": "feature/kyc/verify-identity/data/src/main/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepository.kt:88",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:373:1": "feature/kyc/verify-identity/data/src/main/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepository.kt:88",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:380:1": "feature/kyc/verify-identity/data/src/main/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepository.kt:88",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:381:1": "feature/kyc/verify-identity/data/src/main/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepository.kt:88",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:389:1": "feature/kyc/verify-identity/data/src/main/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepository.kt:88",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:399:1": "feature/kyc/verify-identity/data/src/main/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepository.kt:88",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:410:1": "feature/kyc/verify-identity/data/src/main/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepository.kt:88",
+    "feature/kyc/verify-identity/data/src/test/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepositoryTest.kt:417:1": "feature/kyc/verify-identity/data/src/main/java/co/branch/feature/kyc/verifyidentity/data/repository/DefaultHyperKycRepository.kt:88"
+   }
+  },
+  {
+   "name": "isManualInputVisible",
+   "file": "library/chat/domain/src/main/java/co/branch/library/chat/domain/repository/ChatRepository.kt",
+   "line": 21,
+   "usages": [
+    "library/chat/domain/src/main/java/co/branch/library/chat/domain/usecase/ManualInputVisibilityUseCase.kt:9:1",
+    "library/chat/domain/src/test/java/co/branch/library/chat/domain/usercase/ManualInputVisibilityUseCaseTest.kt:25:1",
+    "library/chat/domain/src/test/java/co/branch/library/chat/domain/usercase/ManualInputVisibilityUseCaseTest.kt:33:1",
+    "library/chat/domain/src/test/java/co/branch/library/chat/domain/usercase/ManualInputVisibilityUseCaseTest.kt:44:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "mapToDomain",
+   "file": "library/core/utils/src/main/java/co/branch/library/core/utils/config/CountryConfigurationMapper.kt",
+   "line": 24,
+   "usages": [],
+   "jump": {}
+  },
+  {
+   "name": "mapToDomain",
+   "file": "library/core/utils/src/main/java/co/branch/library/core/utils/config/CountryConfigurationMapper.kt",
+   "line": 10,
+   "usages": [
+    "feature/platform/config/data/src/main/java/co/branch/feature/platform/config/data/ConfigurationsLocalDataSource.kt:102:1",
+    "library/core/utils/src/main/java/co/branch/library/core/utils/config/CountryConfigurationMapper.kt:26:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "fetchRpdStatus",
+   "file": "feature/lending/loan-requested/presentation/src/main/kotlin/co/branch/feature/lending/loan_requested/LoanRequestedViewModel.kt",
+   "line": 156,
+   "usages": [
+    "feature/lending/loan-requested/presentation/src/main/kotlin/co/branch/feature/lending/loan_requested/LoanRequestedViewModel.kt:480:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "onOtpScreenPaused",
+   "file": "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/actionauth/PinActionAuthViewModel.kt",
+   "line": 101,
+   "usages": [
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinActionAuthNavigationHost.kt:78:1",
+    "feature/security-pin/presentation/src/test/kotlin/co/branch/feature/securitypin/actionauth/PinActionAuthViewModelTest.kt:322:1",
+    "feature/security-pin/presentation/src/test/kotlin/co/branch/feature/securitypin/actionauth/PinActionAuthViewModelTest.kt:343:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "getLoanDetails",
+   "file": "feature/lending/loan-document/domain/src/main/kotlin/co/branch/feature/lending/loan_document/domain/repository/LoanDocumentRepository.kt",
+   "line": 27,
+   "usages": [
+    "feature/lending/loan-document/data/src/test/kotlin/co/branch/feature/lending/loan_document/data/repository/DefaultLoanDocumentRepositoryTest.kt:178:1",
+    "feature/lending/loan-document/data/src/test/kotlin/co/branch/feature/lending/loan_document/data/repository/DefaultLoanDocumentRepositoryTest.kt:197:1",
+    "feature/lending/loan-document/domain/src/main/kotlin/co/branch/feature/lending/loan_document/domain/usecase/GetLoanDetailsUseCase.kt:15:1",
+    "feature/lending/loan-document/domain/src/test/kotlin/co/branch/feature/lending/loan_document/domain/usecase/GetLoanDetailsUseCaseTest.kt:29:1",
+    "feature/lending/loan-document/domain/src/test/kotlin/co/branch/feature/lending/loan_document/domain/usecase/GetLoanDetailsUseCaseTest.kt:34:1",
+    "feature/lending/loan-document/domain/src/test/kotlin/co/branch/feature/lending/loan_document/domain/usecase/GetLoanDetailsUseCaseTest.kt:40:1"
+   ],
+   "jump": {
+    "feature/lending/loan-document/data/src/test/kotlin/co/branch/feature/lending/loan_document/data/repository/DefaultLoanDocumentRepositoryTest.kt:178:1": "feature/lending/loan-document/data/src/main/kotlin/co/branch/feature/lending/loan_document/data/repository/DefaultLoanDocumentRepository.kt:92",
+    "feature/lending/loan-document/data/src/test/kotlin/co/branch/feature/lending/loan_document/data/repository/DefaultLoanDocumentRepositoryTest.kt:197:1": "feature/lending/loan-document/data/src/main/kotlin/co/branch/feature/lending/loan_document/data/repository/DefaultLoanDocumentRepository.kt:92"
+   }
+  },
+  {
+   "name": "updateLocation",
+   "file": "feature/platform/device-sync/data/src/main/kotlin/co/branch/feature/platform/devicesync/data/remote/DeviceSyncApi.kt",
+   "line": 25,
+   "usages": [
+    "feature/platform/sync/data/src/main/java/co/branch/feature/platform/sync/data/DataSyncManagerImpl.kt:903:1",
+    "feature/platform/sync/data/src/test/java/co/branch/feature/platform/sync/data/DataSyncManagerImplTest.kt:427:1",
+    "feature/platform/sync/data/src/test/java/co/branch/feature/platform/sync/data/DataSyncManagerImplTest.kt:446:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "resetPermissionsStatus",
+   "file": "feature/platform/permissions/data/src/main/kotlin/co/branch/feature/platform/permissions/PermissionsUtility.kt",
+   "line": 71,
+   "usages": [
+    "feature/platform/permissions/data/src/main/kotlin/co/branch/feature/platform/permissions/PermissionsUtilityImpl.kt:279:2"
+   ],
+   "jump": {
+    "feature/platform/permissions/data/src/main/kotlin/co/branch/feature/platform/permissions/PermissionsUtilityImpl.kt:279:2": "feature/platform/permissions/data/src/main/kotlin/co/branch/feature/platform/permissions/PermissionsUtilityImpl.kt:281"
+   }
+  },
+  {
+   "name": "getPersistedSignal",
+   "file": "library/dynamic-app-icon/domain/src/main/kotlin/co/branch/library/dynamicappicon/domain/repository/AppIconRepository.kt",
+   "line": 14,
+   "usages": [
+    "library/dynamic-app-icon/domain/src/main/kotlin/co/branch/library/dynamicappicon/domain/ApplyAppIconSignalUseCase.kt:34:1",
+    "library/dynamic-app-icon/domain/src/test/kotlin/co/branch/library/dynamicappicon/domain/ApplyAppIconSignalUseCaseTest.kt:28:1",
+    "library/dynamic-app-icon/domain/src/test/kotlin/co/branch/library/dynamicappicon/domain/ApplyAppIconSignalUseCaseTest.kt:40:1",
+    "library/dynamic-app-icon/domain/src/test/kotlin/co/branch/library/dynamicappicon/domain/ApplyAppIconSignalUseCaseTest.kt:53:1",
+    "library/dynamic-app-icon/domain/src/test/kotlin/co/branch/library/dynamicappicon/domain/ApplyAppIconSignalUseCaseTest.kt:66:1",
+    "library/dynamic-app-icon/domain/src/test/kotlin/co/branch/library/dynamicappicon/domain/ApplyAppIconSignalUseCaseTest.kt:78:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "toNavType",
+   "file": "app/src/main/java/co/branch/app/ui/main/NavigationBarState.kt",
+   "line": 171,
+   "usages": [
+    "app/src/main/java/co/branch/app/ui/main/MainActivity.kt:725:1",
+    "app/src/main/java/co/branch/app/ui/main/MainActivity.kt:1080:1",
+    "app/src/test/kotlin/co/branch/app/ui/main/NavigationBarStateTest.kt:58:1",
+    "app/src/test/kotlin/co/branch/app/ui/main/NavigationBarStateTest.kt:59:1",
+    "app/src/test/kotlin/co/branch/app/ui/main/NavigationBarStateTest.kt:60:1",
+    "app/src/test/kotlin/co/branch/app/ui/main/NavigationBarStateTest.kt:61:1",
+    "app/src/test/kotlin/co/branch/app/ui/main/NavigationBarStateTest.kt:62:1",
+    "app/src/test/kotlin/co/branch/app/ui/main/NavigationBarStateTest.kt:63:1",
+    "app/src/test/kotlin/co/branch/app/ui/main/NavigationBarStateTest.kt:68:1",
+    "app/src/test/kotlin/co/branch/app/ui/main/NavigationBarStateTest.kt:69:1",
+    "app/src/test/kotlin/co/branch/app/ui/main/NavigationBarStateTest.kt:70:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "toFeedback",
+   "file": "feature/lending/lending-feedback/data/src/main/kotlin/co/branch/feature/lending/lending_feedback/data/mapper/AccountFeedbackMapper.kt",
+   "line": 11,
+   "usages": [
+    "feature/lending/lending-feedback/data-test/src/main/kotlin/co/branch/feature/lending/lending_feedback/data/test/repository/FakeLendingFeedbackRepository.kt:4:1",
+    "feature/lending/lending-feedback/data-test/src/main/kotlin/co/branch/feature/lending/lending_feedback/data/test/repository/FakeLendingFeedbackRepository.kt:19:1",
+    "feature/lending/lending-feedback/data/src/main/kotlin/co/branch/feature/lending/lending_feedback/data/repository/DefaultLendingFeedbackRepository.kt:4:1",
+    "feature/lending/lending-feedback/data/src/main/kotlin/co/branch/feature/lending/lending_feedback/data/repository/DefaultLendingFeedbackRepository.kt:16:1",
+    "feature/lending/lending-feedback/data/src/test/kotlin/co/branch/feature/lending/lending_feedback/data/mapper/AccountFeedbackMapperTest.kt:56:1",
+    "feature/lending/lending-feedback/data/src/test/kotlin/co/branch/feature/lending/lending_feedback/data/mapper/AccountFeedbackMapperTest.kt:64:1",
+    "feature/lending/lending-feedback/data/src/test/kotlin/co/branch/feature/lending/lending_feedback/data/mapper/AccountFeedbackMapperTest.kt:82:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "withEvent",
+   "file": "feature/kyc/tier/presentation/src/main/kotlin/co/branch/feature/kyc/tier/account_limit/AccountLimitViewModel.kt",
+   "line": 150,
+   "usages": [
+    "feature/kyc/tier/presentation/src/main/kotlin/co/branch/feature/kyc/tier/account_limit/AccountLimitViewModel.kt:141:1",
+    "feature/kyc/tier/presentation/src/main/kotlin/co/branch/feature/kyc/tier/account_limit/AccountLimitViewModel.kt:145:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "toButtonAction",
+   "file": "feature/credit-score/data/src/main/kotlin/co/branch/feature/creditscore/data/mapper/CreditScoreActionMapper.kt",
+   "line": 14,
+   "usages": [
+    "feature/credit-score/data/src/main/kotlin/co/branch/feature/creditscore/data/mapper/CreditScoreActionMapper.kt:29:1",
+    "feature/credit-score/data/src/test/kotlin/co/branch/feature/creditscore/data/mapper/CreditScoreActionMapperTest.kt:26:1",
+    "feature/credit-score/data/src/test/kotlin/co/branch/feature/creditscore/data/mapper/CreditScoreActionMapperTest.kt:41:1",
+    "feature/credit-score/data/src/test/kotlin/co/branch/feature/creditscore/data/mapper/CreditScoreActionMapperTest.kt:48:1",
+    "feature/credit-score/data/src/test/kotlin/co/branch/feature/creditscore/data/mapper/CreditScoreActionMapperTest.kt:61:1",
+    "feature/credit-score/data/src/test/kotlin/co/branch/feature/creditscore/data/mapper/CreditScoreHomeMapperTest.kt:303:1",
+    "feature/credit-score/data/src/test/kotlin/co/branch/feature/creditscore/data/mapper/CreditScoreHomeMapperTest.kt:323:1",
+    "feature/credit-score/data/src/test/kotlin/co/branch/feature/creditscore/data/mapper/CreditScoreHomeMapperTest.kt:334:1",
+    "feature/credit-score/data/src/test/kotlin/co/branch/feature/creditscore/data/mapper/CreditScoreHomeMapperTest.kt:383:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "toData",
+   "file": "feature/manage-account/src/main/java/co/branch/feature/manageaccount/data/AutoDebitEnrollmentMapper.kt",
+   "line": 13,
+   "usages": [
+    "feature/manage-account/src/main/java/co/branch/feature/manageaccount/data/DefaultManageAutoDebitRepository.kt:24:1",
+    "feature/manage-account/src/test/java/co/branch/feature/manageaccount/data/AutoDebitEnrollmentMapperTest.kt:20:1",
+    "feature/manage-account/src/test/java/co/branch/feature/manageaccount/data/AutoDebitEnrollmentMapperTest.kt:21:1",
+    "feature/manage-account/src/test/java/co/branch/feature/manageaccount/data/AutoDebitEnrollmentMapperTest.kt:22:1",
+    "feature/manage-account/src/test/java/co/branch/feature/manageaccount/data/AutoDebitEnrollmentMapperTest.kt:23:1",
+    "feature/manage-account/src/test/java/co/branch/feature/manageaccount/data/AutoDebitEnrollmentMapperTest.kt:31:1",
+    "feature/manage-account/src/test/java/co/branch/feature/manageaccount/data/AutoDebitEnrollmentMapperTest.kt:38:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "displayMessage",
+   "file": "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/actionauth/PinActionAuthViewModel.kt",
+   "line": 309,
+   "usages": [
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/actionauth/PinActionAuthViewModel.kt:207:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "getCurrentActiveLoan",
+   "file": "feature/lending/account-details/data/src/main/kotlin/co/branch/feature/lending/account_details/data/model/LendingAccountDetailsExtensions.kt",
+   "line": 240,
+   "usages": [
+    "feature/lending/account-details/data-impl/src/main/kotlin/co/branch/feature/lending/account_details/dataimpl/mapper/AccountDetailsMapper.kt:11:1",
+    "feature/lending/account-details/data-impl/src/main/kotlin/co/branch/feature/lending/account_details/dataimpl/mapper/AccountDetailsMapper.kt:39:1",
+    "feature/lending/account-details/data/src/main/kotlin/co/branch/feature/lending/account_details/data/model/LendingAccountDetailsExtensions.kt:254:1",
+    "feature/lending/active-loan-details/data/src/main/kotlin/co/branch/feature/lending/active_loan_details/data/mapper/ActiveLoanDetailsMapper.kt:10:1",
+    "feature/lending/active-loan-details/data/src/main/kotlin/co/branch/feature/lending/active_loan_details/data/mapper/ActiveLoanDetailsMapper.kt:35:1",
+    "feature/lending/active-loan-details/data/src/main/kotlin/co/branch/feature/lending/active_loan_details/data/mapper/ActiveLoanDetailsMapper.kt:94:1",
+    "feature/lending/active-loan-details/data/src/main/kotlin/co/branch/feature/lending/active_loan_details/data/remote/ActiveLoanExtrasDecoder.kt:5:1",
+    "feature/lending/active-loan-details/data/src/main/kotlin/co/branch/feature/lending/active_loan_details/data/remote/ActiveLoanExtrasDecoder.kt:25:1",
+    "feature/lending/active-loan-details/data/src/test/kotlin/co/branch/feature/lending/active_loan_details/data/mapper/ActiveLoanDetailsMapperTestHelpers.kt:5:1",
+    "feature/lending/active-loan-details/data/src/test/kotlin/co/branch/feature/lending/active_loan_details/data/mapper/ActiveLoanDetailsMapperTestHelpers.kt:121:1",
+    "feature/lending/active-loan-details/data/src/test/kotlin/co/branch/feature/lending/active_loan_details/data/mapper/ActiveLoanDetailsMapperTestHelpers.kt:136:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "ifTrue",
+   "file": "library/core/domain/src/main/java/co/branch/library/core/domain/util/BooleanExtensions.kt",
+   "line": 3,
+   "usages": [
+    "library/lending/util/src/main/kotlin/co/branch/library/lending/util/promotion/PromotionUtil.kt:12:1",
+    "library/lending/util/src/main/kotlin/co/branch/library/lending/util/promotion/PromotionUtil.kt:48:1",
+    "library/lending/util/src/main/kotlin/co/branch/library/lending/util/promotion/PromotionUtil.kt:510:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "updateIfSuccess",
+   "file": "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/utils/MutableStateFlowExtensions.kt",
+   "line": 15,
+   "usages": [
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatViewModel.kt:20:1",
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatViewModel.kt:96:1",
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatViewModel.kt:124:1",
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatViewModel.kt:141:1",
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatViewModel.kt:205:1",
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatViewModel.kt:215:1",
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatViewModel.kt:275:1",
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatViewModel.kt:288:1",
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatViewModel.kt:356:1",
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatViewModel.kt:374:1",
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatViewModel.kt:422:1",
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatViewModel.kt:444:1",
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatViewModel.kt:468:1",
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatViewModel.kt:474:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "isRecentlyVisited",
+   "file": "library/core/data/src/main/java/co/branch/library/core/data/model/ProductOverview.kt",
+   "line": 22,
+   "usages": [
+    "feature/home/src/main/kotlin/co/branch/feature/home/ui/compose/ProductOverviewScreen.kt:46:1",
+    "feature/home/src/main/kotlin/co/branch/feature/home/ui/mapper/HomeContributionsAdapter.kt:152:1",
+    "feature/home/src/main/kotlin/co/branch/feature/home/ui/mapper/HomeContributionsAdapter.kt:159:1",
+    "feature/home/src/main/kotlin/co/branch/feature/home/ui/mapper/HomeContributionsAdapter.kt:161:1",
+    "feature/home/src/main/kotlin/co/branch/feature/home/ui/mapper/HomeContributionsAdapter.kt:186:1",
+    "feature/home/src/main/kotlin/co/branch/feature/home/ui/mapper/HomeContributionsAdapter.kt:466:1",
+    "library/home/data/src/main/java/co/branch/library/home/data/mapper/HomeContributionsMapper.kt:36:1",
+    "library/home/data/src/main/java/co/branch/library/home/data/mapper/HomeContributionsMapper.kt:45:1",
+    "library/home/data/src/main/java/co/branch/library/home/data/mapper/HomeContributionsMapper.kt:47:1",
+    "library/home/data/src/main/java/co/branch/library/home/data/mapper/HomeContributionsMapper.kt:77:1",
+    "library/home/data/src/main/java/co/branch/library/home/data/mapper/HomeContributionsMapper.kt:162:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "showNeedHelpOption",
+   "file": "feature/lending/loan-requested/presentation/src/main/kotlin/co/branch/feature/lending/loan_requested/LoanRequestedUiData.kt",
+   "line": 15,
+   "usages": [
+    "feature/lending/loan-requested/presentation/src/main/kotlin/co/branch/feature/lending/loan_requested/composable/LoanRequestedScreen.kt:98:1",
+    "feature/lending/loan-requested/presentation/src/main/kotlin/co/branch/feature/lending/loan_requested/composable/LoanRequestedScreen.kt:228:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "isPromotionEnabled",
+   "file": "feature/promotion/domain/src/main/kotlin/co/branch/feature/promotion/domain/model/PromotionsHome.kt",
+   "line": 29,
+   "usages": [
+    "feature/promotion/data/src/main/kotlin/co/branch/feature/promotion/data/mapper/PromotionsHomeMapper.kt:35:1",
+    "feature/promotion/data/src/test/kotlin/co/branch/feature/promotion/data/fixtures/PromotionsHomeFixturesTest.kt:87:1",
+    "feature/promotion/data/src/test/kotlin/co/branch/feature/promotion/data/fixtures/PromotionsHomeFixturesTest.kt:96:1",
+    "feature/promotion/data/src/test/kotlin/co/branch/feature/promotion/data/repository/DefaultPromotionsRepositoryTest.kt:80:1",
+    "feature/promotion/data/src/test/kotlin/co/branch/feature/promotion/data/repository/DefaultPromotionsRepositoryTest.kt:96:1",
+    "feature/promotion/domain/src/test/kotlin/co/branch/feature/promotion/domain/usecase/GetPromotionsHomeUseCaseTest.kt:53:1",
+    "feature/promotion/presentation/src/test/kotlin/co/branch/feature/promotion/presentation/home/PromotionsHomeViewModelTest.kt:243:1",
+    "feature/promotion/presentation/src/test/kotlin/co/branch/feature/promotion/presentation/redeem/RedeemInviteCodeViewModelTest.kt:532:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "maxEnrollmentAttempts",
+   "file": "library/biometric/domain/src/main/kotlin/co/branch/library/biometric/domain/model/BiometricFlowDetails.kt",
+   "line": 14,
+   "usages": [
+    "library/biometric/data-test/src/main/java/co/branch/library/biometric/data/test/repository/FakeBiometricFlowDetailsRepository.kt:40:1",
+    "library/biometric/data/src/main/kotlin/co/branch/library/biometric/data/mapper/BiometricFlowDetailsMapper.kt:20:1",
+    "library/biometric/data/src/test/kotlin/co/branch/library/biometric/data/mapper/BiometricFlowDetailsMapperTest.kt:49:1",
+    "library/biometric/data/src/test/kotlin/co/branch/library/biometric/data/repository/DefaultBiometricFlowDetailsRepositoryFormatTest.kt:61:1",
+    "library/biometric/data/src/test/kotlin/co/branch/library/biometric/data/repository/DefaultBiometricFlowDetailsRepositoryFormatTest.kt:79:1",
+    "library/biometric/domain/src/main/kotlin/co/branch/library/biometric/domain/usecase/IsBiometricEnrollmentAttemptWithinLimitUseCase.kt:26:2",
+    "library/biometric/domain/src/test/kotlin/co/branch/library/biometric/domain/usecase/GetBiometricFlowDetailsUseCaseTest.kt:29:1",
+    "library/biometric/domain/src/test/kotlin/co/branch/library/biometric/domain/usecase/IsBiometricEnrollmentAttemptWithinLimitUseCaseTest.kt:36:1",
+    "library/biometric/domain/src/test/kotlin/co/branch/library/biometric/domain/usecase/IsBiometricEnrollmentAttemptWithinLimitUseCaseTest.kt:54:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "failureText",
+   "file": "library/chat/domain/src/main/java/co/branch/library/chat/domain/model/ChatUiState.kt",
+   "line": 24,
+   "usages": [
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatScreen.kt:261:1",
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatScreen.kt:262:1",
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatViewModel.kt:180:1",
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatViewModel.kt:261:1",
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatViewModel.kt:376:1",
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatViewModel.kt:414:1",
+    "feature/chat/src/main/kotlin/co/branch/feature/chat/ui/fragment/ChatViewModel.kt:456:1",
+    "feature/chat/src/test/java/co/branch/feature/chat/viewmodel/ChatScreenTest.kt:243:1",
+    "feature/chat/src/test/java/co/branch/feature/chat/viewmodel/ChatViewModelBaselineTest.kt:165:1",
+    "feature/chat/src/test/java/co/branch/feature/chat/viewmodel/ChatViewModelBaselineTest.kt:194:1",
+    "feature/chat/src/test/java/co/branch/feature/chat/viewmodel/ChatViewModelBaselineTest.kt:291:1",
+    "feature/chat/src/test/java/co/branch/feature/chat/viewmodel/ChatViewModelBaselineTest.kt:325:1",
+    "feature/chat/src/test/java/co/branch/feature/chat/viewmodel/ChatViewModelBaselineTest.kt:360:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "pinProcessState",
+   "file": "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/pin/PinEntryLayoutState.kt",
+   "line": 37,
+   "usages": [
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinActionAuthFlowScreen.kt:55:1",
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinEntryFlowScreen.kt:37:1",
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/SerializedPinEntryScreen.kt:54:1",
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinEntryKeypad.kt:84:1",
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinEntryKeypad.kt:238:1",
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinEntryKeypad.kt:242:1",
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinEntryKeypad.kt:255:1",
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinEntryKeypad.kt:256:1",
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinEntryKeypad.kt:275:1",
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinEntryKeypad.kt:293:1",
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinEntryKeypad.kt:294:1",
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinEntryKeypad.kt:296:1",
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinEntryKeypad.kt:309:1",
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinEntryKeypad.kt:313:1",
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinEntryKeypad.kt:314:1",
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinEntryKeypad.kt:318:1",
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinEntryKeypad.kt:320:1",
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinEntryKeypad.kt:324:1",
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinEntryKeypad.kt:325:1",
+    "feature/security-pin/presentation/src/main/kotlin/co/branch/feature/securitypin/ui/PinEntryKeypad.kt:353:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "applyButtonLink",
+   "file": "feature/lending/rejected/presentation/src/main/kotlin/co/branch/feature/lending/rejected/LoanRejectedUiState.kt",
+   "line": 38,
+   "usages": [
+    "feature/lending/rejected/data/src/test/kotlin/co/branch/feature/lending/rejected/data/repository/RejectedExtrasParseTest.kt:44:1",
+    "feature/lending/rejected/data/src/test/kotlin/co/branch/feature/lending/rejected/data/repository/RejectedExtrasParseTest.kt:73:1",
+    "feature/lending/rejected/presentation/src/test/kotlin/co/branch/feature/lending/rejected/RejectedExtrasParseTest.kt:80:1",
+    "feature/lending/rejected/presentation/src/main/kotlin/co/branch/feature/lending/rejected/RejectedViewModel.kt:311:1",
+    "feature/lending/rejected/presentation/src/main/kotlin/co/branch/feature/lending/rejected/mapper/LoanRejectionContentToStateMapper.kt:22:1",
+    "feature/lending/rejected/presentation/src/test/kotlin/co/branch/feature/lending/rejected/mapper/LoanRejectionContentToStateMapperTest.kt:19:1",
+    "feature/lending/rejected/presentation/src/test/kotlin/co/branch/feature/lending/rejected/mapper/LoanRejectionContentToStateMapperTest.kt:27:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "timezone",
+   "file": "feature/my-account/data/src/main/java/co/branch/feature/myaccount/data/model/UserAccountDetails.kt",
+   "line": 76,
+   "usages": [
+    "feature/my-account/domain/src/main/java/co/branch/feature/myaccount/domain/usecase/UpdateLoggerMetadataUseCase.kt:39:1",
+    "feature/my-account/domain/src/test/java/co/branch/feature/myaccount/domain/usecase/UpdateLoggerMetadataUseCaseTest.kt:74:1",
+    "feature/platform/sync/data/src/main/java/co/branch/feature/platform/sync/data/DataSyncManagerImpl.kt:879:1",
+    "feature/platform/work/data/src/main/kotlin/co/branch/feature/platform/work/worker/UpdateAccountDetailsWorker.kt:73:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "AutoDebitConsentViewModel",
+   "file": "feature/lending/account-auto-debit/presentation/src/main/kotlin/co/branch/feature/lending/account_auto_debit/consent/ui/AutoDebitConsentViewModel.kt",
+   "line": 22,
+   "usages": [
+    "feature/lending/account-auto-debit/presentation/src/main/kotlin/co/branch/feature/lending/account_auto_debit/consent/ui/AutoDebitConsentFragment.kt:24:1",
+    "feature/lending/account-auto-debit/presentation/src/main/kotlin/co/branch/feature/lending/account_auto_debit/consent/ui/AutoDebitConsentFragment.kt:25:1",
+    "feature/lending/account-auto-debit/presentation/src/main/kotlin/co/branch/feature/lending/account_auto_debit/consent/ui/composable/AutoDebitConsentEntry.kt:10:1",
+    "feature/lending/account-auto-debit/presentation/src/main/kotlin/co/branch/feature/lending/account_auto_debit/consent/ui/composable/AutoDebitConsentEntry.kt:25:1",
+    "feature/lending/account-auto-debit/presentation/src/main/kotlin/co/branch/feature/lending/account_auto_debit/ui/composable/destination/AutoDebitConsentDestination.kt:7:1",
+    "feature/lending/account-auto-debit/presentation/src/main/kotlin/co/branch/feature/lending/account_auto_debit/ui/composable/destination/AutoDebitConsentDestination.kt:15:1",
+    "feature/lending/account-auto-debit/presentation/src/test/kotlin/co/branch/feature/lending/account_auto_debit/consent/ui/AutoDebitConsentViewModelTest.kt:29:1",
+    "feature/lending/account-auto-debit/presentation/src/test/kotlin/co/branch/feature/lending/account_auto_debit/consent/ui/AutoDebitConsentViewModelTest.kt:45:1",
+    "feature/lending/account-auto-debit/presentation/src/test/kotlin/co/branch/feature/lending/account_auto_debit/consent/ui/AutoDebitConsentViewModelTest.kt:87:1",
+    "feature/lending/account-auto-debit/presentation/src/test/kotlin/co/branch/feature/lending/account_auto_debit/consent/ui/AutoDebitConsentViewModelTest.kt:116:1",
+    "feature/lending/account-auto-debit/presentation/src/test/kotlin/co/branch/feature/lending/account_auto_debit/consent/ui/AutoDebitConsentViewModelTest.kt:172:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "TransferHomeViewModel",
+   "file": "feature/wallets/transfer-home-v3/presentation/src/main/kotlin/co/branch/feature/wallets/transferhomev3/presentation/TransferHomeViewModel.kt",
+   "line": 28,
+   "usages": [
+    "feature/wallets/transfer-home-v3/presentation/src/main/kotlin/co/branch/feature/wallets/transferhomev3/presentation/TransferHomeFragmentV3.kt:92:1",
+    "feature/wallets/transfer-home-v3/presentation/src/main/kotlin/co/branch/feature/wallets/transferhomev3/presentation/TransferHomeFragmentV3.kt:199:1",
+    "feature/wallets/transfer-home-v3/presentation/src/test/kotlin/co/branch/feature/wallets/transferhomev3/presentation/TransferHomeFragmentV3QuickActionTest.kt:34:1",
+    "feature/wallets/transfer-home-v3/presentation/src/test/kotlin/co/branch/feature/wallets/transferhomev3/presentation/TransferHomeScreenViewEventTest.kt:54:1",
+    "feature/wallets/transfer-home-v3/presentation/src/test/kotlin/co/branch/feature/wallets/transferhomev3/presentation/TransferHomeViewModelTest.kt:60:1",
+    "feature/wallets/transfer-home-v3/presentation/src/test/kotlin/co/branch/feature/wallets/transferhomev3/presentation/TransferHomeViewModelTest.kt:76:1",
+    "feature/wallets/transfer-home-v3/presentation/src/test/kotlin/co/branch/feature/wallets/transferhomev3/presentation/TransferHomeViewModelTest.kt:96:1",
+    "feature/wallets/transfer-home-v3/presentation/src/test/kotlin/co/branch/feature/wallets/transferhomev3/presentation/TransferHomeViewModelTest.kt:332:1",
+    "feature/wallets/transfer-home-v3/presentation/src/test/kotlin/co/branch/feature/wallets/transferhomev3/presentation/TransferHomeViewModelTest.kt:357:1",
+    "feature/wallets/transfer-home-v3/presentation/src/test/kotlin/co/branch/feature/wallets/transferhomev3/presentation/TransferHomeViewModelWalletAccountDetailsUpdatedTest.kt:35:1",
+    "feature/wallets/transfer-home-v3/presentation/src/test/kotlin/co/branch/feature/wallets/transferhomev3/presentation/TransferHomeViewModelWalletAccountDetailsUpdatedTest.kt:88:1",
+    "feature/wallets/transfer-home-v3/presentation/src/test/kotlin/co/branch/feature/wallets/transferhomev3/presentation/TransferHomeViewModelWalletAccountDetailsUpdatedTest.kt:102:1",
+    "feature/wallets/transfer-home-v3/presentation/src/test/kotlin/co/branch/feature/wallets/transferhomev3/presentation/TransferHomeViewModelWalletAccountDetailsUpdatedTest.kt:119:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "RepaymentScheduleViewModel",
+   "file": "feature/lending/repayment-schedule/presentation/src/main/kotlin/co/branch/feature/lending/repayment_schedule/ui/RepaymentScheduleViewModel.kt",
+   "line": 58,
+   "usages": [
+    "feature/lending/repayment-schedule/presentation/src/main/kotlin/co/branch/feature/lending/repayment_schedule/ui/RepaymentScheduleActivity.kt:48:1",
+    "feature/lending/repayment-schedule/presentation/src/test/kotlin/co/branch/feature/lending/repayment_schedule/ui/RepaymentScheduleViewModelBaselineTest.kt:82:1",
+    "feature/lending/repayment-schedule/presentation/src/test/kotlin/co/branch/feature/lending/repayment_schedule/ui/RepaymentScheduleViewModelTest.kt:73:1",
+    "feature/lending/repayment-schedule/presentation/src/test/kotlin/co/branch/feature/lending/repayment_schedule/ui/RepaymentScheduleViewModelTest.kt:122:1",
+    "feature/lending/repayment-schedule/presentation/src/test/kotlin/co/branch/feature/lending/repayment_schedule/ui/RepaymentScheduleViewModelTest.kt:123:1",
+    "feature/lending/repayment-schedule/presentation/src/test/kotlin/co/branch/feature/lending/repayment_schedule/ui/ReviewRepaymentScheduleViewModelBaselineTest.kt:93:1",
+    "feature/lending/repayment-schedule/presentation/src/test/kotlin/co/branch/feature/lending/repayment_schedule/ui/ReviewRepaymentScheduleViewModelBaselineTest.kt:95:1",
+    "feature/lending/repayment-schedule/presentation/src/test/kotlin/co/branch/feature/lending/repayment_schedule/ui/ReviewRepaymentScheduleViewModelBaselineTest.kt:120:1",
+    "feature/lending/repayment-schedule/presentation/src/test/kotlin/co/branch/feature/lending/repayment_schedule/ui/ReviewRepaymentScheduleViewModelBaselineTest.kt:122:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "FailureViewModel",
+   "file": "feature/merge-account/presentation/src/main/kotlin/co/branch/feature/mergeaccount/v2/failure/FailureViewModel.kt",
+   "line": 29,
+   "usages": [
+    "feature/merge-account/presentation/src/main/kotlin/co/branch/feature/mergeaccount/v2/destination/FailureDestination.kt:17:1",
+    "feature/merge-account/presentation/src/main/kotlin/co/branch/feature/mergeaccount/v2/destination/FailureDestination.kt:62:1",
+    "feature/merge-account/presentation/src/test/kotlin/co/branch/feature/mergeaccount/shared/navigation/MergeAccountDestinationAnalyticsTest.kt:75:1",
+    "feature/merge-account/presentation/src/test/kotlin/co/branch/feature/mergeaccount/shared/navigation/MergeAccountDestinationAnalyticsTest.kt:190:1",
+    "feature/merge-account/presentation/src/test/kotlin/co/branch/feature/mergeaccount/shared/navigation/MergeAccountDestinationAnalyticsTest.kt:208:1",
+    "feature/merge-account/presentation/src/test/kotlin/co/branch/feature/mergeaccount/shared/navigation/MergeAccountV2DestinationTest.kt:72:1",
+    "feature/merge-account/presentation/src/test/kotlin/co/branch/feature/mergeaccount/shared/navigation/MergeAccountV2DestinationTest.kt:268:1",
+    "feature/merge-account/presentation/src/test/kotlin/co/branch/feature/mergeaccount/v2/MergeAccountErrorTextTest.kt:23:1",
+    "feature/merge-account/presentation/src/test/kotlin/co/branch/feature/mergeaccount/v2/MergeAccountErrorTextTest.kt:249:1",
+    "feature/merge-account/presentation/src/test/kotlin/co/branch/feature/mergeaccount/v2/failure/FailureViewModelTest.kt:53:1",
+    "feature/merge-account/presentation/src/test/kotlin/co/branch/feature/mergeaccount/v2/failure/FailureViewModelTest.kt:463:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "PinResetPrimerViewModel",
+   "file": "feature/pin-reset/src/main/kotlin/co/branch/feature/pin/reset/viewmodel/PinResetPrimerViewModel.kt",
+   "line": 33,
+   "usages": [
+    "feature/pin-reset/src/main/kotlin/co/branch/feature/pin/reset/ui/composable/destination/PinResetPrimerDestination.kt:13:1",
+    "feature/pin-reset/src/main/kotlin/co/branch/feature/pin/reset/ui/composable/destination/PinResetPrimerDestination.kt:24:1",
+    "feature/pin-reset/src/test/kotlin/co/branch/feature/pin/reset/viewmodel/PinResetPrimerViewModelTest.kt:48:1",
+    "feature/pin-reset/src/test/kotlin/co/branch/feature/pin/reset/viewmodel/PinResetPrimerViewModelTest.kt:64:1",
+    "feature/pin-reset/src/test/kotlin/co/branch/feature/pin/reset/viewmodel/PinResetPrimerViewModelTest.kt:82:1",
+    "feature/pin-reset/src/test/kotlin/co/branch/feature/pin/reset/viewmodel/PinResetPrimerViewModelTest.kt:101:1",
+    "feature/pin-reset/src/test/kotlin/co/branch/feature/pin/reset/viewmodel/PinResetPrimerViewModelTest.kt:122:1",
+    "feature/pin-reset/src/test/kotlin/co/branch/feature/pin/reset/viewmodel/PinResetPrimerViewModelTest.kt:155:1",
+    "feature/pin-reset/src/test/kotlin/co/branch/feature/pin/reset/viewmodel/PinResetPrimerViewModelTest.kt:255:1",
+    "feature/pin-reset/src/test/kotlin/co/branch/feature/pin/reset/viewmodel/PinResetPrimerViewModelTest.kt:266:1",
+    "feature/pin-reset/src/test/kotlin/co/branch/feature/pin/reset/viewmodel/PinResetPrimerViewModelTest.kt:277:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "SelectDepositAccountViewModel",
+   "file": "feature/wallets/add-funds/presentation/src/main/kotlin/co/branch/feature/wallets/addfunds/presentation/selectdepositaccount/SelectDepositAccountViewModel.kt",
+   "line": 28,
+   "usages": [
+    "feature/wallets/add-funds/presentation/src/main/kotlin/co/branch/feature/wallets/addfunds/presentation/selectdepositaccount/SelectDepositAccountFragment.kt:27:1",
+    "feature/wallets/add-funds/presentation/src/main/kotlin/co/branch/feature/wallets/addfunds/presentation/selectdepositaccount/SelectDepositAccountFragment.kt:28:1",
+    "feature/wallets/add-funds/presentation/src/main/kotlin/co/branch/feature/wallets/addfunds/presentation/selectdepositaccount/SelectDepositAccountFragment.kt:61:1",
+    "feature/wallets/add-funds/presentation/src/test/kotlin/co/branch/feature/wallets/addfunds/presentation/selectdepositaccount/SelectDepositAccountFragmentTest.kt:21:1",
+    "feature/wallets/add-funds/presentation/src/test/kotlin/co/branch/feature/wallets/addfunds/presentation/selectdepositaccount/SelectDepositAccountFragmentTest.kt:22:1",
+    "feature/wallets/add-funds/presentation/src/test/kotlin/co/branch/feature/wallets/addfunds/presentation/selectdepositaccount/SelectDepositAccountFragmentTest.kt:30:1",
+    "feature/wallets/add-funds/presentation/src/test/kotlin/co/branch/feature/wallets/addfunds/presentation/selectdepositaccount/SelectDepositAccountFragmentTest.kt:37:1",
+    "feature/wallets/add-funds/presentation/src/test/kotlin/co/branch/feature/wallets/addfunds/presentation/selectdepositaccount/SelectDepositAccountViewModelTest.kt:33:1",
+    "feature/wallets/add-funds/presentation/src/test/kotlin/co/branch/feature/wallets/addfunds/presentation/selectdepositaccount/SelectDepositAccountViewModelTest.kt:38:1",
+    "feature/wallets/add-funds/presentation/src/test/kotlin/co/branch/feature/wallets/addfunds/presentation/selectdepositaccount/SelectDepositAccountViewModelTest.kt:39:1",
+    "feature/wallets/add-funds/presentation/src/test/kotlin/co/branch/feature/wallets/addfunds/presentation/selectdepositaccount/SelectDepositAccountViewModelTest.kt:42:1",
+    "feature/wallets/add-funds/presentation/src/test/kotlin/co/branch/feature/wallets/addfunds/presentation/selectdepositaccount/SelectDepositAccountViewModelTest.kt:60:1",
+    "feature/wallets/add-funds/presentation/src/test/kotlin/co/branch/feature/wallets/addfunds/presentation/selectdepositaccount/SelectDepositAccountViewModelTest.kt:64:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "RpdScreenRepository",
+   "file": "library/lending/reverse-penny-drop/domain/src/main/kotlin/co/branch/library/lending/reverse_penny_drop/domain/repository/RpdScreenRepository.kt",
+   "line": 6,
+   "usages": [
+    "library/lending/reverse-penny-drop/data/src/main/kotlin/co/branch/library/lending/reverse_penny_drop/data/di/RpdDataModule.kt:6:1",
+    "library/lending/reverse-penny-drop/data/src/main/kotlin/co/branch/library/lending/reverse_penny_drop/data/di/RpdDataModule.kt:23:1",
+    "library/lending/reverse-penny-drop/data/src/main/kotlin/co/branch/library/lending/reverse_penny_drop/data/repository/DefaultRpdScreenRepository.kt:7:1",
+    "library/lending/reverse-penny-drop/data/src/main/kotlin/co/branch/library/lending/reverse_penny_drop/data/repository/DefaultRpdScreenRepository.kt:14:1",
+    "library/lending/reverse-penny-drop/domain/src/main/kotlin/co/branch/library/lending/reverse_penny_drop/domain/usecase/GetAddBankAccountScreenUseCase.kt:4:1",
+    "library/lending/reverse-penny-drop/domain/src/main/kotlin/co/branch/library/lending/reverse_penny_drop/domain/usecase/GetAddBankAccountScreenUseCase.kt:9:1",
+    "library/lending/reverse-penny-drop/domain/src/test/kotlin/co/branch/library/lending/reverse_penny_drop/domain/usecase/GetAddBankAccountScreenUseCaseTest.kt:4:1",
+    "library/lending/reverse-penny-drop/domain/src/test/kotlin/co/branch/library/lending/reverse_penny_drop/domain/usecase/GetAddBankAccountScreenUseCaseTest.kt:14:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "FavouritesExtrasRepository",
+   "file": "feature/wallets/favourites/domain/src/main/kotlin/co/branch/feature/wallets/favourites/domain/repository/FavouritesExtrasRepository.kt",
+   "line": 6,
+   "usages": [
+    "feature/financial-account/presentation/src/test/kotlin/co/branch/feature/financialaccount/presentation/baseline/FinancialAccountTestBindings.kt:36:1",
+    "feature/financial-account/presentation/src/test/kotlin/co/branch/feature/financialaccount/presentation/baseline/FinancialAccountTestBindings.kt:211:1",
+    "feature/lending/ui-test/src/androidTest/kotlin/co/branch/feature/lending/ui_test/LendingUiTestScreenExtrasModule.kt:19:1",
+    "feature/lending/ui-test/src/androidTest/kotlin/co/branch/feature/lending/ui_test/LendingUiTestScreenExtrasModule.kt:121:1",
+    "feature/wallets/favourites/data/src/main/kotlin/co/branch/feature/wallets/favourites/data/di/FavouritesDataModule.kt:4:1",
+    "feature/wallets/favourites/data/src/main/kotlin/co/branch/feature/wallets/favourites/data/di/FavouritesDataModule.kt:15:1",
+    "feature/wallets/favourites/data/src/main/kotlin/co/branch/feature/wallets/favourites/data/repository/DefaultFavouritesExtrasRepository.kt:7:1",
+    "feature/wallets/favourites/data/src/main/kotlin/co/branch/feature/wallets/favourites/data/repository/DefaultFavouritesExtrasRepository.kt:15:1",
+    "feature/wallets/favourites/presentation/src/main/kotlin/co/branch/feature/wallets/favourites/presentation/FavouritesViewModel.kt:8:1",
+    "feature/wallets/favourites/presentation/src/main/kotlin/co/branch/feature/wallets/favourites/presentation/FavouritesViewModel.kt:31:1",
+    "feature/wallets/favourites/presentation/src/test/kotlin/co/branch/feature/wallets/favourites/presentation/FavouritesScreenViewEventTest.kt:13:1",
+    "feature/wallets/favourites/presentation/src/test/kotlin/co/branch/feature/wallets/favourites/presentation/FavouritesScreenViewEventTest.kt:52:1",
+    "feature/wallets/favourites/presentation/src/test/kotlin/co/branch/feature/wallets/favourites/presentation/FavouritesViewModelTest.kt:9:1",
+    "feature/wallets/favourites/presentation/src/test/kotlin/co/branch/feature/wallets/favourites/presentation/FavouritesViewModelTest.kt:51:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "DeviceFingerprinting",
+   "file": "library/fingerprint/domain/src/main/java/co/branch/library/fingerprint/domain/DeviceFingerprinting.kt",
+   "line": 9,
+   "usages": [
+    "feature/lending/permissions/domain/src/main/kotlin/co/branch/feature/lending/permissions/domain/usecase/FetchAndPostDeviceFingerprintUseCase.kt:3:1",
+    "feature/lending/permissions/domain/src/main/kotlin/co/branch/feature/lending/permissions/domain/usecase/FetchAndPostDeviceFingerprintUseCase.kt:8:1",
+    "feature/lending/permissions/domain/src/test/kotlin/co/branch/feature/lending/permissions/domain/usecase/LendingPermissionsUseCasesTest.kt:5:1",
+    "feature/lending/permissions/domain/src/test/kotlin/co/branch/feature/lending/permissions/domain/usecase/LendingPermissionsUseCasesTest.kt:47:1",
+    "feature/onboarding/login/data/src/main/kotlin/co/branch/feature/onboarding/login/data/repository/DefaultLoginDeviceRepository.kt:4:1",
+    "feature/onboarding/login/data/src/main/kotlin/co/branch/feature/onboarding/login/data/repository/DefaultLoginDeviceRepository.kt:12:1",
+    "feature/onboarding/login/data/src/test/kotlin/co/branch/feature/onboarding/login/data/repository/DefaultLoginDeviceRepositoryTest.kt:3:1",
+    "feature/onboarding/login/data/src/test/kotlin/co/branch/feature/onboarding/login/data/repository/DefaultLoginDeviceRepositoryTest.kt:13:1",
+    "library/fingerprint/data/src/main/java/co/branch/library/fingerpint/data/di/DeviceFingerprintingModule.kt:4:1",
+    "library/fingerprint/data/src/main/java/co/branch/library/fingerpint/data/di/DeviceFingerprintingModule.kt:19:1",
+    "library/fingerprint/data/src/main/java/co/branch/library/fingerprint/data/DeviceFingerprintManager.kt:5:1",
+    "library/fingerprint/data/src/main/java/co/branch/library/fingerprint/data/DeviceFingerprintManager.kt:24:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "LendingWaitingApi",
+   "file": "feature/lending/waiting/data/src/main/kotlin/co/branch/feature/lending/waiting/data/remote/LendingWaitingApi.kt",
+   "line": 7,
+   "usages": [
+    "feature/lending/waiting/data/src/main/kotlin/co/branch/feature/lending/waiting/data/di/LendingWaitingNetworkModule.kt:3:1",
+    "feature/lending/waiting/data/src/main/kotlin/co/branch/feature/lending/waiting/data/di/LendingWaitingNetworkModule.kt:19:1",
+    "feature/lending/waiting/data/src/main/kotlin/co/branch/feature/lending/waiting/data/di/LendingWaitingNetworkModule.kt:20:1",
+    "feature/lending/waiting/data/src/main/kotlin/co/branch/feature/lending/waiting/data/remote/LendingWaitingRemoteDataSource.kt:14:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "SplashUserEvent",
+   "file": "app/src/main/kotlin/co/branch/app/ui/splash/SplashUiState.kt",
+   "line": 43,
+   "usages": [
+    "app/src/main/kotlin/co/branch/app/ui/splash/SplashUiState.kt:47:1",
+    "app/src/main/kotlin/co/branch/app/ui/splash/SplashViewModel.kt:54:1",
+    "app/src/main/kotlin/co/branch/app/ui/splash/SplashViewModel.kt:56:1",
+    "app/src/main/kotlin/co/branch/app/ui/splash/composable/SplashScreen.kt:10:1",
+    "app/src/main/kotlin/co/branch/app/ui/splash/composable/SplashScreen.kt:20:1",
+    "app/src/main/kotlin/co/branch/app/ui/splash/composable/SplashScreen.kt:31:1",
+    "app/src/test/kotlin/co/branch/app/ui/splash/SplashViewModelDelegationTest.kt:58:1",
+    "app/src/test/kotlin/co/branch/app/ui/splash/SplashViewModelDelegationTest.kt:70:1",
+    "app/src/test/kotlin/co/branch/app/ui/splash/SplashViewModelDelegationTest.kt:82:1",
+    "app/src/test/kotlin/co/branch/app/ui/splash/SplashViewModelDelegationTest.kt:115:1",
+    "app/src/test/kotlin/co/branch/app/ui/splash/SplashViewModelTest.kt:142:1",
+    "app/src/test/kotlin/co/branch/app/ui/splash/SplashViewModelTest.kt:229:1",
+    "app/src/test/kotlin/co/branch/app/ui/splash/SplashViewModelTest.kt:249:1",
+    "app/src/test/kotlin/co/branch/app/ui/splash/SplashViewModelTest.kt:257:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "CameraUiState",
+   "file": "feature/kyc/verify-identity/presentation/src/main/java/co/branch/feature/kyc/verifyidentity/camera/CameraUiState.kt",
+   "line": 38,
+   "usages": [
+    "feature/kyc/verify-identity/presentation/src/main/java/co/branch/feature/kyc/verifyidentity/camera/CameraDestination.kt:125:1",
+    "feature/kyc/verify-identity/presentation/src/main/java/co/branch/feature/kyc/verifyidentity/camera/CameraDestination.kt:364:1",
+    "feature/kyc/verify-identity/presentation/src/main/java/co/branch/feature/kyc/verifyidentity/camera/CameraUiState.kt:41:1",
+    "feature/kyc/verify-identity/presentation/src/main/java/co/branch/feature/kyc/verifyidentity/camera/CameraUiState.kt:44:1",
+    "feature/kyc/verify-identity/presentation/src/main/java/co/branch/feature/kyc/verifyidentity/camera/CameraUiState.kt:52:1",
+    "feature/kyc/verify-identity/presentation/src/main/java/co/branch/feature/kyc/verifyidentity/camera/CameraViewModel.kt:50:1",
+    "feature/kyc/verify-identity/presentation/src/main/java/co/branch/feature/kyc/verifyidentity/camera/CameraViewModel.kt:50:2",
+    "feature/kyc/verify-identity/presentation/src/main/java/co/branch/feature/kyc/verifyidentity/camera/CameraViewModel.kt:84:1",
+    "feature/kyc/verify-identity/presentation/src/main/java/co/branch/feature/kyc/verifyidentity/camera/CameraViewModel.kt:86:1",
+    "feature/kyc/verify-identity/presentation/src/main/java/co/branch/feature/kyc/verifyidentity/camera/CameraViewModel.kt:176:1",
+    "feature/kyc/verify-identity/presentation/src/test/java/co/branch/feature/kyc/verifyidentity/camera/CameraViewModelTest.kt:119:1",
+    "feature/kyc/verify-identity/presentation/src/test/java/co/branch/feature/kyc/verifyidentity/camera/CameraViewModelTest.kt:128:1",
+    "feature/kyc/verify-identity/presentation/src/test/java/co/branch/feature/kyc/verifyidentity/camera/CameraViewModelTest.kt:140:1",
+    "feature/kyc/verify-identity/presentation/src/test/java/co/branch/feature/kyc/verifyidentity/camera/CameraViewModelTest.kt:156:1",
+    "feature/kyc/verify-identity/presentation/src/test/java/co/branch/feature/kyc/verifyidentity/camera/CameraViewModelTest.kt:168:1",
+    "feature/kyc/verify-identity/presentation/src/test/java/co/branch/feature/kyc/verifyidentity/camera/CameraViewModelTest.kt:173:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "EXTRA_LOAN_ID",
+   "file": "feature/lending/upi-auto-debit/presentation/src/main/kotlin/co/branch/feature/lending/upi_auto_debit/terms/ui/UpiAutoDebitTermsActivity.kt",
+   "line": 115,
+   "usages": [
+    "feature/lending/upi-auto-debit/presentation/src/main/kotlin/co/branch/feature/lending/upi_auto_debit/terms/ui/UpiAutoDebitTermsActivity.kt:46:1",
+    "feature/lending/upi-auto-debit/presentation/src/main/kotlin/co/branch/feature/lending/upi_auto_debit/terms/ui/UpiAutoDebitTermsActivity.kt:146:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "KEY_ACCOUNT_DETAILS",
+   "file": "feature/wallets/account-details/data/src/main/kotlin/co/branch/feature/wallets/accountdetails/data/prefs/WalletSharedPreferencesImpl.kt",
+   "line": 158,
+   "usages": [
+    "feature/wallets/account-details/data/src/main/kotlin/co/branch/feature/wallets/accountdetails/data/prefs/WalletSharedPreferencesImpl.kt:133:1",
+    "feature/wallets/account-details/data/src/main/kotlin/co/branch/feature/wallets/accountdetails/data/prefs/WalletSharedPreferencesImpl.kt:143:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "SUBJECT_ADD_FAVOURITE_FAILED",
+   "file": "feature/wallets/add-favourite/presentation/src/main/kotlin/co/branch/feature/wallets/addfavourite/presentation/add_favourite_bank/AddFavouriteBankViewModel.kt",
+   "line": 247,
+   "usages": [
+    "feature/wallets/add-favourite/presentation/src/main/kotlin/co/branch/feature/wallets/addfavourite/presentation/add_favourite_bank/AddFavouriteBankViewModel.kt:154:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "REPAYMENT_REWARD_TEXT_EXTRA",
+   "file": "feature/lending/account-details/data-impl/src/main/kotlin/co/branch/feature/lending/account_details/dataimpl/repository/DefaultLendingAccountDetailsCacheRepository.kt",
+   "line": 149,
+   "usages": [
+    "feature/lending/account-details/data-impl/src/main/kotlin/co/branch/feature/lending/account_details/dataimpl/repository/DefaultLendingAccountDetailsCacheRepository.kt:71:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "TIMER_DELAY_MILLIS",
+   "file": "feature/pin-reset/src/main/kotlin/co/branch/feature/pin/reset/viewmodel/PinResetVerifyOtpViewModel.kt",
+   "line": 325,
+   "usages": [
+    "feature/pin-reset/src/main/kotlin/co/branch/feature/pin/reset/viewmodel/PinResetVerifyOtpViewModel.kt:205:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "EXTRA_PROMPT_TEXT",
+   "file": "feature/platform/base-ui/src/main/java/co/branch/feature/platform/baseui/common/BranchOtpActivity.java",
+   "line": 27,
+   "usages": [
+    "feature/lending/repayment-ui/presentation/src/main/kotlin/co/branch/feature/lending/repayment_ui/RepaymentViewUtilityImpl.kt:95:1",
+    "feature/lending/repayment-ui/presentation/src/test/kotlin/co/branch/feature/lending/repayment_ui/RepaymentViewUtilityImplBaselineTest.kt:133:1",
+    "feature/lending/repayment/presentation/src/main/kotlin/co/branch/feature/lending/repayment/pending_payment/PendingPaymentFragment.kt:278:1",
+    "feature/platform/base-ui/src/main/java/co/branch/feature/platform/baseui/common/BranchOtpActivity.java:49:1",
+    "feature/platform/base-ui/src/main/java/co/branch/feature/platform/baseui/common/BranchOtpActivity.java:50:1",
+    "feature/platform/base-ui/src/main/java/co/branch/feature/platform/baseui/common/BranchOtpActivity.java:100:1",
+    "library/lending/navigator/src/main/kotlin/co/branch/library/lending/navigator/LendingNavigator.kt:489:1",
+    "library/lending/navigator/src/main/kotlin/co/branch/library/lending/navigator/LendingNavigator.kt:496:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "isFileUploadAvailable",
+   "file": "feature/platform/webview/src/main/java/co/branch/feature/platform/webview/AdvancedWebView.java",
+   "line": 1135,
+   "usages": [],
+   "jump": {}
+  },
+  {
+   "name": "convertDpToPixel",
+   "file": "feature/platform/base-ui/src/main/java/co/branch/feature/platform/baseui/ViewUtilityImpl.java",
+   "line": 95,
+   "usages": [
+    "feature/platform/base-ui/src/main/java/co/branch/feature/platform/baseui/bottom_sheet/StyledMessageBottomSheet.kt:42:1",
+    "feature/platform/base-ui/src/main/java/co/branch/feature/platform/baseui/view/BranchPillView.kt:155:1",
+    "feature/platform/base-ui/src/main/java/co/branch/feature/platform/baseui/view/BranchPillView.kt:159:1",
+    "feature/platform/base-ui/src/main/java/co/branch/feature/platform/baseui/view/BranchPillView.kt:163:1",
+    "feature/platform/base-ui/src/main/java/co/branch/feature/platform/baseui/view/BranchPillView.kt:167:1",
+    "feature/platform/base-ui/src/main/java/co/branch/feature/platform/baseui/view/BranchPillView.kt:186:1",
+    "feature/platform/base-ui/src/main/java/co/branch/feature/platform/baseui/view/BranchPillView.kt:190:1",
+    "feature/platform/base-ui/src/main/java/co/branch/feature/platform/baseui/view/BranchPillView.kt:194:1",
+    "feature/platform/base-ui/src/main/java/co/branch/feature/platform/baseui/view/BranchPillView.kt:198:1",
+    "feature/platform/base-ui/src/main/java/co/branch/feature/platform/baseui/view/SproutPasscodeField.kt:94:1",
+    "feature/platform/base-ui/src/main/java/co/branch/feature/platform/baseui/view/SproutPasscodeField.kt:101:1",
+    "feature/platform/base-ui/src/main/java/co/branch/feature/platform/baseui/view/SproutPasscodeField.kt:108:1",
+    "feature/platform/base-ui/src/test/kotlin/co/branch/feature/platform/baseui/ViewUtilityImplTest.kt:179:1",
+    "feature/platform/serialized-views/src/main/java/co/branch/feature/platform/serializedviews/view/CardWithSpotlight.kt:76:1",
+    "feature/platform/serialized-views/src/main/java/co/branch/feature/platform/serializedviews/view/CardWithSpotlight.kt:83:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "getCallingIntent",
+   "file": "feature/platform/serialized-views/src/main/java/co/branch/feature/platform/serializedviews/SerializedViewActivity.java",
+   "line": 23,
+   "usages": [],
+   "jump": {}
+  },
+  {
+   "name": "EXTRA_PRODUCT",
+   "file": "feature/platform/serialized-views/src/main/java/co/branch/feature/platform/serializedviews/SerializedViewFragment.java",
+   "line": 94,
+   "usages": [
+    "feature/platform/serialized-views/src/main/java/co/branch/feature/platform/serializedviews/SerializedViewFragment.java:132:1",
+    "feature/platform/serialized-views/src/main/java/co/branch/feature/platform/serializedviews/SerializedViewFragment.java:133:1",
+    "feature/platform/serialized-views/src/main/java/co/branch/feature/platform/serializedviews/DataInitializedSerializedViewFragment.kt:191:1",
+    "feature/platform/serialized-views/src/main/java/co/branch/feature/platform/serializedviews/DataInitializedSerializedViewFragment.kt:510:1"
+   ],
+   "jump": {}
+  },
+  {
+   "name": "UserStories",
+   "file": "feature/onboarding/presentation/src/main/kotlin/co/branch/feature/onboarding/compose/UserStories.kt",
+   "line": 75,
+   "usages": [
+    "feature/onboarding/presentation/src/main/kotlin/co/branch/feature/onboarding/compose/UserStories.kt:226:1",
+    "feature/onboarding/presentation/src/main/kotlin/co/branch/feature/onboarding/compose/UserStories.kt:243:1",
+    "feature/onboarding/presentation/src/main/kotlin/co/branch/feature/onboarding/compose/UserStoriesSuccessScreen.kt:26:1",
+    "feature/onboarding/presentation/src/test/kotlin/co/branch/feature/onboarding/compose/UserStoriesTest.kt:48:1",
+    "feature/onboarding/presentation/src/test/kotlin/co/branch/feature/onboarding/compose/UserStoriesTest.kt:64:1",
+    "feature/onboarding/presentation/src/test/kotlin/co/branch/feature/onboarding/compose/UserStoriesTest.kt:80:1",
+    "feature/onboarding/presentation/src/test/kotlin/co/branch/feature/onboarding/compose/UserStoriesTest.kt:100:1",
+    "feature/onboarding/presentation/src/test/kotlin/co/branch/feature/onboarding/compose/UserStoriesTest.kt:118:1"
+   ],
+   "jump": {}
+  }
+ ]
+}

@@ -38,7 +38,7 @@ impl App {
             );
             self.libs = l;
             self.libs_rx = None;
-            self.index.generation += 1; // UI-call detection and annotations may change
+            self.index.change(|i| i.generation += 1); // UI-call detection and annotations may change
         }
     }
 

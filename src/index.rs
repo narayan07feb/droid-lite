@@ -1,6 +1,6 @@
 //! Project-wide symbol index: declarations of every Kotlin/Java file, fuzzy search, definitions, completion.
 
-use crate::kotlin::{Atom, Decl, FileSyms, Kind, scan};
+use crate::kotlin::{Atom, Decl, FileSyms, Kind, scan_file};
 use crate::project::is_code;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -21,6 +21,64 @@ pub struct Index {
     shared: BTreeMap<PathBuf, Arc<Path>>,
     /// Bumped on every change, so callers can cache results.
     pub generation: u64,
+    /// The latest changed files with the generation each change made, so a cached result can
+    /// tell whether a file it depends on changed (bounded; older changes are only counted).
+    changes: std::collections::VecDeque<(u64, Arc<Path>)>,
+}
+
+/// How many file changes the index remembers.
+const CHANGES_KEPT: usize = 2048;
+
+/// The index shared by the editor and the one background worker. The worker reads it a short
+/// chunk at a time; the editor never waits for it: its changes queue up and are applied by the
+/// next [`Shared::flush`] that finds the index free (the editor's next frame, or the worker
+/// before its next chunk). A poisoned lock still holds a usable index.
+#[derive(Clone, Default)]
+pub struct Shared(
+    Arc<std::sync::RwLock<Index>>,
+    Arc<std::sync::Mutex<Vec<Change>>>,
+);
+
+type Change = Box<dyn FnOnce(&mut Index) + Send>;
+
+impl Shared {
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, Index> {
+        self.0.read().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Queues a change and applies it now when nothing reads the index.
+    pub fn change(&self, f: impl FnOnce(&mut Index) + Send + 'static) {
+        self.1
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Box::new(f));
+        self.flush();
+    }
+    /// Applies the queued changes if the index is free; returns whether none are left.
+    pub fn flush(&self) -> bool {
+        let mut queue = self.1.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.is_empty() {
+            return true;
+        }
+        let mut index = match self.0.try_write() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        for f in queue.drain(..) {
+            f(&mut index);
+        }
+        true
+    }
+    pub fn set(&self, index: Index) {
+        self.change(move |i| *i = index);
+    }
+    /// Waits until the queued changes are in (the worker never holds the lock long).
+    #[cfg(test)]
+    pub fn settle(&self) {
+        while !self.flush() {
+            std::thread::yield_now();
+        }
+    }
 }
 
 /// One search hit.
@@ -47,7 +105,7 @@ impl Index {
                         let mut seen = HashSet::new();
                         c.iter()
                             .filter_map(|p| {
-                                let mut f = scan(&std::fs::read_to_string(p).ok()?);
+                                let mut f = scan_file(p, &std::fs::read_to_string(p).ok()?);
                                 share(&mut f, &mut seen);
                                 Some(((*p).clone(), f))
                             })
@@ -77,14 +135,37 @@ impl Index {
         for k in supers_of(&syms) {
             self.subtypes.entry(k).or_default().push(shared.clone());
         }
-        self.shared.insert(path.clone(), shared);
+        self.shared.insert(path.clone(), shared.clone());
         self.files.insert(path, syms);
         self.generation += 1;
+        self.log_change(shared);
+    }
+
+    fn log_change(&mut self, p: Arc<Path>) {
+        if self.changes.len() == CHANGES_KEPT {
+            self.changes.pop_front();
+        }
+        self.changes.push_back((self.generation, p));
+    }
+
+    /// Files changed after generation `since`, or `None` when that is older than the log.
+    pub fn changed_since(&self, since: u64) -> Option<Vec<Arc<Path>>> {
+        let oldest = self.changes.front().map_or(self.generation, |(g, _)| *g);
+        if since + 1 < oldest && self.changes.len() == CHANGES_KEPT {
+            return None;
+        }
+        Some(
+            self.changes
+                .iter()
+                .filter(|(g, _)| *g > since)
+                .map(|(_, p)| p.clone())
+                .collect(),
+        )
     }
 
     pub fn update(&mut self, path: &Path, src: &str) {
         if is_code(path) {
-            self.insert_scanned(path.to_path_buf(), scan(src));
+            self.insert_scanned(path.to_path_buf(), scan_file(path, src));
         }
     }
 
@@ -92,7 +173,10 @@ impl Index {
         let Some(old) = self.files.remove(path) else {
             return;
         };
-        self.shared.remove(path);
+        if let Some(p) = self.shared.remove(path) {
+            self.generation += 1;
+            self.log_change(p);
+        }
         for k in names_of(&old) {
             if let Some(v) = self.by_name.get_mut(&k) {
                 v.retain(|(p, _)| **p != *path);
@@ -461,54 +545,6 @@ pub fn type_name(ty: &str) -> String {
     t.rsplit('.').next().unwrap_or(t).trim().to_string()
 }
 
-impl Index {
-    /// Hilt / Dagger links for the given type names, in one pass over the project: what provides
-    /// each one (`@Provides` / `@Binds` functions, classes with an `@Inject constructor`) and where
-    /// it is injected (parameters of an `@Inject constructor`, `@Inject` fields).
-    pub fn hilt(
-        &self,
-        types: &HashSet<String>,
-    ) -> (HashMap<String, Vec<Hit>>, HashMap<String, Vec<Hit>>) {
-        let (mut providers, mut injected) = (HashMap::new(), HashMap::new());
-        let hit = |p: &PathBuf, f: &FileSyms, d: &Decl| Hit {
-            name: d.name.clone(),
-            detail: describe(f, d),
-            path: p.clone(),
-            offset: d.offset,
-            score: 0,
-        };
-        for (p, f, d) in self.decls() {
-            let provided = match d.kind {
-                Kind::Fun if d.has_annotation("Provides") || d.has_annotation("Binds") => {
-                    Some(type_name(&d.ty))
-                }
-                Kind::Class if d.has_annotation("Inject") => Some(d.name.clone()),
-                _ => None,
-            };
-            if let Some(t) = provided.filter(|t| types.contains(t)) {
-                providers
-                    .entry(t)
-                    .or_insert_with(Vec::new)
-                    .push(hit(p, f, d));
-            }
-            let wanted: Vec<String> = match d.kind {
-                Kind::Class if d.has_annotation("Inject") => {
-                    d.params.iter().map(|x| type_name(&x.ty)).collect()
-                }
-                Kind::Property if d.has_annotation("Inject") => vec![type_name(&d.ty)],
-                _ => Vec::new(),
-            };
-            for t in wanted.into_iter().filter(|t| types.contains(t)) {
-                injected
-                    .entry(t)
-                    .or_insert_with(Vec::new)
-                    .push(hit(p, f, d));
-            }
-        }
-        (providers, injected)
-    }
-}
-
 pub fn kmp_role(f: &FileSyms, d: &Decl) -> Option<&'static str> {
     kmp_role_in(d, &expect_types(f))
 }
@@ -723,7 +759,7 @@ mod tests {
     #[test]
     fn a_variable_named_actual_is_not_a_modifier() {
         // `actual` read by a property, then another declaration: still not a modifier of `t`
-        let f = scan(
+        let f = crate::kotlin::scan(
             "class T {\n    val expected = 1\n    val actual = 2\n    val copy = actual\n    fun t() { assertEquals(expected, actual) }\n}\n",
         );
         let names: Vec<&str> = f.decls.iter().map(|d| &*d.name).collect();
@@ -733,7 +769,9 @@ mod tests {
         );
         assert!(f.decls.iter().all(|d| d.modifiers.is_empty()));
         // an enum entry named `actual` stays an entry
-        let e = scan("enum class Match {\n    expected,\n    actual\n}\nfun after() {}\n");
+        let e = crate::kotlin::scan(
+            "enum class Match {\n    expected,\n    actual\n}\nfun after() {}\n",
+        );
         let names: Vec<&str> = e.decls.iter().map(|d| &*d.name).collect();
         assert!(names.contains(&"actual"), "{names:?}");
         assert!(

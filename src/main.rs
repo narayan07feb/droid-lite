@@ -27,11 +27,14 @@ mod preview_spec;
 mod preview_src;
 mod project;
 mod refactor;
+mod resolve;
 mod reports;
 mod resources;
 mod serve;
 mod theme;
 mod usage;
+#[cfg(test)]
+mod accuracy;
 mod watch;
 
 fn main() -> eframe::Result {

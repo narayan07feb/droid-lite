@@ -114,10 +114,18 @@ impl Fixture {
         // never the real JVM worker or ~/Library/Caches
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
         unsafe {
-            std::env::set_var("DROID_LITE_PREVIEW_DIR", std::env::temp_dir().join(format!("dlpv-{name}-{}", std::process::id())));
+            std::env::set_var(
+                "DROID_LITE_PREVIEW_DIR",
+                std::env::temp_dir().join(format!("dlpv-{name}-{}", std::process::id())),
+            );
             std::env::set_var(
                 "DROID_LITE_PREVIEW_WORKER",
-                format!("python3 {}", manifest.join("tests/fixtures/fake_preview_worker.py").display()),
+                format!(
+                    "python3 {}",
+                    manifest
+                        .join("tests/fixtures/fake_preview_worker.py")
+                        .display()
+                ),
             );
             std::env::set_var("FAKE_PREVIEW_PNG", manifest.join("assets/icon-256.png"));
             std::env::set_var("DROID_LITE_MAC_GUARD", "/nonexistent/mac-guard");
@@ -146,7 +154,7 @@ impl Fixture {
             .with_size([1440.0, 900.0])
             .build_eframe(move |cc| App::new(cc, Some(root)));
         wait(&mut h, "index", |a| {
-            a.indexing.is_none() && a.index.symbol_count() > 0
+            a.indexing.is_none() && a.index.read().symbol_count() > 0
         });
         h
     }
@@ -209,7 +217,7 @@ fn e2e_open_project_tree_and_index() {
     let app = h.state();
     assert_eq!(app.project.as_ref().unwrap().name, "Demo");
     assert!(app.tree.iter().any(|n| n.label == "app"));
-    assert!(app.index.find_type("UserRepository").is_some());
+    assert!(app.index.read().find_type("UserRepository").is_some());
     h.get_by_label(&format!("{}  app", ic::PACKAGE)); // the module row is on screen
     assert_eq!(
         app.branch.as_deref().map(|b| b == "main" || b == "master"),
@@ -329,10 +337,17 @@ fn e2e_compose_panel_tree_stability_lints_preview_render() {
     place_cursor(&mut h, "Column(", 0);
     steps(&mut h, 3);
     // only the previews by default: the UI tree is behind "Structure", which is remembered
-    assert!(h.query_by_label("Column").is_none(), "the UI tree is hidden by default");
-    h.get_by_label(&format!("{}  Structure", ic::TREE_STRUCTURE)).click();
+    assert!(
+        h.query_by_label("Column").is_none(),
+        "the UI tree is hidden by default"
+    );
+    h.get_by_label(&format!("{}  Structure", ic::TREE_STRUCTURE))
+        .click();
     steps(&mut h, 3);
-    assert!(h.state().show_structure, "the toggle turns the structure on");
+    assert!(
+        h.state().show_structure,
+        "the toggle turns the structure on"
+    );
     for label in ["Column", "Text"] {
         h.get_by_label(label);
     }
@@ -416,11 +431,16 @@ fn e2e_compose_panel_tree_stability_lints_preview_render() {
         "{rules:?}"
     );
     // previews draw by themselves (no click) through the preview worker (the fixture's stand-in), no Gradle
-    wait(&mut h, "preview picture", |a| {
-        matches!(a.previews.cards.as_slice(), [(name, Ok(_))] if name == "UserCardPreview")
-    });
+    wait(
+        &mut h,
+        "preview picture",
+        |a| matches!(a.previews.cards.as_slice(), [(name, Ok(_))] if name == "UserCardPreview"),
+    );
     assert!(h.state().gradle.is_none(), "no Gradle run for a preview");
-    assert!(h.query_all_by_label("UserCardPreview").count() >= 2, "the card title beside the list link");
+    assert!(
+        h.query_all_by_label("UserCardPreview").count() >= 2,
+        "the card title beside the list link"
+    );
     // a file that does not compile shows the compiler's text on the card
     let broken = f.path("app/src/main/java/com/demo/ui/BrokenPreview.kt");
     std::fs::write(
@@ -569,7 +589,7 @@ fn e2e_reload_when_file_changes_on_disk() {
     wait(&mut h, "reload", |a| {
         a.tabs[a.active].text.contains("class Changed")
     });
-    assert!(h.state().index.find_type("Changed").is_some());
+    assert!(h.state().index.read().find_type("Changed").is_some());
     // with unsaved edits the user is asked instead
     type_text(&mut h, "x");
     std::fs::write(&user, "package com.demo.data\n\nclass Again\n").unwrap();
@@ -578,14 +598,20 @@ fn e2e_reload_when_file_changes_on_disk() {
     h.get_by_label("Reload from disk").click();
     steps(&mut h, 3);
     assert!(tab(&h).text.contains("class Again") && !tab(&h).dirty());
-    assert_eq!(newest_version(&user), Some(typed), "the dropped edits are in local history");
+    assert_eq!(
+        newest_version(&user),
+        Some(typed),
+        "the dropped edits are in local history"
+    );
     // a new file shows up in the tree and the index
     std::fs::write(
         f.path("app/src/main/java/com/demo/data/Extra.kt"),
         "package com.demo.data\nclass Extra\n",
     )
     .unwrap();
-    wait(&mut h, "new file", |a| a.index.find_type("Extra").is_some());
+    wait(&mut h, "new file", |a| {
+        a.index.read().find_type("Extra").is_some()
+    });
 }
 
 #[test]
@@ -728,7 +754,7 @@ fn e2e_memory_stays_flat_over_repeated_work() {
         let ctx = h.ctx.clone();
         h.state_mut().open_project(&root, &ctx);
         wait(h, "index", |a| {
-            a.indexing.is_none() && a.index.symbol_count() > 0
+            a.indexing.is_none() && a.index.read().symbol_count() > 0
         });
         for p in &files {
             open(h, p);
@@ -776,7 +802,7 @@ fn e2e_snapshot_for_review() {
     );
     std::fs::write(f.path("app/src/main/java/com/demo/ui/Both.kt"), both).unwrap();
     wait(&mut h, "index Both", |a| {
-        a.index.find_type("FakeRepo").is_some()
+        a.index.read().find_type("FakeRepo").is_some()
     });
     open(&mut h, &f.path("app/src/main/java/com/demo/ui/Both.kt"));
     place_cursor(&mut h, "fun UserCard", 4);
@@ -1000,13 +1026,24 @@ fn e2e_bulk_disk_changes_and_background_open_do_not_block() {
         let t = Instant::now();
         h.step();
         worst = worst.max(t.elapsed().as_millis());
-        if (0..300).all(|i| h.state().index.find_type(&format!("Gen{i}")).is_some()) {
+        if (0..300).all(|i| {
+            h.state()
+                .index
+                .read()
+                .find_type(&format!("Gen{i}"))
+                .is_some()
+        }) {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(
-        (0..300).all(|i| h.state().index.find_type(&format!("Gen{i}")).is_some()),
+        (0..300).all(|i| h
+            .state()
+            .index
+            .read()
+            .find_type(&format!("Gen{i}"))
+            .is_some()),
         "all 300 new files indexed"
     );
     assert!(
@@ -1021,7 +1058,7 @@ fn e2e_bulk_disk_changes_and_background_open_do_not_block() {
     // deleting the folder drops them again
     std::fs::remove_dir_all(&dir).unwrap();
     wait(&mut h, "folder delete", |a| {
-        a.index.find_type("Gen0").is_none()
+        a.index.read().find_type("Gen0").is_none()
     });
 }
 
@@ -1404,18 +1441,13 @@ fn e2e_cmd_hover_shows_declaration_and_usages() {
     h.event(Event::ModifiersChanged(Modifiers::COMMAND));
     for _ in 0..80 {
         h.step();
-        if h.state().usages.get("User").is_some_and(|u| u.1.is_some()) {
+        if user_usages(&h).is_some() {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     steps(&mut h, 30); // tooltips appear after a short delay
-    let found = h
-        .state()
-        .usages
-        .get("User")
-        .and_then(|u| u.1.clone())
-        .expect("usages counted");
+    let found = user_usages(&h).expect("usages counted");
     assert_eq!(found.len(), 5, "User.kt: 2, UserCard.kt: 3");
     // the card leaves out the declaration `class User(` itself
     h.get_by_label_contains("4 usages in 2 files");
@@ -2775,8 +2807,7 @@ fn e2e_device_screenshot_and_recording() {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-        .unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let calls = f.path("adb-calls.txt");
     let out = f.path("captures");
     std::fs::create_dir_all(&out).unwrap();
@@ -3003,7 +3034,9 @@ fn e2e_a_project_plugin_runs_nothing_until_allowed_and_asks_again_after_a_change
     assert!(!f.path("listed").exists(), "nothing ran before the OK");
     assert!(h.state().tests.plugins[0].loading.is_none());
     h.get_by_label("Allow").click();
-    wait(&mut h, "cases listed", |a| a.tests.plugins[0].cases.len() == 1);
+    wait(&mut h, "cases listed", |a| {
+        a.tests.plugins[0].cases.len() == 1
+    });
     assert!(f.path("listed").exists());
     let store: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(f.config.join("approved-plugins.json")).unwrap(),
@@ -3018,11 +3051,17 @@ fn e2e_a_project_plugin_runs_nothing_until_allowed_and_asks_again_after_a_change
     std::fs::remove_file(f.path("listed")).unwrap();
     h.state_mut().load_plugins(&ctx);
     wait(&mut h, "plugins found", |a| a.tests.found());
-    wait(&mut h, "listed again", |a| a.tests.plugins[0].cases.len() == 1);
+    wait(&mut h, "listed again", |a| {
+        a.tests.plugins[0].cases.len() == 1
+    });
     assert!(f.path("listed").exists());
     // a changed plugin.json asks again, and runs nothing meanwhile
     std::fs::remove_file(f.path("listed")).unwrap();
-    std::fs::write(dir.join("plugin.json"), manifest.replace("list.sh", "list.sh\",\"x")).unwrap();
+    std::fs::write(
+        dir.join("plugin.json"),
+        manifest.replace("list.sh", "list.sh\",\"x"),
+    )
+    .unwrap();
     h.state_mut().load_plugins(&ctx);
     wait(&mut h, "plugins found", |a| a.tests.found());
     steps(&mut h, 3);
@@ -3092,29 +3131,45 @@ fn e2e_a_running_watch_stops_when_its_folder_changes_and_one_that_cannot_be_chec
     let f = Fixture::new("plugin-watch-recheck");
     let dir = f.path(".droid-lite/plugins/live");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("plugin.json"), r#"{"name":"Live","watch":["sh","{plugin}/watch.sh"]}"#).unwrap();
+    std::fs::write(
+        dir.join("plugin.json"),
+        r#"{"name":"Live","watch":["sh","{plugin}/watch.sh"]}"#,
+    )
+    .unwrap();
     std::fs::write(
         dir.join("watch.sh"),
         "echo $$ > \"$DROID_LITE_PROJECT/watch.pid\"\nwhile :; do echo '{\"title\":\"tick\"}'; sleep 0.2; done\n",
     )
     .unwrap();
     let alive = |pid: &str| {
-        let kill = std::process::Command::new("kill").args(["-0", pid]).stderr(std::process::Stdio::null()).status();
+        let kill = std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status();
         kill.is_ok_and(|s| s.success())
     };
     let mut h = f.harness();
-    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE))
+        .click();
     wait(&mut h, "plugins found", |a| a.tests.found());
     steps(&mut h, 3);
     h.get_by_label("Allow").click();
     wait(&mut h, "the watch", |a| a.tests.plugins[0].live.is_some());
-    let pid = std::fs::read_to_string(f.path("watch.pid")).unwrap().trim().to_owned();
+    let pid = std::fs::read_to_string(f.path("watch.pid"))
+        .unwrap()
+        .trim()
+        .to_owned();
     assert!(alive(&pid));
     // a new file in the folder while the watch runs, and no new command: a check finds it
     std::fs::write(dir.join("notes.txt"), "new").unwrap();
     wait(&mut h, "the check", |a| !a.tests.plugins[0].m.allowed);
-    assert!(h.state().tests.plugins[0].watch.is_none() && h.state().tests.plugins[0].live.is_none());
-    assert_eq!(h.state().status, "Live changed since you allowed it; allow it again");
+    assert!(
+        h.state().tests.plugins[0].watch.is_none() && h.state().tests.plugins[0].live.is_none()
+    );
+    assert_eq!(
+        h.state().status,
+        "Live changed since you allowed it; allow it again"
+    );
     // the stopped watch is reaped by the next frames (it is a zombie until then)
     for _ in 0..100 {
         h.step();
@@ -3127,9 +3182,13 @@ fn e2e_a_running_watch_stops_when_its_folder_changes_and_one_that_cannot_be_chec
     // allowed again, it watches again; then the folder grows too big to check: an error, no Allow
     steps(&mut h, 3);
     h.get_by_label("Allow").click();
-    wait(&mut h, "the watch again", |a| a.tests.plugins[0].live.is_some());
+    wait(&mut h, "the watch again", |a| {
+        a.tests.plugins[0].live.is_some()
+    });
     std::fs::write(dir.join("blob"), vec![0u8; 8 << 20]).unwrap();
-    wait(&mut h, "the check", |a| a.tests.plugins[0].m.broken.is_some());
+    wait(&mut h, "the check", |a| {
+        a.tests.plugins[0].m.broken.is_some()
+    });
     assert!(h.state().tests.plugins[0].watch.is_none());
     steps(&mut h, 3);
     // in the tab and the status bar
@@ -3149,7 +3208,8 @@ fn e2e_a_watch_that_ends_at_once_starts_again_after_a_growing_pause() {
     )
     .unwrap();
     let mut h = f.harness();
-    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE))
+        .click();
     wait(&mut h, "plugins found", |a| a.tests.found());
     steps(&mut h, 3);
     h.get_by_label("Allow").click();
@@ -3158,7 +3218,10 @@ fn e2e_a_watch_that_ends_at_once_starts_again_after_a_growing_pause() {
         h.step();
         std::thread::sleep(Duration::from_millis(10));
     }
-    let starts = std::fs::read_to_string(f.path("starts")).unwrap_or_default().lines().count();
+    let starts = std::fs::read_to_string(f.path("starts"))
+        .unwrap_or_default()
+        .lines()
+        .count();
     assert!((1..=2).contains(&starts), "{starts} starts in 1.5 s");
 }
 
@@ -3167,10 +3230,14 @@ fn e2e_allow_waits_for_the_lock_off_the_ui_thread() {
     let f = Fixture::new("plugin-allow-lock");
     let dir = f.path(".droid-lite/plugins/shared");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("plugin.json"), r#"{"name":"Shared","list":["sh","-c","echo '[{\"id\":\"a\"}]'"]}"#)
-        .unwrap();
+    std::fs::write(
+        dir.join("plugin.json"),
+        r#"{"name":"Shared","list":["sh","-c","echo '[{\"id\":\"a\"}]'"]}"#,
+    )
+    .unwrap();
     let mut h = f.harness();
-    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE))
+        .click();
     wait(&mut h, "plugins found", |a| a.tests.found());
     steps(&mut h, 3);
     // the VS Code extension holds the lock
@@ -3180,10 +3247,15 @@ fn e2e_allow_waits_for_the_lock_off_the_ui_thread() {
     let t0 = std::time::Instant::now();
     h.get_by_label("Allow").click();
     steps(&mut h, 5);
-    assert!(t0.elapsed() < Duration::from_secs(2), "a frame waited for the lock");
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "a frame waited for the lock"
+    );
     assert!(!h.state().tests.plugins[0].m.allowed);
     std::fs::remove_file(&lock).unwrap();
-    wait(&mut h, "allowed and listed", |a| a.tests.plugins[0].cases.len() == 1);
+    wait(&mut h, "allowed and listed", |a| {
+        a.tests.plugins[0].cases.len() == 1
+    });
     assert!(h.state().tests.plugins[0].m.allowed);
 }
 
@@ -3206,12 +3278,16 @@ fn e2e_a_project_plugin_not_allowed_shows_no_links_and_only_web_links_ever_show(
     )
     .unwrap();
     let mut h = f.harness();
-    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE))
+        .click();
     wait(&mut h, "plugins found", |a| a.tests.found());
     steps(&mut h, 3);
     assert_eq!(h.state().tests.plugins.len(), 1);
     h.get_by_label_contains("Needs your OK: runs ");
-    assert!(h.query_by_label("PluginWebLink").is_none(), "a link shows before the OK");
+    assert!(
+        h.query_by_label("PluginWebLink").is_none(),
+        "a link shows before the OK"
+    );
     h.get_by_label("Allow").click();
     wait(&mut h, "allowed", |a| a.tests.plugins[0].m.allowed);
     steps(&mut h, 3);
@@ -3219,7 +3295,10 @@ fn e2e_a_project_plugin_not_allowed_shows_no_links_and_only_web_links_ever_show(
     assert!(h.query_by_label("PluginShareLink").is_none());
     let errors = &h.state().tests.errors;
     assert!(
-        errors.len() == 1 && errors[0].ends_with("sharey/plugin.json: links: PluginShareLink: url must be an http or https link"),
+        errors.len() == 1
+            && errors[0].ends_with(
+                "sharey/plugin.json: links: PluginShareLink: url must be an http or https link"
+            ),
         "{errors:?}"
     );
 }
@@ -3235,7 +3314,8 @@ fn e2e_a_watch_that_cannot_start_waits_before_trying_again_and_says_why() {
     )
     .unwrap();
     let mut h = f.harness();
-    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE))
+        .click();
     wait(&mut h, "plugins found", |a| a.tests.found());
     let t0 = std::time::Instant::now();
     while t0.elapsed() < Duration::from_millis(1300) {
@@ -3244,7 +3324,11 @@ fn e2e_a_watch_that_cannot_start_waits_before_trying_again_and_says_why() {
     }
     let p = &h.state().tests.plugins[0];
     assert!(p.watch.is_none());
-    assert!(p.watch_backoff >= Duration::from_secs(1), "{:?}", p.watch_backoff);
+    assert!(
+        p.watch_backoff >= Duration::from_secs(1),
+        "{:?}",
+        p.watch_backoff
+    );
     assert!(p.watch_next.is_some_and(|t| t > std::time::Instant::now()));
     h.get_by_label_contains("watch: could not start /nonexistent/droid-lite-watch");
 }
@@ -3262,7 +3346,8 @@ fn e2e_a_refused_plugin_stops_its_list_and_kills_a_watch_that_ignores_sigterm() 
     .unwrap();
     let alive = |pid: &str| unsafe { libc::kill(pid.trim().parse().unwrap(), 0) } == 0;
     let mut h = f.harness();
-    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE))
+        .click();
     wait(&mut h, "plugins found", |a| a.tests.found());
     steps(&mut h, 3);
     h.get_by_label("Allow").click();
@@ -3282,12 +3367,20 @@ fn e2e_a_refused_plugin_stops_its_list_and_kills_a_watch_that_ignores_sigterm() 
         if list_gone.is_none() && !alive(&list) {
             list_gone = Some(refused.elapsed());
         }
-        if refused.elapsed() > Duration::from_millis(2500) && refused.elapsed() < Duration::from_secs(3) {
-            assert!(alive(&watch), "SIGTERM is ignored: still there before its 5 s");
+        if refused.elapsed() > Duration::from_millis(2500)
+            && refused.elapsed() < Duration::from_secs(3)
+        {
+            assert!(
+                alive(&watch),
+                "SIGTERM is ignored: still there before its 5 s"
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(list_gone.is_some_and(|t| t < Duration::from_secs(2)), "the list's group was killed: {list_gone:?}");
+    assert!(
+        list_gone.is_some_and(|t| t < Duration::from_secs(2)),
+        "the list's group was killed: {list_gone:?}"
+    );
     assert!(!alive(&watch), "SIGKILL after 5 s");
     assert!(refused.elapsed() >= Duration::from_secs(4));
 }
@@ -3320,28 +3413,43 @@ fn e2e_a_plugin_folder_is_read_in_full_only_off_the_ui_thread() {
         r#"{"name":"Shared","list":["sh","{plugin}/list.sh"],"run":["sh","{plugin}/run.sh","{id}"]}"#,
     )
     .unwrap();
-    std::fs::write(dir.join("list.sh"), "echo '[{\"id\":\"a\",\"label\":\"Case A\"}]'\n").unwrap();
+    std::fs::write(
+        dir.join("list.sh"),
+        "echo '[{\"id\":\"a\",\"label\":\"Case A\"}]'\n",
+    )
+    .unwrap();
     std::fs::write(dir.join("run.sh"), "touch \"$DROID_LITE_PROJECT/ran\"\n").unwrap();
     let reads = || crate::plugins::tests::READS.with(|r| r.get());
     let start = reads();
     let mut h = f.harness();
     let ctx = h.ctx.clone();
-    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE))
+        .click();
     wait(&mut h, "plugins found", |a| a.tests.found());
     steps(&mut h, 3);
     h.get_by_label("Allow").click();
-    wait(&mut h, "cases listed", |a| a.tests.plugins[0].cases.len() == 1);
+    wait(&mut h, "cases listed", |a| {
+        a.tests.plugins[0].cases.len() == 1
+    });
     // a reload reads the folder in full (on a thread), and lists
     h.state_mut().load_plugins(&ctx);
     wait(&mut h, "plugins found", |a| a.tests.found());
-    wait(&mut h, "listed again", |a| a.tests.plugins.first().is_some_and(|p| p.cases.len() == 1));
+    wait(&mut h, "listed again", |a| {
+        a.tests.plugins.first().is_some_and(|p| p.cases.len() == 1)
+    });
     // the same bytes written again: it looks changed, the ▶ waits for a full read on a thread
     std::fs::write(dir.join("run.sh"), "touch \"$DROID_LITE_PROJECT/ran\"\n").unwrap();
     steps(&mut h, 3);
     click_in_row(&mut h, "Case A", ic::PLAY);
-    wait(&mut h, "run", |a| a.tests.plugins[0].run.is_none() && a.tests.plugins[0].status.contains_key("a"));
+    wait(&mut h, "run", |a| {
+        a.tests.plugins[0].run.is_none() && a.tests.plugins[0].status.contains_key("a")
+    });
     assert!(f.path("ran").exists());
-    assert_eq!(reads(), start, "no full read of the folder on the UI thread");
+    assert_eq!(
+        reads(),
+        start,
+        "no full read of the folder on the UI thread"
+    );
 }
 
 #[test]
@@ -3815,6 +3923,14 @@ fn e2e_hilt_links_lint_in_problems_translations_emulator_and_deep_links() {
     let texts = |h: &Harness<'static, App>| -> Vec<String> {
         lenses(h).into_iter().flat_map(|(_, t)| t).collect()
     };
+    // the links come from the worker's pass over the file
+    for _ in 0..500 {
+        if !texts(&h).is_empty() {
+            break;
+        }
+        steps(&mut h, 1);
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(texts(&h), ["Injected in 2 places"]);
     h.get_by_label("Injected in 2 places").click();
     steps(&mut h, 3);
@@ -3824,6 +3940,14 @@ fn e2e_hilt_links_lint_in_problems_translations_emulator_and_deep_links() {
         &mut h,
         &f.path("app/src/main/java/com/demo/HomeViewModel.kt"),
     );
+    // the links come from the worker's pass over the file
+    for _ in 0..500 {
+        if !texts(&h).is_empty() {
+            break;
+        }
+        steps(&mut h, 1);
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(texts(&h), ["Dependencies: Repo"]);
     h.get_by_label("Dependencies: Repo").click();
     steps(&mut h, 3);
@@ -3930,6 +4054,15 @@ fn e2e_hilt_links_lint_in_problems_translations_emulator_and_deep_links() {
         ),
         "{log}"
     );
+}
+
+/// The ⌘-hover count of `User`: by the declaration it means once the file is read, by name before.
+fn user_usages(h: &Harness<'static, App>) -> Option<Vec<FoundLine>> {
+    h.state()
+        .usages
+        .iter()
+        .find(|(k, _)| *k == "User" || k.starts_with("User\u{0}"))
+        .and_then(|(_, u)| u.1.clone())
 }
 
 #[test]
@@ -4097,10 +4230,16 @@ fn e2e_ux_audit() {
     let f = Fixture::new("audit");
     let mut projects: Vec<(&str, Option<PathBuf>, Option<PathBuf>)> = vec![
         ("empty", None, None),
-        ("small", Some(f.root.clone()), Some(f.path("app/src/main/java/com/demo/ui/UserCard.kt"))),
+        (
+            "small",
+            Some(f.root.clone()),
+            Some(f.path("app/src/main/java/com/demo/ui/UserCard.kt")),
+        ),
     ];
     if let Ok(p) = std::env::var("DROID_LITE_AUDIT_PROJECT") {
-        let file = std::env::var("DROID_LITE_AUDIT_FILE").ok().map(PathBuf::from);
+        let file = std::env::var("DROID_LITE_AUDIT_FILE")
+            .ok()
+            .map(PathBuf::from);
         projects.push(("real", Some(PathBuf::from(p)), file));
     }
     for (name, root, file) in projects {
@@ -4114,7 +4253,9 @@ fn e2e_ux_audit() {
                 let ctx = h.ctx.clone();
                 h.state().settings.apply(&ctx);
                 if root.is_some() {
-                    wait(&mut h, "index", |a| a.indexing.is_none() && a.index.symbol_count() > 0);
+                    wait(&mut h, "index", |a| {
+                        a.indexing.is_none() && a.index.read().symbol_count() > 0
+                    });
                 }
                 if let Some(file) = &file {
                     open(&mut h, file);
@@ -4124,7 +4265,8 @@ fn e2e_ux_audit() {
                 let shot = |h: &mut Harness<'static, App>, state: &str| {
                     steps(h, 4);
                     let img = h.render().expect("render needs the wgpu feature");
-                    img.save(dir.join(format!("{name}-{}-{theme}-{state}.png", width as u32))).unwrap();
+                    img.save(dir.join(format!("{name}-{}-{theme}-{state}.png", width as u32)))
+                        .unwrap();
                 };
                 shot(&mut h, "1-main");
                 if root.is_none() {
@@ -4134,9 +4276,15 @@ fn e2e_ux_audit() {
                 h.state_mut().show_right = true;
                 shot(&mut h, "2-current-changes");
                 h.state_mut().right = Right::Compose;
-                for (i, b) in [Bottom::Build, Bottom::Find, Bottom::Logcat, Bottom::Tests, Bottom::Performance]
-                    .into_iter()
-                    .enumerate()
+                for (i, b) in [
+                    Bottom::Build,
+                    Bottom::Find,
+                    Bottom::Logcat,
+                    Bottom::Tests,
+                    Bottom::Performance,
+                ]
+                .into_iter()
+                .enumerate()
                 {
                     h.state_mut().bottom = b;
                     h.state_mut().show_bottom = true;
@@ -4165,12 +4313,24 @@ fn e2e_toolbar_items_never_overlap_at_any_width() {
         let mut h = Harness::builder()
             .with_size([width, 900.0])
             .build_eframe(move |cc| App::new(cc, Some(root)));
-        wait(&mut h, "index", |a| a.indexing.is_none() && a.index.symbol_count() > 0);
-        h.state_mut().branch =
-            Some("narayansoni/gro-13003-android-remove-india-p2p-screens-and-rename-shared-p2p".into());
+        wait(&mut h, "index", |a| {
+            a.indexing.is_none() && a.index.read().symbol_count() > 0
+        });
+        h.state_mut().branch = Some(
+            "narayansoni/gro-13003-android-remove-india-p2p-screens-and-rename-shared-p2p".into(),
+        );
         steps(&mut h, 6); // the layout uses the widths of the last frame
         let mut rects = Vec::new();
-        for label in ["Refactor", "Help", "»", "Search", "Gradle task", "Run task", "Run device", "App"] {
+        for label in [
+            "Refactor",
+            "Help",
+            "»",
+            "Search",
+            "Gradle task",
+            "Run task",
+            "Run device",
+            "App",
+        ] {
             if let Some(n) = h.query_by_label(label) {
                 rects.push((label, n.rect()));
             }
@@ -4180,14 +4340,23 @@ fn e2e_toolbar_items_never_overlap_at_any_width() {
             "{width}: the menus are shown, in the bar or in »"
         );
         for (i, (a, ra)) in rects.iter().enumerate() {
-            assert!(ra.right() <= width + 0.5, "{width}: {a} goes past the window edge ({ra:?})");
+            assert!(
+                ra.right() <= width + 0.5,
+                "{width}: {a} goes past the window edge ({ra:?})"
+            );
             for (b, rb) in &rects[i + 1..] {
-                assert!(!ra.intersects(*rb), "{width}: {a} {ra:?} overlaps {b} {rb:?}");
+                assert!(
+                    !ra.intersects(*rb),
+                    "{width}: {a} {ra:?} overlaps {b} {rb:?}"
+                );
             }
         }
         // where it does not fit, the long branch name is shortened instead of pushing the rest
         if width <= 1600.0 {
-            assert!(h.query_by_label_contains("rename-shared-p2p").is_none(), "{width}: the branch name is elided");
+            assert!(
+                h.query_by_label_contains("rename-shared-p2p").is_none(),
+                "{width}: the branch name is elided"
+            );
         }
     }
 }
@@ -4217,7 +4386,9 @@ fn e2e_real_preview_shot() {
     let mut h = Harness::builder()
         .with_size([1600.0, 1000.0])
         .build_eframe(move |cc| App::new(cc, Some(root)));
-    wait(&mut h, "index", |a| a.indexing.is_none() && a.index.symbol_count() > 0);
+    wait(&mut h, "index", |a| {
+        a.indexing.is_none() && a.index.read().symbol_count() > 0
+    });
     open(&mut h, Path::new(&file));
     steps(&mut h, 5);
     let started = std::time::Instant::now(); // drawn by itself once the file is open
@@ -4240,10 +4411,20 @@ fn e2e_real_preview_shot() {
         std::thread::sleep(Duration::from_millis(50));
     }
     let p = &h.state().previews;
-    eprintln!("preview: {:.1} s, note {:?}, cards {:?}", started.elapsed().as_secs_f32(), p.note,
-        p.cards.iter().map(|(n, c)| (n.clone(), c.as_ref().err().cloned())).collect::<Vec<_>>());
+    eprintln!(
+        "preview: {:.1} s, note {:?}, cards {:?}",
+        started.elapsed().as_secs_f32(),
+        p.note,
+        p.cards
+            .iter()
+            .map(|(n, c)| (n.clone(), c.as_ref().err().cloned()))
+            .collect::<Vec<_>>()
+    );
     steps(&mut h, 4);
-    h.render().expect("render needs the wgpu feature").save(&out).unwrap();
+    h.render()
+        .expect("render needs the wgpu feature")
+        .save(&out)
+        .unwrap();
 }
 
 #[test]
@@ -4291,7 +4472,11 @@ fn e2e_tab_of_a_deleted_file_closes() {
     assert!(h.state().tabs.is_empty(), "{:?}", h.state().status);
     // the edits stay in local history
     assert_eq!(newest_version(&card), Some(typed));
-    assert_eq!(newest_version(&user), None, "a tab without edits keeps nothing");
+    assert_eq!(
+        newest_version(&user),
+        None,
+        "a tab without edits keeps nothing"
+    );
 }
 
 #[test]
@@ -4305,7 +4490,11 @@ fn e2e_sidebar_pull_requests_open_a_file_diff_beside_the_editor() {
         author: "ana".into(),
         draft: false,
         url: String::new(),
-        review: if n == 7 { "APPROVED".into() } else { String::new() },
+        review: if n == 7 {
+            "APPROVED".into()
+        } else {
+            String::new()
+        },
         approvals: u32::from(n == 7) * 2,
         head: String::new(),
         head_oid: String::new(),
@@ -4324,14 +4513,20 @@ fn e2e_sidebar_pull_requests_open_a_file_diff_beside_the_editor() {
     steps(&mut h, 3);
     assert!(h.query_by_label("#7 Fix login").is_some(), "your PRs first");
     // an approved PR shows it at a glance, and the Approved tab lists only those
-    assert!(h.query_by_label("Approved by 2").is_some(), "approvals counted");
+    assert!(
+        h.query_by_label("Approved by 2").is_some(),
+        "approvals counted"
+    );
     h.state_mut().prs.lists.insert(
         crate::git::PrFilter::Approved,
         Ok(vec![item(7, "Fix login")]),
     );
     h.get_by_label("Approved").click();
     steps(&mut h, 3);
-    assert!(h.query_by_label("#7 Fix login").is_some(), "the approved filter");
+    assert!(
+        h.query_by_label("#7 Fix login").is_some(),
+        "the approved filter"
+    );
     h.get_by_label("Awaiting your review").click();
     steps(&mut h, 3);
     assert!(h.query_by_label("#7 Fix login").is_none());
@@ -4468,7 +4663,10 @@ fn e2e_check_out_a_pull_request_from_the_sidebar() {
     let mut plugin = super::tests_ui::Plugin::default();
     plugin.run = Some((String::new(), "a case".into(), sleeper()));
     h.state_mut().tests.plugins.push(plugin);
-    assert_eq!(refused(&mut h, "#7 Fix login"), "Wait for the test run to finish");
+    assert_eq!(
+        refused(&mut h, "#7 Fix login"),
+        "Wait for the test run to finish"
+    );
     if let Some((_, _, r)) = h.state_mut().tests.plugins[0].run.as_mut() {
         r.stop();
     }
@@ -4662,7 +4860,12 @@ fn e2e_pull_requests_of_one_project_never_show_in_another() {
     });
     assert_eq!(h.state().branch.as_deref(), Some("trunk"));
     assert!(h.state().prs.note.is_none());
-    assert!(h.state().prs.lists.contains_key(&crate::git::PrFilter::Mine));
+    assert!(
+        h.state()
+            .prs
+            .lists
+            .contains_key(&crate::git::PrFilter::Mine)
+    );
     // A's checkout ends: nothing of it reaches B, and A never switched
     wait(&mut h, "A's checkout stopped", |a| {
         a.prs.stopping_count() == 0
@@ -4921,7 +5124,11 @@ fn e2e_switching_project_with_unsaved_edits_asks_first() {
     edit(&mut h, "// one\n");
     switch(&mut h, &b);
     opened(&mut h, &b);
-    assert!(std::fs::read_to_string(&user).unwrap().ends_with("// one\n"));
+    assert!(
+        std::fs::read_to_string(&user)
+            .unwrap()
+            .ends_with("// one\n")
+    );
     switch(&mut h, &f.root);
     opened(&mut h, &f.root);
     // the file changed on disk meanwhile: a folder dropped on the window waits for a choice
@@ -4961,7 +5168,10 @@ fn e2e_switching_project_with_unsaved_edits_asks_first() {
     h.state_mut().settings.autosave = false;
     edit(&mut h, "// three\n");
     switch(&mut h, &b);
-    assert!(h.query_by_label(list).is_some(), "with auto-save off, any edit asks");
+    assert!(
+        h.query_by_label(list).is_some(),
+        "with auto-save off, any edit asks"
+    );
     h.get_by_label("Save").click();
     opened(&mut h, &b);
     assert_eq!(
@@ -5214,10 +5424,21 @@ fn e2e_a_copy_that_cannot_be_kept_keeps_the_window_and_the_project_open() {
     steps(&mut h, 2);
     h.get_by_label("Keep a copy and close").click();
     steps(&mut h, 3);
-    assert!(!h.state().close_ok && h.state().close_asked, "the window stays open");
+    assert!(
+        !h.state().close_ok && h.state().close_asked,
+        "the window stays open"
+    );
     assert!(h.state().status.starts_with(&why), "{}", h.state().status);
-    assert!(h.state().copy_error.as_deref().is_some_and(|e| e.starts_with(&why)));
-    assert!(h.query_all_by_label_contains(&why).count() >= 2, "the window says why too");
+    assert!(
+        h.state()
+            .copy_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with(&why))
+    );
+    assert!(
+        h.query_all_by_label_contains(&why).count() >= 2,
+        "the window says why too"
+    );
     h.get_by_label("Cancel").click();
     steps(&mut h, 2);
     assert!(h.state().copy_error.is_none());
@@ -5228,7 +5449,10 @@ fn e2e_a_copy_that_cannot_be_kept_keeps_the_window_and_the_project_open() {
     steps(&mut h, 2);
     h.get_by_label("Keep a copy and switch").click();
     steps(&mut h, 3);
-    assert_eq!(h.state().project.as_ref().map(|p| p.root.clone()), Some(f.root.clone()));
+    assert_eq!(
+        h.state().project.as_ref().map(|p| p.root.clone()),
+        Some(f.root.clone())
+    );
     assert!(h.state().indexing.is_none() && h.state().switch_to.is_some());
     assert_eq!(tab(&h).text, typed);
     assert!(h.state().status.starts_with(&why), "{}", h.state().status);
@@ -5250,12 +5474,17 @@ fn e2e_a_copy_that_cannot_be_kept_keeps_the_window_and_the_project_open() {
     drop(h);
     let mut h = f.harness();
     wait(&mut h, "recovered", |a| {
-        a.toast_texts().contains(&"Recovered unsaved edits for User.kt")
+        a.toast_texts()
+            .contains(&"Recovered unsaved edits for User.kt")
     });
     let t = h.state().tabs.iter().find(|t| t.path == user).unwrap();
     assert_eq!(t.text, typed);
     assert!(t.dirty(), "recovered edits are not saved yet");
-    assert_eq!(std::fs::read_to_string(&user).unwrap(), USER_KT, "the file is not touched");
+    assert_eq!(
+        std::fs::read_to_string(&user).unwrap(),
+        USER_KT,
+        "the file is not touched"
+    );
     let _ = std::fs::remove_dir_all(&b);
 }
 
@@ -5274,7 +5503,11 @@ fn e2e_save_never_overwrites_another_version_it_could_not_keep() {
     h.state_mut().tabs[a].text.push_str("// one\n");
     h.state_mut().save();
     h.state_mut().wait_saves();
-    assert!(std::fs::read_to_string(&user).unwrap().ends_with("// one\n"));
+    assert!(
+        std::fs::read_to_string(&user)
+            .unwrap()
+            .ends_with("// one\n")
+    );
     // another version on disk that cannot be kept: not overwritten
     h.state_mut().tabs[a].text.push_str("// two\n");
     let theirs = "package com.demo.data\n\nclass Theirs\n";
@@ -5283,7 +5516,9 @@ fn e2e_save_never_overwrites_another_version_it_could_not_keep() {
     h.state_mut().wait_saves();
     assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs);
     assert!(
-        h.state().status.starts_with(&format!("Could not keep a copy of {}", user.display())),
+        h.state()
+            .status
+            .starts_with(&format!("Could not keep a copy of {}", user.display())),
         "{}",
         h.state().status
     );
@@ -5291,7 +5526,11 @@ fn e2e_save_never_overwrites_another_version_it_could_not_keep() {
     set_mode(&history, 0o755);
     h.state_mut().save();
     h.state_mut().wait_saves();
-    assert!(std::fs::read_to_string(&user).unwrap().ends_with("// two\n"));
+    assert!(
+        std::fs::read_to_string(&user)
+            .unwrap()
+            .ends_with("// two\n")
+    );
     assert_eq!(newest_version(&user).as_deref(), Some(theirs));
 }
 
@@ -5308,7 +5547,10 @@ fn e2e_save_of_a_clean_tab_never_overwrites_a_change_on_disk() {
     h.state_mut().save();
     h.state_mut().wait_saves();
     assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs);
-    assert_eq!(h.state().status, "File changed on disk; reload or keep yours");
+    assert_eq!(
+        h.state().status,
+        "File changed on disk; reload or keep yours"
+    );
     assert!(tab(&h).disk_changed);
     // Keep mine: then ⌘S writes it, and the other version is in local history
     steps(&mut h, 2);
@@ -5328,7 +5570,9 @@ fn e2e_a_file_that_cannot_be_read_never_blanks_its_tab() {
     open(&mut h, &user);
     std::thread::sleep(Duration::from_millis(300));
     std::fs::write(&user, [0xff, 0xfe, b'x']).unwrap();
-    wait(&mut h, "unreadable", |a| a.tabs[a.active].unreadable.is_some());
+    wait(&mut h, "unreadable", |a| {
+        a.tabs[a.active].unreadable.is_some()
+    });
     assert_eq!(tab(&h).text, USER_KT, "the tab keeps its text");
     assert!(tab(&h).disk_changed);
     steps(&mut h, 2);
@@ -5343,7 +5587,11 @@ fn e2e_a_file_that_cannot_be_read_never_blanks_its_tab() {
     steps(&mut h, 2);
     h.get_all_by_label("Restore").next().unwrap().click();
     steps(&mut h, 2);
-    assert!(h.state().status.contains("is not UTF-8 text"), "{}", h.state().status);
+    assert!(
+        h.state().status.contains("is not UTF-8 text"),
+        "{}",
+        h.state().status
+    );
     assert_eq!(tab(&h).text, USER_KT);
 }
 
@@ -5382,7 +5630,12 @@ fn e2e_own_late_save_event_is_not_a_change_on_disk() {
     // the watcher reports that save after more typing
     let (tx, rx) = channel();
     h.state_mut().disk_rx.push(rx);
-    tx.send(vec![super::disk::DiskChange::File(user.clone(), saved, None)]).unwrap();
+    tx.send(vec![super::disk::DiskChange::File(
+        user.clone(),
+        saved,
+        None,
+    )])
+    .unwrap();
     steps(&mut h, 2);
     assert!(!tab(&h).disk_changed, "no changed-on-disk bar");
     assert!(tab(&h).text.ends_with("// two\n"));
@@ -5404,7 +5657,11 @@ fn e2e_undo_of_a_rename_never_overwrites_a_new_file_at_the_old_name() {
     // User.kt was made again after the rename to Person.kt
     h.state_mut().undo = Some(refactor_ui::Undo::of(&user, &person, Vec::new()));
     h.state_mut().undo_refactor();
-    assert!(h.state().status.contains("exists again"), "{}", h.state().status);
+    assert!(
+        h.state().status.contains("exists again"),
+        "{}",
+        h.state().status
+    );
     assert_eq!(std::fs::read_to_string(&user).unwrap(), USER_KT);
     assert_eq!(std::fs::read_to_string(&person).unwrap(), "class Person\n");
     assert!(h.state().undo.is_some(), "the undo can run later");
@@ -5454,9 +5711,13 @@ fn e2e_unsaved_edits_are_backed_up_and_recovered_after_a_crash() {
     drop(h);
     let mut h = f.harness();
     wait(&mut h, "recovered", |a| {
-        a.toast_texts().contains(&"Recovered unsaved edits for User.kt")
+        a.toast_texts()
+            .contains(&"Recovered unsaved edits for User.kt")
     });
-    assert_eq!(h.state().tabs.iter().find(|t| t.path == user).unwrap().text, two);
+    assert_eq!(
+        h.state().tabs.iter().find(|t| t.path == user).unwrap().text,
+        two
+    );
     // once saved, the backup goes
     let i = h.state().tabs.iter().position(|t| t.path == user).unwrap();
     h.state_mut().active = i;
@@ -5475,7 +5736,9 @@ fn e2e_a_backup_older_than_the_file_on_disk_is_offered_with_a_diff_not_put_back(
     open(&mut h, &user);
     h.state_mut().settings.autosave = false;
     let a = h.state().active;
-    h.state_mut().tabs[a].text.push_str("// typed before the crash\n");
+    h.state_mut().tabs[a]
+        .text
+        .push_str("// typed before the crash\n");
     h.state_mut().tabs[a].mark_edited();
     steps(&mut h, 2);
     let typed = tab(&h).text.clone();
@@ -5486,14 +5749,33 @@ fn e2e_a_backup_older_than_the_file_on_disk_is_offered_with_a_diff_not_put_back(
     std::fs::write(&user, theirs).unwrap();
     let mut h = f.harness();
     wait(&mut h, "offered", |a| {
-        a.toast_texts().iter().any(|t| t.starts_with("Changed on disk since their unsaved backup"))
+        a.toast_texts()
+            .iter()
+            .any(|t| t.starts_with("Changed on disk since their unsaved backup"))
     });
-    assert!(h.state().tabs.iter().filter(|t| t.path == user).all(|t| t.text == theirs));
-    assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs, "the newer file stays");
-    assert_eq!(newest_version(&user).as_deref(), Some(typed.as_str()), "the backup is in Local history");
+    assert!(
+        h.state()
+            .tabs
+            .iter()
+            .filter(|t| t.path == user)
+            .all(|t| t.text == theirs)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&user).unwrap(),
+        theirs,
+        "the newer file stays"
+    );
+    assert_eq!(
+        newest_version(&user).as_deref(),
+        Some(typed.as_str()),
+        "the backup is in Local history"
+    );
     let (title, diff) = h.state().git.commit.clone().expect("a diff is shown");
     assert!(title.contains("Unsaved backup of User.kt"), "{title}");
-    assert!(diff.iter().any(|l| l == "+// typed before the crash"), "{diff:?}");
+    assert!(
+        diff.iter().any(|l| l == "+// typed before the crash"),
+        "{diff:?}"
+    );
     assert!(unsaved_backups(&f).is_empty(), "not offered again");
 }
 
@@ -5505,8 +5787,12 @@ fn e2e_another_running_window_keeps_its_backups() {
     let typed = format!("{USER_KT}// typed in the other window\n");
     // a backup the other window (a live process) wrote
     let file = super::backup::write_one(&dir, &user, &typed).unwrap();
-    let mut other = std::process::Command::new("sleep").arg("30").spawn().unwrap();
-    let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let mut other = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     v["pid"] = other.id().into();
     v["start"] = super::backup::started(other.id()).unwrap().into();
     let theirs = dir.join(format!("other-{}.json", other.id()));
@@ -5514,16 +5800,33 @@ fn e2e_another_running_window_keeps_its_backups() {
     std::fs::remove_file(&file).unwrap();
     let mut h = f.harness();
     steps(&mut h, 3);
-    assert!(h.state().tabs.iter().filter(|t| t.path == user).all(|t| t.text == USER_KT));
+    assert!(
+        h.state()
+            .tabs
+            .iter()
+            .filter(|t| t.path == user)
+            .all(|t| t.text == USER_KT)
+    );
     assert!(theirs.exists(), "the other window's backup stays");
-    assert!(!h.state().toast_texts().iter().any(|t| t.contains("Recovered")));
+    assert!(
+        !h.state()
+            .toast_texts()
+            .iter()
+            .any(|t| t.contains("Recovered"))
+    );
     // that window crashed: the next start takes it
     other.kill().unwrap();
     other.wait().unwrap();
     drop(h);
     let mut h = f.harness();
-    wait(&mut h, "recovered", |a| a.toast_texts().contains(&"Recovered unsaved edits for User.kt"));
-    assert_eq!(h.state().tabs.iter().find(|t| t.path == user).unwrap().text, typed);
+    wait(&mut h, "recovered", |a| {
+        a.toast_texts()
+            .contains(&"Recovered unsaved edits for User.kt")
+    });
+    assert_eq!(
+        h.state().tabs.iter().find(|t| t.path == user).unwrap().text,
+        typed
+    );
     assert!(!theirs.exists(), "this window's own backup replaces it");
     assert_eq!(unsaved_backups(&f), vec![typed]);
 }
@@ -5567,14 +5870,22 @@ fn e2e_autosave_never_writes_over_a_change_on_disk_the_watcher_has_not_reported(
     h.state_mut().wait_saves();
     assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs);
     assert!(tab(&h).disk_changed && tab(&h).dirty(), "the bar asks");
-    assert!(h.state().status.starts_with("Auto-save did not write"), "{}", h.state().status);
+    assert!(
+        h.state().status.starts_with("Auto-save did not write"),
+        "{}",
+        h.state().status
+    );
     // Keep mine: auto-save writes it
     steps(&mut h, 2);
     h.get_by_label("Keep mine").click();
     steps(&mut h, 2);
     h.state_mut().autosave();
     h.state_mut().wait_saves();
-    assert!(std::fs::read_to_string(&user).unwrap().ends_with("// mine\n"));
+    assert!(
+        std::fs::read_to_string(&user)
+            .unwrap()
+            .ends_with("// mine\n")
+    );
     // deleted meanwhile: auto-save does not bring it back
     std::fs::remove_file(&user).unwrap();
     h.state_mut().tabs[a].text.push_str("// more\n");
@@ -5597,7 +5908,9 @@ fn e2e_translations_and_history_restore_wait_for_a_checkout() {
     strings("values", "Hi");
     let hindi = strings("values-hi", "Namaste");
     let mut h = f.harness();
-    wait(&mut h, "resources", |a| a.res.get("string", "hi").len() == 2);
+    wait(&mut h, "resources", |a| {
+        a.res.get("string", "hi").len() == 2
+    });
     let ctx = h.ctx.clone();
     h.state_mut().run(Action::Translations, &ctx);
     steps(&mut h, 3);
@@ -6041,14 +6354,29 @@ fn e2e_save_never_waits_for_the_disk_and_two_quick_saves_land_in_order() {
     // auto-save never writes over a change on disk: the first save is not one
     h.state_mut().autosave();
     steps(&mut h, 2);
-    assert!(started.elapsed() < Duration::from_secs(2), "the window waited for the disk");
-    assert_eq!(std::fs::read_to_string(&user).unwrap(), USER_KT, "not written yet");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the window waited for the disk"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&user).unwrap(),
+        USER_KT,
+        "not written yet"
+    );
     assert!(tab(&h).dirty());
     go.send(()).unwrap();
     h.state_mut().wait_saves();
     // the second save found the first one's text on disk: its own, not a change on disk
-    assert!(std::fs::read_to_string(&user).unwrap().ends_with("// one\n// two\n"));
-    assert!(!tab(&h).dirty() && !tab(&h).disk_changed, "{}", h.state().status);
+    assert!(
+        std::fs::read_to_string(&user)
+            .unwrap()
+            .ends_with("// one\n// two\n")
+    );
+    assert!(
+        !tab(&h).dirty() && !tab(&h).disk_changed,
+        "{}",
+        h.state().status
+    );
     assert_eq!(h.state().status, format!("Saved {}", user.display()));
     assert_eq!(h.state().saves_pending, 0);
 }

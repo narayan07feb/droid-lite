@@ -31,7 +31,7 @@ impl App {
                         .into_iter()
                         .map(|p| match std::fs::read_to_string(&p) {
                             Ok(text) => {
-                                let syms = is_code(&p).then(|| crate::kotlin::scan(&text));
+                                let syms = is_code(&p).then(|| crate::kotlin::scan_file(&p, &text));
                                 DiskChange::File(p, text, syms)
                             }
                             Err(_) if !p.exists() => DiskChange::Gone(p),
@@ -104,7 +104,8 @@ impl App {
                     if let Some(syms) = syms
                         && project.files.binary_search(&path).is_ok()
                     {
-                        self.index.insert_scanned(path.clone(), syms);
+                        let p = path.clone();
+                        self.index.change(move |i| i.insert_scanned(p, syms));
                     }
                     if let Some(t) = self.tabs.iter_mut().find(|t| t.path == path) {
                         t.deleted = false;
@@ -149,7 +150,8 @@ impl App {
                     let before = project.files.len();
                     project.files.retain(|f| !f.starts_with(&path)); // a file, or a deleted folder
                     tree_dirty |= project.files.len() != before;
-                    self.index.remove_under(&path);
+                    let p = path.clone();
+                    self.index.change(move |i| i.remove_under(&p));
                     for t in self.tabs.iter_mut().filter(|t| t.path.starts_with(&path)) {
                         t.deleted = true;
                     }

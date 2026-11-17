@@ -9,7 +9,6 @@ use crate::compose::{self, Stability, Verdict};
 use crate::highlight::{ERROR, WARN};
 use crate::icons as ic;
 use crate::index::Hit;
-use crate::index::type_name;
 use crate::keymap::{self, Action};
 use crate::kotlin::Kind;
 use egui::{Align2, Color32, FontId, Galley, Pos2, Rect, RichText, Sense, Ui};
@@ -161,7 +160,7 @@ impl App {
         };
         let key = (
             t.rev,
-            self.index.generation,
+            self.index.read().generation,
             self.outputs_gen,
             self.decl_usages_gen,
         );
@@ -183,7 +182,7 @@ impl App {
         let mut badges = Vec::new();
         for d in &t.syms.decls {
             let line = line_of(d.offset);
-            let kmp = self.index.counterparts(&t.path, &t.syms, d);
+            let kmp = self.index.read().counterparts(&t.path, &t.syms, d);
             if !kmp.is_empty() {
                 let expect = crate::index::kmp_role(&t.syms, d) == Some("expect");
                 let mut sets: Vec<&str> = kmp
@@ -208,9 +207,11 @@ impl App {
                     .iter()
                     .flat_map(|s| {
                         self.index
+                            .read()
                             .named(s)
                             .filter(|(_, _, x)| x.kind.is_type())
                             .map(|(p, f, x)| hit_of(p, f, x))
+                            .collect::<Vec<_>>()
                     })
                     .collect();
                 if !supers.is_empty() {
@@ -226,7 +227,7 @@ impl App {
                         targets: supers,
                     });
                 }
-                let impls = self.index.implementations(&d.name);
+                let impls = self.index.read().implementations(&d.name);
                 if !impls.is_empty() {
                     let verb = if d.kind == Kind::Interface {
                         "Implemented in"
@@ -251,7 +252,7 @@ impl App {
                 && matches!(d.kind, Kind::Fun | Kind::Property)
             {
                 if d.has_modifier("override") {
-                    if let Some(h) = self.index.overridden(c, &d.name) {
+                    if let Some(h) = self.index.read().overridden(c, &d.name) {
                         marks.push(Mark {
                             line,
                             short: format!("{}  {}", ic::ARROW_UP, h.name),
@@ -260,7 +261,7 @@ impl App {
                         });
                     }
                 } else {
-                    let impls = self.index.member_implementations(c, &d.name);
+                    let impls = self.index.read().member_implementations(c, &d.name);
                     if !impls.is_empty() {
                         marks.push(Mark {
                             line,
@@ -278,7 +279,7 @@ impl App {
             if d.is_composable() && !d.is_preview() && !d.params.is_empty() {
                 let (stability, guessed) = match self.stability.get(&d.name) {
                     Some(s) => (s.clone(), false),
-                    None => (compose::guess(d, &self.index), true),
+                    None => (compose::guess(d, &self.index.read()), true),
                 };
                 let count = |v: Verdict| stability.params.iter().filter(|p| p.verdict == v).count();
                 let (text, color) = match (
@@ -429,7 +430,7 @@ impl App {
                 Request::Pick(m.tip.clone(), m.targets.clone()),
             );
         }
-        for (line, short, tip, r) in self.hilt_links(&t.syms, &line_of) {
+        for (line, short, tip, r) in self.hilt_links(&t.path, t.rev, &line_of) {
             add(line, short, tip, r);
         }
         let lenses = rows
@@ -462,99 +463,51 @@ impl App {
         }
     }
 
-    /// Takes a finished count, and starts one for the active tab when its count is stale. One
-    /// count runs at a time: edits made meanwhile are counted when it ends.
+    /// Takes the worker's finished pass of the active file, and asks for a new one when the
+    /// file's text or the index changed. The worker cancels a pass that a newer one replaces.
     fn count_decl_usages(&mut self) {
-        if let Some(rx) = &self.decl_usages_rx {
-            match rx.try_recv() {
-                Ok(u) => {
-                    self.decl_usages = Some(u);
-                    self.decl_usages_gen += 1;
-                    self.decl_usages_rx = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => return,
-                Err(_) => self.decl_usages_rx = None,
-            }
+        if self.xref.poll()
+            && let Some(f) = &self.xref.file
+        {
+            self.decl_usages = Some(DeclUsages {
+                key: (f.path.clone(), f.rev, 0),
+                by_decl: f.usages.clone(),
+            });
+            self.decl_usages_gen += 1;
         }
         let (Some(t), Some(p)) = (self.tabs.get(self.active), &self.project) else {
             return;
         };
-        let key = (t.path.clone(), t.rev, self.index.generation);
+        let generation = self.index.read().generation;
         if t.readonly
             || !crate::project::is_code(&t.path)
-            || self.decl_usages.as_ref().is_some_and(|u| u.key == key)
+            || self.xref.asked_for(&t.path, t.rev, generation)
         {
             return;
         }
-        let targets: Vec<((Option<String>, String), crate::usage::Target)> = t
+        let targets: Vec<((Option<String>, String), usize)> = t
             .syms
             .decls
             .iter()
             .filter(|d| wants_usages(d))
-            .map(|d| {
-                let target = crate::usage::Target::new(&self.index, &t.path, &t.syms, d, &t.text);
-                (usage_key(d), target)
-            })
+            .map(|d| (usage_key(d), d.offset))
             .collect();
-        let files: Vec<std::path::PathBuf> = p
-            .files
-            .iter()
-            .filter(|f| crate::project::is_code(f))
-            .cloned()
-            .collect();
-        let open: HashMap<std::path::PathBuf, String> = self
+        let files: std::sync::Arc<Vec<std::path::PathBuf>> = std::sync::Arc::new(
+            p.files
+                .iter()
+                .filter(|f| crate::project::is_code(f))
+                .cloned()
+                .collect(),
+        );
+        let open: HashMap<std::path::PathBuf, std::sync::Arc<str>> = self
             .tabs
             .iter()
             .filter(|t| !t.deleted)
-            .map(|t| (t.path.clone(), t.text.clone()))
+            .map(|t| (t.path.clone(), std::sync::Arc::from(t.text.as_str())))
             .collect();
-        let root = p.root.clone();
-        let ctx = self.ctx.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut by_decl: HashMap<(Option<String>, String), Vec<Hit>> = targets
-                .iter()
-                .map(|(k, _)| (k.clone(), Vec::new()))
-                .collect();
-            for f in files {
-                let Some(text) = open
-                    .get(&f)
-                    .cloned()
-                    .or_else(|| std::fs::read_to_string(&f).ok())
-                else {
-                    continue;
-                };
-                let mut syms = None;
-                for (k, target) in &targets {
-                    if !text.contains(&target.name) {
-                        continue;
-                    }
-                    let syms = syms.get_or_insert_with(|| crate::kotlin::scan(&text));
-                    for r in crate::refactor::occurrences(&text, &target.name) {
-                        let at = r.start;
-                        if f == target.path && at == target.offset
-                            || !target.is_use(&f, &text, syms, at)
-                        {
-                            continue;
-                        }
-                        let l = super::found_line(&f, &text, at);
-                        let rel = f.strip_prefix(&root).unwrap_or(&f);
-                        by_decl.get_mut(k).unwrap().push(Hit {
-                            name: l.text,
-                            detail: format!("{}:{}", rel.display(), l.line),
-                            path: f.clone(),
-                            offset: at,
-                            score: 0,
-                        });
-                    }
-                }
-            }
-            let _ = tx.send(DeclUsages { key, by_decl });
-            if let Some(c) = ctx {
-                c.request_repaint();
-            }
-        });
-        self.decl_usages_rx = Some(rx);
+        let (path, rev, text, root) = (t.path.clone(), t.rev, t.text.clone(), p.root.clone());
+        self.xref
+            .want_file(&path, rev, generation, &text, open, files, root, targets);
     }
 
     pub(super) fn handle(&mut self, r: Request, ctx: &egui::Context) {
@@ -570,77 +523,39 @@ impl App {
         }
     }
 
-    /// Hilt / Dagger links of a file's declarations: where a provided or `@Inject` class is
-    /// injected, and what provides the dependencies of an `@Inject` class or field.
+    /// Hilt / Dagger links of the active file from the worker's pass: "Injected in N places"
+    /// on a binding (`@Provides` / `@Binds` / `@Inject constructor`), and on an `@Inject` class,
+    /// field or `@Provides` function the bindings its dependencies get, matched by type and
+    /// qualifier like Dagger does.
     fn hilt_links(
         &self,
-        syms: &crate::kotlin::FileSyms,
+        path: &std::path::Path,
+        rev: u64,
         line_of: &dyn Fn(usize) -> usize,
     ) -> Vec<(usize, String, String, Request)> {
-        let provides = |d: &crate::kotlin::Decl| match d.kind {
-            Kind::Fun if d.has_annotation("Provides") || d.has_annotation("Binds") => {
-                Some(type_name(&d.ty))
-            }
-            Kind::Class if d.has_annotation("Inject") => Some(d.name.clone()),
-            _ => None,
-        };
-        let needs = |d: &crate::kotlin::Decl| -> Vec<String> {
-            match d.kind {
-                Kind::Class if d.has_annotation("Inject") => {
-                    d.params.iter().map(|p| type_name(&p.ty)).collect()
-                }
-                Kind::Property if d.has_annotation("Inject") => vec![type_name(&d.ty)],
-                _ => Vec::new(),
-            }
-        };
-        let types: HashSet<String> = syms
-            .decls
-            .iter()
-            .flat_map(|d| provides(d).into_iter().chain(needs(d)))
-            .collect();
-        if types.is_empty() {
+        let Some(f) = self.xref.for_file(path, rev) else {
             return Vec::new();
-        }
-        let (providers, injected) = self.index.hilt(&types);
-        let mut out = Vec::new();
-        for d in &syms.decls {
-            let line = line_of(d.offset);
-            if let Some(ty) = provides(d)
-                && let Some(h) = injected.get(&ty)
-            {
-                let n = h.len();
-                out.push((
-                    line,
-                    format!("{}  {n}", ic::SYRINGE),
-                    format!("Injected in {n} place{}", if n == 1 { "" } else { "s" }),
-                    Request::Pick(format!("Where {ty} is injected"), h.clone()),
-                ));
-            }
-            let wanted: Vec<String> = needs(d)
-                .into_iter()
-                .filter(|t| providers.contains_key(t))
-                .collect();
-            if wanted.is_empty() {
-                continue;
-            }
-            let found: Vec<Hit> = wanted.iter().flat_map(|t| providers[t].clone()).collect();
-            let tip = match (&found[..], d.kind) {
-                ([one], Kind::Property) => format!("Provided by {}", one.name),
-                (_, Kind::Property) => format!("{} providers", found.len()),
-                _ => format!("Dependencies: {}", wanted.join(", ")),
-            };
-            let short = match &found[..] {
-                [one] => one.name.clone(),
-                _ => found.len().to_string(),
-            };
-            out.push((
-                line,
-                format!("{}  {short}", ic::PLUGS_CONNECTED),
-                tip,
-                Request::Pick(format!("Providers of {}", wanted.join(", ")), found),
-            ));
-        }
-        out
+        };
+        f.hilt
+            .iter()
+            .filter(|l| !l.hits.is_empty() || l.injected)
+            .map(|l| {
+                let short = if l.injected {
+                    format!("{}  {}", ic::SYRINGE, l.hits.len())
+                } else {
+                    match &l.hits[..] {
+                        [one] => format!("{}  {}", ic::PLUGS_CONNECTED, one.name),
+                        hits => format!("{}  {}", ic::PLUGS_CONNECTED, hits.len()),
+                    }
+                };
+                (
+                    line_of(l.at),
+                    short,
+                    l.title.clone(),
+                    Request::Pick(l.title.clone(), l.hits.clone()),
+                )
+            })
+            .collect()
     }
 
     /// A popup to choose one of several targets (implementations, declarations).
@@ -662,19 +577,20 @@ impl App {
         let Some((word, _)) = self.word_at_cursor() else {
             return;
         };
-        let mut hits = self.index.implementations(&word);
+        let mut hits = self.index.read().implementations(&word);
         let containers: Vec<String> = self
             .index
+            .read()
             .named(&word)
             .filter_map(|(_, _, d)| d.container.as_deref().map(String::from))
             .collect();
         for c in containers {
-            hits.extend(self.index.member_implementations(&c, &word));
+            hits.extend(self.index.read().member_implementations(&c, &word));
         }
         // Kotlin Multiplatform: from an expect to its actuals, from an actual to its expect
         if let Some(t) = self.tabs.get(self.active) {
             for d in t.syms.decls.iter().filter(|d| *d.name == *word) {
-                hits.extend(self.index.counterparts(&t.path, &t.syms, d));
+                hits.extend(self.index.read().counterparts(&t.path, &t.syms, d));
             }
         }
         match hits.len() {
