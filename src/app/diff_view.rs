@@ -146,7 +146,13 @@ pub(super) fn compute(old: &str, new: &str) -> Result<Aligned, String> {
             "Diff is off for files over {MAX_LINES} lines ({lines} lines)"
         ));
     }
-    Ok(align(old, new, &git::line_diff(old, new)))
+    aligned(old, new, git::line_diff(old, new))
+}
+
+/// [`align`] over `diff`, or a note when git could not compare them (never "No changes").
+fn aligned(old: &str, new: &str, diff: Result<Vec<String>, String>) -> Result<Aligned, String> {
+    diff.map(|d| align(old, new, &d))
+        .map_err(|e| format!("No diff: {e}"))
 }
 
 /// Pairs the lines of `old` and `new` with `diff` (their `-U0` diff): unchanged lines between the
@@ -792,6 +798,14 @@ pub(super) fn paint_old(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_git_that_fails_shows_a_note_not_unchanged_lines() {
+        let e = aligned("a\n", "b\n", Err("git diff failed: bad".into())).unwrap_err();
+        assert_eq!(e, "No diff: git diff failed: bad");
+        let a = aligned("a\n", "b\n", git::line_diff("a\n", "b\n")).unwrap();
+        assert_eq!(a.changed, 1);
+    }
 
     fn kinds(a: &Aligned) -> Vec<(Option<usize>, Option<usize>, Kind)> {
         a.rows.iter().map(|r| (r.old, r.new, r.kind)).collect()

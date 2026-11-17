@@ -813,7 +813,13 @@ impl Server {
         if !self.open {
             return Err("call initialize first".into());
         }
-        let path = canon(params["path"].as_str().ok_or("missing \"path\"")?);
+        let raw = params["path"].as_str().ok_or("missing \"path\"")?;
+        let path = canon(raw);
+        // as `update`: a file outside the project is never read nor drawn
+        let root = self.project.as_ref().map(|p| p.root.as_path());
+        if !in_project(root, &path) {
+            return Err(format!("{raw:?} is not in the project"));
+        }
         let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
         let syms = crate::kotlin::scan(&text);
         let previews: Vec<String> = syms
@@ -1972,6 +1978,29 @@ mod tests {
         let r = call(&mut s, "implementations", json!({ "name": "Api" }));
         assert_eq!(r["result"].as_array().map(Vec::len), Some(1), "{r}");
         assert!(s.texts.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(other);
+    }
+
+    #[test]
+    fn previews_never_read_a_file_outside_the_project() {
+        let root = project("prevout");
+        let other = project("prevout-other");
+        let mut s = Server::default();
+        init(&mut s, &root);
+        let f = other.join("app/src/main/java/demo/RealApi.kt");
+        let up = root
+            .join("app/missing/../../..")
+            .join(other.file_name().unwrap());
+        for path in [f.clone(), up.join("app/src/main/java/demo/RealApi.kt")] {
+            let r = call(&mut s, "previews", json!({ "path": path }));
+            assert!(
+                r["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("not in the project")),
+                "{path:?}: {r}"
+            );
+        }
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(other);
     }

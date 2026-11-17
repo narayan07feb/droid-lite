@@ -244,7 +244,34 @@ fn in_gradle(p: &Piece, gradle: &Path) -> Option<PathBuf> {
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().trim_start_matches('0') == want)
         .map(|e| e.path().join(p.file_name()))
-        .find(|f| size_of(f) == p.size)
+        .find(|f| size_of(f) == p.size && has_sha1(f, p.sha1))
+}
+
+/// Whether file `f` has SHA-1 `sha1`: a file in Gradle's cache is never taken by its folder name
+/// and size alone. Each file is read once while its size and time stay the same.
+fn has_sha1(f: &Path, sha1: &str) -> bool {
+    type Key = (PathBuf, u64, std::time::SystemTime);
+    static SEEN: std::sync::Mutex<Option<std::collections::HashMap<Key, String>>> =
+        std::sync::Mutex::new(None);
+    let Some(key) = std::fs::metadata(f)
+        .and_then(|m| Ok((f.to_path_buf(), m.len(), m.modified()?)))
+        .ok()
+    else {
+        return false;
+    };
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = seen.get_or_insert_default();
+    let sum = match seen.get(&key) {
+        Some(s) => s.clone(),
+        None => {
+            let Ok(s) = sha1_file(f) else {
+                return false;
+            };
+            seen.insert(key, s.clone());
+            s
+        }
+    };
+    sum.eq_ignore_ascii_case(sha1)
 }
 
 /// Where Droid Lite keeps a downloaded piece.
@@ -768,11 +795,11 @@ mod tests {
     fn gradle_cache_hit_is_used_as_it_is_and_nothing_downloads() {
         let (g, own) = (temp("g-hit"), temp("g-hit-own"));
         // Gradle names the folder by the SHA-1 without its leading zeros
-        let p = piece("lib", "0e8eb255b2c378b9a6c7341e7b0e12f0a5636377", 5);
-        let f = g.join("demo.lib/lib/1.0/e8eb255b2c378b9a6c7341e7b0e12f0a5636377/lib-1.0.jar");
+        let p = piece("lib", "0f1defd5135596709273b3a1a07e466ea2bf4fff", 6);
+        let f = g.join("demo.lib/lib/1.0/f1defd5135596709273b3a1a07e466ea2bf4fff/lib-1.0.jar");
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();
-        std::fs::write(&f, "hello").unwrap();
-        let net = fake(b"hello");
+        std::fs::write(&f, "hello2").unwrap();
+        let net = fake(b"hello2");
         assert_eq!(
             resolve(&[p], Some(&g), &own, &net, &quiet).unwrap(),
             vec![f]
@@ -795,6 +822,20 @@ mod tests {
         std::fs::create_dir_all(short.parent().unwrap()).unwrap();
         std::fs::write(&short, "hell").unwrap();
         assert_eq!(plan(&[p], Some(&g), &own), vec![None]);
+    }
+
+    #[test]
+    fn gradle_cache_file_with_the_right_name_and_size_but_other_bytes_is_not_used() {
+        let (g, own) = (temp("g-forged"), temp("g-forged-own"));
+        let p = piece("lib", HELLO_SHA1, 5);
+        let f = g.join(format!("demo.lib/lib/1.0/{HELLO_SHA1}/lib-1.0.jar"));
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, "jello").unwrap();
+        assert_eq!(plan(std::slice::from_ref(&p), Some(&g), &own), vec![None]);
+        // put right (a new time): read again, and taken
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&f, "hello").unwrap();
+        assert_eq!(plan(&[p], Some(&g), &own), vec![Some(f)]);
     }
 
     #[test]

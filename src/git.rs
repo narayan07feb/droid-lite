@@ -90,46 +90,82 @@ pub fn file_at(path: &Path, rev: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// `git diff --no-index` of two texts (written to temp files), with `args` before the paths.
-fn diff_no_index(old: &str, new: &str, args: &[&str]) -> String {
-    let dir = std::env::temp_dir().join(format!(
-        "droid-lite-hunks-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = std::fs::create_dir_all(&dir);
+/// `git diff --no-index` of two texts, with `args` before the paths; why it could not run. The
+/// texts go to new files (0600) in a new private folder (0700): a name planted in the temp folder
+/// (a symlink) is never followed. A diff tool the repo or the environment sets
+/// (`diff.external`, `GIT_EXTERNAL_DIFF`) never runs.
+fn diff_no_index(old: &str, new: &str, args: &[&str]) -> Result<String, String> {
+    let dir = private_temp_dir("droid-lite-hunks").map_err(|e| e.to_string())?;
     let (a, b) = (dir.join("old"), dir.join("new"));
-    if std::fs::write(&a, old).is_err() || std::fs::write(&b, new).is_err() {
-        return String::new();
+    let out = new_private_file(&a, old)
+        .and_then(|()| new_private_file(&b, new))
+        .map_err(|e| e.to_string())
+        .and_then(|()| {
+            no_index_cmd(&a, &b, args)
+                .output()
+                .map_err(|e| format!("git did not start: {e}"))
+        });
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = out?;
+    // 0: the same, 1: different; anything else is an error
+    match out.status.code() {
+        Some(0 | 1) => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
+        _ => Err(match String::from_utf8_lossy(&out.stderr).trim() {
+            "" => format!("git diff failed ({})", out.status),
+            e => format!("git diff failed: {e}"),
+        }),
     }
-    let out = Command::new("git")
-        .args(["diff", "--no-index", "--no-color"])
+}
+
+fn no_index_cmd(a: &Path, b: &Path, args: &[&str]) -> Command {
+    let mut c = Command::new("git");
+    c.args(["diff", "--no-index", "--no-color", "--no-ext-diff"])
         .args(args)
         .arg("--")
-        .arg(&a)
-        .arg(&b)
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    let _ = std::fs::remove_file(&a);
-    let _ = std::fs::remove_file(&b);
-    let _ = std::fs::remove_dir(&dir);
-    out
+        .arg(a)
+        .arg(b)
+        .stdin(Stdio::null());
+    c
+}
+
+/// A new folder only this user can open, under the temp folder; never one that was there.
+fn private_temp_dir(prefix: &str) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    loop {
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()));
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            r => return r.map(|()| dir),
+        }
+    }
+}
+
+/// Writes `text` to a new file `path` (0600); fails when something is there.
+fn new_private_file(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(text.as_bytes())
 }
 
 /// The `-U0` diff from `old` to `new` as lines, for side-by-side views: a `\r` at a line end
 /// does not count as a change, text that looks binary is still compared line by line, and the
-/// "\\ No newline at end of file" notes are left out.
-pub fn line_diff(old: &str, new: &str) -> Vec<String> {
+/// "\\ No newline at end of file" notes are left out. Why git could not compare them.
+pub fn line_diff(old: &str, new: &str) -> Result<Vec<String>, String> {
     if old == new {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let args = ["-U0", "--text", "--no-ext-diff", "--ignore-cr-at-eol"];
-    diff_no_index(old, new, &args)
+    let args = ["-U0", "--text", "--ignore-cr-at-eol"];
+    Ok(diff_no_index(old, new, &args)?
         .lines()
         .filter(|l| !l.starts_with('\\'))
         .map(String::from)
-        .collect()
+        .collect())
 }
 
 /// Line changes from `old` to `new`, through `git diff --no-index -U0`.
@@ -137,7 +173,8 @@ pub fn hunks(old: &str, new: &str) -> Vec<Hunk> {
     if old == new {
         return Vec::new();
     }
-    let out = diff_no_index(old, new, &["-U0"]);
+    // a git that fails marks nothing (the gutter shows no change bars)
+    let out = diff_no_index(old, new, &["-U0"]).unwrap_or_default();
     let mut v: Vec<Hunk> = Vec::new();
     for line in out.lines() {
         if let Some(h) = line.strip_prefix("@@ -") {
@@ -1110,7 +1147,7 @@ pub fn base_branch(root: &Path) -> (Option<String>, Option<String>) {
 /// Files this branch changed since it left `base` (what a pull request shows).
 pub fn branch_changes(root: &Path, base: &str) -> Vec<Change> {
     let Ok(out) = git(root)
-        .args(["diff", "--name-status", "-M", &format!("{base}...HEAD")])
+        .args(["diff", "--no-ext-diff", "--name-status", "-M", &format!("{base}...HEAD")])
         .output()
     else {
         return Vec::new();
@@ -1172,7 +1209,7 @@ pub fn changes(root: &Path, choice: Option<&str>) -> Changes {
 /// The diff of one file: against `base...HEAD` for branch changes, else the uncommitted change.
 pub fn file_diff(root: &Path, path: &Path, base: Option<&str>, staged: bool) -> String {
     let mut c = git(root);
-    c.arg("diff");
+    c.args(["diff", "--no-ext-diff"]);
     match base {
         Some(b) => {
             c.arg(format!("{b}...HEAD"));
@@ -1293,7 +1330,7 @@ pub fn blob_at(top: &Path, sha: &str, rel: &str, max: usize) -> Result<Option<St
 /// The path `rel` had at commit `sha` when git sees it as renamed since (staged or committed).
 pub fn renamed_from(top: &Path, sha: &str, rel: &str) -> Option<String> {
     let out = git(top)
-        .args(["diff", "-M", "--name-status", "-z", "--no-color", sha, "--"])
+        .args(["diff", "--no-ext-diff", "-M", "--name-status", "-z", "--no-color", sha, "--"])
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
@@ -2024,6 +2061,44 @@ mod tests {
         g(&["cherry-pick", "--abort"]);
         assert_eq!(operation_in_progress(&repo), None);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_git_diff_is_an_error_and_a_repo_diff_tool_never_runs() {
+        assert!(diff_no_index("a\n", "b\n", &["--no-such-flag"]).is_err());
+        assert_eq!(line_diff("a\n", "a\n"), Ok(Vec::new()));
+        // a diff tool set by the environment (as diff.external in a repo) would print this
+        let ran = std::env::temp_dir().join(format!("dl-ext-diff-{}", std::process::id()));
+        let tool = ran.with_extension("sh");
+        std::fs::write(&tool, format!("#!/bin/sh\ntouch {}\n", ran.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = private_temp_dir("dl-ext").unwrap();
+        let (a, b) = (dir.join("old"), dir.join("new"));
+        new_private_file(&a, "a\n").unwrap();
+        new_private_file(&b, "b\n").unwrap();
+        assert!(new_private_file(&a, "x").is_err(), "never over a file that is there");
+        let out = no_index_cmd(&a, &b, &[])
+            .env("GIT_EXTERNAL_DIFF", &tool)
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("+b"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&tool);
+        assert!(!ran.exists(), "the external diff tool ran");
+    }
+
+    #[test]
+    fn diff_temp_files_live_in_a_new_private_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let a = private_temp_dir("dl-priv").unwrap();
+        let b = private_temp_dir("dl-priv").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o700);
+        new_private_file(&a.join("old"), "x").unwrap();
+        assert_eq!(std::fs::metadata(a.join("old")).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
     }
 
     #[test]

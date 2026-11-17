@@ -112,15 +112,31 @@ impl PrsState {
     }
 }
 
-/// Opens a link in Google Chrome, else the default browser.
+/// Opens a web link (`http`, `https` only: [`crate::plugins::is_web_link`]) in Google Chrome,
+/// else the default browser, without waiting for either.
 fn open_url(url: &str) {
-    let chrome = std::process::Command::new("open")
-        .args(["-a", "Google Chrome", url])
-        .status()
-        .is_ok_and(|s| s.success());
-    if !chrome {
-        let _ = std::process::Command::new("open").arg(url).status();
+    if let Some(mut c) = open_url_cmd(url) {
+        let _ = c.spawn();
     }
+}
+
+/// The command [`open_url`] starts; `None` for a link that is not a web page.
+fn open_url_cmd(url: &str) -> Option<std::process::Command> {
+    if !crate::plugins::is_web_link(url) {
+        return None;
+    }
+    let mut c = std::process::Command::new("/bin/sh");
+    // the link is an argument, never shell text
+    c.args([
+        "-c",
+        r#"open -a "Google Chrome" "$1" || open "$1""#,
+        "sh",
+        url,
+    ])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+    Some(c)
 }
 
 const APPROVED: egui::Color32 = egui::Color32::from_rgb(0x5F, 0xB8, 0x65);
@@ -412,7 +428,9 @@ impl App {
         if let Some(r) = self.prs.running_in(root) {
             return Some(format!("Wait for the check out of #{} to stop", r.number));
         }
-        let running = if self.gradle.is_some() {
+        let running = if self.saves_pending > 0 {
+            Some("the save")
+        } else if self.gradle.is_some() {
             Some("the Gradle build")
         } else if self.tests.running() {
             Some("the test run")
@@ -553,5 +571,33 @@ impl App {
             }
         }
         self.active = self.active.min(self.tabs.len().saturating_sub(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_web_links_open_and_the_link_is_never_shell_text() {
+        for bad in [
+            "file:///etc/passwd",
+            "smb://host/share",
+            "javascript:alert(1)",
+            "-a Calculator",
+        ] {
+            assert!(open_url_cmd(bad).is_none(), "{bad}");
+        }
+        let url = "https://github.com/o/r/pull/1;touch /tmp/x";
+        let c = open_url_cmd(url).unwrap();
+        let args: Vec<_> = c
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.last().map(String::as_str), Some(url));
+        assert!(
+            !args[1].contains("github"),
+            "the script does not hold the link"
+        );
     }
 }

@@ -159,7 +159,7 @@ pub(super) fn record_text(path: &Path, text: &[u8]) -> Result<(), String> {
 
 /// Makes `dir` (0700 when new) and its parent (the history root) closed to other users, also
 /// when they exist already: local history holds unsaved source.
-fn private_dir(dir: &Path) -> std::io::Result<()> {
+pub(super) fn private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -218,7 +218,8 @@ fn prune_soon() {
     if last == 0 || now.abs_diff(last) > 60_000 {
         LAST.store(now, std::sync::atomic::Ordering::Relaxed);
         if let Some(root) = history_root() {
-            prune_all(&root, HISTORY_CAP);
+            // it reads every history folder: never on the window's thread
+            super::saver::run(move || prune_all(&root, HISTORY_CAP));
         }
     }
 }
@@ -508,22 +509,25 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_asked = true;
         }
-        if !self.close_asked {
+        // the choice waits for saves on their way (it may have started them)
+        if !self.close_asked || self.saves_pending > 0 {
             return;
         }
         let tabs = self.unwritten_edits();
         if tabs.is_empty() {
             self.close_asked = false;
+            if std::mem::take(&mut self.close_after_saves) {
+                self.close_now(ctx);
+            }
             return;
         }
         let buttons = ["Keep my version (save)", "Keep a copy and close", "Cancel"];
         match self.unsaved_dialog(ctx, &tabs, buttons) {
             Some(0) => {
+                // closes once they are written; a save that failed (its folder is gone) keeps
+                // the window open, with the reason
                 self.save_tabs(&tabs);
-                // a save that failed (its folder is gone) keeps the window open, with the reason
-                if self.unwritten_edits().is_empty() {
-                    self.close_now(ctx);
-                }
+                self.close_after_saves = true;
             }
             Some(1) => {
                 // a copy that cannot be kept keeps the window open, with the reason
@@ -536,6 +540,7 @@ impl App {
             }
             Some(_) => {
                 self.close_asked = false;
+                self.close_after_saves = false;
                 self.copy_error = None;
             }
             None => {}
@@ -560,6 +565,10 @@ impl App {
         let Some(dir) = self.switch_to.clone() else {
             return;
         };
+        // it waits for saves on their way (auto-save or Save started them)
+        if self.saves_pending > 0 {
+            return;
+        }
         let tabs = self.unsaved_tabs();
         let pick = if tabs.is_empty() {
             Some(1)
@@ -567,13 +576,9 @@ impl App {
             self.unsaved_dialog(ctx, &tabs, ["Save", "Keep a copy and switch", "Cancel"])
         };
         match pick {
-            Some(0) => {
-                self.save_tabs(&tabs);
-                // a save that failed keeps the project open, with the reason
-                if self.unsaved_tabs().is_empty() {
-                    self.switch_project(&dir, ctx);
-                }
-            }
+            // switches once they are written; a save that failed keeps the project open, with
+            // the reason
+            Some(0) => self.save_tabs(&tabs),
             Some(1) => self.switch_project(&dir, ctx), // it keeps the copies, or stays
             Some(_) => {
                 self.switch_to = None;

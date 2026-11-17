@@ -115,16 +115,27 @@ fn owner_alive(pid: u32, start: u64) -> bool {
 }
 
 /// Writes the unsaved `text` of `path` to `dir` (a temp file, then a rename), with this process
-/// and the hash of the file on disk now.
+/// and the hash of the file on disk now. The folder (0700) and the files (0600) are this user's
+/// only, as local history: they hold unsaved source. Each write has its own new temp file, so the
+/// 30 s backup and the signal thread never write into one file at once.
 pub(super) fn write_one(dir: &Path, path: &Path, text: &str) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    super::comfort::private_dir(dir).map_err(|e| e.to_string())?;
     let file = backup_file(dir, path);
-    let tmp = file.with_extension(format!("tmp{}", std::process::id()));
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = file.with_extension(format!("tmp{}-{n}", std::process::id()));
     let (pid, start) = me();
     let disk = std::fs::read(path).ok().map(|b| disk_hash(&b));
     let body = json!({ "path": path.to_string_lossy(), "text": text, "disk": disk, "pid": pid, "start": start })
         .to_string();
-    std::fs::write(&tmp, body)
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(body.as_bytes()))
         .and_then(|()| std::fs::rename(&tmp, &file))
         .map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
@@ -544,6 +555,42 @@ mod tests {
             f,
             backup_file(&dir.join("unsaved"), &src),
             "one file per process"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backups_are_private_and_two_writers_never_mix_one_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("dl-backup-private-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("A.kt");
+        let unsaved = dir.join("unsaved");
+        std::fs::create_dir_all(&unsaved).unwrap();
+        std::fs::set_permissions(&unsaved, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let f = write_one(&unsaved, &src, "secret").unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&unsaved), 0o700, "an open folder is closed");
+        assert_eq!(mode(&f), 0o600);
+        // the 30 s backup and the signal thread at once: the file is always one whole backup
+        let texts: Vec<String> = (0..4).map(|i| format!("{i}").repeat(200_000)).collect();
+        std::thread::scope(|s| {
+            for t in &texts {
+                let (unsaved, src) = (&unsaved, &src);
+                s.spawn(move || {
+                    for _ in 0..20 {
+                        write_one(unsaved, src, t).unwrap();
+                    }
+                });
+            }
+        });
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        assert!(texts.iter().any(|t| v["text"].as_str() == Some(t)));
+        assert_eq!(
+            std::fs::read_dir(&unsaved).unwrap().count(),
+            1,
+            "no temp file is left"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

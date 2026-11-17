@@ -18,6 +18,7 @@ mod perf;
 mod prs_ui;
 mod refactor_ui;
 mod run_ui;
+mod saver;
 mod tests_ui;
 mod toasts;
 mod translations;
@@ -40,7 +41,7 @@ use egui::text::{CCursor, CCursorRange};
 use egui::{Align, Align2, Color32, FontId, Key, Modifiers, RichText, TextEdit, Ui};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Instant, SystemTime};
 
 /// Back/forward and recent-file lists are capped so a long session does not grow them forever.
@@ -454,6 +455,12 @@ pub struct App {
     close_asked: bool,
     /// That choice was made: the next close request goes through.
     close_ok: bool,
+    /// "Keep my version (save)" was chosen: the window closes once those saves are written.
+    close_after_saves: bool,
+    /// Results of saves the save thread ([`saver`]) wrote, and how many are still on their way.
+    save_tx: Sender<saver::SaveDone>,
+    save_rx: Receiver<saver::SaveDone>,
+    saves_pending: usize,
     /// A project switch that waits for the unsaved-edits choice ([`App::guard_switch`]).
     switch_to: Option<PathBuf>,
     /// Why "Keep a copy" could not keep a copy (shown in the Unsaved edits window).
@@ -501,6 +508,7 @@ impl App {
     pub fn new(cc: &eframe::CreationContext, open: Option<PathBuf>) -> App {
         crate::theme::install_fonts(&cc.egui_ctx);
         let settings = comfort::Settings::load();
+        let (save_tx, save_rx) = channel();
         settings.apply(&cc.egui_ctx);
         crate::theme::style(&cc.egui_ctx);
         let mut app = App {
@@ -573,6 +581,10 @@ impl App {
             window_focused: true,
             close_asked: false,
             close_ok: false,
+            close_after_saves: false,
+            save_tx,
+            save_rx,
+            saves_pending: 0,
             switch_to: None,
             copy_error: None,
             backup: Default::default(),
@@ -849,83 +861,90 @@ impl App {
         self.save_tab(false);
     }
 
-    /// Writes the active tab. `auto` (auto-save) never writes over a file that changed on disk
-    /// since it was loaded or saved here, nor brings back one deleted meanwhile, even before the
-    /// watcher reports it: the tab gets the changed-on-disk bar instead.
+    /// Writes the active tab on the save thread ([`saver`]); [`App::poll_saves`] applies the
+    /// result. `auto` (auto-save) never writes over a file that changed on disk since it was
+    /// loaded or saved here, nor brings back one deleted meanwhile, even before the watcher
+    /// reports it: the tab gets the changed-on-disk bar instead.
     fn save_tab(&mut self, auto: bool) {
         if self.refuse_during_checkout() {
             return;
         }
         self.settle(true);
-        let Some(tab) = self.tabs.get_mut(self.active) else {
+        let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
         if tab.readonly {
             self.status = "Library sources are read-only".into();
             return;
         }
-        // what is on disk goes to local history before it is replaced
-        match std::fs::read(&tab.path) {
-            Ok(disk) if disk == tab.text.as_bytes() => {}
-            Ok(disk) => {
-                // changed on disk since it was loaded or saved here (the watcher may not know yet)
-                let theirs = disk != tab.saved.as_bytes();
-                if theirs && auto {
-                    tab.disk_changed = true;
-                    self.status = format!(
-                        "Auto-save did not write {}: it changed on disk; reload or keep yours",
-                        tab.path.display()
-                    );
-                    return;
-                }
-                if theirs && !tab.dirty() {
-                    tab.disk_changed = true;
-                    self.status = "File changed on disk; reload or keep yours".into();
-                    return;
-                }
-                if let Err(e) = comfort::record_text(&tab.path, &disk)
-                    && theirs
-                {
-                    self.status = format!(
-                        "{}. Not saved: the other version on disk stays",
-                        comfort::copy_failed(&tab.path, &e)
-                    );
-                    return;
-                }
+        let job = saver::SaveJob {
+            path: tab.path.clone(),
+            text: tab.text.clone(),
+            saved: tab.saved.clone(),
+            dirty: tab.dirty(),
+            auto,
+        };
+        let (tx, ctx) = (self.save_tx.clone(), self.ctx.clone());
+        self.saves_pending += 1;
+        saver::run(move || {
+            let outcome = std::panic::catch_unwind(|| saver::save(&job, write_atomic))
+                .unwrap_or_else(|_| saver::Outcome::Failed("Save failed: internal error".into()));
+            let _ = tx.send(saver::SaveDone {
+                path: job.path,
+                text: job.text,
+                outcome,
+            });
+            if let Some(c) = ctx {
+                c.request_repaint();
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if auto && !tab.saved.is_empty() {
-                    tab.deleted = true;
-                    self.status = format!(
-                        "Auto-save did not write {}: it was deleted on disk",
-                        tab.path.display()
-                    );
-                    return;
+        });
+    }
+
+    /// Applies the saves the save thread finished, in the order they were made.
+    fn poll_saves(&mut self) {
+        while let Ok(d) = self.save_rx.try_recv() {
+            self.saves_pending = self.saves_pending.saturating_sub(1);
+            // a tab closed meanwhile (or another project) gets the status only
+            let tab = self.tabs.iter_mut().find(|t| t.path == d.path);
+            match d.outcome {
+                saver::Outcome::Written => {
+                    self.git.changes_stale = true;
+                    if let Some(tab) = tab {
+                        tab.saved = d.text.clone();
+                        tab.disk_changed = false;
+                        tab.deleted = false;
+                        tab.unreadable = None;
+                        if !self.previews.saved.contains(&d.path) {
+                            self.previews.saved.push(d.path.clone());
+                        }
+                        self.index.update(&d.path, &d.text);
+                        if let Some(l) = self.lsp.as_mut() {
+                            l.did_save(&d.path);
+                        }
+                    }
+                    self.status = format!("Saved {}", d.path.display());
                 }
-            }
-            Err(e) => {
-                self.status = format!("Save failed: cannot read {}: {e}", tab.path.display());
-                return;
+                saver::Outcome::DiskChanged(s) => {
+                    if let Some(tab) = tab {
+                        tab.disk_changed = true;
+                    }
+                    self.status = s;
+                }
+                saver::Outcome::Deleted(s) => {
+                    if let Some(tab) = tab {
+                        tab.deleted = true;
+                    }
+                    self.status = s;
+                }
+                saver::Outcome::Failed(s) => self.status = s,
             }
         }
-        match write_atomic(&tab.path, tab.text.as_bytes()) {
-            Ok(()) => {
-                self.git.changes_stale = true;
-                tab.saved = tab.text.clone();
-                tab.disk_changed = false;
-                tab.deleted = false;
-                tab.unreadable = None;
-                if !self.previews.saved.contains(&tab.path) {
-                    self.previews.saved.push(tab.path.clone());
-                }
-                self.index.update(&tab.path, &tab.text);
-                if let Some(l) = self.lsp.as_mut() {
-                    l.did_save(&tab.path);
-                }
-                self.status = format!("Saved {}", tab.path.display());
-            }
-            Err(e) => self.status = format!("Save failed: {e}"),
-        }
+    }
+
+    /// Waits for every save sent so far and applies them (on quit, and in tests).
+    fn wait_saves(&mut self) {
+        saver::wait();
+        self.poll_saves();
     }
 
     fn close_tab(&mut self, i: usize) {
@@ -4118,6 +4137,7 @@ impl eframe::App for App {
         if self.settings.autosave && stopped.is_empty() {
             self.autosave();
         }
+        self.wait_saves();
         // a forced quit never loses typing: what is still unsaved goes to local history, else to
         // the unsaved folder (and the log)
         let failed = self.keep_copies(&self.unsaved_tabs());
@@ -4131,6 +4151,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         let mut watch = Watchdog::start();
         watch.stage("background results", || self.poll(&ctx));
+        self.poll_saves();
         watch.stage("disk changes", || self.poll_disk(&ctx));
         watch.stage("analysis", || self.settle(false));
         watch.stage("git blame", || self.poll_git(&ctx));
@@ -4892,7 +4913,10 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let pid = std::process::id();
+    // the save thread and a refactor may write at once: each write has its own temp file
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = format!("{}-{n}", std::process::id());
     let mut tmp = target.with_file_name(format!(".{name}.droid-lite-{pid}.tmp"));
     let mut made = create_temp(&tmp, mode);
     if made

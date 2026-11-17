@@ -316,6 +316,7 @@ fn e2e_editing_completion_with_import_and_save() {
     );
     assert!(tab(&h).dirty());
     key(&mut h, Modifiers::COMMAND, Key::S);
+    h.state_mut().wait_saves();
     assert!(!tab(&h).dirty());
     assert_eq!(std::fs::read_to_string(&card).unwrap(), text);
 }
@@ -1871,6 +1872,7 @@ fn e2e_session_restore_history_autosave_and_settings() {
     key(&mut h, Modifiers::COMMAND, Key::S);
     type_text(&mut h, "// two\n");
     key(&mut h, Modifiers::COMMAND, Key::S);
+    h.state_mut().wait_saves();
     let versions = comfort::history(&card);
     assert_eq!(versions.len(), 2, "the original and the first save");
     assert_eq!(std::fs::read_to_string(&versions[1].file).unwrap(), CARD_KT);
@@ -1905,6 +1907,7 @@ fn e2e_session_restore_history_autosave_and_settings() {
     steps(&mut h, 2);
     h.input_mut().focused = false; // the user switches to another app
     steps(&mut h, 3);
+    h.state_mut().wait_saves();
     assert_eq!(
         std::fs::read_to_string(&card).unwrap(),
         CARD_KT,
@@ -4752,6 +4755,7 @@ fn e2e_autosave_never_overwrites_a_file_changed_on_disk() {
     steps(&mut h, 2);
     h.input_mut().focused = false;
     steps(&mut h, 3);
+    h.state_mut().wait_saves();
     assert!(std::fs::read_to_string(&user).unwrap().contains("mine"));
 }
 
@@ -4832,6 +4836,8 @@ fn e2e_closing_with_edits_auto_save_will_not_write_asks_first() {
     steps(&mut h, 2);
     h.get_by_label("Keep my version (save)").click();
     steps(&mut h, 3);
+    h.state_mut().wait_saves();
+    steps(&mut h, 2); // closes once written
     assert!(std::fs::read_to_string(&user).unwrap().contains("mine"));
     assert!(h.state().close_ok && !h.state().close_asked);
     // a file deleted on disk while it has edits asks too
@@ -5033,6 +5039,7 @@ fn e2e_a_running_check_out_locks_edits_and_commands_and_quit_stops_it() {
     assert_eq!(std::fs::read_to_string(&user).unwrap(), USER_KT);
     h.state_mut().status.clear();
     h.state_mut().save();
+    h.state_mut().wait_saves();
     assert_eq!(h.state().status, wait_note);
     assert_eq!(std::fs::read_to_string(&user).unwrap(), USER_KT);
     h.state_mut().tabs[a].text = before.clone();
@@ -5266,12 +5273,14 @@ fn e2e_save_never_overwrites_another_version_it_could_not_keep() {
     let a = h.state().active;
     h.state_mut().tabs[a].text.push_str("// one\n");
     h.state_mut().save();
+    h.state_mut().wait_saves();
     assert!(std::fs::read_to_string(&user).unwrap().ends_with("// one\n"));
     // another version on disk that cannot be kept: not overwritten
     h.state_mut().tabs[a].text.push_str("// two\n");
     let theirs = "package com.demo.data\n\nclass Theirs\n";
     std::fs::write(&user, theirs).unwrap();
     h.state_mut().save();
+    h.state_mut().wait_saves();
     assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs);
     assert!(
         h.state().status.starts_with(&format!("Could not keep a copy of {}", user.display())),
@@ -5281,6 +5290,7 @@ fn e2e_save_never_overwrites_another_version_it_could_not_keep() {
     assert!(tab(&h).dirty());
     set_mode(&history, 0o755);
     h.state_mut().save();
+    h.state_mut().wait_saves();
     assert!(std::fs::read_to_string(&user).unwrap().ends_with("// two\n"));
     assert_eq!(newest_version(&user).as_deref(), Some(theirs));
 }
@@ -5296,6 +5306,7 @@ fn e2e_save_of_a_clean_tab_never_overwrites_a_change_on_disk() {
     let theirs = "package com.demo.data\n\nclass Theirs\n";
     std::fs::write(&user, theirs).unwrap();
     h.state_mut().save();
+    h.state_mut().wait_saves();
     assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs);
     assert_eq!(h.state().status, "File changed on disk; reload or keep yours");
     assert!(tab(&h).disk_changed);
@@ -5304,6 +5315,7 @@ fn e2e_save_of_a_clean_tab_never_overwrites_a_change_on_disk() {
     h.get_by_label("Keep mine").click();
     steps(&mut h, 2);
     h.state_mut().save();
+    h.state_mut().wait_saves();
     assert_eq!(std::fs::read_to_string(&user).unwrap(), USER_KT);
     assert_eq!(newest_version(&user).as_deref(), Some(theirs));
 }
@@ -5323,6 +5335,7 @@ fn e2e_a_file_that_cannot_be_read_never_blanks_its_tab() {
     h.get_by_label_contains("cannot be read as text now (it is not UTF-8 text)");
     // ⌘S does not write over it unasked
     h.state_mut().save();
+    h.state_mut().wait_saves();
     assert_eq!(std::fs::read(&user).unwrap(), [0xff, 0xfe, b'x']);
     // a version in local history that is not UTF-8 is not restored: it says why
     super::comfort::record_text(&user, &[0xff, 0xfe]).unwrap();
@@ -5363,6 +5376,7 @@ fn e2e_own_late_save_event_is_not_a_change_on_disk() {
     let a = h.state().active;
     h.state_mut().tabs[a].text.push_str("// one\n");
     h.state_mut().save();
+    h.state_mut().wait_saves();
     let saved = tab(&h).text.clone();
     h.state_mut().tabs[a].text.push_str("// two\n");
     // the watcher reports that save after more typing
@@ -5376,6 +5390,7 @@ fn e2e_own_late_save_event_is_not_a_change_on_disk() {
     h.state_mut().tabs[a].disk_changed = true;
     h.state_mut().tabs[a].deleted = true;
     h.state_mut().save();
+    h.state_mut().wait_saves();
     assert!(!tab(&h).disk_changed && !tab(&h).deleted);
 }
 
@@ -5446,6 +5461,7 @@ fn e2e_unsaved_edits_are_backed_up_and_recovered_after_a_crash() {
     let i = h.state().tabs.iter().position(|t| t.path == user).unwrap();
     h.state_mut().active = i;
     h.state_mut().save();
+    h.state_mut().wait_saves();
     h.state_mut().backup.written_at = None;
     steps(&mut h, 2);
     assert!(unsaved_backups(&f).is_empty());
@@ -5530,6 +5546,7 @@ fn e2e_a_panic_time_backup_goes_once_its_tab_is_saved() {
     assert_eq!(super::backup::write_snapshot(true), 1);
     assert_eq!(unsaved_backups(&f).len(), 1);
     h.state_mut().save();
+    h.state_mut().wait_saves();
     steps(&mut h, 2);
     assert!(unsaved_backups(&f).is_empty(), "saved: the backup goes");
 }
@@ -5547,6 +5564,7 @@ fn e2e_autosave_never_writes_over_a_change_on_disk_the_watcher_has_not_reported(
     let theirs = "package com.demo.data\n\nclass Theirs\n";
     std::fs::write(&user, theirs).unwrap();
     h.state_mut().autosave();
+    h.state_mut().wait_saves();
     assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs);
     assert!(tab(&h).disk_changed && tab(&h).dirty(), "the bar asks");
     assert!(h.state().status.starts_with("Auto-save did not write"), "{}", h.state().status);
@@ -5555,11 +5573,13 @@ fn e2e_autosave_never_writes_over_a_change_on_disk_the_watcher_has_not_reported(
     h.get_by_label("Keep mine").click();
     steps(&mut h, 2);
     h.state_mut().autosave();
+    h.state_mut().wait_saves();
     assert!(std::fs::read_to_string(&user).unwrap().ends_with("// mine\n"));
     // deleted meanwhile: auto-save does not bring it back
     std::fs::remove_file(&user).unwrap();
     h.state_mut().tabs[a].text.push_str("// more\n");
     h.state_mut().autosave();
+    h.state_mut().wait_saves();
     assert!(!user.exists());
     assert!(tab(&h).deleted);
 }
@@ -5999,4 +6019,36 @@ fn e2e_diff_frame_cost_on_a_5000_line_file() {
     wait(&mut h, "scrolled from the left column", |a| {
         a.tabs[a.active].diff.scroll.y > before + 100.0
     });
+}
+
+#[test]
+fn e2e_save_never_waits_for_the_disk_and_two_quick_saves_land_in_order() {
+    let f = Fixture::new("saveworker");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    h.state_mut().settings.autosave = false;
+    // a slow disk: the save thread is busy until `go` is sent
+    let (go, gate) = channel::<()>();
+    super::saver::run(move || {
+        let _ = gate.recv_timeout(Duration::from_secs(20));
+    });
+    let a = h.state().active;
+    h.state_mut().tabs[a].text.push_str("// one\n");
+    let started = std::time::Instant::now();
+    h.state_mut().save();
+    h.state_mut().tabs[a].text.push_str("// two\n");
+    // auto-save never writes over a change on disk: the first save is not one
+    h.state_mut().autosave();
+    steps(&mut h, 2);
+    assert!(started.elapsed() < Duration::from_secs(2), "the window waited for the disk");
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), USER_KT, "not written yet");
+    assert!(tab(&h).dirty());
+    go.send(()).unwrap();
+    h.state_mut().wait_saves();
+    // the second save found the first one's text on disk: its own, not a change on disk
+    assert!(std::fs::read_to_string(&user).unwrap().ends_with("// one\n// two\n"));
+    assert!(!tab(&h).dirty() && !tab(&h).disk_changed, "{}", h.state().status);
+    assert_eq!(h.state().status, format!("Saved {}", user.display()));
+    assert_eq!(h.state().saves_pending, 0);
 }
