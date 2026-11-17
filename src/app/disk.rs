@@ -160,6 +160,7 @@ impl App {
                 if ui.button("Reload from disk").clicked()
                     && let Ok(text) = std::fs::read_to_string(&t.path)
                 {
+                    super::comfort::record_text(&t.path, t.text.as_bytes()); // the edits it drops
                     t.text = text.clone();
                     t.saved = text;
                     t.cursor = t.cursor.min(t.text.len());

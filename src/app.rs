@@ -448,6 +448,8 @@ pub struct App {
     close_asked: bool,
     /// That choice was made: the next close request goes through.
     close_ok: bool,
+    /// A project switch that waits for the unsaved-edits choice ([`App::guard_switch`]).
+    switch_to: Option<PathBuf>,
     show_settings: bool,
     /// Hash of the last saved session, and when it was written.
     session_saved: (u64, Instant),
@@ -561,6 +563,7 @@ impl App {
             window_focused: true,
             close_asked: false,
             close_ok: false,
+            switch_to: None,
             show_settings: false,
             session_saved: (0, Instant::now()),
             history_for: None,
@@ -610,9 +613,25 @@ impl App {
         app
     }
 
-    /// Opens a project without blocking the window: listing files, indexing and reading the git
-    /// branch run on a worker thread; `poll` installs the result.
+    /// Opens a project, unless that would drop edits: auto-save first writes what it writes on
+    /// quit, then tabs still unsaved wait for a choice ([`App::guard_switch`]).
     fn open_project(&mut self, dir: &Path, ctx: &egui::Context) {
+        if self.settings.autosave {
+            self.autosave();
+        }
+        if self.unsaved_tabs().is_empty() {
+            self.switch_project(dir, ctx);
+        } else {
+            self.switch_to = Some(dir.to_path_buf());
+        }
+    }
+
+    /// Opens a project without blocking the window: listing files, indexing and reading the git
+    /// branch run on a worker thread; `poll` installs the result. Unsaved edits of the old
+    /// project's tabs go to local history first.
+    fn switch_project(&mut self, dir: &Path, ctx: &egui::Context) {
+        self.switch_to = None;
+        self.keep_copies(&self.unsaved_tabs());
         for t in std::mem::take(&mut self.tabs) {
             self.forget_tab(&t);
         }
@@ -846,6 +865,10 @@ impl App {
                 return;
             }
             let t = self.tabs.remove(i);
+            if t.dirty() {
+                // its edits stay in local history
+                comfort::record_text(&t.path, t.text.as_bytes());
+            }
             self.forget_tab(&t);
             self.active = self.active.min(self.tabs.len().saturating_sub(1));
         }
@@ -870,8 +893,12 @@ impl App {
         }
     }
 
+    /// Drops the active tab's edits; they stay in local history.
     fn revert(&mut self) {
         if let Some(t) = self.tabs.get_mut(self.active) {
+            if t.dirty() {
+                comfort::record_text(&t.path, t.text.as_bytes());
+            }
             t.text = t.saved.clone();
             t.reanalyse();
         }
@@ -3944,10 +3971,7 @@ impl eframe::App for App {
             self.autosave();
         }
         // a forced quit never loses typing: what is still unsaved goes to local history
-        let unsaved: Vec<usize> = (0..self.tabs.len())
-            .filter(|&i| self.tabs[i].dirty() && !self.tabs[i].readonly)
-            .collect();
-        self.keep_copies(&unsaved);
+        self.keep_copies(&self.unsaved_tabs());
         // every plugin list, view, run and watch (and tools they left running) is killed now
         // (their Drop), not left to threads that end with the app
         self.tests = Default::default();
@@ -3970,6 +3994,7 @@ impl eframe::App for App {
         self.refresh_changes(&ctx); // git status for tree colours, not only the Current changes tab
         self.watch_focus(&ctx);
         self.guard_close(&ctx);
+        self.guard_switch(&ctx);
         self.save_session(false);
         watch.stage("shortcuts", || self.shortcuts(&ctx));
         self.usages_popup_keys(&ctx);

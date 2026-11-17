@@ -304,6 +304,10 @@ impl App {
         }
         self.index.update(path, text);
         if let Some(t) = self.tabs.iter_mut().find(|t| t.path == path) {
+            if t.dirty() {
+                // typing since a refactor that is undone stays in local history
+                super::comfort::record_text(path, t.text.as_bytes());
+            }
             t.text = text.to_string();
             t.saved = text.to_string();
             t.cursor = t.cursor.min(text.len());

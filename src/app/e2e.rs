@@ -503,6 +503,10 @@ fn e2e_refactor_rename_preview_apply_file_rename_and_undo() {
         "a longer name that starts the same is not touched"
     );
     assert_eq!(tab(&h).path, person, "the open tab follows the file");
+    // typing since then, which the undo replaces, stays in local history
+    let a = h.state().active;
+    h.state_mut().tabs[a].text.push_str("// later\n");
+    let typed = tab(&h).text.clone();
     // Refactor menu → Undo
     h.get_by_label("Refactor").click();
     steps(&mut h, 2);
@@ -510,6 +514,7 @@ fn e2e_refactor_rename_preview_apply_file_rename_and_undo() {
     steps(&mut h, 3);
     assert!(user.exists() && !person.exists());
     assert_eq!(std::fs::read_to_string(&user).unwrap(), USER_KT);
+    assert_eq!(newest_version(&user), Some(typed));
 }
 
 #[test]
@@ -565,9 +570,11 @@ fn e2e_reload_when_file_changes_on_disk() {
     type_text(&mut h, "x");
     std::fs::write(&user, "package com.demo.data\n\nclass Again\n").unwrap();
     wait(&mut h, "conflict bar", |a| a.tabs[a.active].disk_changed);
+    let typed = tab(&h).text.clone();
     h.get_by_label("Reload from disk").click();
     steps(&mut h, 3);
     assert!(tab(&h).text.contains("class Again") && !tab(&h).dirty());
+    assert_eq!(newest_version(&user), Some(typed), "the dropped edits are in local history");
     // a new file shows up in the tree and the index
     std::fs::write(
         f.path("app/src/main/java/com/demo/data/Extra.kt"),
@@ -1874,9 +1881,22 @@ fn e2e_session_restore_history_autosave_and_settings() {
         .unwrap()
         .rect()
         .center();
+    // typing not saved yet, which the restore replaces, is kept as a new version first (after
+    // the watcher saw the save: a late event would mark the edited tab as changed on disk)
+    std::thread::sleep(Duration::from_millis(300));
+    steps(&mut h, 3);
+    let a = h.state().active;
+    h.state_mut().tabs[a].text.push_str("// three\n");
+    let typed = tab(&h).text.clone();
     click_at(&mut h, restore, egui::PointerButton::Primary);
     assert_eq!(tab(&h).text, CARD_KT);
     assert!(tab(&h).dirty(), "restored text waits for ⌘S");
+    assert_eq!(newest_version(&card), Some(typed));
+    // Revert (the bar's button) drops the restored text; it is kept too
+    h.state_mut().revert();
+    assert!(!tab(&h).dirty());
+    assert_eq!(newest_version(&card), Some(CARD_KT.to_string()));
+    h.state_mut().tabs[a].text = CARD_KT.into();
     // auto-save when the window loses focus
     h.input_mut().focused = true;
     steps(&mut h, 2);
@@ -4255,6 +4275,7 @@ fn e2e_tab_of_a_deleted_file_closes() {
     wait(&mut h, "both tabs marked deleted", |a| {
         a.tabs.iter().filter(|t| t.deleted).count() == 2
     });
+    let typed = tab(&h).text.clone();
     // the × of a deleted file's tab closes it, edited or not
     for _ in 0..2 {
         let xs: Vec<_> = h.query_all_by_label(ic::X).collect();
@@ -4262,6 +4283,9 @@ fn e2e_tab_of_a_deleted_file_closes() {
         steps(&mut h, 3);
     }
     assert!(h.state().tabs.is_empty(), "{:?}", h.state().status);
+    // the edits stay in local history
+    assert_eq!(newest_version(&card), Some(typed));
+    assert_eq!(newest_version(&user), None, "a tab without edits keeps nothing");
 }
 
 #[test]
@@ -4829,6 +4853,117 @@ fn e2e_closing_with_edits_auto_save_will_not_write_asks_first() {
     let a = h.state().active;
     h.state_mut().tabs[a].text.push_str("// y\n");
     assert!(ask_to_close(&mut h), "with auto-save off, any edit asks");
+}
+
+/// The newest local history version of `path`.
+fn newest_version(path: &Path) -> Option<String> {
+    super::comfort::history(path)
+        .first()
+        .map(|v| std::fs::read_to_string(&v.file).unwrap())
+}
+
+/// A folder dropped on the window.
+#[derive(Debug)]
+struct DroppedFolder(PathBuf);
+
+impl egui::DroppedFile for DroppedFolder {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        Err("a folder".into())
+    }
+}
+
+#[test]
+fn e2e_switching_project_with_unsaved_edits_asks_first() {
+    let f = Fixture::new("switchask");
+    // project B: another folder
+    let b = std::env::temp_dir().join(format!("droid-lite-e2e-switch-b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&b);
+    std::fs::create_dir_all(b.join("app/src/main/java/b")).unwrap();
+    std::fs::write(b.join("settings.gradle.kts"), "include(\":app\")\n").unwrap();
+    std::fs::write(b.join("app/src/main/java/b/B.kt"), "package b\nclass B\n").unwrap();
+    let b = b.canonicalize().unwrap();
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    let switch = |h: &mut Harness<'static, App>, root: &Path| {
+        let ctx = h.ctx.clone();
+        h.state_mut().open_project(root, &ctx);
+        steps(h, 2);
+    };
+    let opened = |h: &mut Harness<'static, App>, root: &Path| {
+        wait(h, "project open", |a| {
+            a.indexing.is_none() && a.project.as_ref().is_some_and(|p| p.root == root)
+        });
+    };
+    let edit = |h: &mut Harness<'static, App>, s: &str| {
+        open(h, &user);
+        let a = h.state().active;
+        h.state_mut().tabs[a].text.push_str(s);
+    };
+    // edits auto-save writes: written, then the switch goes through at once
+    edit(&mut h, "// one\n");
+    switch(&mut h, &b);
+    opened(&mut h, &b);
+    assert!(std::fs::read_to_string(&user).unwrap().ends_with("// one\n"));
+    switch(&mut h, &f.root);
+    opened(&mut h, &f.root);
+    // the file changed on disk meanwhile: a folder dropped on the window waits for a choice
+    edit(&mut h, "// two\n");
+    std::thread::sleep(Duration::from_millis(300));
+    let theirs = "package com.demo.data\n\nclass Theirs\n";
+    std::fs::write(&user, theirs).unwrap();
+    wait(&mut h, "conflict bar", |a| a.tabs[a.active].disk_changed);
+    let typed = tab(&h).text.clone();
+    let drop_b = |h: &mut Harness<'static, App>| {
+        let folder = std::sync::Arc::new(DroppedFolder(b.clone()));
+        h.input_mut().dropped_files.push(folder);
+        steps(h, 3);
+    };
+    drop_b(&mut h);
+    let list =
+        "These files have edits that are not saved:\napp/src/main/java/com/demo/data/User.kt";
+    assert!(h.query_by_label(list).is_some(), "the files are listed");
+    assert_eq!(h.state().project.as_ref().unwrap().root, f.root);
+    // Cancel: the project, the tab and its edits stay; the file on disk is not touched
+    h.get_by_label("Cancel").click();
+    steps(&mut h, 3);
+    assert!(h.query_by_label(list).is_none());
+    assert!(h.state().switch_to.is_none());
+    assert_eq!(h.state().project.as_ref().unwrap().root, f.root);
+    assert_eq!(tab(&h).text, typed);
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs);
+    // Keep a copy and switch: the edits go to local history, the file on disk stays
+    drop_b(&mut h);
+    h.get_by_label("Keep a copy and switch").click();
+    opened(&mut h, &b);
+    assert_eq!(newest_version(&user), Some(typed));
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs);
+    // auto-save off: Save writes the edits, then the switch goes on
+    switch(&mut h, &f.root);
+    opened(&mut h, &f.root);
+    h.state_mut().settings.autosave = false;
+    edit(&mut h, "// three\n");
+    switch(&mut h, &b);
+    assert!(h.query_by_label(list).is_some(), "with auto-save off, any edit asks");
+    h.get_by_label("Save").click();
+    opened(&mut h, &b);
+    assert_eq!(
+        std::fs::read_to_string(&user).unwrap(),
+        format!("{theirs}// three\n")
+    );
+    // a switch that does not ask (as the dialog's own) still keeps unsaved edits in local history
+    switch(&mut h, &f.root);
+    opened(&mut h, &f.root);
+    edit(&mut h, "// four\n");
+    let typed = tab(&h).text.clone();
+    let ctx = h.ctx.clone();
+    h.state_mut().switch_project(&b, &ctx);
+    opened(&mut h, &b);
+    assert_eq!(newest_version(&user), Some(typed));
+    let _ = std::fs::remove_dir_all(&b);
 }
 
 #[test]

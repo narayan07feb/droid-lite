@@ -295,12 +295,72 @@ impl App {
             .collect()
     }
 
+    /// Tabs with edits that are not saved.
+    pub(super) fn unsaved_tabs(&self) -> Vec<usize> {
+        (0..self.tabs.len())
+            .filter(|&i| self.tabs[i].dirty() && !self.tabs[i].readonly)
+            .collect()
+    }
+
     /// Puts the text of tabs `tabs` in local history, so nothing typed is lost.
     pub(super) fn keep_copies(&self, tabs: &[usize]) {
         for &i in tabs {
             let t = &self.tabs[i];
             record_text(&t.path, t.text.as_bytes());
         }
+    }
+
+    fn save_tabs(&mut self, tabs: &[usize]) {
+        let active = self.active;
+        for &i in tabs {
+            self.active = i;
+            self.save();
+        }
+        self.active = active;
+    }
+
+    /// The "Unsaved edits" window listing tabs `tabs`, with `buttons` (keep mine, keep a copy,
+    /// cancel); the one clicked.
+    fn unsaved_dialog(
+        &self,
+        ctx: &egui::Context,
+        tabs: &[usize],
+        buttons: [&str; 3],
+    ) -> Option<usize> {
+        let root = self
+            .project
+            .as_ref()
+            .map(|p| p.root.clone())
+            .unwrap_or_default();
+        let list = crate::git::file_list(
+            "These files have edits that are not saved:",
+            &root,
+            tabs.iter().map(|&i| self.tabs[i].path.as_path()),
+        );
+        let mut pick = None;
+        egui::Window::new("Unsaved edits")
+            .id(egui::Id::unique(buttons[1]))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(list);
+                ui.label(
+                    RichText::new(
+                        "Their files changed or were deleted on disk (or auto-save is off).",
+                    )
+                    .color(theme::t().weak)
+                    .small(),
+                );
+                ui.horizontal(|ui| {
+                    for (i, b) in buttons.into_iter().enumerate() {
+                        if ui.button(b).clicked() {
+                            pick = Some(i);
+                        }
+                    }
+                });
+            });
+        pick
     }
 
     /// The window is asked to close while tabs have edits auto-save will not write: the close
@@ -322,49 +382,10 @@ impl App {
             self.close_asked = false;
             return;
         }
-        let root = self
-            .project
-            .as_ref()
-            .map(|p| p.root.clone())
-            .unwrap_or_default();
-        let list = crate::git::file_list(
-            "These files have edits that are not saved:",
-            &root,
-            tabs.iter().map(|&i| self.tabs[i].path.as_path()),
-        );
-        let mut pick = None;
-        egui::Window::new("Unsaved edits")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(list);
-                ui.label(
-                    RichText::new(
-                        "Their files changed or were deleted on disk (or auto-save is off).",
-                    )
-                    .color(theme::t().weak)
-                    .small(),
-                );
-                ui.horizontal(|ui| {
-                    for (i, b) in ["Keep my version (save)", "Keep a copy and close", "Cancel"]
-                        .into_iter()
-                        .enumerate()
-                    {
-                        if ui.button(b).clicked() {
-                            pick = Some(i);
-                        }
-                    }
-                });
-            });
-        match pick {
+        let buttons = ["Keep my version (save)", "Keep a copy and close", "Cancel"];
+        match self.unsaved_dialog(ctx, &tabs, buttons) {
             Some(0) => {
-                let active = self.active;
-                for &i in &tabs {
-                    self.active = i;
-                    self.save();
-                }
-                self.active = active;
+                self.save_tabs(&tabs);
                 // a save that failed (its folder is gone) keeps the window open, with the reason
                 if self.unwritten_edits().is_empty() {
                     self.close_now(ctx);
@@ -375,6 +396,33 @@ impl App {
                 self.close_now(ctx);
             }
             Some(_) => self.close_asked = false,
+            None => {}
+        }
+    }
+
+    /// A project switch ([`App::open_project`]) waits while tabs have unsaved edits: "Save",
+    /// "Keep a copy and switch" (in local history) or "Cancel" (the current project stays). Once
+    /// nothing is unsaved (saved or reverted meanwhile) it goes on.
+    pub(super) fn guard_switch(&mut self, ctx: &egui::Context) {
+        let Some(dir) = self.switch_to.clone() else {
+            return;
+        };
+        let tabs = self.unsaved_tabs();
+        let pick = if tabs.is_empty() {
+            Some(1)
+        } else {
+            self.unsaved_dialog(ctx, &tabs, ["Save", "Keep a copy and switch", "Cancel"])
+        };
+        match pick {
+            Some(0) => {
+                self.save_tabs(&tabs);
+                // a save that failed keeps the project open, with the reason
+                if self.unsaved_tabs().is_empty() {
+                    self.switch_project(&dir, ctx);
+                }
+            }
+            Some(1) => self.switch_project(&dir, ctx), // it keeps the copies
+            Some(_) => self.switch_to = None,
             None => {}
         }
     }
@@ -476,6 +524,9 @@ impl App {
                 if let Ok(old) = std::fs::read_to_string(&file) {
                     self.open_file(&path, None);
                     if let Some(t) = self.tabs.iter_mut().find(|t| t.path == path) {
+                        if t.dirty() {
+                            record_text(&t.path, t.text.as_bytes()); // the edits it replaces
+                        }
                         t.text = old;
                         t.cursor = t.cursor.min(t.text.len());
                         t.caret = Some(t.cursor);
