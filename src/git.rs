@@ -1220,6 +1220,93 @@ pub fn merge_base(root: &Path, base: &str) -> Option<String> {
     (out.status.success() && !sha.is_empty()).then_some(sha)
 }
 
+/// A file of the work tree and one commit of its repository: the repository's top folder, the
+/// file's path in it and the commit's full sha.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RevFile {
+    pub top: PathBuf,
+    pub rel: String,
+    pub sha: String,
+}
+
+/// git's stdout (trimmed), or its error text.
+fn out_or_err(c: &mut Command) -> Result<String, String> {
+    let out = c
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| e.to_string())?;
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    match out.status.success() {
+        true => Ok(String::from_utf8_lossy(&out.stdout).trim().to_string()),
+        false if err.is_empty() => Err(format!("git failed ({})", out.status)),
+        false => Err(err),
+    }
+}
+
+/// `path` at commit `rev`: its repository and the commit, or why there is none ("not a git
+/// repository", "no commit yet", git's error).
+pub fn rev_file(path: &Path, rev: &str) -> Result<RevFile, String> {
+    let (dir, name) = path
+        .parent()
+        .zip(path.file_name())
+        .ok_or("not a file path")?;
+    let top = out_or_err(git(dir).args(["rev-parse", "--show-toplevel"]))
+        .map_err(|_| "not a git repository".to_string())?;
+    let prefix = out_or_err(git(dir).args(["rev-parse", "--show-prefix"]))?;
+    let commit = format!("{rev}^{{commit}}");
+    let sha = out_or_err(git(dir).args(["rev-parse", "--verify", "--quiet", &commit])).map_err(
+        |_| match rev {
+            "HEAD" => "no commit yet".to_string(),
+            _ => format!("{rev} is not a commit here"),
+        },
+    )?;
+    Ok(RevFile {
+        top: PathBuf::from(top),
+        rel: format!("{prefix}{}", name.to_string_lossy()),
+        sha,
+    })
+}
+
+/// The text of `rel` at commit `sha` of repository `top`: `Ok(None)` when that commit does not
+/// have it; an error over `max` bytes (the blob is then not read) or when git fails.
+pub fn blob_at(top: &Path, sha: &str, rel: &str, max: usize) -> Result<Option<String>, String> {
+    let ls = out_or_err(git(top).args(["ls-tree", "-l", sha, "--", rel]))?;
+    // <mode> <type> <sha> <size>\t<path>
+    let mut f = ls.split_whitespace();
+    let (kind, size) = (f.nth(1), f.nth(1).and_then(|s| s.parse::<usize>().ok()));
+    if kind != Some("blob") {
+        return Ok(None);
+    }
+    if size.is_some_and(|s| s > max) {
+        return Err(format!("the file is over {} KB", max / 1024));
+    }
+    let out = git(top)
+        .args(["cat-file", "blob", &format!("{sha}:{rel}")])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!("git cat-file failed ({})", out.status));
+    }
+    Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
+}
+
+/// The path `rel` had at commit `sha` when git sees it as renamed since (staged or committed).
+pub fn renamed_from(top: &Path, sha: &str, rel: &str) -> Option<String> {
+    let out = git(top)
+        .args(["diff", "-M", "--name-status", "-z", "--no-color", sha, "--"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut f = text.split('\0');
+    while let Some(status) = f.next().filter(|s| !s.is_empty()) {
+        let old = f.next()?;
+        if status.starts_with('R') && f.next()? == rel {
+            return Some(old.to_string());
+        }
+    }
+    None
+}
+
 /// Runs a git command that changes the repository (stage, unstage, commit, checkout).
 /// Returns git's error text when it fails.
 pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {

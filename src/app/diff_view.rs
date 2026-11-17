@@ -11,14 +11,19 @@ use crate::git;
 use crate::highlight::{self, ERROR};
 use egui::{Color32, FontId, Galley, Pos2, Rect, RichText, Shape, Ui};
 use std::ops::Range;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Wait this long after the last keystroke before comparing again.
 const DEBOUNCE: Duration = Duration::from_millis(150);
 /// Files longer than this (either version) show a note instead of the diff.
 pub(super) const MAX_LINES: usize = 20_000;
+/// Files bigger than this (either version, in bytes) show a note instead of the diff.
+pub(super) const MAX_BYTES: usize = 2 * 1024 * 1024;
+/// How many older versions stay cached (by file and commit).
+const OLD_CACHE: usize = 16;
 /// Word highlights are matched exactly only while (old words × new words) stays under this.
 const MAX_WORD_PAIRS: usize = 10_000;
 
@@ -105,22 +110,36 @@ pub(super) struct Aligned {
     pub added: usize,
     pub removed: usize,
     pub changed: usize,
+    /// The older version's path when the file was renamed since (git's rename detection).
+    pub renamed: Option<String>,
 }
 
 impl Aligned {
     pub fn summary(&self) -> String {
+        let from = self
+            .renamed
+            .as_ref()
+            .map_or(String::new(), |o| format!("Renamed from {o} · "));
         if self.added + self.removed + self.changed == 0 {
-            return "No changes".into();
+            return format!("{from}No changes");
         }
         format!(
-            "{} added · {} removed · {} changed",
+            "{from}{} added · {} removed · {} changed",
             self.added, self.removed, self.changed
         )
     }
 }
 
-/// Pairs `old` and `new` through `git diff`, or says why not (a file too long).
+/// Pairs `old` and `new` through `git diff`, or says why not (a file too long or too big).
 pub(super) fn compute(old: &str, new: &str) -> Result<Aligned, String> {
+    let bytes = old.len().max(new.len());
+    if bytes > MAX_BYTES {
+        return Err(format!(
+            "Diff is off for files over {} KB ({} KB)",
+            MAX_BYTES / 1024,
+            bytes / 1024
+        ));
+    }
     let lines = old.lines().count().max(new.lines().count());
     if lines > MAX_LINES {
         return Err(format!(
@@ -454,7 +473,8 @@ impl App {
     }
 
     /// Compares the active tab again when its text, side, base or HEAD changed (after a typing
-    /// pause), off the UI thread; takes a finished compare.
+    /// pause), off the UI thread; takes a finished compare. A view of another base or HEAD is
+    /// dropped at once: it never shows as the older version of the new one.
     pub(super) fn poll_diff(&mut self, ctx: &egui::Context) {
         let base = self.git.changes.as_ref().and_then(|c| c.base.clone());
         let root = self.project.as_ref().map(|p| p.root.clone());
@@ -463,6 +483,12 @@ impl App {
             return;
         };
         let d = &mut t.diff;
+        let base = (d.against == Against::Base).then_some(base).flatten();
+        let key: Key = (t.rev, d.against, base.clone(), head);
+        let same_base = |k: &Key| (k.1, &k.2, &k.3) == (key.1, &key.2, &key.3);
+        if d.for_key.as_ref().is_some_and(|k| !same_base(k)) {
+            (d.view, d.note, d.rx, d.for_key) = (None, None, None, None);
+        }
         if let Some(rx) = &d.rx
             && let Ok(r) = rx.try_recv()
         {
@@ -481,8 +507,6 @@ impl App {
                 Instant::now()
             });
         }
-        let base = (d.against == Against::Base).then_some(base).flatten();
-        let key: Key = (t.rev, d.against, base.clone(), head);
         if d.for_key.as_ref() == Some(&key) || d.rx.is_some() {
             return;
         }
@@ -492,7 +516,7 @@ impl App {
             return;
         }
         if d.against == Against::Base && base.is_none() {
-            d.note = Some("No PR base found: pick one in the Current changes tab".into());
+            d.note = Some("No base: no PR base found (pick one in the Current changes tab)".into());
             d.view = None;
             d.for_key = Some(key);
             return;
@@ -500,22 +524,81 @@ impl App {
         let (tx, rx) = channel();
         let (path, text, against, c) = (t.path.clone(), t.text.clone(), d.against, ctx.clone());
         std::thread::spawn(move || {
-            let old = match against {
-                Against::Head => Ok(git::head_text(&path)),
+            let rev = match against {
+                Against::Head => Ok("HEAD".to_string()),
                 Against::Base => base
                     .zip(root)
                     .and_then(|(b, r)| git::merge_base(&r, &b))
-                    .map(|fork| git::file_at(&path, &fork))
-                    .ok_or_else(|| "The PR base is not in this repository".to_string()),
+                    .ok_or_else(|| "No base: the PR base is not in this repository".to_string()),
             };
-            // a file the older version does not have: every line is added
-            let r = old.and_then(|o| compute(o.as_deref().unwrap_or(""), &text));
-            let _ = tx.send(r);
+            let _ = tx.send(rev.and_then(|rev| compare(&path, &rev, against, &text)));
             c.request_repaint();
         });
         d.rx = Some(rx);
         d.for_key = Some(key);
     }
+}
+
+/// An older version's file and commit sha.
+type OldKey = (PathBuf, String);
+
+/// Cached older versions by (file, commit sha): a commit's file never changes.
+static OLD: Mutex<Vec<(OldKey, Arc<String>)>> = Mutex::new(Vec::new());
+
+/// `rel` at commit `f.sha`, from the cache or git (then cached); `None` when it is not there.
+fn old_at(f: &git::RevFile, rel: &str) -> Result<Option<Arc<String>>, String> {
+    let key = (f.top.join(rel), f.sha.clone());
+    let cache = || OLD.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, t)) = cache().iter().find(|(k, _)| *k == key) {
+        return Ok(Some(t.clone()));
+    }
+    let Some(text) = git::blob_at(&f.top, &f.sha, rel, MAX_BYTES)? else {
+        return Ok(None);
+    };
+    let text = Arc::new(text);
+    let mut c = cache();
+    if c.len() >= OLD_CACHE {
+        c.remove(0);
+    }
+    c.push((key, text.clone()));
+    Ok(Some(text))
+}
+
+/// The older version of `path` at commit `rev` (followed through a rename), with its path then
+/// when it was renamed; else the note that says why there is none: "New file: …" or
+/// "No base: <reason>". An empty older side is never made up.
+pub(super) fn old_side(
+    path: &Path,
+    rev: &str,
+    against: Against,
+) -> Result<(Arc<String>, Option<String>), String> {
+    let no_base = |e: String| format!("No base: {e}");
+    let f = git::rev_file(path, rev).map_err(no_base)?;
+    if let Some(t) = old_at(&f, &f.rel).map_err(no_base)? {
+        return Ok((t, None));
+    }
+    if let Some(from) = git::renamed_from(&f.top, &f.sha, &f.rel)
+        && let Some(t) = old_at(&f, &from).map_err(no_base)?
+    {
+        return Ok((t, Some(from)));
+    }
+    Err(format!(
+        "New file: it is not in the {}",
+        against.label().to_lowercase()
+    ))
+}
+
+/// The editor text `text` of `path` beside its older version at commit `rev`.
+pub(super) fn compare(
+    path: &Path,
+    rev: &str,
+    against: Against,
+    text: &str,
+) -> Result<Aligned, String> {
+    let (old, renamed) = old_side(path, rev, against)?;
+    let mut a = compute(&old, text)?;
+    a.renamed = renamed;
+    Ok(a)
 }
 
 /// The editor's scroll area, moved by `wheel` from `prev` (a wheel over the left column).
@@ -838,6 +921,95 @@ mod tests {
         let e = compute(&long, "").unwrap_err();
         assert!(e.contains(&format!("{} lines", MAX_LINES + 1)), "{e}");
         assert!(compute("", &"x\n".repeat(MAX_LINES)).is_ok());
+    }
+
+    /// A git repository in a new temp folder; `g` runs git in it.
+    fn repo(name: &str) -> (PathBuf, impl Fn(&[&str])) {
+        let dir = std::env::temp_dir().join(format!("dl-diffview-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.clone();
+        let g = move |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&d)
+                .args(["-c", "user.name=T", "-c", "user.email=t@example.com"])
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "{args:?}");
+        };
+        g(&["init", "-q"]);
+        (dir, g)
+    }
+
+    #[test]
+    fn no_base_and_new_files_say_so_instead_of_an_empty_older_side() {
+        let plain = std::env::temp_dir().join(format!("dl-diffview-plain-{}", std::process::id()));
+        std::fs::create_dir_all(&plain).unwrap();
+        let e = compare(&plain.join("A.kt"), "HEAD", Against::Head, "a\n").unwrap_err();
+        assert_eq!(e, "No base: not a git repository");
+        let (dir, g) = repo("nocommit");
+        std::fs::write(dir.join("A.kt"), "a\n").unwrap();
+        let e = compare(&dir.join("A.kt"), "HEAD", Against::Head, "a\n").unwrap_err();
+        assert_eq!(e, "No base: no commit yet");
+        g(&["add", "A.kt"]);
+        g(&["commit", "-q", "-m", "a"]);
+        std::fs::write(dir.join("B.kt"), "b\n").unwrap();
+        let e = compare(&dir.join("B.kt"), "HEAD", Against::Head, "b\n").unwrap_err();
+        assert_eq!(e, "New file: it is not in the last commit");
+        let e = compare(&dir.join("A.kt"), "nope", Against::Base, "a\n").unwrap_err();
+        assert_eq!(e, "No base: nope is not a commit here");
+        let a = compare(&dir.join("A.kt"), "HEAD", Against::Head, "a\nx\n").unwrap();
+        assert_eq!((a.added, a.renamed), (1, None));
+        for d in [plain, dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn a_renamed_file_compares_with_its_old_path_and_the_old_side_is_cached() {
+        let (dir, g) = repo("rename");
+        std::fs::create_dir_all(dir.join("ui")).unwrap();
+        let body = "class A {\n    fun a() = 1\n    fun b() = 2\n    fun c() = 3\n}\n";
+        std::fs::write(dir.join("ui/Old.kt"), body).unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "a"]);
+        g(&["mv", "ui/Old.kt", "ui/New.kt"]);
+        let new = dir.join("ui/New.kt");
+        let edited = body.replace("= 2", "= 22");
+        let a = compare(&new, "HEAD", Against::Head, &edited).unwrap();
+        assert_eq!(a.renamed.as_deref(), Some("ui/Old.kt"));
+        assert_eq!((a.added, a.removed, a.changed), (0, 0, 1));
+        assert!(
+            a.summary().starts_with("Renamed from ui/Old.kt · "),
+            "{}",
+            a.summary()
+        );
+        // the same file at the same commit comes from the cache
+        let (one, _) = old_side(&new, "HEAD", Against::Head).unwrap();
+        let (two, _) = old_side(&new, "HEAD", Against::Head).unwrap();
+        assert!(Arc::ptr_eq(&one, &two), "read from git once");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_very_big_file_is_not_compared() {
+        let big = "x".repeat(MAX_BYTES + 1);
+        let e = compute("", &big).unwrap_err();
+        assert!(e.contains("over 2048 KB"), "{e}");
+        assert!(compute(&big, "").is_err());
+        assert!(compute("", &"x".repeat(MAX_BYTES)).is_ok());
+        // nor read from git
+        let (dir, g) = repo("big");
+        std::fs::write(dir.join("Big.kt"), &big).unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "a"]);
+        let e = compare(&dir.join("Big.kt"), "HEAD", Against::Head, "").unwrap_err();
+        assert!(e.contains("over 2048 KB"), "{e}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
