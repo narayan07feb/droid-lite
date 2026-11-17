@@ -2219,6 +2219,56 @@ import co.branch.designsystem.neem.component.toast.ToastVariant\n";
         let _ = std::fs::remove_dir_all(d);
     }
 
+    /// The worker's limits (plain JDK code between its "limits" markers), run with `java` on
+    /// their own: a provider that blocks is given up after its time, and a file never draws more
+    /// than MAX_CARDS cards.
+    #[test]
+    fn the_worker_gives_up_a_slow_provider_and_caps_the_cards() {
+        let java = java();
+        if !java.exists() {
+            eprintln!("no java at {}: skipped", java.display());
+            return;
+        }
+        let (a, b) = (WORKER_SOURCE.find("// limits: begin").unwrap(), WORKER_SOURCE.find("// limits: end").unwrap());
+        let main = r#"
+    public static void main(String[] args) throws Exception {
+        List<Picture> many = new ArrayList<>();
+        for (int i = 0; i < 100; i++) many.add(new Picture(Map.of(), "P (" + i + ")", null, null));
+        List<Picture> cut = capped(many, MAX_CARDS);
+        System.out.println("cards " + cut.size() + " " + cut.get(cut.size() - 1).error());
+        System.out.println("few " + capped(many.subList(0, 5), MAX_CARDS).size());
+        System.out.println("fast " + within(() -> 7, 1000, "P"));
+        long t = System.nanoTime();
+        try {
+            within(() -> { Thread.sleep(60_000); return 1; }, 300, "The PreviewParameterProvider p.Slow");
+            System.out.println("slow finished");
+        } catch (Exception e) {
+            System.out.println("slow " + e.getMessage() + " after " + (System.nanoTime() - t) / 1_000_000_000 + " s");
+        }
+        try {
+            within(() -> { throw new IllegalStateException("no data"); }, 1000, "P");
+        } catch (IllegalStateException e) {
+            System.out.println("threw " + e.getMessage());
+        }
+    }
+"#;
+        let src = format!("import java.util.*;\nimport java.util.concurrent.TimeUnit;\n\npublic class Limits {{\n{}\n{main}}}\n", &WORKER_SOURCE[a..b]);
+        let d = std::env::temp_dir().join(format!("dl-worker-limits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("Limits.java"), src).unwrap();
+        let out = Command::new(&java).arg(d.join("Limits.java")).output().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{text}\n{}", String::from_utf8_lossy(&out.stderr));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "cards 60 More previews are not drawn: at most 60 per file.");
+        assert_eq!(lines[1], "few 5");
+        assert_eq!(lines[2], "fast 7");
+        assert_eq!(lines[3], "slow The PreviewParameterProvider p.Slow did not finish within 0 s after 0 s");
+        assert_eq!(lines[4], "threw no data");
+    }
+
     #[test]
     fn a_javac_that_hangs_is_stopped_at_its_limit() {
         let _lock = crate::app::test_lock();

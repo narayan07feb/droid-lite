@@ -603,19 +603,53 @@ public class PreviewWorker {
         }
     }
 
+    // limits: begin (plain JDK code: a Rust test compiles this part on its own)
     /** One card: a spec, drawn with these argument values (null: the function takes none), or an error. */
     record Picture(Map<String, Object> spec, String title, Object[] values, String error) {}
 
     /** At most this many values of one @PreviewParameter provider are drawn (each is a whole picture). */
     static final int MAX_PARAMETER_VALUES = 20;
+    /** At most this many cards per request: several providers in one file never draw hundreds. */
+    static final int MAX_CARDS = 60;
+    /** How long one provider may take to give its values (its code runs in the worker). */
+    static final long PROVIDER_TIMEOUT_MS = 10_000;
+
+    /** `work` on its own thread, given up (and interrupted) after `ms`: a provider that loops or
+     *  blocks never stops the worker. */
+    static <T> T within(java.util.concurrent.Callable<T> work, long ms, String what) throws Exception {
+        var task = new java.util.concurrent.FutureTask<>(work);
+        Thread t = new Thread(task, "preview-provider");
+        t.setDaemon(true);
+        t.setContextClassLoader(Thread.currentThread().getContextClassLoader());
+        t.start();
+        try {
+            return task.get(ms, TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.TimeoutException e) {
+            task.cancel(true);
+            throw new Exception(what + " did not finish within " + ms / 1000 + " s");
+        } catch (java.util.concurrent.ExecutionException e) {
+            throw e.getCause() instanceof Exception x ? x : e;
+        }
+    }
+
+    /** `cards` cut to `max`, the last one saying that more were not drawn. */
+    static List<Picture> capped(List<Picture> cards, int max) {
+        if (cards.size() <= max) return cards;
+        List<Picture> out = new ArrayList<>(cards.subList(0, max - 1));
+        String more = "More previews are not drawn: at most " + max + " per file.";
+        out.add(new Picture(cards.get(max - 1).spec(), "More previews", null, more));
+        return out;
+    }
+    // limits: end
 
     /** The cards of a request, like Android Studio: a spec whose function takes a @PreviewParameter is
-     *  one card per value of its provider, "<title> (1)", "<title> (2)"…; a provider that throws or
-     *  gives no values is one error card naming it. */
+     *  one card per value of its provider, "<title> (1)", "<title> (2)"…; a provider that throws, takes
+     *  too long or gives no values is one error card naming it. At most MAX_CARDS in all. */
     static List<Picture> pictures(List<Map<String, Object>> specs, ClassLoader loader) {
         List<Picture> out = new ArrayList<>();
         Map<String, Object> values = new HashMap<>(); // provider and limit -> its values or what went wrong
         for (Map<String, Object> spec : specs) {
+            if (out.size() > MAX_CARDS) break;
             String title = spec.get("title") instanceof String s ? s : (String) spec.get("function");
             if (!(spec.get("provider") instanceof String provider)) {
                 out.add(new Picture(spec, title, null, null));
@@ -624,7 +658,8 @@ public class PreviewWorker {
             int limit = spec.get("limit") instanceof Number n ? n.intValue() : Integer.MAX_VALUE;
             Object got = values.computeIfAbsent(provider + "#" + limit, k -> {
                 try {
-                    List<Object> v = providerValues(loader, provider, limit);
+                    List<Object> v = within(() -> providerValues(loader, provider, limit), PROVIDER_TIMEOUT_MS,
+                        "The PreviewParameterProvider " + provider);
                     return v.isEmpty() ? "The PreviewParameterProvider " + provider + " gave no values." : v;
                 } catch (Throwable e) {
                     return "The PreviewParameterProvider " + provider + " failed: " + trace(e);
@@ -637,7 +672,7 @@ public class PreviewWorker {
             List<?> v = (List<?>) got;
             for (int i = 0; i < v.size(); i++) out.add(new Picture(spec, title + " (" + (i + 1) + ")", new Object[] {v.get(i)}, null));
         }
-        return out;
+        return capped(out, MAX_CARDS);
     }
 
     /** The provider's `values` (a Kotlin Sequence), at most `limit` and MAX_PARAMETER_VALUES. The
