@@ -261,11 +261,13 @@ impl App {
         self.history.clear();
     }
 
-    /// Saves every edited tab, as IntelliJ does when the window loses focus.
+    /// Saves every edited tab, as IntelliJ does when the window loses focus (and on quit). A tab
+    /// whose file changed on disk meanwhile is not written: its bar asks which version to keep.
     pub(super) fn autosave(&mut self) {
         let active = self.active;
         for i in 0..self.tabs.len() {
-            if self.tabs[i].dirty() && !self.tabs[i].deleted {
+            let t = &self.tabs[i];
+            if t.dirty() && !t.deleted && !t.disk_changed {
                 self.active = i;
                 self.save();
             }

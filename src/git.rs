@@ -289,6 +289,13 @@ pub fn branch(dir: &Path) -> Option<String> {
     (out.status.success() && !b.is_empty()).then_some(b)
 }
 
+/// The commit HEAD points at, or `None` outside a repository or before the first commit.
+pub fn head_sha(dir: &Path) -> Option<String> {
+    let out = git(dir).args(["rev-parse", "HEAD"]).output().ok()?;
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !sha.is_empty()).then_some(sha)
+}
+
 /// One changed file: `code` is git's letter (M, A, D, R, ? for untracked), `staged` for the index.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Change {
@@ -392,9 +399,11 @@ pub struct PrItem {
     pub approvals: u32,
     /// The PR's branch (`headRefName`).
     pub head: String,
+    /// The PR's last commit (`headRefOid`): a fork's `main` is not this repository's `main`.
+    pub head_oid: String,
 }
 
-/// `gh pr list --json number,title,author,isDraft,url,reviewDecision,latestReviews,headRefName` output.
+/// `gh pr list --json number,title,author,isDraft,url,reviewDecision,latestReviews,headRefName,headRefOid` output.
 /// GitHub leaves `reviewDecision` empty when the branch rules ask for no review: then the
 /// reviewers' latest reviews decide (any change request wins over approvals).
 pub fn parse_pr_items(json: &[u8]) -> Vec<PrItem> {
@@ -424,6 +433,7 @@ pub fn parse_pr_items(json: &[u8]) -> Vec<PrItem> {
                 url: v["url"].as_str().unwrap_or("").to_string(),
                 review: review.to_string(),
                 head: v["headRefName"].as_str().unwrap_or("").to_string(),
+                head_oid: v["headRefOid"].as_str().unwrap_or("").to_string(),
             })
         })
         .collect()
@@ -453,15 +463,25 @@ fn gh_failure(out: &std::process::Output) -> String {
     }
     let words = "error|fatal|failed|could not|not found|denied";
     let lines = || e.lines().map(str::trim).filter(|l| !l.is_empty());
-    lines()
+    let line = lines()
         .find(|l| {
             let l = l.to_lowercase();
             words.split('|').any(|w| l.contains(w))
         })
         .or_else(|| lines().next())
-        .unwrap_or("gh failed")
-        .to_string()
+        .unwrap_or("gh failed");
+    match line.char_indices().nth(MAX_ERROR_CHARS) {
+        Some((at, _)) => format!("{}…", &line[..at]),
+        None => line.to_string(),
+    }
 }
+
+/// The longest error line shown; gh's stdout and stderr are kept up to [`MAX_GH_OUTPUT`] bytes.
+const MAX_ERROR_CHARS: usize = 300;
+const MAX_GH_OUTPUT: usize = 64 * 1024;
+
+/// How long `gh pr checkout` may take (a fetch over a slow network) before it is stopped.
+pub const CHECKOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Runs `gh` in `root` (off the UI thread: it uses the network); its stdout, or why it failed.
 fn gh(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
@@ -488,7 +508,7 @@ pub fn list_prs(root: &Path, filter: PrFilter) -> Result<Vec<PrItem>, String> {
     args.extend(who);
     args.extend([
         "--json",
-        "number,title,author,isDraft,url,reviewDecision,latestReviews,headRefName",
+        "number,title,author,isDraft,url,reviewDecision,latestReviews,headRefName,headRefOid",
     ]);
     let prs = gh(root, &args).map(|o| parse_pr_items(&o))?;
     // decided here, not by GitHub's search, so it matches the ✓ in the other lists
@@ -498,37 +518,203 @@ pub fn list_prs(root: &Path, filter: PrFilter) -> Result<Vec<PrItem>, String> {
     })
 }
 
+/// The repository operation that is half done (a rebase stopped at a conflict or an `edit`, a
+/// merge with conflicts, a bisect), from the files git keeps while it runs.
+pub fn operation_in_progress(root: &Path) -> Option<&'static str> {
+    [
+        ("rebase-merge", "rebase"),
+        ("rebase-apply", "rebase"),
+        ("MERGE_HEAD", "merge"),
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ("REVERT_HEAD", "revert"),
+        ("BISECT_LOG", "bisect"),
+    ]
+    .into_iter()
+    .find(|(file, _)| {
+        git(root)
+            .args(["rev-parse", "--git-path", file])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .is_some_and(|o| {
+                let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                !p.is_empty() && root.join(p).exists()
+            })
+    })
+    .map(|(_, name)| name)
+}
+
+/// A detached HEAD with commits that no branch (local or remote) contains: a checkout would
+/// leave them reachable only from the reflog.
+fn head_on_no_branch(root: &Path) -> bool {
+    let on_branch = git(root)
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if on_branch {
+        return false;
+    }
+    git(root)
+        .args([
+            "for-each-ref",
+            "--count=1",
+            "--contains",
+            "HEAD",
+            "refs/heads",
+            "refs/remotes",
+        ])
+        .output()
+        .is_ok_and(|o| o.status.success() && o.stdout.is_empty())
+}
+
+/// `head` and up to 10 of `paths` (relative to `root`), one per line, then how many more.
+pub fn file_list<'a>(head: &str, root: &Path, paths: impl IntoIterator<Item = &'a Path>) -> String {
+    let paths: Vec<&Path> = paths.into_iter().collect();
+    let mut msg = head.to_string();
+    for p in paths.iter().take(10) {
+        let rel = p.strip_prefix(root).unwrap_or(p);
+        msg.push_str(&format!("\n{}", rel.display()));
+    }
+    if paths.len() > 10 {
+        msg.push_str(&format!("\n… and {} more", paths.len() - 10));
+    }
+    msg
+}
+
 /// Checks out pull request `number` with `<gh> pr checkout` (`gh` is the program, a fake in
-/// tests) and returns the branch it is on now. Never loses work: when tracked files have
-/// uncommitted changes it refuses and lists them (untracked files do not count).
-pub fn checkout_pr(root: &Path, number: u64, gh: &std::ffi::OsStr) -> Result<String, String> {
-    let mut dirty: Vec<PathBuf> = Vec::new();
-    for c in status(root).into_iter().filter(|c| c.code != '?') {
-        if !dirty.contains(&c.path) {
-            dirty.push(c.path);
+/// tests), stopped after `timeout`, and returns the branch it is on now and whether a submodule
+/// now points at another commit than its checkout (`git submodule update` is due). Never loses
+/// work: it refuses when git status fails, during a rebase, merge, cherry-pick, revert or bisect,
+/// on a detached HEAD whose commits no branch has, and when tracked files have uncommitted changes
+/// (it lists them; untracked files, also inside submodules, do not count).
+pub fn checkout_pr(
+    root: &Path,
+    number: u64,
+    gh: &std::ffi::OsStr,
+    timeout: std::time::Duration,
+) -> Result<(String, bool), String> {
+    let changes = status_with(root, &["--ignore-submodules=untracked"])?;
+    if let Some(op) = operation_in_progress(root) {
+        return Err(format!("Finish or abort the {op} first"));
+    }
+    if head_on_no_branch(root) {
+        return Err("HEAD has commits on no branch: create a branch first".into());
+    }
+    let mut dirty: Vec<&Path> = Vec::new();
+    for c in changes.iter().filter(|c| c.code != '?') {
+        if !dirty.contains(&c.path.as_path()) {
+            dirty.push(&c.path);
         }
     }
     if !dirty.is_empty() {
-        let mut msg = String::from("Commit or stash your changes first:");
-        for p in dirty.iter().take(10) {
-            let rel = p.strip_prefix(root).unwrap_or(p);
-            msg.push_str(&format!("\n{}", rel.display()));
-        }
-        if dirty.len() > 10 {
-            msg.push_str(&format!("\n… and {} more", dirty.len() - 10));
-        }
-        return Err(msg);
+        return Err(file_list(
+            "Commit or stash your changes first:",
+            root,
+            dirty,
+        ));
     }
-    let out = Command::new(gh)
-        .args(["pr", "checkout", &number.to_string()])
+    let mut cmd = Command::new(gh);
+    cmd.args(["pr", "checkout", &number.to_string()])
         .current_dir(root)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(gh_spawn_error)?;
+        // never wait for a password or a question nobody sees
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GH_PROMPT_DISABLED", "1");
+    let out = output_within(cmd, timeout).map_err(|e| match e {
+        Some(e) => gh_spawn_error(e),
+        None => format!(
+            "gh pr checkout timed out after {} s and was stopped",
+            timeout.as_secs()
+        ),
+    })?;
     if !out.status.success() {
         return Err(gh_failure(&out));
     }
-    branch(root).ok_or_else(|| "Checked out, but git shows no branch".into())
+    let branch = branch(root).ok_or("Checked out, but git shows no branch")?;
+    let submodules = git(root)
+        .args(["submodule", "status"])
+        .output()
+        .is_ok_and(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.starts_with('+'))
+        });
+    Ok((branch, submodules))
+}
+
+/// Runs `cmd` in a process group of its own, its stdout and stderr kept up to
+/// [`MAX_GH_OUTPUT`] bytes each; after `timeout` the whole group (git that gh started too) is
+/// killed and `Err(None)` returned. `Err(Some)` when it could not start.
+fn output_within(
+    mut cmd: Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, Option<std::io::Error>> {
+    use std::io::Read;
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(Some)?;
+    // each pipe is read to its end on a thread, so the program never blocks on a full pipe
+    let read = |pipe: Option<Box<dyn Read + Send>>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let mut buf = [0u8; 8192];
+                while let Ok(n @ 1..) = pipe.read(&mut buf) {
+                    let room = MAX_GH_OUTPUT.saturating_sub(kept.len());
+                    kept.extend_from_slice(&buf[..n.min(room)]);
+                }
+            }
+            let _ = tx.send(kept);
+        });
+        rx
+    };
+    let stdout = read(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = read(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            _ => {
+                #[cfg(unix)]
+                // SAFETY: kill(2) on the group this child leads; it has not been reaped yet
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(None);
+            }
+        }
+    };
+    // a tool it left running may hold the pipes open: wait no longer than the time left
+    let rest = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        rx.recv_timeout(left.max(std::time::Duration::from_secs(1)))
+            .unwrap_or_default()
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: rest(stdout),
+        stderr: rest(stderr),
+    })
 }
 
 /// A pull request's whole diff (`gh pr diff`), split into one diff per file.
@@ -614,14 +800,25 @@ pub fn resolve_base(root: &Path, choice: &str) -> Result<String, String> {
     Err(format!("{} not found", choice.trim()))
 }
 
-/// `git status --porcelain -z`: staged and unstaged changes and untracked files.
-pub fn status(root: &Path) -> Vec<Change> {
-    let Ok(out) = git(root)
+/// `git status --porcelain -z`: staged and unstaged changes and untracked files, or why git
+/// status failed (not a repository, a broken index).
+pub fn status(root: &Path) -> Result<Vec<Change>, String> {
+    status_with(root, &[])
+}
+
+/// [`status`] with more `git status` options (`--ignore-submodules=untracked`).
+fn status_with(root: &Path, extra: &[&str]) -> Result<Vec<Change>, String> {
+    let out = git(root)
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .args(extra)
+        .stderr(Stdio::piped())
         .output()
-    else {
-        return Vec::new();
-    };
+        .map_err(|e| format!("git status: {e}"))?;
+    if !out.status.success() {
+        let e = String::from_utf8_lossy(&out.stderr);
+        let line = e.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        return Err(format!("git status failed: {}", line.trim()));
+    }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut parts = text.split('\0').filter(|p| !p.is_empty());
     let mut v = Vec::new();
@@ -657,7 +854,7 @@ pub fn status(root: &Path) -> Vec<Change> {
             });
         }
     }
-    v
+    Ok(v)
 }
 
 /// The branch the current one is compared with: the PR's base when `gh` answers, else
@@ -744,7 +941,7 @@ pub fn changes(root: &Path, choice: Option<&str>) -> Changes {
         .map(|b| branch_changes(root, b))
         .unwrap_or_default();
     Changes {
-        working: status(root),
+        working: status(root).unwrap_or_default(),
         branch,
         base,
         pr,
@@ -847,7 +1044,7 @@ mod tests {
     #[test]
     fn sidebar_pr_items_are_read() {
         let prs = parse_pr_items(
-            br#"[{"number":7,"title":"Fix","author":{"login":"ana"},"isDraft":true,"url":"https://x/7","reviewDecision":"APPROVED","headRefName":"fix"},{"title":"no number"},{"number":8}]"#,
+            br#"[{"number":7,"title":"Fix","author":{"login":"ana"},"isDraft":true,"url":"https://x/7","reviewDecision":"APPROVED","headRefName":"fix","headRefOid":"abc123"},{"title":"no number"},{"number":8}]"#,
         );
         assert_eq!(prs.len(), 2);
         assert_eq!(
@@ -861,6 +1058,7 @@ mod tests {
                 review: "APPROVED".into(),
                 approvals: 0,
                 head: "fix".into(),
+                head_oid: "abc123".into(),
             }
         );
         assert_eq!(
@@ -1018,7 +1216,7 @@ mod tests {
         std::fs::write(dir.join("B.kt"), "b2\n").unwrap();
         g(&["add", "B.kt"]);
         std::fs::write(dir.join("C kt.kt"), "c\n").unwrap();
-        let st = status(&dir);
+        let st = status(&dir).unwrap();
         assert!(
             st.contains(&Change {
                 path: dir.join("B.kt"),
@@ -1049,33 +1247,35 @@ mod tests {
         assert_eq!(file_diff(&dir, &dir.join("C kt.kt"), None, false), "+c\n");
         assert_eq!(branches(&dir), vec!["feature", "main"]);
         g(&["commit", "-q", "-m", "B"]);
-        assert!(status(&dir).iter().all(|c| c.code == '?'));
+        assert!(status(&dir).unwrap().iter().all(|c| c.code == '?'));
         assert!(run(&dir, &["checkout", "nope"]).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn checkout_pr_runs_gh_and_never_loses_work() {
-        let dir = std::env::temp_dir().join(format!("droid-lite-git-co-{}", std::process::id()));
+    /// A fresh folder for a checkout test, a repository `repo` in it with one commit of `files`
+    /// (A.kt plus F0.kt…), and a fake gh there that logs its calls to `gh.log`.
+    fn checkout_fixture(name: &str, files: usize, gh_script: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("droid-lite-git-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = dir.canonicalize().unwrap();
         let repo = dir.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let repo = dir.join("repo");
         let g = |args: &[&str]| run(&repo, args).unwrap();
         g(&["init", "-q", "-b", "main"]);
         g(&["config", "user.name", "T"]);
         g(&["config", "user.email", "t@example.com"]);
-        for i in 0..12 {
+        std::fs::write(repo.join("A.kt"), "a\n").unwrap();
+        for i in 0..files {
             std::fs::write(repo.join(format!("F{i}.kt")), "a\n").unwrap();
         }
         g(&["add", "."]);
         g(&["commit", "-q", "-m", "base"]);
-        // a fake gh: PR 7 checks out, 8 fails after git's progress lines, 9 needs a sign-in
         let gh = dir.join("gh");
         std::fs::write(
             &gh,
-            "#!/bin/sh\n[ \"$1 $2\" = \"pr checkout\" ] || exit 3\ncase \"$3\" in\n  7) git checkout -q -b pr-7;;\n  8) echo 'From github.com:x/y' >&2; echo 'failed to run git: fatal: no ref pull/8' >&2; exit 1;;\n  *) echo 'please run:  gh auth login' >&2; exit 4;;\nesac\n",
+            format!("#!/bin/sh\necho \"$*\" >> \"$0.log\"\n[ \"$1 $2\" = \"pr checkout\" ] || exit 3\n{gh_script}"),
         )
         .unwrap();
         std::process::Command::new("chmod")
@@ -1083,42 +1283,205 @@ mod tests {
             .arg(&gh)
             .status()
             .unwrap();
+        (dir, repo, gh)
+    }
+
+    /// git with the environment a test needs (an editor that never waits, local submodules).
+    fn git_env(repo: &Path, env: &[(&str, &str)], args: &[&str]) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["-c", "protocol.file.allow=always"])
+            .args(args)
+            .envs(env.iter().copied())
+            .env("GIT_EDITOR", "true")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    }
+
+    const TIMEOUT: std::time::Duration = CHECKOUT_TIMEOUT;
+
+    #[test]
+    fn checkout_pr_runs_gh_and_never_loses_work() {
+        // a fake gh: PR 7 checks out (only with prompts off), 8 fails after git's progress lines,
+        // 9 needs a sign-in, 10 hangs, 11 fails with a very long line
+        let (dir, repo, gh) = checkout_fixture(
+            "co",
+            12,
+            "case \"$3\" in\n  7) [ \"$GIT_TERMINAL_PROMPT $GH_PROMPT_DISABLED\" = '0 1' ] || { echo 'fatal: would prompt' >&2; exit 1; }; git checkout -q -b pr-7;;\n  8) echo 'From github.com:x/y' >&2; echo 'failed to run git: fatal: no ref pull/8' >&2; exit 1;;\n  10) ( sleep 3; touch \"$0.late\" ) & wait;;\n  11) printf 'error: %05000d\\n' 0 >&2; exit 1;;\n  *) echo 'please run:  gh auth login' >&2; exit 4;;\nesac\n",
+        );
+        let g = |args: &[&str]| run(&repo, args).unwrap();
         let gh = gh.as_os_str();
         // untracked files do not block; a gh failure shows its error line, not the progress
         std::fs::write(repo.join("New.kt"), "n\n").unwrap();
         assert_eq!(
-            checkout_pr(&repo, 8, gh),
+            checkout_pr(&repo, 8, gh, TIMEOUT),
             Err("failed to run git: fatal: no ref pull/8".into())
         );
         assert_eq!(
-            checkout_pr(&repo, 9, gh),
+            checkout_pr(&repo, 9, gh, TIMEOUT),
             Err("Not signed in to GitHub: run gh auth login in a terminal".into())
         );
         assert!(
-            checkout_pr(&repo, 7, "/nonexistent/droid-lite-gh".as_ref())
+            checkout_pr(&repo, 7, "/nonexistent/droid-lite-gh".as_ref(), TIMEOUT)
                 .unwrap_err()
                 .contains("not installed")
         );
+        // a long error line is cut
+        let long = checkout_pr(&repo, 11, gh, TIMEOUT).unwrap_err();
+        assert_eq!(long.chars().count(), MAX_ERROR_CHARS + 1, "{long}");
+        assert!(long.starts_with("error: 0000") && long.ends_with('…'));
+        // a gh that hangs is stopped after the timeout, with the git it started
+        let t = std::time::Instant::now();
+        let err = checkout_pr(&repo, 10, gh, std::time::Duration::from_secs(1)).unwrap_err();
+        assert_eq!(err, "gh pr checkout timed out after 1 s and was stopped");
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(2500),
+            "{:?}",
+            t.elapsed()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(3000));
+        assert!(!dir.join("gh.late").exists(), "the whole group was killed");
         assert_eq!(branch(&repo).as_deref(), Some("main"));
         // changed tracked files: refused, nothing switches, up to 10 files listed
         std::fs::write(repo.join("F0.kt"), "b\n").unwrap();
         g(&["add", "F0.kt"]);
         std::fs::write(repo.join("F0.kt"), "c\n").unwrap(); // staged and unstaged: listed once
-        let err = checkout_pr(&repo, 7, gh).unwrap_err();
+        let err = checkout_pr(&repo, 7, gh, TIMEOUT).unwrap_err();
         assert_eq!(err, "Commit or stash your changes first:\nF0.kt");
         for i in 1..12 {
             std::fs::write(repo.join(format!("F{i}.kt")), "b\n").unwrap();
         }
-        let err = checkout_pr(&repo, 7, gh).unwrap_err();
+        let err = checkout_pr(&repo, 7, gh, TIMEOUT).unwrap_err();
         let lines: Vec<&str> = err.lines().collect();
         assert_eq!(lines.len(), 12, "{err}");
         assert_eq!(lines[1], "F0.kt");
         assert_eq!(lines[11], "… and 2 more");
         assert_eq!(branch(&repo).as_deref(), Some("main"));
-        // a clean tree checks out and reports the new branch
+        // a clean tree checks out (prompts off) and reports the new branch
         g(&["reset", "-q", "--hard"]);
-        assert_eq!(checkout_pr(&repo, 7, gh), Ok("pr-7".into()));
+        assert_eq!(
+            checkout_pr(&repo, 7, gh, TIMEOUT),
+            Ok(("pr-7".into(), false))
+        );
         assert_eq!(branch(&repo).as_deref(), Some("pr-7"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn checkout_pr_refuses_when_git_status_fails() {
+        let (dir, repo, gh) = checkout_fixture("costatus", 0, "git checkout -q -b pr\n");
+        // a .git file pointing nowhere: git status exits non-zero
+        let broken = dir.join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join(".git"), "gitdir: /nonexistent/droid-lite-git\n").unwrap();
+        std::fs::write(broken.join("A.kt"), "a\n").unwrap();
+        assert!(status(&broken)
+            .unwrap_err()
+            .starts_with("git status failed: "));
+        let err = checkout_pr(&broken, 7, gh.as_os_str(), TIMEOUT).unwrap_err();
+        assert!(err.starts_with("git status failed: "), "{err}");
+        assert!(!dir.join("gh.log").exists(), "gh never ran");
+        assert!(status(&repo).unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn checkout_pr_refuses_during_a_rebase_or_a_merge() {
+        let (dir, repo, gh) = checkout_fixture("coop", 0, "git checkout -q -b pr-7\n");
+        let gh = gh.as_os_str();
+        let g = |args: &[&str]| assert!(git_env(&repo, &[], args), "{args:?}");
+        g(&["checkout", "-q", "-b", "side"]);
+        std::fs::write(repo.join("A.kt"), "side\n").unwrap();
+        g(&["commit", "-q", "-am", "side"]);
+        g(&["checkout", "-q", "main"]);
+        std::fs::write(repo.join("A.kt"), "main\n").unwrap();
+        g(&["commit", "-q", "-am", "main"]);
+        // an interactive rebase stopped at an `edit`: the tree is clean, but it is half done
+        let edit = [("GIT_SEQUENCE_EDITOR", "sed -i.bak 's/^pick/edit/'")];
+        assert!(git_env(&repo, &edit, &["rebase", "-q", "-i", "HEAD~1"]));
+        assert_eq!(operation_in_progress(&repo), Some("rebase"));
+        assert!(status(&repo).unwrap().is_empty(), "nothing uncommitted");
+        assert_eq!(
+            checkout_pr(&repo, 7, gh, TIMEOUT),
+            Err("Finish or abort the rebase first".into())
+        );
+        g(&["rebase", "--abort"]);
+        // a merge stopped at a conflict
+        assert!(!git_env(&repo, &[], &["merge", "-q", "side"]), "a conflict");
+        assert_eq!(operation_in_progress(&repo), Some("merge"));
+        assert_eq!(
+            checkout_pr(&repo, 7, gh, TIMEOUT),
+            Err("Finish or abort the merge first".into())
+        );
+        g(&["merge", "--abort"]);
+        assert!(!dir.join("gh.log").exists(), "gh never ran");
+        assert_eq!(operation_in_progress(&repo), None);
+        assert_eq!(
+            checkout_pr(&repo, 7, gh, TIMEOUT),
+            Ok(("pr-7".into(), false))
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn checkout_pr_refuses_a_detached_head_with_commits_on_no_branch() {
+        let (dir, repo, gh) = checkout_fixture("codetached", 0, "git checkout -q -b pr-7\n");
+        let gh = gh.as_os_str();
+        let g = |args: &[&str]| run(&repo, args).unwrap();
+        g(&["checkout", "-q", "--detach"]);
+        std::fs::write(repo.join("A.kt"), "lost?\n").unwrap();
+        g(&["commit", "-q", "-am", "on no branch"]);
+        assert_eq!(
+            checkout_pr(&repo, 7, gh, TIMEOUT),
+            Err("HEAD has commits on no branch: create a branch first".into())
+        );
+        assert!(!dir.join("gh.log").exists(), "gh never ran");
+        // detached on a commit a branch has: nothing to lose
+        g(&["checkout", "-q", "--detach", "main"]);
+        assert_eq!(
+            checkout_pr(&repo, 7, gh, TIMEOUT),
+            Ok(("pr-7".into(), false))
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn checkout_pr_ignores_untracked_files_in_submodules_and_asks_for_submodule_update() {
+        let (dir, repo, gh) = checkout_fixture("cosub", 0, "git checkout -q pr-sub\n");
+        let g = |args: &[&str]| assert!(git_env(&repo, &[], args), "{args:?}");
+        // a library repository used as a submodule, with a second commit for the PR
+        let lib = dir.join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let l = |args: &[&str]| assert!(git_env(&lib, &[], args), "{args:?}");
+        l(&["init", "-q", "-b", "main"]);
+        l(&["config", "user.name", "T"]);
+        l(&["config", "user.email", "t@example.com"]);
+        std::fs::write(lib.join("L.kt"), "1\n").unwrap();
+        l(&["add", "."]);
+        l(&["commit", "-q", "-m", "lib 1"]);
+        g(&["submodule", "add", "-q", lib.to_str().unwrap(), "lib"]);
+        g(&["commit", "-q", "-m", "add lib"]);
+        // the PR's branch moves the submodule to lib's second commit
+        g(&["checkout", "-q", "-b", "pr-sub"]);
+        let sub = repo.join("lib");
+        let s = |args: &[&str]| assert!(git_env(&sub, &[], args), "{args:?}");
+        s(&["config", "user.name", "T"]);
+        s(&["config", "user.email", "t@example.com"]);
+        std::fs::write(sub.join("L.kt"), "2\n").unwrap();
+        s(&["commit", "-q", "-am", "lib 2"]);
+        g(&["commit", "-q", "-am", "move lib"]);
+        g(&["checkout", "-q", "main"]);
+        g(&["submodule", "-q", "update"]);
+        // an untracked file inside the submodule is not work a checkout can lose
+        std::fs::write(sub.join("Scratch.kt"), "s\n").unwrap();
+        assert_eq!(
+            checkout_pr(&repo, 7, gh.as_os_str(), TIMEOUT),
+            Ok(("pr-sub".into(), true)),
+            "checked out, and the submodule needs an update"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

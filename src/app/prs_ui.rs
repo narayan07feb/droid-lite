@@ -1,16 +1,32 @@
 //! The sidebar's Pull requests view: your open PRs and the ones waiting for your review (through
 //! `gh`, off the UI thread). A PR opens to its changed files; a file shows its diff in the diff panel.
-//! "Check out" switches the project to a PR's branch (`gh pr checkout`), never over uncommitted work.
+//! "Check out" switches the project to a PR's branch (`gh pr checkout`), never over uncommitted work,
+//! unsaved edits, a half-done rebase or merge, or a running build.
 
 use super::App;
 use crate::git::{self, PrFilter, PrItem};
 use crate::icons as ic;
 use egui::{RichText, Sense, Ui};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 
 type Files = Result<Vec<(String, String)>, String>;
 type List = Result<Vec<PrItem>, String>;
+/// A list and the HEAD commit read with it.
+type Listed = (List, Option<String>);
+
+/// What a `gh pr checkout` thread sends back.
+pub(super) struct Checkout {
+    /// The project it ran in: a reply for a project closed since then is dropped.
+    pub root: PathBuf,
+    pub number: u64,
+    /// The new branch and whether a submodule needs `git submodule update`, or the error.
+    pub result: Result<(String, bool), String>,
+    /// The branch and HEAD commit after it, also after a failure: gh may switch, then fail.
+    pub branch: Option<String>,
+    pub head: Option<String>,
+}
 
 #[derive(Default)]
 pub(super) struct PrsState {
@@ -18,15 +34,29 @@ pub(super) struct PrsState {
     pub shown: bool,
     pub filter: Option<PrFilter>,
     pub lists: HashMap<PrFilter, List>,
-    list_rx: Option<(PrFilter, Receiver<List>)>,
+    list_rx: Option<(PrFilter, Receiver<Listed>)>,
+    /// The commit HEAD points at: the PR whose last commit it is shows "● current".
+    pub head: Option<String>,
     /// The opened PR and its files with their diffs.
     pub open: Option<(u64, Option<Files>)>,
     /// The files of PR number `.0`; a reply for a PR closed since then is dropped.
     files_rx: Option<Receiver<(u64, Files)>>,
     /// "Checking out #7…", then its result or why it was refused; `true` for an error.
     pub note: Option<(String, bool)>,
-    /// The running `gh pr checkout`: the PR number and the new branch or the error.
-    checkout_rx: Option<Receiver<(u64, Result<String, String>)>>,
+    /// The running `gh pr checkout`.
+    checkout_rx: Option<Receiver<Checkout>>,
+}
+
+impl PrsState {
+    /// Another project opened: its lists, files, note and replies still on their way are
+    /// dropped; the sidebar choice and the filter stay.
+    pub(super) fn reset(&mut self) {
+        *self = PrsState {
+            shown: self.shown,
+            filter: self.filter,
+            ..Default::default()
+        };
+    }
 }
 
 /// Opens a link in Google Chrome, else the default browser.
@@ -88,32 +118,10 @@ impl App {
             let (tx, rx) = channel();
             let (r, c) = (root.clone(), ui.ctx().clone());
             std::thread::spawn(move || {
-                let _ = tx.send(git::list_prs(&r, filter));
+                let _ = tx.send((git::list_prs(&r, filter), git::head_sha(&r)));
                 c.request_repaint();
             });
             self.prs.list_rx = Some((filter, rx));
-        }
-        if let Some((f, rx)) = &self.prs.list_rx
-            && let Ok(list) = rx.try_recv()
-        {
-            self.prs.lists.insert(*f, list);
-            self.prs.list_rx = None;
-        }
-        if let Some(rx) = &self.prs.checkout_rx
-            && let Ok((n, res)) = rx.try_recv()
-        {
-            self.prs.checkout_rx = None;
-            self.checked_out(n, res);
-        }
-        if let Some(rx) = &self.prs.files_rx
-            && let Ok((n, files)) = rx.try_recv()
-        {
-            if let Some((open, f)) = &mut self.prs.open
-                && *open == n
-            {
-                *f = Some(files);
-            }
-            self.prs.files_rx = None;
         }
         ui.separator();
         if let Some((text, error)) = &self.prs.note {
@@ -203,7 +211,10 @@ impl App {
                     // the second line: author, draft, review state; Check out at the right
                     ui.horizontal(|ui| {
                         ui.add_space(18.0);
-                        if self.branch.as_deref() == Some(p.head.as_str()) {
+                        // the commit, not the branch name: a fork's PR may be named main too
+                        if !p.head_oid.is_empty()
+                            && self.prs.head.as_deref() == Some(p.head_oid.as_str())
+                        {
                             ui.label(RichText::new("● current").small().color(APPROVED))
                                 .on_hover_text(format!("{} is checked out", p.head));
                         }
@@ -289,27 +300,107 @@ impl App {
             self.show_diff_text(title, text);
         }
         if let Some(n) = checkout {
-            let text = format!("Checking out #{n}…");
-            self.status = text.clone();
-            self.prs.note = Some((text, false));
-            let (tx, rx) = channel();
-            let c = ui.ctx().clone();
-            std::thread::spawn(move || {
-                let _ = tx.send((n, git::checkout_pr(&root, n, &git::gh_program())));
-                c.request_repaint();
-            });
-            self.prs.checkout_rx = Some(rx);
+            self.check_out(n, root, ui.ctx());
         }
     }
 
-    /// After `gh pr checkout`: the branch name, the Current changes tab, tree colours and the PR
-    /// lists refresh here; the tree and open files follow the files on disk (the watcher).
-    fn checked_out(&mut self, n: u64, res: Result<String, String>) {
-        match res {
-            Ok(branch) => {
-                let text = format!("Checked out #{n} ({branch})");
-                self.branch = Some(branch);
-                self.git.changes_stale = true;
+    /// Replies of the PR threads, every frame (also while the sidebar shows the Project tree).
+    pub(super) fn poll_prs(&mut self) {
+        if let Some((f, rx)) = &self.prs.list_rx
+            && let Ok((list, head)) = rx.try_recv()
+        {
+            self.prs.lists.insert(*f, list);
+            self.prs.head = head;
+            self.prs.list_rx = None;
+        }
+        if let Some(rx) = &self.prs.checkout_rx
+            && let Ok(reply) = rx.try_recv()
+        {
+            self.prs.checkout_rx = None;
+            self.checked_out(reply);
+        }
+        if let Some(rx) = &self.prs.files_rx
+            && let Ok((n, files)) = rx.try_recv()
+        {
+            if let Some((open, f)) = &mut self.prs.open
+                && *open == n
+            {
+                *f = Some(files);
+            }
+            self.prs.files_rx = None;
+        }
+    }
+
+    /// Why Check out must wait: a build, test run or preview of this project is running (a
+    /// branch switch under it breaks it), or editor tabs have unsaved edits (they would end up on
+    /// the other branch, or be lost when the files reload).
+    fn checkout_refusal(&self, root: &std::path::Path) -> Option<String> {
+        let running = if self.gradle.is_some() {
+            Some("the Gradle build")
+        } else if self.tests.running() {
+            Some("the test run")
+        } else if self.previews.busy {
+            Some("the preview draw")
+        } else {
+            None
+        };
+        if let Some(r) = running {
+            return Some(format!("Wait for {r} to finish"));
+        }
+        let unsaved: Vec<&std::path::Path> = self
+            .tabs
+            .iter()
+            .filter(|t| t.dirty())
+            .map(|t| t.path.as_path())
+            .collect();
+        (!unsaved.is_empty())
+            .then(|| git::file_list("Save or discard your unsaved edits first:", root, unsaved))
+    }
+
+    /// Runs `gh pr checkout n` on a thread, unless [`App::checkout_refusal`] says no.
+    fn check_out(&mut self, n: u64, root: PathBuf, ctx: &egui::Context) {
+        if let Some(e) = self.checkout_refusal(&root) {
+            self.status = e.lines().next().unwrap_or_default().to_string();
+            self.prs.note = Some((e, true));
+            return;
+        }
+        let text = format!("Checking out #{n}…");
+        self.status = text.clone();
+        self.prs.note = Some((text, false));
+        let (tx, rx) = channel();
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+            let result = git::checkout_pr(&root, n, &git::gh_program(), git::CHECKOUT_TIMEOUT);
+            let (branch, head) = (git::branch(&root), git::head_sha(&root));
+            let _ = tx.send(Checkout {
+                root,
+                number: n,
+                result,
+                branch,
+                head,
+            });
+            c.request_repaint();
+        });
+        self.prs.checkout_rx = Some(rx);
+    }
+
+    /// After `gh pr checkout`, success or not (gh may have switched before it failed): the branch
+    /// name, the Current changes tab and tree colours refresh here, and the PR lists after a
+    /// success; the tree and open files follow the files on disk (the watcher). A reply from a
+    /// project closed since then changes nothing.
+    pub(super) fn checked_out(&mut self, reply: Checkout) {
+        if self.project.as_ref().map(|p| &p.root) != Some(&reply.root) {
+            return;
+        }
+        self.branch = reply.branch;
+        self.prs.head = reply.head;
+        self.git.changes_stale = true;
+        match reply.result {
+            Ok((branch, submodules)) => {
+                let mut text = format!("Checked out #{} ({branch})", reply.number);
+                if submodules {
+                    text.push_str(". Submodules point at other commits: run git submodule update");
+                }
                 self.prs.lists.clear();
                 self.status = text.clone();
                 self.prs.note = Some((text, false));

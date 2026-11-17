@@ -4278,6 +4278,7 @@ fn e2e_sidebar_pull_requests_open_a_file_diff_beside_the_editor() {
         review: if n == 7 { "APPROVED".into() } else { String::new() },
         approvals: u32::from(n == 7) * 2,
         head: String::new(),
+        head_oid: String::new(),
     };
     {
         let s = h.state_mut();
@@ -4354,14 +4355,17 @@ fn e2e_check_out_a_pull_request_from_the_sidebar() {
     std::fs::write(&user, USER_KT.replace("var age", "val age")).unwrap();
     git(&["commit", "-q", "-am", "PR 7"]);
     git(&["checkout", "-q", &start]);
-    // a fake gh: lists PR 7 (branch pr-7) and 8; checks out 7, fails on 8
+    // a fake gh: lists PR 7 (branch pr-7), 8, and 9 from a fork whose branch has the name of
+    // the current one but another commit; checks out 7, fails on 8 after making a branch
     let bin = std::env::temp_dir().join(format!("droid-lite-fake-gh-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&bin);
     std::fs::create_dir_all(&bin).unwrap();
     let gh = bin.join("gh");
+    let list = r#"[{"number":7,"title":"Fix login","headRefName":"pr-7","headRefOid":"'"$(git rev-parse pr-7)"'"},{"number":8,"title":"Add cards","headRefName":"pr-8","headRefOid":"1111111111111111111111111111111111111111"},{"number":9,"title":"Fork main","headRefName":"START","headRefOid":"2222222222222222222222222222222222222222"}]"#
+        .replace("START", &start);
     std::fs::write(
         &gh,
-        "#!/bin/sh\necho \"$*\" >> \"$0.log\"\ncase \"$1 $2 $3\" in\n  'pr list '*) echo '[{\"number\":7,\"title\":\"Fix login\",\"headRefName\":\"pr-7\"},{\"number\":8,\"title\":\"Add cards\",\"headRefName\":\"pr-8\"}]';;\n  'pr checkout 7') git checkout -q pr-7;;\n  'pr checkout 8') echo 'From github.com:demo/demo' >&2; echo 'GraphQL: Could not resolve to a PullRequest with the number of 8.' >&2; exit 1;;\n  *) exit 2;;\nesac\n",
+        format!("#!/bin/sh\necho \"$*\" >> \"$0.log\"\ncase \"$1 $2 $3\" in\n  'pr list '*) echo '{list}';;\n  'pr checkout 7') git checkout -q pr-7;;\n  'pr checkout 8') git checkout -q -b pr-8-half; echo 'From github.com:demo/demo' >&2; echo 'GraphQL: Could not resolve to a PullRequest with the number of 8.' >&2; exit 1;;\n  *) exit 2;;\nesac\n"),
     )
     .unwrap();
     std::process::Command::new("chmod")
@@ -4393,14 +4397,59 @@ fn e2e_check_out_a_pull_request_from_the_sidebar() {
     wait(
         &mut h,
         "the PR list from gh",
-        |a| matches!(a.prs.lists.get(&crate::git::PrFilter::Mine), Some(Ok(l)) if l.len() == 2),
+        |a| matches!(a.prs.lists.get(&crate::git::PrFilter::Mine), Some(Ok(l)) if l.len() == 3),
     );
     steps(&mut h, 3);
     assert!(h.query_by_label("#7 Fix login").is_some());
     assert!(
         h.query_by_label("● current").is_none(),
-        "pr-7 is not checked out yet"
+        "pr-7 is not checked out yet, and the fork's {start} is another commit"
     );
+    let refused = |h: &mut Harness<'static, App>, title: &str| {
+        h.state_mut().prs.note = None;
+        click_check_out(h, title);
+        steps(h, 2);
+        let note = h.state().prs.note.clone();
+        let (text, err) = note.expect("a note");
+        assert!(err, "{text}");
+        text
+    };
+    // unsaved edits in an editor tab: they would follow onto the other branch
+    h.state_mut().tabs[0].text.push_str("// unsaved\n");
+    assert_eq!(
+        refused(&mut h, "#7 Fix login"),
+        "Save or discard your unsaved edits first:\napp/src/main/java/com/demo/data/User.kt"
+    );
+    let saved = tab(&h).saved.clone();
+    h.state_mut().tabs[0].text = saved;
+    // a build, a test run or a preview draw of this project still running
+    let ctx = h.ctx.clone();
+    let sleeper = || {
+        let mut c = std::process::Command::new("sleep");
+        c.arg("30");
+        crate::gradle::Run::spawn(c, ctx.clone()).unwrap()
+    };
+    h.state_mut().gradle = Some(sleeper());
+    assert_eq!(
+        refused(&mut h, "#7 Fix login"),
+        "Wait for the Gradle build to finish"
+    );
+    h.state_mut().gradle = None;
+    let mut plugin = super::tests_ui::Plugin::default();
+    plugin.run = Some((String::new(), "a case".into(), sleeper()));
+    h.state_mut().tests.plugins.push(plugin);
+    assert_eq!(refused(&mut h, "#7 Fix login"), "Wait for the test run to finish");
+    if let Some((_, _, r)) = h.state_mut().tests.plugins[0].run.as_mut() {
+        r.stop();
+    }
+    h.state_mut().tests.plugins.clear();
+    h.state_mut().previews.busy = true;
+    assert_eq!(
+        refused(&mut h, "#7 Fix login"),
+        "Wait for the preview draw to finish"
+    );
+    h.state_mut().previews.busy = false;
+    h.state_mut().prs.note = None;
     // uncommitted work in a tracked file: refused, the branch stays, the file is listed
     let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
     std::fs::write(&card, format!("{CARD_KT}// mine\n")).unwrap();
@@ -4420,11 +4469,15 @@ fn e2e_check_out_a_pull_request_from_the_sidebar() {
     );
     assert_eq!(crate::git::branch(&f.root).as_deref(), Some(start.as_str()));
     assert!(tab(&h).text.contains("var age"));
-    // a clean tree: gh checks out, the branch, the open file and the list follow
+    // a clean tree: gh checks out, the branch, the open file and the list follow, also while
+    // the sidebar shows the Project tree (the reply is read every frame)
     git(&["checkout", "-q", "--", "."]);
     h.state_mut().prs.note = None;
     click_check_out(&mut h, "#7 Fix login");
+    h.get_by_label(&format!("{}  Project", ic::TREE_STRUCTURE))
+        .click();
     wait(&mut h, "checked out", checkout_done);
+    assert!(!h.state().prs.shown);
     assert_eq!(
         h.state().prs.note,
         Some(("Checked out #7 (pr-7)".to_string(), false))
@@ -4434,6 +4487,8 @@ fn e2e_check_out_a_pull_request_from_the_sidebar() {
     wait(&mut h, "the open file reloads from disk", |a| {
         a.tabs[a.active].text.contains("val age")
     });
+    h.get_by_label(&format!("{}  Pull requests", ic::GIT_PULL_REQUEST))
+        .click();
     wait(&mut h, "the list reloads", |a| {
         a.prs.lists.contains_key(&crate::git::PrFilter::Mine)
     });
@@ -4449,14 +4504,21 @@ fn e2e_check_out_a_pull_request_from_the_sidebar() {
         calls
             .lines()
             .filter(|l| l.contains("--author @me"))
-            .all(|l| l.contains("headRefName")),
+            .all(|l| l.contains("headRefName") && l.contains("headRefOid")),
         "{calls}"
     );
-    assert!(
-        h.query_by_label("● current").is_some(),
-        "the checked-out PR is marked"
+    assert_eq!(
+        h.get_all_by_label("● current").count(),
+        1,
+        "the checked-out PR is marked, by its commit"
     );
-    // gh fails: its error line, not git's progress
+    let below = |h: &Harness<'static, App>, a: &str, b: &str| {
+        h.get_by_label(b).rect().center().y > h.get_by_label(a).rect().center().y
+    };
+    assert!(below(&h, "#7 Fix login", "● current") && below(&h, "● current", "#8 Add cards"));
+    // gh fails after it made a branch: its error line, not git's progress; the branch name and
+    // the Current changes lists follow anyway
+    h.state_mut().git.changes = Some(Default::default());
     h.state_mut().prs.note = None;
     click_check_out(&mut h, "#8 Add cards");
     wait(&mut h, "failure", checkout_done);
@@ -4467,6 +4529,126 @@ fn e2e_check_out_a_pull_request_from_the_sidebar() {
             true
         ))
     );
-    assert_eq!(h.state().branch.as_deref(), Some("pr-7"));
+    assert_eq!(h.state().branch.as_deref(), Some("pr-8-half"));
+    wait(&mut h, "Current changes reload", |a| {
+        a.git
+            .changes
+            .as_ref()
+            .is_some_and(|c| c.branches.iter().any(|b| b == "pr-8-half"))
+    });
     let _ = std::fs::remove_dir_all(&bin);
+}
+
+#[test]
+fn e2e_pull_requests_of_one_project_never_show_in_another() {
+    let f = Fixture::new("prswitch");
+    // project B: another repository
+    let b = std::env::temp_dir().join(format!("droid-lite-e2e-prswitch-b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&b);
+    std::fs::create_dir_all(b.join("app/src/main/java/b")).unwrap();
+    std::fs::write(b.join("settings.gradle.kts"), "include(\":app\")\n").unwrap();
+    std::fs::write(b.join("app/src/main/java/b/B.kt"), "package b\nclass B\n").unwrap();
+    let b = b.canonicalize().unwrap();
+    let gb = |args: &[&str]| crate::git::run(&b, args).unwrap();
+    gb(&["init", "-q", "-b", "trunk"]);
+    gb(&["config", "user.name", "T"]);
+    gb(&["config", "user.email", "t@example.com"]);
+    gb(&["add", "."]);
+    gb(&["commit", "-q", "-m", "B"]);
+    // a fake gh: each project its own list; a checkout that takes a second
+    let bin = std::env::temp_dir().join(format!("droid-lite-fake-gh-sw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&bin);
+    std::fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        "#!/bin/sh\ncase \"$1 $2 $PWD\" in\n  'pr list '*prswitch-b*) echo '[{\"number\":1,\"title\":\"Only in B\"}]';;\n  'pr list '*) echo '[{\"number\":7,\"title\":\"Only in A\"}]';;\n  'pr checkout '*) sleep 1; git checkout -q -b pr-7;;\nesac\n",
+    )
+    .unwrap();
+    std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(&gh)
+        .status()
+        .unwrap();
+    // SAFETY: the SERIAL lock (held by the fixture) keeps other tests out of the environment.
+    unsafe { std::env::set_var("DROID_LITE_GH", &gh) };
+    let mut h = f.harness();
+    h.get_by_label(&format!("{}  Pull requests", ic::GIT_PULL_REQUEST))
+        .click();
+    wait(&mut h, "A's list", |a| {
+        a.prs.lists.contains_key(&crate::git::PrFilter::Mine)
+    });
+    // A's checkout is still running when B opens
+    click_check_out(&mut h, "#7 Only in A");
+    assert!(h.state().prs.note.is_some());
+    let ctx = h.ctx.clone();
+    h.state_mut().open_project(&b, &ctx);
+    wait(&mut h, "B open", |a| {
+        a.indexing.is_none() && a.project.as_ref().is_some_and(|p| p.root == b)
+    });
+    assert_eq!(h.state().branch.as_deref(), Some("trunk"));
+    assert!(h.state().prs.note.is_none(), "A's checkout note is gone");
+    assert!(h.state().prs.shown, "the sidebar still shows the pull requests");
+    wait(&mut h, "B's list", |a| {
+        matches!(
+            a.prs.lists.get(&crate::git::PrFilter::Mine),
+            Some(Ok(l)) if l.len() == 1 && l[0].number == 1
+        )
+    });
+    steps(&mut h, 3);
+    assert!(h.query_by_label("#1 Only in B").is_some());
+    assert!(h.query_by_label("#7 Only in A").is_none());
+    // A's checkout ends: nothing of it reaches B
+    std::thread::sleep(Duration::from_millis(1500));
+    steps(&mut h, 5);
+    assert_eq!(h.state().branch.as_deref(), Some("trunk"));
+    assert!(h.state().prs.note.is_none());
+    assert_eq!(crate::git::branch(&f.root).as_deref(), Some("pr-7"), "A did switch");
+    // a reply that names A's root changes nothing in B, even if it got through
+    h.state_mut().checked_out(super::prs_ui::Checkout {
+        root: f.root.clone(),
+        number: 7,
+        result: Ok(("pr-7".into(), false)),
+        branch: Some("pr-7".into()),
+        head: None,
+    });
+    assert_eq!(h.state().branch.as_deref(), Some("trunk"));
+    assert!(h.state().prs.note.is_none());
+    assert!(h.state().prs.lists.contains_key(&crate::git::PrFilter::Mine));
+    drop(h);
+    let _ = std::fs::remove_dir_all(&bin);
+    let _ = std::fs::remove_dir_all(&b);
+}
+
+#[test]
+fn e2e_autosave_never_overwrites_a_file_changed_on_disk() {
+    let f = Fixture::new("autosavedisk");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    assert!(h.state().settings.autosave);
+    std::thread::sleep(Duration::from_millis(300));
+    type_text(&mut h, "mine");
+    std::fs::write(&user, "package com.demo.data\n\nclass Theirs\n").unwrap();
+    wait(&mut h, "conflict bar", |a| a.tabs[a.active].disk_changed);
+    // the window loses focus: the other version stays on disk, the edits stay in the editor
+    h.input_mut().focused = true;
+    steps(&mut h, 2);
+    h.input_mut().focused = false;
+    steps(&mut h, 3);
+    let theirs = "package com.demo.data\n\nclass Theirs\n";
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs);
+    assert!(tab(&h).dirty() && tab(&h).text.contains("mine"));
+    assert!(tab(&h).disk_changed, "the bar still asks");
+    // nor on quit
+    eframe::App::on_exit(h.state_mut());
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs);
+    // Keep mine: from then on auto-save writes the edits
+    h.input_mut().focused = true;
+    steps(&mut h, 2);
+    h.get_by_label("Keep mine").click();
+    steps(&mut h, 2);
+    h.input_mut().focused = false;
+    steps(&mut h, 3);
+    assert!(std::fs::read_to_string(&user).unwrap().contains("mine"));
 }

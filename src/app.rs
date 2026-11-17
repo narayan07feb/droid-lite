@@ -620,6 +620,7 @@ impl App {
         self.found.clear();
         self.console.clear();
         self.git = Default::default();
+        self.prs.reset(); // a list or a checkout reply of the old project never shows here
         self.stability.clear();
         self.refactor = None;
         self.undo = None;
@@ -3909,6 +3910,7 @@ impl eframe::App for App {
         self.poll_capture(&ctx);
         self.rescan_resources(&ctx);
         self.poll_libs();
+        self.poll_prs();
         self.refresh_changes(&ctx); // git status for tree colours, not only the Current changes tab
         self.watch_focus(&ctx);
         self.save_session(false);
