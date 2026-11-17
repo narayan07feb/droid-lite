@@ -3890,6 +3890,9 @@ impl eframe::App for App {
         if self.settings.autosave {
             self.autosave();
         }
+        // every plugin list, view, run and watch (and tools they left running) is killed now
+        // (their Drop), not left to threads that end with the app
+        self.tests = Default::default();
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {

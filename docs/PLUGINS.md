@@ -53,7 +53,11 @@ it would run; **Allow** runs it from then on.
   checkout`), or something other than a file in a file's place, counts as a change: it asks for the
   OK again, it is not an error. A folder whose every file still looks the same as at the last full
   read (path, size, times, inode, mode) is not read again, so a check while nothing changed is
-  quick.
+  quick. A full read made within 2 s of a file's last write (or of a time stamp in the future)
+  keeps no such look: on volumes with coarse time stamps (exFAT, HFS+) a rewrite of the same size
+  in the same tick changes no stamp, so the next check reads every file again (git's "racy git"
+  rule). In the app a full read never runs on the UI thread: the tab shows "Checking…" and the
+  command starts once the check passes.
 - **Nothing of a plugin not allowed is clickable.** Its links do not show until you allow it.
 - **Not for code outside the folder.** Allowing trusts this plugin's folder. Its commands may also
   run project code outside it (for example a script in the repo, or `dir` pointing elsewhere);
@@ -127,7 +131,12 @@ processes never delete each other's fresh lock. Anything else in its place (a fo
 | `watch` | no | Runs while the Tests tab shows; prints the live state, one JSON line per change |
 | `views` | no | Extra lists (failures, history, …), each a command that prints entries |
 | `actions` | no | Buttons; each runs like `run` and reports the same way |
-| `links` | no | Links that open in the browser: `http://` and `https://` only (the app drops any other; the VS Code extension shows the plugin.json as an error) |
+| `links` | no | Links that open in the browser: `http://` and `https://` only (any other makes the plugin.json an error) |
+
+The app and the VS Code extension take the same `plugin.json` files: a `name` that is not a text, a
+command that is not a list of texts, a `dir` that is not a text, a view or action without a name or
+a good `run`, or a link without an `http(s)` `url` makes the whole plugin an error, with the same
+words in both.
 
 Each command is an argv array, not a shell line, so spaces in an id are safe. In every argument:
 `{plugin}` is the plugin folder's real path (links resolved), `{project}` the open project, `{id}`
@@ -136,8 +145,12 @@ gets `DROID_LITE_PROJECT` in its environment. Its stdin is empty: never wait for
 
 **Stop** sends `SIGTERM` to the command's process group, so the tools it started get it too, and
 `SIGKILL` 5 s later if any of it is still there. If your plugin starts work in another session (a
-detached process), stop that work in a `SIGTERM` handler. `list` and a view get 120 s to answer;
-then their process group is killed.
+detached process), stop that work in a `SIGTERM` handler. A tool your command started that still
+runs after the command ended keeps its process group: Stop, a reload and quitting stop it too.
+`list` and a view get 120 s to answer and 32 MB of output; past either their process group is
+killed. Once they exit, output still counts for 0.5 s (a tool left running may hold it open); then
+what came is used and the rest of their group is killed. A run or an action shows at most 20000
+lines and 8 MB (status lines count too); a line is cut at 64 KB.
 
 ## list: the cases
 

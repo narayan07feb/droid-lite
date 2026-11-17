@@ -43,9 +43,10 @@ const changedError = (message) => Object.assign(new Error(message), { changed: t
 const isChange = (e) => e.changed || e.code === 'ENOENT' || e.code === 'EACCES';
 
 // the files of a plugin folder without reading any: { files: [[relative path, absolute path]] (as
-// bytes, sorted as UTF-8 bytes), sig }, `sig` a digest of what lstat says of each file (its path,
-// size, times, inode, device and mode): the same sig later means the same bytes, without reading
-// them. A link anywhere inside, a name that is not UTF-8, or more than 2000 files or 8 MiB, throws.
+// bytes, sorted as UTF-8 bytes), sig, newest }, `sig` a digest of what lstat says of each file (its
+// path, size, times, inode, device and mode): the same sig later means the same bytes, without
+// reading them; `newest` the latest mtime or ctime of any file (ns). A link anywhere inside, a name
+// that is not UTF-8, or more than 2000 files or 8 MiB, throws.
 function treeStat(folder) {
   const files = []; // [relative path, absolute path, lstat]
   let total = 0;
@@ -64,11 +65,20 @@ function treeStat(folder) {
   walk(Buffer.from(folder), null);
   files.sort(([a], [b]) => Buffer.compare(a, b));
   const h = crypto.createHash('sha256');
+  let newest = -1n;
   for (const [r, , st] of files) {
     h.update(r).update(Buffer.of(0)).update(`${[st.size, st.mtimeNs, st.ctimeNs, st.ino, st.dev, st.mode].join(',')}\n`);
+    for (const t of [st.mtimeNs, st.ctimeNs]) if (t > newest) newest = t;
   }
-  return { files: files.map(([r, a]) => [r, a]), sig: h.digest('hex') };
+  return { files: files.map(([r, a]) => [r, a]), sig: h.digest('hex'), newest };
 }
+
+// a sig to keep when the folder was read at `now` (ns), or '' (the next check reads every file again).
+// As git's racy-git rule: on a volume with coarse stamps (exFAT, HFS+) a file rewritten with the same
+// size in the same tick as an earlier write keeps every stamp, so a sig taken while any file's mtime or
+// ctime is within 2 s of now (or after it) proves nothing about later bytes. As in the app.
+const RACY_NS = 2000000000n;
+const settled = (sig, newest, now = BigInt(Date.now()) * 1000000n) => (newest > now - RACY_NS ? '' : sig);
 
 // the tree hash of a plugin folder (shared with the app, byte for byte): SHA-256 over every regular
 // file under it, sorted by relative path ('/' separators) compared as UTF-8 bytes; per file its
@@ -76,9 +86,10 @@ function treeStat(folder) {
 // big-endian) and its bytes. Lowercase hex. Read a piece at a time (no copy of the files is kept).
 // Throws what treeStat throws; a file grown past 8 MiB is too big; one that is no longer a regular
 // file (a FIFO opens without waiting) or whose length changed while it was read is a change. Also
-// gives the plugin.json bytes it hashed, so what the user sees is what the OK covers, and the sig.
+// gives the plugin.json bytes it hashed, so what the user sees is what the OK covers, and the sig
+// (none when it was taken too close to a file's stamps: settled).
 function treeHash(folder) {
-  const { files, sig } = treeStat(folder);
+  const { files, sig, newest } = treeStat(folder);
   const h = crypto.createHash('sha256');
   const buf = Buffer.alloc(64 << 10);
   let manifest;
@@ -109,7 +120,7 @@ function treeHash(folder) {
       if (keep) manifest = Buffer.concat(keep);
     } finally { fs.closeSync(fd); }
   }
-  return { hash: h.digest('hex'), manifest, sig };
+  return { hash: h.digest('hex'), manifest, sig: settled(sig, newest) };
 }
 
 // the store: {"version":2,"approved":{"<project real path>":{"<plugin folder real path>":"<tree hash>"}}}.
@@ -259,9 +270,13 @@ const MAX_LOG = 20000; // lines kept per run in the test output
 const MAX_LOG_CHARS = 8 << 20; // and characters (about 8 MB) in all
 const MAX_LINE = 64 << 10; // longest line kept (chars); the rest of a longer one is dropped
 // ms: list/view time, output after exit, TERM -> KILL, the store's lock wait, the check of a project
-// plugin's folder while a command of it runs
-const limits = { json: 120000, grace: 500, kill: 5000, lock: 5000, recheck: 3000 };
-const procs = new Set(); // every plugin process group still running (runs, actions, watch, list, views)
+// plugin's folder while a command of it runs, the look at a group whose leader ended
+const limits = { json: 120000, grace: 500, kill: 5000, lock: 5000, recheck: 3000, linger: 500 };
+// every plugin process group still running (runs, actions, watch, list, views): also after its
+// leader ended, while tools it started run (they are stopped with it on dispose or a revoke)
+const procs = new Set();
+// a process group still has members (kill -0): until it has none its id is no other process's
+const groupLives = (pid) => { try { process.kill(-pid, 0); return true; } catch { return false; } };
 
 // plugin.json of `dir`, or of its droid-lite-plugin/ folder
 function findPluginJson(dir) {
@@ -389,7 +404,13 @@ function spawn(cmd, plugin, project, onEnd = () => {}) {
   const end = (code, err) => { if (!ended) { ended = true; onEnd(code, err); } };
   proc.plugin = plugin;
   procs.add(proc);
-  proc.on('close', () => procs.delete(proc));
+  proc.on('close', () => {
+    if (!proc.pid || !groupLives(proc.pid)) return procs.delete(proc);
+    const look = setInterval(() => {
+      if (!groupLives(proc.pid)) { clearInterval(look); procs.delete(proc); }
+    }, limits.linger);
+    look.unref?.();
+  });
   proc.on('error', (err) => end(undefined, err));
   proc.on('exit', (code, signal) => setTimeout(() => {
     proc.stdout.destroy();
@@ -833,7 +854,9 @@ function setup(ctx, projectOf) {
       }
       await load();
     }),
-    // Add: link the tool's plugin folder into the shared folder the app reads too
+    // Add: link the tool's plugin folder into the shared folder the app reads too. As the app: a
+    // folder already linked is not added twice; another plugin (or a dangling link) at its name gets
+    // the next free name (-2, -3, …)
     vscode.commands.registerCommand('droidLite.addTestPlugin', async () => {
       const [dir] = await vscode.window.showOpenDialog({
         canSelectFolders: true, canSelectFiles: false, openLabel: 'Add plugin',
@@ -843,11 +866,28 @@ function setup(ctx, projectOf) {
       const file = findPluginJson(dir.fsPath);
       if (!file) return vscode.window.showErrorMessage(`No plugin.json in ${dir.fsPath} or its droid-lite-plugin/ folder.`);
       let name;
-      try { name = JSON.parse(fs.readFileSync(file, 'utf8')).name; } catch (e) { return vscode.window.showErrorMessage(`${file}: ${e.message}`); }
-      const link = path.join(userDir(), String(name || path.basename(dir.fsPath)).toLowerCase().replace(/[^a-z0-9]+/g, '-'));
-      fs.mkdirSync(userDir(), { recursive: true });
-      if (fs.existsSync(link)) return vscode.window.showWarningMessage(`${name} is already added.`);
-      fs.symlinkSync(path.dirname(file), link);
+      try {
+        const spec = JSON.parse(fs.readFileSync(file, 'utf8'));
+        const bad = problem(spec);
+        if (bad) throw new Error(bad);
+        name = spec.name;
+        const folder = realpath(path.dirname(file));
+        fs.mkdirSync(userDir(), { recursive: true });
+        const names = fs.readdirSync(userDir());
+        const at = (n) => path.join(userDir(), n);
+        if (names.some((n) => { try { return realpath(at(n)) === folder; } catch { return false; /* dangling */ } })) {
+          return vscode.window.showWarningMessage(`${name} is already added.`);
+        }
+        const slug = Array.from(name.toLowerCase(), (c) => (/[a-z0-9]/.test(c) ? c : '-')).join('');
+        let link;
+        for (let n = 1; ; n++) {
+          link = at(n === 1 ? slug : `${slug}-${n}`);
+          try { fs.lstatSync(link); } catch { break; /* free */ }
+        }
+        fs.symlinkSync(folder, link);
+      } catch (e) {
+        return vscode.window.showErrorMessage(`${file}: ${e.message}`);
+      }
       await load();
       vscode.window.showInformationMessage(`Added ${name}: its cases are in the Test Explorer.`);
     }),
@@ -868,4 +908,4 @@ function setup(ctx, projectOf) {
   return { load, readPlugins, loaded };
 }
 
-module.exports = { setup, readPlugins, argv, json, findPluginJson, location, limits, procs, treeHash, treeStat, changed, approve, removeStale, utf8Name };
+module.exports = { setup, readPlugins, argv, json, findPluginJson, location, limits, procs, treeHash, treeStat, settled, changed, approve, removeStale, utf8Name };

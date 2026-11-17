@@ -2960,6 +2960,7 @@ fn e2e_a_project_plugin_runs_nothing_until_allowed_and_asks_again_after_a_change
     let mut h = f.harness();
     h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE))
         .click();
+    wait(&mut h, "plugins found", |a| a.tests.found());
     steps(&mut h, 3);
     h.get_by_label(&format!(
         "Needs your OK: runs [\"sh\", \"{{plugin}}/list.sh\"] from {}\nAllowing trusts this \
@@ -2988,12 +2989,14 @@ fn e2e_a_project_plugin_runs_nothing_until_allowed_and_asks_again_after_a_change
     let ctx = h.ctx.clone();
     std::fs::remove_file(f.path("listed")).unwrap();
     h.state_mut().load_plugins(&ctx);
+    wait(&mut h, "plugins found", |a| a.tests.found());
     wait(&mut h, "listed again", |a| a.tests.plugins[0].cases.len() == 1);
     assert!(f.path("listed").exists());
     // a changed plugin.json asks again, and runs nothing meanwhile
     std::fs::remove_file(f.path("listed")).unwrap();
     std::fs::write(dir.join("plugin.json"), manifest.replace("list.sh", "list.sh\",\"x")).unwrap();
     h.state_mut().load_plugins(&ctx);
+    wait(&mut h, "plugins found", |a| a.tests.found());
     steps(&mut h, 3);
     assert!(!h.state().tests.plugins[0].m.allowed);
     h.get_by_label_contains("Needs your OK: runs ");
@@ -3019,6 +3022,7 @@ fn e2e_a_project_plugin_changed_after_the_ok_runs_nothing_and_asks_again() {
     let mut h = f.harness();
     h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE))
         .click();
+    wait(&mut h, "plugins found", |a| a.tests.found());
     steps(&mut h, 3);
     h.get_by_label("Allow").click();
     wait(&mut h, "cases listed", |a| {
@@ -3027,6 +3031,8 @@ fn e2e_a_project_plugin_changed_after_the_ok_runs_nothing_and_asks_again() {
     // allowed and loaded; then a file of the folder changes (no reload)
     std::fs::write(dir.join("run.sh"), "touch \"$DROID_LITE_PROJECT/pwned\"\n").unwrap();
     click_in_row(&mut h, "Case A", ic::PLAY);
+    // the folder looks changed: it is read in full on a thread, then refused
+    wait(&mut h, "the check", |a| !a.tests.plugins[0].m.allowed);
     steps(&mut h, 3);
     let why = "Shared changed since you allowed it; allow it again";
     assert_eq!(h.state().status, why);
@@ -3070,6 +3076,7 @@ fn e2e_a_running_watch_stops_when_its_folder_changes_and_one_that_cannot_be_chec
     };
     let mut h = f.harness();
     h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    wait(&mut h, "plugins found", |a| a.tests.found());
     steps(&mut h, 3);
     h.get_by_label("Allow").click();
     wait(&mut h, "the watch", |a| a.tests.plugins[0].live.is_some());
@@ -3115,6 +3122,7 @@ fn e2e_a_watch_that_ends_at_once_starts_again_after_a_growing_pause() {
     .unwrap();
     let mut h = f.harness();
     h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    wait(&mut h, "plugins found", |a| a.tests.found());
     steps(&mut h, 3);
     h.get_by_label("Allow").click();
     let t0 = std::time::Instant::now();
@@ -3135,6 +3143,7 @@ fn e2e_allow_waits_for_the_lock_off_the_ui_thread() {
         .unwrap();
     let mut h = f.harness();
     h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    wait(&mut h, "plugins found", |a| a.tests.found());
     steps(&mut h, 3);
     // the VS Code extension holds the lock
     std::fs::create_dir_all(&f.config).unwrap();
@@ -3157,23 +3166,34 @@ fn e2e_a_project_plugin_not_allowed_shows_no_links_and_only_web_links_ever_show(
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("plugin.json"),
-        r#"{"name":"Linky","list":["sh","-c","echo []"],"links":[{"name":"PluginWebLink","url":"https://example.com"},
-            {"name":"PluginFileLink","url":"file:///etc/passwd"},{"name":"PluginShareLink","url":"smb://evil/share"}]}"#,
+        r#"{"name":"Linky","list":["sh","-c","echo []"],"links":[{"name":"PluginWebLink","url":"https://example.com"}]}"#,
+    )
+    .unwrap();
+    // a link that is not http(s) makes the whole plugin an error, as in the VS Code extension
+    let bad = f.path(".droid-lite/plugins/sharey");
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(
+        bad.join("plugin.json"),
+        r#"{"name":"Sharey","links":[{"name":"PluginShareLink","url":"smb://evil/share"}]}"#,
     )
     .unwrap();
     let mut h = f.harness();
     h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    wait(&mut h, "plugins found", |a| a.tests.found());
     steps(&mut h, 3);
+    assert_eq!(h.state().tests.plugins.len(), 1);
     h.get_by_label_contains("Needs your OK: runs ");
-    for name in ["PluginWebLink", "PluginFileLink", "PluginShareLink"] {
-        assert!(h.query_by_label(name).is_none(), "{name} shows before the OK");
-    }
+    assert!(h.query_by_label("PluginWebLink").is_none(), "a link shows before the OK");
     h.get_by_label("Allow").click();
     wait(&mut h, "allowed", |a| a.tests.plugins[0].m.allowed);
     steps(&mut h, 3);
     h.get_by_label("PluginWebLink");
-    assert!(h.query_by_label("PluginFileLink").is_none());
     assert!(h.query_by_label("PluginShareLink").is_none());
+    let errors = &h.state().tests.errors;
+    assert!(
+        errors.len() == 1 && errors[0].ends_with("sharey/plugin.json: links: PluginShareLink: url must be an http or https link"),
+        "{errors:?}"
+    );
 }
 
 #[test]
@@ -3188,6 +3208,7 @@ fn e2e_a_watch_that_cannot_start_waits_before_trying_again_and_says_why() {
     .unwrap();
     let mut h = f.harness();
     h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    wait(&mut h, "plugins found", |a| a.tests.found());
     let t0 = std::time::Instant::now();
     while t0.elapsed() < Duration::from_millis(1300) {
         h.step();
@@ -3214,6 +3235,7 @@ fn e2e_a_refused_plugin_stops_its_list_and_kills_a_watch_that_ignores_sigterm() 
     let alive = |pid: &str| unsafe { libc::kill(pid.trim().parse().unwrap(), 0) } == 0;
     let mut h = f.harness();
     h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    wait(&mut h, "plugins found", |a| a.tests.found());
     steps(&mut h, 3);
     h.get_by_label("Allow").click();
     wait(&mut h, "the list and the watch", |a| {
@@ -3254,9 +3276,44 @@ fn e2e_add_plugin_selects_the_added_folder_not_the_first_of_that_name() {
     let mut h = f.harness();
     let ctx = h.ctx.clone();
     h.state_mut().add_plugin(&tool, &ctx);
+    wait(&mut h, "plugins found", |a| a.tests.found());
     let t = &h.state().tests;
     assert_eq!(t.plugins.len(), 2);
     assert_eq!(t.plugins[t.active].m.real, tool.canonicalize().unwrap());
+}
+
+#[test]
+fn e2e_a_plugin_folder_is_read_in_full_only_off_the_ui_thread() {
+    let f = Fixture::new("plugin-off-ui");
+    let dir = f.path(".droid-lite/plugins/shared");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.json"),
+        r#"{"name":"Shared","list":["sh","{plugin}/list.sh"],"run":["sh","{plugin}/run.sh","{id}"]}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("list.sh"), "echo '[{\"id\":\"a\",\"label\":\"Case A\"}]'\n").unwrap();
+    std::fs::write(dir.join("run.sh"), "touch \"$DROID_LITE_PROJECT/ran\"\n").unwrap();
+    let reads = || crate::plugins::tests::READS.with(|r| r.get());
+    let start = reads();
+    let mut h = f.harness();
+    let ctx = h.ctx.clone();
+    h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE)).click();
+    wait(&mut h, "plugins found", |a| a.tests.found());
+    steps(&mut h, 3);
+    h.get_by_label("Allow").click();
+    wait(&mut h, "cases listed", |a| a.tests.plugins[0].cases.len() == 1);
+    // a reload reads the folder in full (on a thread), and lists
+    h.state_mut().load_plugins(&ctx);
+    wait(&mut h, "plugins found", |a| a.tests.found());
+    wait(&mut h, "listed again", |a| a.tests.plugins.first().is_some_and(|p| p.cases.len() == 1));
+    // the same bytes written again: it looks changed, the ▶ waits for a full read on a thread
+    std::fs::write(dir.join("run.sh"), "touch \"$DROID_LITE_PROJECT/ran\"\n").unwrap();
+    steps(&mut h, 3);
+    click_in_row(&mut h, "Case A", ic::PLAY);
+    wait(&mut h, "run", |a| a.tests.plugins[0].run.is_none() && a.tests.plugins[0].status.contains_key("a"));
+    assert!(f.path("ran").exists());
+    assert_eq!(reads(), start, "no full read of the folder on the UI thread");
 }
 
 #[test]
@@ -3269,6 +3326,7 @@ fn e2e_plugin_tests_tab_runs_cases_from_list_gutter_views_and_actions() {
     // no plugin yet: the tab says how to add one
     h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE))
         .click();
+    wait(&mut h, "plugins found", |a| a.tests.found());
     steps(&mut h, 2);
     h.get_by_label(&format!("{}  Add plugin…", ic::FOLDER_OPEN));
     // Add plugin with the example of docs/PLUGINS.md (the dialog's pick), so the documented
@@ -3365,8 +3423,10 @@ fn e2e_plugin_tests_tab_runs_cases_from_list_gutter_views_and_actions() {
     // Remove drops the link only
     h.get_by_label(&format!("{}  Tests", ic::CHECK_CIRCLE))
         .click();
+    wait(&mut h, "plugins found", |a| a.tests.found());
     steps(&mut h, 2);
     h.get_by_label("Remove").click();
+    wait(&mut h, "plugins found", |a| a.tests.found());
     steps(&mut h, 2);
     assert!(h.state().tests.plugins.is_empty());
     assert!(!f.config.join("plugins/example-tests").exists());

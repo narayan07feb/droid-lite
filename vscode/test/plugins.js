@@ -130,6 +130,7 @@ const fake = {
     showInformationMessage: (m) => { fake.info = m; },
     showErrorMessage: (m) => { fake.err = m; },
     showWarningMessage: (m, o, ...buttons) => { fake.asked = { m, o, buttons }; return Promise.resolve(fake.answer); },
+    showOpenDialog: () => Promise.resolve(fake.pick && [{ fsPath: fake.pick }]),
   },
   commands: { registerCommand: (n, f) => { commands[n] = f; return {}; } },
 };
@@ -151,6 +152,13 @@ const pids = path.join(toolsState, 'pids');
 const idOf = (n) => fs.realpathSync(path.join(project, '.droid-lite', 'plugins', n));
 let checks = 0;
 const check = (name, ok) => { assert.ok(ok, name); checks++; };
+// runs `f` with the clock an hour ahead: a folder written just now is read long after (its sig is
+// kept, not racy)
+const later = async (f) => {
+  const realNow = Date.now;
+  Date.now = () => realNow() + 3600000;
+  try { return await f(); } finally { Date.now = realNow; }
+};
 
 (async () => {
   // the plugin folders are read, a broken plugin.json is an error with its path
@@ -164,26 +172,8 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
 
   // a plugin.json with a command that is not a list of strings, a bad name, entry or link is an
   // error with its path (a string `run` used to throw inside the run and hang the Test Explorer)
-  const badSpecs = {
-    'run-string': [{ name: 'A', run: './t.sh' }, 'run must be a list of strings'],
-    'list-number': [{ name: 'A', list: ['sh', 3] }, 'list must be a list of strings'],
-    'watch-empty': [{ name: 'A', watch: [] }, 'watch must be a list of strings'],
-    'name-number': [{ name: 5 }, 'name must be a string'],
-    'no-name': [{ run: ['x'] }, 'name must be a string'],
-    'null': [null, 'not a JSON object'],
-    'list': [[{ name: 'A' }], 'not a JSON object'],
-    'dir-number': [{ name: 'A', dir: 1 }, 'dir must be a string'],
-    'view-run': [{ name: 'A', views: [{ name: 'V', run: 'x' }] }, 'views: V: run must be a list of strings'],
-    'view-no-run': [{ name: 'A', views: [{ name: 'V' }] }, 'views: V: run must be a list of strings'],
-    'action-run': [{ name: 'A', actions: [{ name: 'B', run: ['x', null] }] }, 'actions: B: run must be a list of strings'],
-    'action-name': [{ name: 'A', actions: [{ run: ['x'] }] }, 'actions must be a list of objects with a name'],
-    'actions-object': [{ name: 'A', actions: { name: 'B', run: ['x'] } }, 'actions must be a list of objects with a name'],
-    'views-strings': [{ name: 'A', views: ['V'] }, 'views must be a list of objects with a name'],
-    'link-file': [{ name: 'A', links: [{ name: 'L', url: 'file:///etc/passwd' }] }, 'links: L: url must be an http or https link'],
-    'link-command': [{ name: 'A', links: [{ name: 'L', url: 'command:workbench.action.terminal.new' }] }, 'links: L: url must be an http or https link'],
-    'link-number': [{ name: 'A', links: [{ name: 'L', url: 7 }] }, 'links: L: url must be an http or https link'],
-    'link-name': [{ name: 'A', links: [{ url: 'https://x' }] }, 'links must be a list of objects with a name'],
-  };
+  // shared with the app's test: it refuses the same files with the same words
+  const badSpecs = require('./bad-manifests.json');
   const badProject = path.join(tmp, 'bad');
   for (const [n, [spec]] of Object.entries(badSpecs)) {
     fs.mkdirSync(path.join(badProject, '.droid-lite', 'plugins', n), { recursive: true });
@@ -301,7 +291,12 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   ev = await Promise.race([go([toolCase('left')]), sleep(4000).then(() => 'stuck')]);
   check('a run settles on exit, not on closed output', ev !== 'stuck' && Date.now() - t0 < 3000
     && quiet(ev).some((e) => e[0] === 'passed'));
-  pidsIn(path.join(toolsState, 'left')).forEach((pid) => { try { process.kill(pid, 'SIGKILL'); } catch { /* ended */ } });
+  // the tool it left keeps its group tracked (stopped on dispose below), until it ends
+  const leftPid = pidsIn(path.join(toolsState, 'left')).at(-1);
+  const leftGroup = Number(require('child_process').execFileSync('ps', ['-o', 'pgid=', '-p', String(leftPid)]).toString().trim());
+  await sleep(tests.limits.linger * 2);
+  check('a group whose leader ended stays tracked while a tool it started runs', alive(leftPid)
+    && [...tests.procs].some((x) => x.pid === leftGroup));
 
   // one huge line is cut, the next line still comes
   ev = await go([toolCase('long')]);
@@ -425,7 +420,7 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   commands['droidLite.testAction'](toolsRow.plugin, toolsRow.plugin.spec.actions[1]);
   await until('the TERM-proof action', () => pidsIn(pids).length === 6);
   const proof = pidsIn(pids).slice(4);
-  const leftOver = [...pidsIn(pids), pidsIn(watchFile).at(-1)];
+  const leftOver = [...pidsIn(pids), pidsIn(watchFile).at(-1), leftPid];
   const timers = [];
   const realTimeout = global.setTimeout;
   global.setTimeout = (...a) => { const t = realTimeout(...a); timers.push(t); return t; };
@@ -437,7 +432,7 @@ const check = (name, ok) => { assert.ok(ok, name); checks++; };
   check('dispose: their SIGKILL timer keeps the host up', timers.length && timers.every((t) => t.hasRef()));
   await Promise.race([running, sleep(3000)]);
   await until('every plugin process to end', () => !leftOver.some(alive), 4000).catch(() => {});
-  check('dispose ends every plugin process', leftOver.length === 7 && !leftOver.some(alive));
+  check('dispose ends every plugin process, a tool left by an ended run too', leftOver.length === 8 && !leftOver.some(alive));
   await until('no tracked process', () => tests.procs.size === 0, 2000).catch(() => {});
   check('no tracked process left', tests.procs.size === 0);
 
@@ -1010,12 +1005,12 @@ const t = require(process.argv[2]);
     fs.readSync = (...a) => { reads++; return before(...a); };
     try { return f(); } finally { fs.readSync = before; }
   };
-  const sPlugin = tests.readPlugins(projectS).find((x) => x.name === 'S');
+  const sPlugin = await later(() => tests.readPlugins(projectS).find((x) => x.name === 'S'));
   const oneHash = (countReads(() => tests.treeHash(real(sDir))), reads);
   countReads(() => [1, 2, 3].map(() => tests.changed(sPlugin)));
   const unchangedReads = reads;
   fs.writeFileSync(path.join(sDir, 'l.sh'), 'echo []\n'); // the same bytes again
-  const same = countReads(() => tests.changed(sPlugin));
+  const same = await later(() => countReads(() => tests.changed(sPlugin)));
   const sameReads = reads;
   countReads(() => tests.changed(sPlugin));
   const afterReads = reads;
@@ -1030,8 +1025,10 @@ const t = require(process.argv[2]);
   let loadReads = 0;
   fs.readSync = (...a) => { loadReads++; return realReadSync2(...a); };
   try {
-    const apiS = tests.setup(ctxS, () => projectS);
-    await apiS.loaded;
+    await later(async () => {
+      const apiS = tests.setup(ctxS, () => projectS);
+      await apiS.loaded;
+    });
   } finally { fs.readSync = realReadSync2; }
   countReads(() => tests.readPlugins(projectS));
   const readOnly = reads; // the plugins read (one hash of S), and no list spawned
@@ -1059,6 +1056,89 @@ const t = require(process.argv[2]);
   const tilde = { name: 'T', folder: tmp, cwd: tmp, spec: {} };
   const homeCases = await tests.json(['~/droid-lite-list.sh'], tilde, project);
   check('~/ in a command is the home folder', homeCases?.[0]?.id === 'h');
+
+  // racy-git rule: a sig taken in the tick of a write is not kept. On a volume with coarse stamps
+  // (played here: lstat gives times in steps of 10^15 ns) a same-size rewrite in that tick, mtime set
+  // back, changes no stamp at all, and must still be found
+  const projectR = path.join(tmp, 'projectR');
+  const rDir = path.join(projectR, '.droid-lite', 'plugins', 'r');
+  fs.mkdirSync(rDir, { recursive: true });
+  fs.writeFileSync(path.join(rDir, 'plugin.json'), JSON.stringify({ name: 'R', list: ['sh', '-c', 'echo []'] }));
+  fs.writeFileSync(path.join(rDir, 'l.sh'), 'echo []\n');
+  approve(rDir);
+  const plainLstat = fs.lstatSync;
+  const step = 1000000000000000n;
+  fs.lstatSync = (...a) => {
+    const st = plainLstat(...a);
+    if (st && typeof st.mtimeNs === 'bigint') {
+      st.mtimeNs -= st.mtimeNs % step;
+      st.ctimeNs -= st.ctimeNs % step;
+    }
+    return st;
+  };
+  const nowR = Date.now;
+  let rRacy;
+  let rAfter;
+  try {
+    const tick = tests.treeStat(real(rDir)).newest;
+    Date.now = () => Number((tick + 500000000n) / 1000000n); // read 0.5 s into the tick
+    rRacy = tests.readPlugins(projectR).find((x) => x.name === 'R');
+    const lsh = path.join(rDir, 'l.sh');
+    const { mtime } = fs.statSync(lsh);
+    fs.writeFileSync(lsh, 'rm -r ~\n');
+    fs.utimesSync(lsh, mtime, mtime);
+    check('a same-size rewrite in the tick keeps every coarse stamp', tests.treeStat(real(rDir)).newest === tick);
+    rAfter = tests.changed(rRacy);
+  } finally { fs.lstatSync = plainLstat; Date.now = nowR; }
+  check('a sig taken in the tick of a write is not kept, and the rewrite is found', rRacy?.hash && rRacy.sig === ''
+    && /R changed since you allowed it; allow it again/.test(rAfter?.why));
+  const settledNow = BigInt(Date.now()) * 1000000n;
+  check('a stamp within 2 s of the read, or after it, is racy', tests.settled('s', settledNow - 1000000000n, settledNow) === ''
+    && tests.settled('s', settledNow + 5n, settledNow) === '' && tests.settled('s', settledNow - 3000000000n, settledNow) === 's');
+  // the sig holds each file's change time: a same-size rewrite whose mtime is set back still changes it
+  // (its mtime a whole second, so utimes can set it back exactly)
+  const lsh2 = path.join(rDir, 'l.sh');
+  const mtime2 = Math.floor(Date.now() / 1000) - 100;
+  fs.writeFileSync(lsh2, 'echo []\n');
+  fs.utimesSync(lsh2, mtime2, mtime2);
+  approve(rDir);
+  const rPlugin = await later(() => tests.readPlugins(projectR).find((x) => x.name === 'R'));
+  fs.writeFileSync(lsh2, 'rm -r ~\n');
+  fs.utimesSync(lsh2, mtime2, mtime2);
+  check('a same-size rewrite with its mtime set back is found by the change time', rPlugin?.sig
+    && /R changed since you allowed it; allow it again/.test(tests.changed(rPlugin)?.why));
+
+  // Add: a different tool with a name already taken gets -2, one already added is not added twice, a
+  // dangling link at the name is skipped (as in the app)
+  const userPlugins = path.join(home, '.config', 'droid-lite', 'plugins');
+  const toolA = path.join(tmp, 'toolA');
+  const toolB = path.join(tmp, 'toolB', 'droid-lite-plugin');
+  fs.mkdirSync(toolA, { recursive: true });
+  fs.mkdirSync(toolB, { recursive: true });
+  fs.writeFileSync(path.join(toolA, 'plugin.json'), JSON.stringify({ name: 'Same Tool' }));
+  fs.writeFileSync(path.join(toolB, 'plugin.json'), JSON.stringify({ name: 'Same Tool' }));
+  const linkOf = (n) => { try { return fs.readlinkSync(path.join(userPlugins, n)); } catch { return undefined; } };
+  fake.err = '';
+  fake.pick = toolA;
+  await commands['droidLite.addTestPlugin']();
+  fake.pick = path.dirname(toolB);
+  await commands['droidLite.addTestPlugin']();
+  check('a different tool with the same name is added as -2', linkOf('same-tool') === real(toolA) && linkOf('same-tool-2') === real(toolB));
+  fake.asked = undefined;
+  fake.pick = toolA;
+  await commands['droidLite.addTestPlugin']();
+  check('a tool already added is not added twice', /Same Tool is already added/.test(fake.asked?.m) && !linkOf('same-tool-3'));
+  const toolC = path.join(tmp, 'toolC');
+  fs.mkdirSync(toolC);
+  fs.writeFileSync(path.join(toolC, 'plugin.json'), JSON.stringify({ name: 'Dang' }));
+  fs.symlinkSync(path.join(tmp, 'gone'), path.join(userPlugins, 'dang'));
+  fake.pick = toolC;
+  await commands['droidLite.addTestPlugin']();
+  check('a dangling link at the name is skipped, no throw', linkOf('dang-2') === real(toolC) && linkOf('dang') === path.join(tmp, 'gone') && !fake.err);
+  fs.writeFileSync(path.join(toolC, 'plugin.json'), JSON.stringify({ name: 'Bad', run: 'x' }));
+  await commands['droidLite.addTestPlugin']();
+  check('a plugin.json the app refuses is not added', /run must be a list of strings/.test(fake.err) && !linkOf('bad'));
+  for (const n of ['same-tool', 'same-tool-2', 'dang', 'dang-2']) fs.unlinkSync(path.join(userPlugins, n));
 
   fs.rmSync(tmp, { recursive: true, force: true });
   console.log(`ok: test plugins, ${checks} checks`);

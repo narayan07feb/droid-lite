@@ -1,7 +1,7 @@
 //! Runs Gradle tasks in the background, and finds the preview screenshot tool a module uses.
 
 use crate::project::Project;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
@@ -11,17 +11,76 @@ pub enum Line {
     Done(Option<i32>),
 }
 
+/// The longest output line kept, in bytes: the rest of a longer one is dropped (memory stays
+/// bounded whatever a tool prints).
+pub const MAX_LINE: usize = 64 << 10;
+
+/// Calls `f` with each line of `r` (without its `\n` or `\r\n`; bytes that are not UTF-8 become
+/// U+FFFD) until the end or until `f` says false. A line longer than [`MAX_LINE`] is cut there and
+/// marked; the rest of it is dropped unread into memory.
+pub fn lines_capped(r: impl Read, mut f: impl FnMut(String) -> bool) {
+    let mut r = BufReader::new(r);
+    let mut line: Vec<u8> = Vec::new();
+    let mut cut = false;
+    let emit = |line: &mut Vec<u8>, cut: bool, f: &mut dyn FnMut(String) -> bool| {
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        let mut s = String::from_utf8_lossy(line).into_owned();
+        if cut {
+            s.push_str(" … [line cut]");
+        }
+        line.clear();
+        f(s)
+    };
+    loop {
+        let buf = match r.fill_buf() {
+            Ok([]) => break,
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let (part, used, end) = match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => (&buf[..i], i + 1, true),
+            None => (buf, buf.len(), false),
+        };
+        if !cut {
+            let room = MAX_LINE - line.len();
+            line.extend_from_slice(&part[..part.len().min(room)]);
+            if part.len() > room {
+                cut = true;
+                if !emit(&mut line, true, &mut f) {
+                    return;
+                }
+            }
+        }
+        r.consume(used);
+        if end {
+            if !cut && !emit(&mut line, false, &mut f) {
+                return;
+            }
+            cut = false;
+        }
+    }
+    if !line.is_empty() && !cut {
+        emit(&mut line, false, &mut f);
+    }
+}
+
 pub struct Run {
     child: Child,
     rx: Receiver<Line>,
     /// It leads its own process group ([`Run::spawn_group`]): signals reach the tools it started.
     group: bool,
-    /// `poll` saw it exit and reaped it: its pid (and group id) may be another process's by now,
-    /// so it is never signalled again.
+    /// `poll` saw it exit and reaped it. Its pid may be another process's by now, so it alone is
+    /// never signalled again; its group only while the group still has members (a group id is
+    /// not given to a new process while its group lives).
     reaped: bool,
     /// When SIGKILL follows the SIGTERM of [`Run::terminate`], and how long after.
     kill_at: Option<Instant>,
     kill_after: Duration,
+    /// Asked to draw again when the SIGKILL is due ([`Run::poll`] sends it).
+    ctx: egui::Context,
 }
 
 impl Run {
@@ -77,12 +136,11 @@ impl Run {
         {
             let (tx, ctx) = (tx.clone(), ctx.clone());
             std::thread::spawn(move || {
-                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
-                    if tx.send(Line::Out(line)).is_err() {
-                        break;
-                    }
+                lines_capped(pipe, |line| {
+                    let sent = tx.send(Line::Out(line)).is_ok();
                     ctx.request_repaint();
-                }
+                    sent
+                });
             });
         }
         Ok(Run {
@@ -92,22 +150,45 @@ impl Run {
             reaped: false,
             kill_at: None,
             kill_after: Duration::from_secs(5),
+            ctx,
         })
     }
 
-    /// New output lines, then `Done` once the process has exited. A run that [`Run::terminate`]
-    /// asked to stop and is still there gets SIGKILL once its time is up.
+    /// New output lines, then `Done` (once) when the process has exited. A run that
+    /// [`Run::terminate`] asked to stop and is still there (it, or in a group of its own any tool
+    /// it started) gets SIGKILL once its time is up; until then the next frame is asked for then.
     pub fn poll(&mut self) -> Vec<Line> {
         let mut out: Vec<Line> = self.rx.try_iter().collect();
-        if let Ok(Some(status)) = self.child.try_wait() {
+        if !self.reaped
+            && let Ok(Some(status)) = self.child.try_wait()
+        {
             self.reaped = true;
             out.extend(self.rx.try_iter());
             out.push(Line::Done(status.code()));
-        } else if self.kill_at.is_some_and(|t| Instant::now() >= t) {
-            self.kill_at = None;
-            self.signal(Signal::Kill);
+        }
+        if let Some(t) = self.kill_at {
+            let now = Instant::now();
+            if !self.lives() {
+                self.kill_at = None;
+            } else if now >= t {
+                self.kill_at = None;
+                self.signal(Signal::Kill);
+            } else {
+                self.ctx.request_repaint_after(t - now);
+            }
         }
         out
+    }
+
+    /// `poll` saw it exit (tools it started may still run: [`Run::lives`]).
+    pub fn ended(&self) -> bool {
+        self.reaped
+    }
+
+    /// It, or (in a group of its own) a tool it started, may still run: not reaped yet, or its
+    /// group still has members.
+    pub fn lives(&self) -> bool {
+        !self.reaped || (self.group && group_lives(self.child.id()))
     }
 
     pub fn stop(&mut self) {
@@ -115,21 +196,25 @@ impl Run {
     }
 
     /// SIGTERM to its process group (to it alone when it has none), then SIGKILL after 5 s if it
-    /// is still there ([`Run::poll`]). False, and no signal, once `poll` reaped it.
+    /// is still there ([`Run::poll`], a frame is asked for then). A group whose leader ended
+    /// still gets them while tools it started run. False, and no signal, once nothing of it is
+    /// left ([`Run::lives`]).
     pub fn terminate(&mut self) -> bool {
-        if self.reaped {
+        if !self.lives() {
             return false;
         }
         self.signal(Signal::Term);
         if self.kill_at.is_none() {
             self.kill_at = Some(Instant::now() + self.kill_after);
+            self.ctx.request_repaint_after(self.kill_after);
         }
         true
     }
 
-    /// Only while it is not reaped: until then its pid (and group id) cannot be another's.
+    /// Only while it lives ([`Run::lives`]): until it is reaped its pid (and group id) cannot be
+    /// another's; after, its group id cannot be while the group has members.
     fn signal(&mut self, s: Signal) {
-        if self.reaped {
+        if !self.lives() {
             return;
         }
         #[cfg(unix)]
@@ -149,6 +234,17 @@ impl Run {
     }
 }
 
+/// The process group `pgid` still has members (`kill(-pgid, 0)`).
+pub fn group_lives(pgid: u32) -> bool {
+    #[cfg(unix)]
+    return unsafe { libc::kill(-(pgid as libc::pid_t), 0) } == 0;
+    #[cfg(not(unix))]
+    return {
+        let _ = pgid;
+        false
+    };
+}
+
 #[derive(Clone, Copy)]
 enum Signal {
     Term,
@@ -157,10 +253,13 @@ enum Signal {
 
 impl Drop for Run {
     /// A dropped run (new project, app quit) must not leave Gradle running or a zombie behind: it
-    /// and, in a group of its own, every tool it started get SIGKILL (unless it was reaped).
+    /// and, in a group of its own, every tool it started get SIGKILL (also after it was reaped,
+    /// while tools it started still run).
     fn drop(&mut self) {
         self.signal(Signal::Kill);
-        let _ = self.child.wait();
+        if !self.reaped {
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -238,6 +337,103 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert!(!alive(&child));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Waits up to 3 s for `pid` to end.
+    fn ends(pid: &str) -> bool {
+        let t0 = Instant::now();
+        while alive(pid) && t0.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        !alive(pid)
+    }
+
+    /// Polls until `Done`.
+    fn done(run: &mut Run) {
+        let t0 = Instant::now();
+        while !run.poll().iter().any(|l| matches!(l, Line::Done(_))) {
+            assert!(t0.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_tool_left_running_by_an_ended_run_is_stopped_by_terminate_and_by_drop() {
+        let d = temp("left");
+        for how in ["terminate", "drop"] {
+            let _ = std::fs::remove_file(d.join("child.pid"));
+            let mut run = Run::spawn_group(
+                sh("sleep 30 >/dev/null 2>&1 & echo $! > child.pid", &d),
+                egui::Context::default(),
+            )
+            .unwrap();
+            done(&mut run);
+            let child = pid_in(&d.join("child.pid"));
+            assert!(
+                alive(&child) && run.lives(),
+                "{how}: the tool outlives the run"
+            );
+            assert!(run.poll().is_empty(), "Done comes once");
+            if how == "terminate" {
+                assert!(run.terminate(), "its group still has a member");
+                assert!(ends(&child), "SIGTERM reached it");
+                let _ = run.poll();
+                assert!(!run.lives() && !run.terminate());
+            } else {
+                drop(run);
+                assert!(ends(&child), "SIGKILL reached it");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_terminated_run_asks_for_a_frame_when_its_sigkill_is_due() {
+        let d = temp("repaint");
+        let ctx = egui::Context::default();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        ctx.set_repaint_observer(move |i| seen.lock().unwrap().push(i.delay));
+        let mut run =
+            Run::spawn_group(sh("trap '' TERM; sleep 30 >/dev/null 2>&1", &d), ctx).unwrap();
+        run.kill_after = Duration::from_secs(4);
+        std::thread::sleep(Duration::from_millis(100));
+        asked.lock().unwrap().clear();
+        assert!(run.terminate());
+        let _ = run.poll();
+        let delays = asked.lock().unwrap().clone();
+        assert!(
+            delays.len() >= 2 && delays.iter().all(|d| *d > Duration::from_secs(3)),
+            "{delays:?}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_huge_line_is_cut_and_the_next_one_still_comes() {
+        let mut text = vec![b'x'; 200_000];
+        text.extend_from_slice(b"\r\nafter\n\xff ok\r\nlast");
+        let mut got = Vec::new();
+        lines_capped(&text[..], |l| {
+            got.push(l);
+            true
+        });
+        assert_eq!(
+            got.len(),
+            4,
+            "{:?}",
+            got.iter().map(String::len).collect::<Vec<_>>()
+        );
+        assert_eq!(got[0].len(), MAX_LINE + " … [line cut]".len());
+        assert!(got[0].ends_with("x … [line cut]"));
+        assert_eq!(got[1..], ["after", "\u{fffd} ok", "last"]);
+        // a reader that says stop gets no more lines
+        let mut n = 0;
+        lines_capped(&b"a\nb\nc\n"[..], |_| {
+            n += 1;
+            false
+        });
+        assert_eq!(n, 1);
     }
 
     #[test]

@@ -41,7 +41,8 @@ pub struct Manifest {
     pub broken: Option<String>,
     /// A project plugin's folder as the walk before its last full read saw it (each file's path,
     /// size, times, inode and mode, [`Walk::stat`]): while it still looks the same, a check needs
-    /// no new read of every byte ([`Manifest::recheck`]).
+    /// no new read of every byte ([`Manifest::recheck`]). Empty when it was taken too close to a
+    /// file's stamps to prove anything ([`settled`]).
     pub seen: String,
 }
 
@@ -132,13 +133,69 @@ fn named(v: &Value, key: &str) -> Vec<Named> {
         .collect()
 }
 
+/// Why a plugin.json cannot be used, in the VS Code extension's words (its `problem`): the whole
+/// plugin is an error. Every command is a list of strings, a link opens only an http(s) page.
+fn problem(v: &Value) -> Option<String> {
+    let is_argv = |x: &Value| {
+        x.as_array()
+            .is_some_and(|a| !a.is_empty() && a.iter().all(Value::is_string))
+    };
+    let Some(o) = v.as_object() else {
+        return Some("not a JSON object".into());
+    };
+    if !o
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|n| !n.is_empty())
+    {
+        return Some("name must be a string".into());
+    }
+    if o.get("dir").is_some_and(|d| !d.is_string()) {
+        return Some("dir must be a string".into());
+    }
+    for k in ["list", "run", "watch"] {
+        if o.get(k).is_some_and(|x| !is_argv(x)) {
+            return Some(format!("{k} must be a list of strings"));
+        }
+    }
+    for k in ["views", "actions", "links"] {
+        let Some(x) = o.get(k) else {
+            continue;
+        };
+        let named = |i: &Value| i.get("name").and_then(Value::as_str).map(str::to_owned);
+        let Some(items) = x
+            .as_array()
+            .filter(|a| a.iter().all(|i| named(i).is_some()))
+        else {
+            return Some(format!("{k} must be a list of objects with a name"));
+        };
+        for i in items {
+            let name = named(i).unwrap_or_default();
+            if k == "links" {
+                if !i
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_web_link)
+                {
+                    return Some(format!("links: {name}: url must be an http or https link"));
+                }
+            } else if !i.get("run").is_some_and(is_argv) {
+                return Some(format!("{k}: {name}: run must be a list of strings"));
+            }
+        }
+    }
+    None
+}
+
 impl Manifest {
+    /// A plugin.json the VS Code extension takes too: anything it refuses ([`problem`]) is an
+    /// error here, with the same words.
     pub fn parse(json: &str, folder: &Path) -> Result<Manifest, String> {
         let v: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
-        let name = text(&v, "name");
-        if name.is_empty() {
-            return Err("\"name\" is missing".into());
+        if let Some(why) = problem(&v) {
+            return Err(why);
         }
+        let name = text(&v, "name");
         // as the VS Code extension's path.resolve(real folder, dir)
         let real = folder
             .canonicalize()
@@ -153,7 +210,6 @@ impl Manifest {
             .into_iter()
             .flatten()
             .map(|l| (text(l, "name"), text(l, "url")))
-            .filter(|(_, u)| is_web_link(u))
             .collect();
         Ok(Manifest {
             name,
@@ -208,24 +264,54 @@ impl Manifest {
         )
     }
 
-    /// The command for `argv`, with `{plugin}` (the real folder), `{project}` and `{id}` filled
-    /// in, run in `dir`. Its stdin is empty: a plugin must never wait for typed input. An error for
-    /// a project plugin the user has not allowed ([`Manifest::allowed`]): nothing of it runs. A
-    /// project plugin's folder is checked again first ([`Manifest::recheck`]), and Python writes
-    /// no `__pycache__` into it (that would change the folder and ask for the OK again).
+    /// The command for `argv` after a full check of a project plugin's folder on this thread
+    /// ([`Manifest::recheck`]); the app checks off the UI thread ([`Manifest::quick_command`]).
+    #[cfg(test)]
     pub fn command(
         &mut self,
         argv: &[String],
         project: Option<&Path>,
         id: &str,
     ) -> Result<Command, String> {
-        if !self.allowed {
-            return Err(match &self.broken {
-                Some(why) => why.clone(),
-                None => format!("{} needs your OK first (Tests tab)", self.name),
-            });
-        }
+        self.may_run()?;
         self.recheck()?;
+        Ok(self.build(argv, project, id))
+    }
+
+    /// The command for `argv` without reading the plugin's folder: `Ok(None)` when a project
+    /// plugin's folder looks changed since its last full read ([`Manifest::looks_same`]), so it is
+    /// checked in full first ([`Manifest::recheck`], on a thread); `checked`: such a check passed
+    /// just now. An error for a plugin that may not run ([`Manifest::allowed`]).
+    pub fn quick_command(
+        &mut self,
+        argv: &[String],
+        project: Option<&Path>,
+        id: &str,
+        checked: bool,
+    ) -> Result<Option<Command>, String> {
+        self.may_run()?;
+        if !checked && !self.looks_same() {
+            return Ok(None);
+        }
+        Ok(Some(self.build(argv, project, id)))
+    }
+
+    /// An error for a project plugin the user has not allowed: nothing of it runs.
+    fn may_run(&self) -> Result<(), String> {
+        if self.allowed {
+            return Ok(());
+        }
+        Err(match &self.broken {
+            Some(why) => why.clone(),
+            None => format!("{} needs your OK first (Tests tab)", self.name),
+        })
+    }
+
+    /// `argv` with `{plugin}` (the real folder), `{project}` and `{id}` filled in, run in `dir`.
+    /// Its stdin is empty: a plugin must never wait for typed input. A project plugin's Python
+    /// writes no `__pycache__` into its folder (that would change the folder and ask for the OK
+    /// again).
+    fn build(&self, argv: &[String], project: Option<&Path>, id: &str) -> Command {
         let project = project.map(|p| p.display().to_string()).unwrap_or_default();
         let fill = |s: &str| {
             s.replace("{plugin}", &self.real.display().to_string())
@@ -243,36 +329,48 @@ impl Manifest {
         // its own process group, so Stop reaches the tools it starts too
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-        Ok(cmd)
+        cmd
+    }
+
+    /// A user plugin; or a project plugin whose folder is where it was allowed and whose every
+    /// file still looks as it did at the last full read ([`Manifest::seen`]): a walk, no file
+    /// read.
+    pub fn looks_same(&self) -> bool {
+        let Some(t) = &self.trust else {
+            return true;
+        };
+        let root = Path::new(&t.project);
+        !self.seen.is_empty()
+            && root
+                .join(".droid-lite/plugins")
+                .canonicalize()
+                .ok()
+                .and_then(|p| real_inside(&self.folder, root, &p).ok())
+                .filter(|real| real.as_os_str() == Path::new(&t.folder).as_os_str())
+                .and_then(|real| walk(&real).ok())
+                .is_some_and(|w| w.stat == self.seen)
     }
 
     /// A project plugin's folder as it is on disk now must be the one the user allowed: read
     /// again (the same checks as when it was found) and hashed. A folder whose every file still
-    /// looks as it did before the last full read ([`Manifest::seen`]) is not read again. When it is
-    /// not the one allowed, it is no longer allowed and is replaced by what its folder holds now
-    /// (so the OK shows the new commands), and the error says to allow it again; so it does when a
-    /// file was gone or locked for a moment (a save, a `git checkout`). When the folder can no
-    /// longer be checked at all (links outside, too big), it is [`Manifest::broken`]. The user's
-    /// own plugins pass.
+    /// looks as it did before the last full read ([`Manifest::looks_same`]) is not read again.
+    /// When it is not the one allowed, it is no longer allowed and is replaced by what its folder
+    /// holds now (so the OK shows the new commands), and the error says to allow it again; so it
+    /// does when a file was gone or locked for a moment (a save, a `git checkout`). When the
+    /// folder can no longer be checked at all (links outside, too big), it is
+    /// [`Manifest::broken`]. The user's own plugins pass.
     pub fn recheck(&mut self) -> Result<(), String> {
         let Some(t) = &self.trust else {
             return Ok(());
         };
+        if self.looks_same() {
+            return Ok(());
+        }
         let root = Path::new(&t.project);
         let plugins = root
             .join(".droid-lite/plugins")
             .canonicalize()
             .map_err(|e| io_refusal(".droid-lite/plugins", e));
-        let looks_same = plugins
-            .as_ref()
-            .ok()
-            .and_then(|p| real_inside(&self.folder, root, p).ok())
-            .filter(|real| real.as_os_str() == Path::new(&t.folder).as_os_str())
-            .and_then(|real| walk(&real).ok())
-            .is_some_and(|w| !self.seen.is_empty() && w.stat == self.seen);
-        if looks_same {
-            return Ok(());
-        }
         let now = plugins.and_then(|plugins| project_plugin(&self.folder, root, &plugins));
         if let Ok(m) = &now
             && m.trust.as_ref() == Some(t)
@@ -670,12 +768,41 @@ struct Walk {
     /// A digest of what the walk saw of each file (its path, size, times, inode, device and mode):
     /// the same digest later means the same bytes, without reading them ([`Manifest::seen`]).
     stat: String,
+    /// The latest modification or change time of any file, in ns since 1970 ([`settled`]).
+    newest: i128,
+}
+
+/// How close to the time a folder's digest is taken a file's stamp makes it racy ([`settled`]):
+/// the coarsest timestamps (exFAT) count in steps of 2 s.
+const RACY: i128 = 2_000_000_000;
+
+/// The time now in ns since 1970, as file stamps count.
+fn now_ns() -> i128 {
+    #[cfg(test)]
+    if let Some(t) = tests::CLOCK.with(|c| c.get()) {
+        return t;
+    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i128)
+}
+
+/// The walk's digest to keep as [`Manifest::seen`] when the folder was read at `now`, or none
+/// (the next check reads every file again). As git's racy-git rule: on a volume with coarse
+/// stamps (exFAT, HFS+) a file rewritten with the same size in the same tick as an earlier write
+/// keeps every stamp, so a digest taken while any file's mtime or ctime is within [`RACY`] of
+/// `now` (or after it) proves nothing about later bytes.
+fn settled(w: &Walk, now: i128) -> String {
+    if w.newest > now - RACY {
+        return String::new();
+    }
+    w.stat.clone()
 }
 
 /// Walks the plugin folder `root` without reading any file. An error for a link anywhere inside, a
 /// name that is not UTF-8, or more than [`TREE_MAX_FILES`] files or [`TREE_MAX_BYTES`] bytes.
 fn walk(root: &Path) -> Result<Walk, Refusal> {
-    let (mut files, mut total) = (Vec::new(), 0u64);
+    let (mut files, mut total, mut newest) = (Vec::new(), 0u64, i128::MIN);
     let mut dirs = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, rel)) = dirs.pop() {
         let here = if rel.is_empty() { "." } else { rel.as_str() };
@@ -695,7 +822,10 @@ fn walk(root: &Path) -> Result<Walk, Refusal> {
                 dirs.push((e.path(), rel));
             } else if md.is_file() {
                 total += md.len();
-                files.push((rel, e.path(), stat_key(&md)));
+                let key = stat_key(&md);
+                let ns = |s: i64, n: i64| s as i128 * 1_000_000_000 + n as i128;
+                newest = newest.max(ns(key[1], key[2])).max(ns(key[3], key[4]));
+                files.push((rel, e.path(), key));
                 if files.len() > TREE_MAX_FILES || total > TREE_MAX_BYTES {
                     return Err(too_big());
                 }
@@ -714,6 +844,7 @@ fn walk(root: &Path) -> Result<Walk, Refusal> {
     Ok(Walk {
         files: files.into_iter().map(|(r, p, _)| (r, p)).collect(),
         stat: stat.hex(),
+        newest,
     })
 }
 
@@ -723,7 +854,7 @@ fn stat_key(md: &std::fs::Metadata) -> [i64; 8] {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        [
+        let key = [
             md.size() as i64,
             md.mtime(),
             md.mtime_nsec(),
@@ -732,7 +863,10 @@ fn stat_key(md: &std::fs::Metadata) -> [i64; 8] {
             md.ino() as i64,
             md.dev() as i64,
             md.mode() as i64,
-        ]
+        ];
+        #[cfg(test)]
+        let key = tests::coarse(key);
+        key
     }
     #[cfg(not(unix))]
     {
@@ -864,6 +998,7 @@ fn project_plugin(folder: &Path, project: &Path, plugins: &Path) -> Result<Manif
     let real = real_inside(folder, project, plugins)?;
     let w = walk(&real)?;
     let (hash, json) = tree_hash(&w)?;
+    let seen = settled(&w, now_ns());
     let json = json.ok_or_else(|| Refusal::changed("no plugin.json"))?;
     let json = std::str::from_utf8(&json).map_err(|e| Refusal::broken(e.to_string()))?;
     let mut m = Manifest::parse(json, folder).map_err(Refusal::broken)?;
@@ -872,7 +1007,7 @@ fn project_plugin(folder: &Path, project: &Path, plugins: &Path) -> Result<Manif
         folder: real.to_string_lossy().into_owned(),
         hash,
     });
-    m.seen = w.stat;
+    m.seen = seen;
     Ok(m)
 }
 
@@ -1171,21 +1306,21 @@ pub fn file_cases(cases: &[Case], out: &mut Vec<(PathBuf, usize, String, String)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
     fn manifest_fills_defaults_and_placeholders() {
         let m = Manifest::parse(
             r#"{"name":"Demo","list":["./list.sh","{project}"],"run":["./run.sh","{id}"],
-                "actions":[{"name":"Check","run":["./check.sh"]},{"name":"broken"}],
+                "actions":[{"name":"Check","run":["./check.sh"]}],
                 "views":[{"name":"Failures","run":["./failures.sh"]}],
-                "links":[{"name":"Live","url":"http://127.0.0.1:1"},{"name":"no url"}]}"#,
+                "links":[{"name":"Live","url":"http://127.0.0.1:1"}]}"#,
             Path::new("/p/demo"),
         )
         .unwrap();
         assert_eq!(m.dir, Path::new("/p/demo"));
-        assert_eq!(m.actions.len(), 1, "an action without a command is dropped");
+        assert_eq!(m.actions.len(), 1);
         assert_eq!(m.views[0].name, "Failures");
         assert_eq!(m.links, vec![("Live".into(), "http://127.0.0.1:1".into())]);
         assert!(m.watch.is_none());
@@ -2007,15 +2142,28 @@ mod tests {
     fn only_http_and_https_links_are_kept() {
         let m = Manifest::parse(
             r#"{"name":"L","links":[{"name":"web","url":"https://example.com"},
-                {"name":"up","url":"HTTP://127.0.0.1:8080"},{"name":"file","url":"file:///etc/passwd"},
-                {"name":"share","url":"smb://evil/share"},{"name":"path","url":"/Applications/Calculator.app"},
-                {"name":"js","url":"javascript:alert(1)"},{"name":"app","url":"x-apple.systempreferences:"},
-                {"name":"spaced","url":" https://example.com"}]}"#,
+                {"name":"up","url":"HTTP://127.0.0.1:8080"}]}"#,
             Path::new("/p"),
         )
         .unwrap();
         let names: Vec<&str> = m.links.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["web", "up"]);
+        // any other link makes the whole plugin.json an error, as in the VS Code extension
+        for url in [
+            "file:///etc/passwd",
+            "smb://evil/share",
+            "/Applications/Calculator.app",
+            "javascript:alert(1)",
+            "x-apple.systempreferences:",
+            " https://example.com",
+        ] {
+            let json = serde_json::json!({"name": "L", "links": [{"name": "x", "url": url}]});
+            assert_eq!(
+                Manifest::parse(&json.to_string(), Path::new("/p")).unwrap_err(),
+                "links: x: url must be an http or https link",
+                "{url}"
+            );
+        }
         let rows = parse_entries(
             r#"[{"label":"a","url":"https://x.test/a"},{"label":"b","url":"file:///etc/hosts"}]"#,
             None,
@@ -2027,7 +2175,144 @@ mod tests {
 
     thread_local! {
         /// Full reads of a plugin folder ([`tree_hash`]) on this thread.
-        pub(super) static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(crate) static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// The time [`now_ns`] gives on this thread, when set.
+        pub(super) static CLOCK: std::cell::Cell<Option<i128>> = const { std::cell::Cell::new(None) };
+        /// Plays a volume whose stamps count in steps of this many seconds (0: off): the times of
+        /// [`stat_key`] are cut down to them on this thread.
+        static COARSE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// `key` as a volume with [`COARSE`] stamps would give it.
+    pub(super) fn coarse(mut key: [i64; 8]) -> [i64; 8] {
+        let step = COARSE.with(|c| c.get());
+        if step > 0 {
+            for (s, n) in [(1, 2), (3, 4)] {
+                key[s] -= key[s].rem_euclid(step);
+                key[n] = 0;
+            }
+        }
+        key
+    }
+
+    /// The real time now plus `secs`, in ns, for [`CLOCK`].
+    fn later(secs: i128) -> Option<i128> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i128;
+        Some(now + secs * 1_000_000_000)
+    }
+
+    /// Writes `text` (of the same size) over `f` in place (same inode), then sets its mtime back.
+    fn rewrite_keeping_mtime(f: &Path, text: &str) {
+        let mtime = std::fs::metadata(f).unwrap().modified().unwrap();
+        std::fs::write(f, text).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(f)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    /// A folder read in the same clock tick as its last write keeps no digest (git's racy-git
+    /// rule): on a volume with coarse stamps a same-size rewrite in that tick, mtime set back,
+    /// changes no stamp at all, and must still be found.
+    #[test]
+    fn a_digest_taken_in_the_tick_of_a_write_is_not_kept() {
+        let d = temp("racy");
+        let dir = d.join("proj/.droid-lite/plugins/p");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plugin.json"), r#"{"name":"P","list":["./l.sh"]}"#).unwrap();
+        std::fs::write(dir.join("l.sh"), "echo []\n").unwrap();
+        let store = approvals_file(&d.join("config"));
+        approve(&store, &project_plugins(&d.join("proj"), None)[0]).unwrap();
+        // stamps in steps of 10^6 s (one tick for the whole test); the folder read 0.5 s into the
+        // tick its files were written in
+        let step = 1_000_000;
+        COARSE.with(|c| c.set(step));
+        let tick = walk(&dir).unwrap().newest;
+        CLOCK.with(|c| c.set(Some(tick + 500_000_000)));
+        let mut m = project_plugins(&d.join("proj"), Some(&store)).remove(0);
+        assert!(m.allowed);
+        assert!(m.seen.is_empty(), "racy: no digest kept");
+        let list = m.list.clone().unwrap();
+        rewrite_keeping_mtime(&dir.join("l.sh"), "rm -r ~\n");
+        assert_eq!(walk(&dir).unwrap().newest, tick, "no stamp changed");
+        assert!(
+            m.quick_command(&list, None, "", false).unwrap().is_none(),
+            "it must be read again"
+        );
+        assert_eq!(
+            m.command(&list, None, "").unwrap_err(),
+            "P changed since you allowed it; allow it again"
+        );
+        // read more than 2 s after the newest stamp, the digest is kept
+        COARSE.with(|c| c.set(0));
+        CLOCK.with(|c| c.set(later(3600)));
+        approve(&store, &project_plugins(&d.join("proj"), None)[0]).unwrap();
+        let m = project_plugins(&d.join("proj"), Some(&store)).remove(0);
+        assert!(m.allowed && !m.seen.is_empty());
+        // a stamp in the future is racy too
+        CLOCK.with(|c| c.set(later(-3600)));
+        assert!(
+            project_plugins(&d.join("proj"), Some(&store))[0]
+                .seen
+                .is_empty()
+        );
+        CLOCK.with(|c| c.set(None));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The digest holds each file's change time: a same-size rewrite whose mtime is set back
+    /// (`utimes`, as `touch -r` or a tool keeping times does) still changes it.
+    #[test]
+    fn a_same_size_rewrite_with_its_mtime_set_back_is_found_by_the_change_time() {
+        let d = temp("ctime");
+        let dir = d.join("proj/.droid-lite/plugins/p");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plugin.json"), r#"{"name":"P","list":["./l.sh"]}"#).unwrap();
+        std::fs::write(dir.join("l.sh"), "echo []\n").unwrap();
+        let store = approvals_file(&d.join("config"));
+        approve(&store, &project_plugins(&d.join("proj"), None)[0]).unwrap();
+        CLOCK.with(|c| c.set(later(3600)));
+        let mut m = project_plugins(&d.join("proj"), Some(&store)).remove(0);
+        assert!(m.allowed && !m.seen.is_empty());
+        let list = m.list.clone().unwrap();
+        assert!(m.quick_command(&list, None, "", false).unwrap().is_some());
+        rewrite_keeping_mtime(&dir.join("l.sh"), "rm -r ~\n");
+        assert!(
+            m.quick_command(&list, None, "", false).unwrap().is_none(),
+            "it looks changed"
+        );
+        assert_eq!(
+            m.command(&list, None, "").unwrap_err(),
+            "P changed since you allowed it; allow it again"
+        );
+        CLOCK.with(|c| c.set(None));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The app refuses exactly the plugin.json files the VS Code extension refuses, with the same
+    /// words (the cases are shared with its test: vscode/test/bad-manifests.json).
+    #[test]
+    fn a_plugin_json_the_extension_refuses_is_refused_with_its_words() {
+        let cases: serde_json::Map<String, Value> =
+            serde_json::from_str(include_str!("../vscode/test/bad-manifests.json")).unwrap();
+        assert!(cases.len() >= 20);
+        for (n, case) in cases {
+            let json = case[0].to_string();
+            assert_eq!(
+                Manifest::parse(&json, Path::new("/p")),
+                Err(case[1].as_str().unwrap().to_owned()),
+                "{n}: {json}"
+            );
+        }
+        let good = r#"{"name":"Good","dir":"..","list":["a"],"run":["a","{id}"],"watch":["w"],
+            "views":[{"name":"V","run":["v"]}],"actions":[{"name":"B","run":["b"]}],
+            "links":[{"name":"L","url":"HTTPS://example.com"}]}"#;
+        assert!(Manifest::parse(good, Path::new("/p")).is_ok());
     }
 
     /// An allowed plugin whose folder looks as it did at the last full read (every file's size,
@@ -2041,6 +2326,8 @@ mod tests {
         std::fs::write(dir.join("l.sh"), "echo []\n").unwrap();
         let store = approvals_file(&d.join("config"));
         approve(&store, &project_plugins(&d.join("proj"), None)[0]).unwrap();
+        // read long after the files were written (else no digest is kept: racy)
+        CLOCK.with(|c| c.set(later(3600)));
         let mut m = project_plugins(&d.join("proj"), Some(&store)).remove(0);
         assert!(m.allowed && !m.seen.is_empty());
         let list = m.list.clone().unwrap();
@@ -2061,6 +2348,7 @@ mod tests {
             m.command(&list, None, "").unwrap_err(),
             "P changed since you allowed it; allow it again"
         );
+        CLOCK.with(|c| c.set(None));
         let _ = std::fs::remove_dir_all(&d);
     }
 

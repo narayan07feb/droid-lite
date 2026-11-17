@@ -3,19 +3,28 @@
 //! lines that a case names. The plugin contract is in docs/PLUGINS.md.
 
 use super::{App, Bottom, config_dir};
-use crate::gradle::{Line, Run};
+use crate::gradle::{Line, Run, group_lives};
 use crate::icons as ic;
 use crate::plugins::{self, Case, Entry, Live, Manifest, Status, Trust};
 use egui::{Align, Color32, Layout, RichText, Ui};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// Log lines kept per plugin.
-const KEEP_LOG: usize = 5000;
+/// Output lines a run or action shows (status lines count too), as the VS Code extension keeps.
+const MAX_LOG: usize = 20000;
+/// And bytes of them in all.
+const MAX_LOG_BYTES: usize = 8 << 20;
+/// The most a `list` or a view may print: past it its process group is killed.
+const MAX_FETCH: usize = 32 << 20;
+/// The end of a failed `list`'s stderr kept for its error.
+const ERR_TAIL: usize = 64 << 10;
+/// How long a `list` or a view's output may still come after it exited (a tool it left running
+/// may hold its output open).
+const GRACE: Duration = Duration::from_millis(500);
 /// How often a project plugin's folder is checked again while one of its commands runs.
 const RECHECK: Duration = Duration::from_secs(3);
 /// The longest pause before a `watch` that ended is started again (it doubles from 1 s).
@@ -23,11 +32,43 @@ const WATCH_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// How long a `list` or a view may take before its process group is killed.
 const FETCH_LIMIT: Duration = Duration::from_secs(120);
 
-/// A `list` or a view running on a thread. Dropping it (a refused plugin, a reload) kills its
-/// process group.
+/// A `list` or a view running on a thread. Dropping it (a refused plugin, a reload, the app
+/// quitting) kills its process group.
 pub(super) struct Fetch {
     rx: Receiver<Result<String, String>>,
-    cancel: Arc<AtomicBool>,
+    slot: Arc<Mutex<Slot>>,
+}
+
+/// What of a [`Fetch`]'s process may be signalled, shared by its thread and its Drop.
+enum Slot {
+    Starting,
+    /// The leader of process group `pgid`, not reaped (so the id is no other process's).
+    Running(u32),
+    /// Its leader was reaped; tools it started may still be in the group (while they are, the
+    /// group id is no other process's).
+    Reaped(u32),
+    /// Dropped or done: nothing is signalled any more.
+    Gone,
+}
+
+fn lock(slot: &Mutex<Slot>) -> MutexGuard<'_, Slot> {
+    slot.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn kill_group(pgid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+    }
+}
+
+/// Ends `slot`: SIGKILL to what of its group is left.
+fn end_group(slot: &Mutex<Slot>) {
+    match std::mem::replace(&mut *lock(slot), Slot::Gone) {
+        Slot::Running(g) => kill_group(g),
+        Slot::Reaped(g) if group_lives(g) => kill_group(g),
+        _ => {}
+    }
 }
 
 impl Fetch {
@@ -37,8 +78,9 @@ impl Fetch {
 }
 
 impl Drop for Fetch {
+    /// Kills its group at once, not at its thread's next look: the app may be gone by then.
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        end_group(&self.slot);
     }
 }
 /// A saved OK: the trust it covers, and whether it was saved.
@@ -60,15 +102,21 @@ pub(super) struct Mark {
 pub(super) struct Tests {
     pub(super) plugins: Vec<Plugin>,
     /// Broken manifests.
-    errors: Vec<String>,
+    pub(super) errors: Vec<String>,
     pub(super) active: usize,
     filter: String,
     /// Marks a gutter ▶ picked when its line has several cases; the list shows only these.
     pub(super) only: Vec<usize>,
     pub(super) marks: Vec<Mark>,
-    /// Runs asked to stop (a watch no longer shown, a refused plugin's watch): kept until they
-    /// end, so the SIGKILL after SIGTERM still comes ([`Run::terminate`]).
+    /// Runs asked to stop (a watch no longer shown, a refused plugin's watch), and runs that
+    /// ended while tools they started still run: kept until nothing of them is left, so the
+    /// SIGKILL after SIGTERM still comes ([`Run::terminate`]) and a reload or quit (Drop) stops
+    /// those tools too.
     stopping: Vec<Run>,
+    /// The plugins being found and their folders checked, on a thread ([`App::load_plugins`]).
+    discovering: Option<Receiver<Vec<Result<Manifest, String>>>>,
+    /// The plugin folder to show once they are found (Add plugin).
+    select: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -100,6 +148,30 @@ pub(super) struct Plugin {
     pub(super) rows: Vec<Entry>,
     rows_rx: Option<Fetch>,
     rows_error: Option<String>,
+    /// What the running case or action may still show ([`MAX_LOG`], [`MAX_LOG_BYTES`]).
+    room: Room,
+    /// Commands waiting for the full check of a folder that looked changed ([`App::gated`]).
+    pub(super) pending: Vec<Pending>,
+    /// That check passed just now: the waiting commands start without another.
+    verified: bool,
+}
+
+/// A command of a plugin that waits for its folder's full check.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum Pending {
+    List,
+    View(usize),
+    /// A case id, or an action.
+    Run(String, Option<usize>),
+    Watch,
+}
+
+/// Output lines and bytes a run showed so far, and whether it said the rest is not shown.
+#[derive(Default)]
+struct Room {
+    lines: usize,
+    bytes: usize,
+    told: bool,
 }
 
 impl Plugin {
@@ -110,10 +182,34 @@ impl Plugin {
         }
     }
 
-    fn log(&mut self, line: String) {
-        self.log.push(line);
-        if self.log.len() > KEEP_LOG {
-            self.log.drain(..KEEP_LOG / 5);
+    /// One output line of the running case or action: a result, a case's status or a log line,
+    /// while the run has room ([`MAX_LOG`] lines, [`MAX_LOG_BYTES`]; every line counts, as in the
+    /// VS Code extension). Past that one line says so, and only a case still running ends (once).
+    fn run_line(&mut self, line: &str, root: Option<&Path>) {
+        self.room.lines += 1;
+        self.room.bytes += line.len();
+        let full = self.room.lines > MAX_LOG || self.room.bytes > MAX_LOG_BYTES;
+        if full && !self.room.told {
+            self.room.told = true;
+            self.log.push(format!(
+                "[more than {MAX_LOG} lines or {} MB: the rest is not shown]",
+                MAX_LOG_BYTES >> 20
+            ));
+        }
+        match plugins::parse_event(line, root) {
+            plugins::Event::Log(s) if !full => self.log.push(s),
+            plugins::Event::Log(_) => {}
+            plugins::Event::Result(e) => {
+                if let (Some(c), Some(s)) = (&e.case, e.status) {
+                    let ends = s != Status::Running && self.status.get(c) == Some(&Status::Running);
+                    if !full || ends {
+                        self.status.insert(c.clone(), s);
+                    }
+                }
+                if !full && e.status != Some(Status::Running) {
+                    self.results.push(e);
+                }
+            }
         }
     }
 
@@ -136,83 +232,144 @@ impl Plugin {
 /// Runs `cmd` to the end on a thread ([`fetch_run`]).
 fn fetch(cmd: std::process::Command, ctx: &egui::Context) -> Fetch {
     let (tx, rx) = channel();
-    let cancel = Arc::new(AtomicBool::new(false));
-    let (stop, ctx) = (cancel.clone(), ctx.clone());
+    let slot = Arc::new(Mutex::new(Slot::Starting));
+    let (theirs, ctx) = (slot.clone(), ctx.clone());
     std::thread::spawn(move || {
-        let _ = tx.send(fetch_run(cmd, &stop, FETCH_LIMIT));
+        let _ = tx.send(fetch_run(cmd, &theirs, FETCH_LIMIT));
         ctx.request_repaint();
     });
-    Fetch { rx, cancel }
+    Fetch { rx, slot }
+}
+
+/// Checks plugin `p`'s folder in full on a thread ([`Manifest::recheck`]), unless a check runs:
+/// [`App::poll_oks`] takes the result.
+fn check_folder(p: &mut Plugin, ctx: &egui::Context) {
+    if p.check.is_some() {
+        return;
+    }
+    p.checked = Some(Instant::now());
+    let (tx, rx) = channel();
+    let (mut m, ctx) = (p.m.clone(), ctx.clone());
+    std::thread::spawn(move || {
+        let trust = m.trust.clone();
+        let r = m.recheck();
+        let _ = tx.send((trust, m, r));
+        ctx.request_repaint();
+    });
+    p.check = Some(rx);
+}
+
+/// Reads `pipe` to its end on a thread into the buffer it gives: at most `cap` bytes (past them
+/// `over` is set and reading stops), or with `tail` only about the last `cap` bytes.
+fn read_pipe(
+    pipe: Option<impl std::io::Read + Send + 'static>,
+    cap: usize,
+    tail: bool,
+    over: Arc<AtomicBool>,
+) -> (Arc<Mutex<Vec<u8>>>, std::thread::JoinHandle<()>) {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let into = buf.clone();
+    let reader = std::thread::spawn(move || {
+        let Some(mut p) = pipe else {
+            return;
+        };
+        let mut chunk = vec![0u8; 64 << 10];
+        loop {
+            let k = match p.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(k) => k,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return,
+            };
+            let mut v = into.lock().unwrap_or_else(|e| e.into_inner());
+            if !tail && v.len() + k > cap {
+                over.store(true, Ordering::Relaxed);
+                return;
+            }
+            v.extend_from_slice(&chunk[..k]);
+            if tail && v.len() > 2 * cap {
+                let cut = v.len() - cap;
+                v.drain(..cut);
+            }
+        }
+    });
+    (buf, reader)
 }
 
 /// Runs `cmd` (the leader of its own process group) to the end: its stdout, or an error with the
-/// end of its stderr. Past `limit`, or once `cancel` is set, its whole group gets SIGKILL. It is
-/// reaped only after its pipes closed, so until then its group id cannot be another's.
+/// end of its stderr. Once it exited, output may come for [`GRACE`] more: then what was read is
+/// used (tools it left may hold its output open), and what is left of its group gets SIGKILL.
+/// Past `limit`, past [`MAX_FETCH`] of output, or once its [`Fetch`] is dropped (`slot` is gone),
+/// its whole group gets SIGKILL. Its group is signalled only while its id cannot be another's ([`Slot`]).
 fn fetch_run(
     mut cmd: std::process::Command,
-    cancel: &AtomicBool,
+    slot: &Mutex<Slot>,
     limit: Duration,
 ) -> Result<String, String> {
-    use std::io::Read;
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| e.to_string())?;
-    let read = |pipe: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut v = Vec::new();
-            if let Some(mut p) = pipe {
-                let _ = p.read_to_end(&mut v);
-            }
-            v
-        })
-    };
-    let out = read(
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let err = read(
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let end = Instant::now() + limit;
-    let status = loop {
-        if out.is_finished()
-            && err.is_finished()
-            && let Some(status) = child.try_wait().map_err(|e| e.to_string())?
-        {
-            break status;
-        }
-        let why = if cancel.load(Ordering::Relaxed) {
-            Some("stopped".to_owned())
-        } else if Instant::now() >= end {
-            Some(format!("no answer in {} s", limit.as_secs()))
-        } else {
-            None
-        };
-        if let Some(why) = why {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
-            }
-            let _ = child.kill();
+    let pgid = child.id();
+    {
+        let mut s = lock(slot);
+        if matches!(*s, Slot::Gone) {
+            drop(s);
+            kill_group(pgid);
             let _ = child.wait();
-            return Err(why);
+            return Err("stopped".into());
+        }
+        *s = Slot::Running(pgid);
+    }
+    let over = Arc::new(AtomicBool::new(false));
+    let (out, out_done) = read_pipe(child.stdout.take(), MAX_FETCH, false, over.clone());
+    let (err, err_done) = read_pipe(child.stderr.take(), ERR_TAIL, true, over.clone());
+    let end = Instant::now() + limit;
+    let mut exited = None;
+    let why = loop {
+        if over.load(Ordering::Relaxed) {
+            break Some("output too big".to_owned());
+        }
+        {
+            let mut s = lock(slot);
+            if matches!(*s, Slot::Gone) {
+                break Some("stopped".to_owned());
+            }
+            if exited.is_none() {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        *s = Slot::Reaped(pgid);
+                        exited = Some((status, Instant::now()));
+                    }
+                    Ok(None) => {}
+                    Err(e) => break Some(e.to_string()),
+                }
+            }
+        }
+        if let Some((_, at)) = exited
+            && ((out_done.is_finished() && err_done.is_finished()) || at.elapsed() >= GRACE)
+        {
+            break None;
+        }
+        if Instant::now() >= end {
+            break Some(format!("no answer in {} s", limit.as_secs()));
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let (out, err) = (
-        out.join().unwrap_or_default(),
-        err.join().unwrap_or_default(),
-    );
+    end_group(slot);
+    let Some((status, _)) = exited.filter(|_| why.is_none()) else {
+        if exited.is_none() {
+            let _ = child.wait();
+        }
+        return Err(why.unwrap_or_default());
+    };
+    let take =
+        |b: &Mutex<Vec<u8>>| std::mem::take(&mut *b.lock().unwrap_or_else(|e| e.into_inner()));
     if status.success() {
-        return Ok(String::from_utf8_lossy(&out).into_owned());
+        return Ok(String::from_utf8_lossy(&take(&out)).into_owned());
     }
+    let err = take(&err);
     let err = String::from_utf8_lossy(&err);
     let tail: Vec<&str> = err.lines().rev().take(3).collect();
     Err(format!(
@@ -272,6 +429,12 @@ enum Click {
 }
 
 impl Tests {
+    /// The plugins were found ([`App::load_plugins`] runs on a thread).
+    #[cfg(test)]
+    pub(super) fn found(&self) -> bool {
+        self.discovering.is_none()
+    }
+
     pub(super) fn running(&self) -> bool {
         self.plugins.iter().any(|p| p.run.is_some())
     }
@@ -335,10 +498,8 @@ impl App {
         match plugins::add(&home, picked) {
             Ok((name, real)) => {
                 self.load_plugins(ctx);
-                // by folder: two plugins may share a name
-                if let Some(i) = self.tests.plugins.iter().position(|p| p.m.real == real) {
-                    self.tests.active = i;
-                }
+                // by folder (two plugins may share a name), once they are found
+                self.tests.select = Some(real);
                 self.bottom = Bottom::Tests;
                 self.status = format!("Added the plugin {name}");
             }
@@ -351,34 +512,106 @@ impl App {
         config_dir().map(|d| plugins::approvals_file(&d))
     }
 
-    /// Finds the plugins (config folder and the project's `.droid-lite/plugins`) and lists their
+    /// Finds the plugins (config folder and the project's `.droid-lite/plugins`) on a thread (a
+    /// project plugin's folder is read in full: [`App::poll_found`] takes them), then lists their
     /// cases in the background. A project plugin the user has not allowed runs nothing: the tab
     /// asks for the OK first. Running cases of the old set stop (Drop).
     pub(super) fn load_plugins(&mut self, ctx: &egui::Context) {
-        let mut t = Tests::default();
-        let project = self.project.as_ref().map(|p| p.root.as_path());
+        let project = self.project.as_ref().map(|p| p.root.clone());
         let user: Vec<PathBuf> = self.plugins_home().into_iter().collect();
-        for m in plugins::discover_all(&user, project, self.approvals().as_deref()) {
+        let store = self.approvals();
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(plugins::discover_all(
+                &user,
+                project.as_deref(),
+                store.as_deref(),
+            ));
+            ctx.request_repaint();
+        });
+        self.tests = Tests {
+            discovering: Some(rx),
+            ..Default::default()
+        };
+    }
+
+    /// The plugins [`App::load_plugins`] found: shown, and their cases listed.
+    fn poll_found(&mut self, ctx: &egui::Context) {
+        let Some(Ok(found)) = self.tests.discovering.as_ref().map(|rx| rx.try_recv()) else {
+            return;
+        };
+        self.tests.discovering = None;
+        for m in found {
             match m {
-                Ok(m) => t.plugins.push(Plugin::new(m)),
-                Err(e) => t.errors.push(e),
+                Ok(m) => self.tests.plugins.push(Plugin::new(m)),
+                Err(e) => self.tests.errors.push(e),
             }
         }
-        self.tests = t;
+        if let Some(real) = self.tests.select.take()
+            && let Some(i) = self.tests.plugins.iter().position(|p| p.m.real == real)
+        {
+            self.tests.active = i;
+        }
         for i in 0..self.tests.plugins.len() {
             self.list_cases(i, ctx);
         }
     }
 
-    fn list_cases(&mut self, i: usize, ctx: &egui::Context) {
+    /// The command for `argv` of plugin `i` (`id` fills `{id}`), at once when its folder looks
+    /// as at its last full read ([`Manifest::quick_command`]: a walk, no file read). Else `then`
+    /// waits for a full check of the folder on a thread ([`check_folder`]) and runs once it
+    /// passes: `Ok(None)`. An error when the plugin may not run.
+    fn gated(
+        &mut self,
+        i: usize,
+        argv: &[String],
+        id: &str,
+        then: Pending,
+        ctx: &egui::Context,
+    ) -> Result<Option<std::process::Command>, String> {
         let root = self.project.as_ref().map(|p| p.root.clone());
         let p = &mut self.tests.plugins[i];
+        let cmd = p.m.quick_command(argv, root.as_deref(), id, p.verified)?;
+        if cmd.is_none() {
+            if !p.pending.contains(&then) {
+                p.pending.push(then);
+            }
+            check_folder(p, ctx);
+        }
+        Ok(cmd)
+    }
+
+    /// The commands of plugin `i` that waited for the check of its folder, which passed just now.
+    fn run_pending(&mut self, i: usize, ctx: &egui::Context) {
+        for then in std::mem::take(&mut self.tests.plugins[i].pending) {
+            self.tests.plugins[i].verified = true;
+            match then {
+                Pending::List => self.list_cases(i, ctx),
+                Pending::View(v) => self.load_view(i, v, ctx),
+                Pending::Run(id, action) => self.run_case(i, &id, action, ctx),
+                Pending::Watch => {
+                    let p = &self.tests.plugins[i];
+                    if self.bottom == Bottom::Tests && self.tests.active == i && p.watch.is_none() {
+                        self.start_watch(i, ctx);
+                    }
+                }
+            }
+            if let Some(p) = self.tests.plugins.get_mut(i) {
+                p.verified = false;
+            }
+        }
+    }
+
+    fn list_cases(&mut self, i: usize, ctx: &egui::Context) {
+        let p = &self.tests.plugins[i];
         let Some(list) = p.m.list.clone() else {
             return;
         };
         let allowed = p.m.allowed;
-        match p.m.command(&list, root.as_deref(), "") {
-            Ok(cmd) => p.loading = Some(fetch(cmd, ctx)),
+        match self.gated(i, &list, "", Pending::List, ctx) {
+            Ok(Some(cmd)) => self.tests.plugins[i].loading = Some(fetch(cmd, ctx)),
+            Ok(None) => {}
             // a not allowed plugin just waits for the OK; an allowed one changed meanwhile
             Err(e) if allowed => self.refused(i, e),
             Err(_) => {}
@@ -401,6 +634,8 @@ impl App {
             // a list or view still running: its group is killed (Fetch's Drop)
             p.loading = None;
             p.rows_rx = None;
+            p.pending.clear();
+            p.verified = false;
             p.error = Some(why.clone());
         }
         self.status = why;
@@ -429,10 +664,11 @@ impl App {
         self.status = format!("Allowing the plugin {}…", p.m.name);
     }
 
-    /// Saved OKs and finished folder checks; starts the next check of each project plugin that
-    /// runs a command (its folder may change while a watch runs for hours).
+    /// Saved OKs and finished folder checks (commands that waited for one start); starts the
+    /// next check of each project plugin that runs a command (its folder may change while a
+    /// watch runs for hours).
     fn poll_oks(&mut self, ctx: &egui::Context) {
-        let (mut listed, mut refused) = (Vec::new(), Vec::new());
+        let (mut listed, mut refused, mut ready) = (Vec::new(), Vec::new(), Vec::new());
         for (i, p) in self.tests.plugins.iter_mut().enumerate() {
             if let Some(rx) = &p.allowing
                 && let Ok((trust, r)) = rx.try_recv()
@@ -457,7 +693,12 @@ impl App {
                 if p.m.allowed && trust == p.m.trust {
                     match r {
                         // unchanged: how it looks now, so the next check needs no full read
-                        Ok(()) => p.m.seen = m.seen,
+                        Ok(()) => {
+                            p.m.seen = m.seen;
+                            if !p.pending.is_empty() {
+                                ready.push(i);
+                            }
+                        }
                         Err(e) => {
                             p.m = m;
                             refused.push((i, e));
@@ -466,20 +707,15 @@ impl App {
                 }
             }
             let busy = p.watch.is_some() || p.run.is_some();
-            if p.m.trust.is_some() && p.m.allowed && busy && p.check.is_none() {
+            if p.m.trust.is_some() && p.m.allowed && busy {
                 if p.checked.is_none_or(|t| t.elapsed() >= RECHECK) {
-                    p.checked = Some(Instant::now());
-                    let (tx, rx) = channel();
-                    let (mut m, ctx) = (p.m.clone(), ctx.clone());
-                    std::thread::spawn(move || {
-                        let trust = m.trust.clone();
-                        let r = m.recheck();
-                        let _ = tx.send((trust, m, r));
-                        ctx.request_repaint();
-                    });
-                    p.check = Some(rx);
+                    check_folder(p, ctx);
                 }
                 ctx.request_repaint_after(RECHECK);
+            }
+            // commands wait for a check (one of an older OK did not count)
+            if p.m.allowed && !p.pending.is_empty() && !ready.contains(&i) {
+                check_folder(p, ctx);
             }
         }
         for (i, e) in refused {
@@ -488,16 +724,22 @@ impl App {
         for i in listed {
             self.list_cases(i, ctx);
         }
+        for i in ready {
+            self.run_pending(i, ctx);
+        }
     }
 
     fn load_view(&mut self, i: usize, v: usize, ctx: &egui::Context) {
-        let root = self.project.as_ref().map(|p| p.root.clone());
-        let p = &mut self.tests.plugins[i];
-        let (argv, allowed) = (p.m.views[v].argv.clone(), p.m.allowed);
-        match p.m.command(&argv, root.as_deref(), "") {
-            Ok(cmd) => p.rows_rx = Some(fetch(cmd, ctx)),
+        let p = &self.tests.plugins[i];
+        let Some(argv) = p.m.views.get(v).map(|n| n.argv.clone()) else {
+            return;
+        };
+        let allowed = p.m.allowed;
+        match self.gated(i, &argv, "", Pending::View(v), ctx) {
+            Ok(Some(cmd)) => self.tests.plugins[i].rows_rx = Some(fetch(cmd, ctx)),
+            Ok(None) => {}
             Err(e) if allowed => self.refused(i, e),
-            Err(e) => p.rows_error = Some(e),
+            Err(e) => self.tests.plugins[i].rows_error = Some(e),
         }
     }
 
@@ -509,23 +751,33 @@ impl App {
         action: Option<usize>,
         ctx: &egui::Context,
     ) {
-        let root = self.project.as_ref().map(|p| p.root.clone());
-        let Some(p) = self.tests.plugins.get_mut(i) else {
+        let Some(p) = self.tests.plugins.get(i) else {
             return;
         };
         if p.run.is_some() {
             return;
         }
         let (argv, title) = match action {
-            Some(a) => (p.m.actions[a].argv.clone(), p.m.actions[a].name.clone()),
+            Some(a) => match p.m.actions.get(a) {
+                Some(n) => (n.argv.clone(), n.name.clone()),
+                None => return,
+            },
             None => match &p.m.run {
                 Some(r) => (r.clone(), id.to_owned()),
                 None => return,
             },
         };
         let allowed = p.m.allowed;
-        let cmd = match p.m.command(&argv, root.as_deref(), id) {
-            Ok(c) => c,
+        let then = Pending::Run(id.to_owned(), action);
+        let cmd = match self.gated(i, &argv, id, then, ctx) {
+            Ok(Some(c)) => c,
+            // its folder looks changed: it starts once a full check on a thread passes
+            Ok(None) => {
+                self.status = format!("{}: checking its folder…", self.tests.plugins[i].m.name);
+                self.tests.active = i;
+                self.bottom = Bottom::Tests;
+                return;
+            }
             Err(e) if allowed => {
                 self.refused(i, e);
                 self.tests.active = i;
@@ -537,8 +789,10 @@ impl App {
                 return;
             }
         };
+        let p = &mut self.tests.plugins[i];
         p.results.clear();
         p.log.clear();
+        p.room = Room::default();
         match Run::spawn_group(cmd, ctx.clone()) {
             Ok(run) => {
                 if action.is_none() {
@@ -548,7 +802,7 @@ impl App {
                 p.run = Some((key.to_owned(), title.clone(), run));
                 self.status = format!("{}: running {title}", p.m.name);
             }
-            Err(e) => p.log(format!("Could not start {}: {e}", argv[0])),
+            Err(e) => p.log.push(format!("Could not start {}: {e}", argv[0])),
         }
         self.tests.active = i;
         self.bottom = Bottom::Tests;
@@ -557,11 +811,14 @@ impl App {
     /// Reads every plugin's finished lists and new run, watch and view output. Called each frame.
     pub(super) fn poll_tests(&mut self) {
         let root = self.project.as_ref().map(|p| p.root.clone());
-        self.tests
-            .stopping
-            .retain_mut(|r| !r.poll().iter().any(|l| matches!(l, Line::Done(_))));
+        self.tests.stopping.retain_mut(|r| {
+            r.poll();
+            r.lives()
+        });
         let mut lists_changed = false;
         let mut ended_runs = Vec::new();
+        // ended runs whose tools still run: stopped with the rest on a reload or quit
+        let mut left = Vec::new();
         for p in &mut self.tests.plugins {
             if let Some(rx) = &p.loading
                 && let Ok(r) = rx.try_recv()
@@ -597,7 +854,7 @@ impl App {
                             }
                         }
                         Line::Done(_) => {
-                            p.watch = None;
+                            left.extend(p.watch.take().filter(Run::lives));
                             p.watch_ended();
                         }
                     }
@@ -608,28 +865,14 @@ impl App {
             };
             let (id, title) = (id.clone(), title.clone());
             let mut ended = None;
-            let mut events = Vec::new();
             for l in run.poll() {
                 match l {
-                    Line::Out(s) => events.push(plugins::parse_event(&s, root.as_deref())),
+                    Line::Out(s) => p.run_line(&s, root.as_deref()),
                     Line::Done(code) => ended = Some(code),
                 }
             }
-            for e in events {
-                match e {
-                    plugins::Event::Log(s) => p.log(s),
-                    plugins::Event::Result(e) => {
-                        if let (Some(c), Some(s)) = (&e.case, e.status) {
-                            p.status.insert(c.clone(), s);
-                        }
-                        if e.status != Some(Status::Running) {
-                            p.results.push(e);
-                        }
-                    }
-                }
-            }
             if let Some(code) = ended {
-                p.run = None;
+                left.extend(p.run.take().map(|(_, _, r)| r).filter(Run::lives));
                 let ok = code == Some(0);
                 // a run that never said how its own case ended gets the exit code's verdict
                 if !id.is_empty() && p.status.get(&id) == Some(&Status::Running) {
@@ -645,7 +888,7 @@ impl App {
                     Some(c) => format!("{title} ended (exit {c})"),
                     None => format!("{title} stopped"),
                 };
-                p.log(line.clone());
+                p.log.push(line.clone());
                 self.status = if failed > 0 {
                     format!("{}: {title}: {failed} failed", p.m.name)
                 } else {
@@ -654,6 +897,7 @@ impl App {
                 ended_runs.push((self.status.clone(), failed == 0 && ok));
             }
         }
+        self.tests.stopping.extend(left);
         for (text, ok) in ended_runs {
             self.toast(text, ok, Bottom::Tests);
         }
@@ -666,13 +910,14 @@ impl App {
     /// pause that grows while it keeps ending soon. Also takes saved OKs and folder checks
     /// ([`App::poll_oks`]).
     pub(super) fn keep_watch(&mut self, ctx: &egui::Context) {
+        self.poll_found(ctx);
         self.poll_oks(ctx);
-        if !self.tests.stopping.is_empty() {
+        // reaped soon (each frame polls them); a SIGKILL due asks for its own frame
+        if self.tests.stopping.iter().any(|r| !r.ended()) {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
-        let root = self.project.as_ref().map(|p| p.root.clone());
         let shown = self.bottom == Bottom::Tests;
-        let mut refused = None;
+        let mut start = None;
         for (i, p) in self.tests.plugins.iter_mut().enumerate() {
             let want = shown && i == self.tests.active;
             let wait = p.watch_next.map_or(Duration::ZERO, |t| {
@@ -682,25 +927,10 @@ impl App {
                 (None, Some(_)) if want && p.m.allowed && !wait.is_zero() => {
                     ctx.request_repaint_after(wait);
                 }
-                // not allowed (or refused once): nothing to start, no check each frame
-                (None, Some(w)) if want && p.m.allowed => {
-                    let w = w.clone();
-                    p.watch_started = Some(Instant::now());
-                    match p.m.command(&w, root.as_deref(), "") {
-                        Ok(c) => match Run::spawn_group(c, ctx.clone()) {
-                            Ok(run) => {
-                                p.watch = Some(run);
-                                p.watch_error = None;
-                            }
-                            // tried again after the pause, not every frame
-                            Err(e) => {
-                                p.watch_error =
-                                    Some(format!("watch: could not start {}: {e}", w[0]));
-                                p.watch_ended();
-                            }
-                        },
-                        Err(e) => refused = Some((i, e)),
-                    }
+                // not allowed (or refused once): nothing to start, no check each frame; one
+                // waiting for the check of its folder starts when that passes
+                (None, Some(_)) if want && p.m.allowed && !p.pending.contains(&Pending::Watch) => {
+                    start = Some(i);
                 }
                 (Some(_), _) if !want => {
                     if let Some(mut w) = p.watch.take() {
@@ -713,8 +943,34 @@ impl App {
                 _ => {}
             }
         }
-        if let Some((i, e)) = refused {
-            self.refused(i, e);
+        if let Some(i) = start {
+            self.start_watch(i, ctx);
+        }
+    }
+
+    /// Starts plugin `i`'s `watch` (once its folder's check passed, [`App::gated`]).
+    fn start_watch(&mut self, i: usize, ctx: &egui::Context) {
+        let Some(w) = self.tests.plugins[i].m.watch.clone() else {
+            return;
+        };
+        match self.gated(i, &w, "", Pending::Watch, ctx) {
+            Ok(Some(c)) => {
+                let p = &mut self.tests.plugins[i];
+                p.watch_started = Some(Instant::now());
+                match Run::spawn_group(c, ctx.clone()) {
+                    Ok(run) => {
+                        p.watch = Some(run);
+                        p.watch_error = None;
+                    }
+                    // tried again after the pause, not every frame
+                    Err(e) => {
+                        p.watch_error = Some(format!("watch: could not start {}: {e}", w[0]));
+                        p.watch_ended();
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => self.refused(i, e),
         }
     }
 
@@ -736,6 +992,13 @@ impl App {
 
     pub(super) fn tests_panel(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
+        if self.tests.discovering.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Checking the plugins…");
+            });
+            return;
+        }
         if self.tests.plugins.is_empty() {
             for e in &self.tests.errors {
                 ui.colored_label(crate::highlight::ERROR, e);
@@ -933,7 +1196,7 @@ impl App {
         if let Some(e) = &p.error {
             ui.colored_label(crate::highlight::ERROR, e);
         }
-        if p.loading.is_some() {
+        if p.loading.is_some() || p.pending.contains(&Pending::List) {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label("Listing…");
@@ -1151,6 +1414,12 @@ fn rows_list(ui: &mut Ui, p: &Plugin) -> Option<Click> {
 /// Right side: the live state, the run's results, then its log.
 fn output(ui: &mut Ui, p: &Plugin) -> Option<Click> {
     let mut click = None;
+    if !p.pending.is_empty() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Checking the plugin's folder…");
+        });
+    }
     if let Some(e) = &p.watch_error {
         ui.colored_label(crate::highlight::ERROR, e);
     }
@@ -1229,20 +1498,33 @@ mod tests {
         panic!("no pid in {}", f.display());
     }
 
+    /// A new [`Slot`] for [`fetch_run`].
+    fn slot() -> Mutex<Slot> {
+        Mutex::new(Slot::Starting)
+    }
+
+    /// Waits up to 3 s for `pid` to end.
+    fn ends(pid: &str) -> bool {
+        let t0 = Instant::now();
+        while alive(pid) && t0.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        !alive(pid)
+    }
+
     #[test]
     fn a_list_past_its_time_ends_with_its_whole_group() {
         let d = temp("limit");
         let t0 = Instant::now();
         let r = fetch_run(
             group("sleep 30 & echo $! > child.pid; wait", &d),
-            &AtomicBool::new(false),
+            &slot(),
             Duration::from_millis(500),
         );
         assert_eq!(r, Err("no answer in 0 s".into()));
         assert!(t0.elapsed() < Duration::from_secs(3));
         let child = pid_in(&d.join("child.pid"));
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(!alive(&child), "the tool it started ended too");
+        assert!(ends(&child), "the tool it started ended too");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1256,23 +1538,133 @@ mod tests {
         let child = pid_in(&d.join("child.pid"));
         assert!(alive(&child));
         drop(f);
-        let t0 = Instant::now();
-        while alive(&child) && t0.elapsed() < Duration::from_secs(3) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(!alive(&child), "a refused plugin's list stops");
-        let ok = fetch_run(
-            group("echo '[1]'; echo oops >&2", &d),
-            &AtomicBool::new(false),
-            FETCH_LIMIT,
-        );
+        assert!(ends(&child), "a refused plugin's list stops");
+        let ok = fetch_run(group("echo '[1]'; echo oops >&2", &d), &slot(), FETCH_LIMIT);
         assert_eq!(ok, Ok("[1]\n".into()));
         let bad = fetch_run(
             group("echo a >&2; echo b >&2; exit 3", &d),
-            &AtomicBool::new(false),
+            &slot(),
             FETCH_LIMIT,
         );
         assert_eq!(bad, Err("exit 3: a b".into()));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_list_that_prints_too_much_is_stopped_with_its_group() {
+        let d = temp("big");
+        let t0 = Instant::now();
+        let r = fetch_run(
+            group(
+                "sleep 30 >/dev/null & echo $! > child.pid; head -c 40000000 /dev/zero; wait",
+                &d,
+            ),
+            &slot(),
+            Duration::from_secs(3),
+        );
+        assert_eq!(r, Err("output too big".into()));
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        assert!(ends(&pid_in(&d.join("child.pid"))));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A list whose tool left a process holding its output: what it printed counts half a
+    /// second after it exited, and that process is killed.
+    #[test]
+    fn a_list_that_left_a_tool_holding_its_output_ends_after_a_grace() {
+        let d = temp("grace");
+        let t0 = Instant::now();
+        let r = fetch_run(
+            group("sleep 30 & echo $! > child.pid; echo '[1]'", &d),
+            &slot(),
+            Duration::from_secs(5),
+        );
+        assert_eq!(r, Ok("[1]\n".into()));
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        assert!(ends(&pid_in(&d.join("child.pid"))));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Not a test by itself: the next test runs it in a process of its own, which drops its
+    /// plugins' list and run and quits at once, as the app does.
+    #[test]
+    #[ignore]
+    fn quit_helper() {
+        let Some(d) = std::env::var_os("DROID_LITE_QUIT_DIR").map(PathBuf::from) else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        let mut p = Plugin::new(Manifest::default());
+        p.loading = Some(fetch(
+            group("sleep 30 & echo $! > list.pid; wait", &d),
+            &ctx,
+        ));
+        let run = Run::spawn_group(group("sleep 30 & echo $! > run.pid; wait", &d), ctx).unwrap();
+        p.run = Some((String::new(), "t".into(), run));
+        pid_in(&d.join("list.pid"));
+        pid_in(&d.join("run.pid"));
+        let mut t = Tests::default();
+        t.plugins.push(p);
+        drop(t);
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn quitting_ends_every_list_and_run_of_the_plugins() {
+        let d = temp("quit");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["app::tests_ui::tests::quit_helper", "--exact", "--ignored"])
+            .env("DROID_LITE_QUIT_DIR", &d)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        for f in ["list.pid", "run.pid"] {
+            assert!(ends(&pid_in(&d.join(f))), "{f}: ended with the app");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A run shows at most 20000 lines and 8 MB, status lines too (as the VS Code extension);
+    /// past that a case still running ends once, and no new case gets a status.
+    #[test]
+    fn a_flooding_run_keeps_its_output_bounded() {
+        let mut p = Plugin::new(Manifest::default());
+        p.status.insert("flood".into(), Status::Running);
+        for i in 0..30000 {
+            p.run_line(
+                &format!(r#"{{"case":"c{i}","status":"passed","label":"step"}}"#),
+                None,
+            );
+        }
+        for _ in 0..30000 {
+            p.run_line(r#"{"case":"flood","status":"failed","message":"m"}"#, None);
+        }
+        let notice = "[more than 20000 lines or 8 MB: the rest is not shown]";
+        assert!(
+            p.results.len() + p.log.len() <= MAX_LOG + 1,
+            "{}",
+            p.results.len()
+        );
+        assert_eq!(p.log, [notice]);
+        assert!(p.status.len() <= MAX_LOG + 1);
+        assert_eq!(p.status.get("flood"), Some(&Status::Failed));
+        assert_eq!(
+            p.results
+                .iter()
+                .filter(|e| e.case.as_deref() == Some("flood"))
+                .count(),
+            0
+        );
+        let mut p = Plugin::new(Manifest::default());
+        let line = "x".repeat(60000);
+        for _ in 0..200 {
+            p.run_line(&line, None);
+        }
+        p.run_line("after", None);
+        let bytes: usize = p.log.iter().map(String::len).sum();
+        assert!(bytes <= MAX_LOG_BYTES + notice.len() && p.log.len() > 100);
+        assert_eq!(p.log.last().map(String::as_str), Some(notice));
     }
 }
