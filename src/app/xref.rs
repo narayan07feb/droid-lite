@@ -88,7 +88,7 @@ use crate::project::Stamp;
 /// file was modified within [`RACY`] of now, as a same-size edit in the same tick of a coarse
 /// clock (FAT, exFAT) would keep every time the same (like git's "racily clean").
 fn stamp(p: &Path) -> Option<(Stamp, bool)> {
-    let now = std::time::SystemTime::now();
+    let now = now();
     let st = crate::project::stamp(&std::fs::metadata(p).ok()?);
     let trusted = st.1.is_some_and(|t| t + RACY <= now);
     Some((st, trusted))
@@ -96,6 +96,22 @@ fn stamp(p: &Path) -> Option<(Stamp, bool)> {
 
 /// The coarsest file time a disk may keep (FAT's two seconds).
 const RACY: Duration = Duration::from_secs(2);
+
+/// The wall clock ([`TEST_NOW`] in tests that set it).
+fn now() -> std::time::SystemTime {
+    #[cfg(test)]
+    if let Some(t) = TEST_NOW.get() {
+        return t;
+    }
+    std::time::SystemTime::now()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What [`now`] says on this thread.
+    static TEST_NOW: std::cell::Cell<Option<std::time::SystemTime>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// The words a text spells, as 4096 bits (two per word): "maybe" or "no".
 type Spelling = [u64; 64];
@@ -1797,7 +1813,14 @@ mod tests {
     #[test]
     fn a_file_modified_just_now_is_not_trusted_to_be_unchanged_later() {
         let (dir, u, v, s) = spell_project("racy", "package a\nfun yy(x: Int) = 2\n", false);
+        // V's time and the clock one second apart, however slow this machine is
+        let t = std::time::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        let f = std::fs::File::options().write(true).open(&v).unwrap();
+        f.set_modified(t).unwrap();
+        drop(f);
+        TEST_NOW.set(Some(t + Duration::from_secs(1)));
         assert_eq!(pass_u(&s, &dir, &u, "package a\nclass A\n"), 0);
+        TEST_NOW.set(None);
         let kept = kept_spelling(&s, &v);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(

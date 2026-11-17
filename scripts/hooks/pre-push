@@ -19,7 +19,14 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     continue
   fi
   echo "perf check: $remote_ref ${remote_sha%"${remote_sha#????????}"}..${local_sha%"${local_sha#????????}"}"
-  python3 scripts/perf_check.py "$remote_sha" "$local_sha" || {
+  allow=""
+  # an old build from before the pinned keystroke file re-indexes a file of its own choice
+  if ! git grep -q DROID_LITE_BENCH_FILE "$remote_sha" -- src; then
+    echo "perf check: WARNING: ${remote_sha%"${remote_sha#????????}"} predates the pinned keystroke file;"
+    echo "perf check: WARNING: the per-keystroke step is NOT compared on this push"
+    allow=--allow-uncompared
+  fi
+  python3 scripts/perf_check.py "$remote_sha" "$local_sha" $allow || {
     echo "Push stopped: it is slower or uses more memory (table above)."
     echo "Fix it, or push anyway with: git push --no-verify"
     exit 1

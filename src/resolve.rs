@@ -800,6 +800,35 @@ impl FileInfo {
         (j < i - 1).then(|| self.text[self.start(j)..self.end(i - 2)].to_string())
     }
 
+    /// The type a `typealias` declared at `r` stands for, also when it goes on past a line
+    /// (`typealias Body =` and `Html.() -> Unit` on the next line).
+    fn alias_text(&self, r: &DeclRef) -> Option<String> {
+        let k = self.tok_at(r.1)?;
+        let eq = (k..self.toks.len()).find(|&e| self.t(e) == "=")?;
+        let first = eq + 1;
+        let mut depth = 0i32;
+        let mut last = first;
+        let mut j = first;
+        while j < self.toks.len() {
+            let joined = matches!(
+                self.t(j - 1),
+                "->" | "." | "," | "(" | "<" | "=" | ":" | "@"
+            ) || matches!(self.t(j), "->" | "." | "?" | ")" | ">" | ",");
+            if j > first && depth == 0 && self.newline_before(j) && !joined {
+                break;
+            }
+            match self.t(j) {
+                "(" | "<" => depth += 1,
+                ")" | ">" => depth -= 1,
+                _ => {}
+            }
+            last = j;
+            j += 1;
+        }
+        (last >= first && first < self.toks.len())
+            .then(|| self.text[self.start(first)..self.end(last)].to_string())
+    }
+
     /// Type parameters seen in the declaration, with their bounds (`""` for none): its own
     /// (`fun <T, R> …`, `class Box<T : Item>`), then those of the classes around it.
     fn type_params(&self, d: &Decl) -> Vec<(String, String)> {
@@ -961,29 +990,18 @@ struct FunParam {
     receiver: Option<String>,
     /// `A, B` of `(A, B) -> R`; empty for none.
     params: String,
+    /// Type parameters of a generic typealias and the type arguments given to it,
+    subst: Vec<(String, String)>,
+    /// spelled in this file, at this place, with these type parameters.
+    site: Option<SpelledAt>,
 }
 
-/// The receiver and the parameter list of a function type: `T.(A, B) -> R` gives `T` and
-/// `A, B`. Annotations, `suspend`, outer parentheses and `?` are read through
-/// (`(@Composable T.() -> Unit)?`). `None` for a type that is not a function type.
-fn fun_type_parts(ty: &str) -> Option<(Option<&str>, &str)> {
-    // the `)` that closes the `(` at byte `open` of `t`
-    let close = |t: &str, open: usize| {
-        let mut depth = 0;
-        for (i, c) in t.bytes().enumerate().skip(open) {
-            match c {
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(i);
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
-    };
+/// Where a type is spelled: the file, the place and the type parameters seen there.
+type SpelledAt = (Rc<FileInfo>, usize, Vec<(String, String)>);
+
+/// A type without its annotations, `suspend`, outer parentheses and `?`:
+/// `(@Composable Body)?` gives `Body`.
+fn strip_type_decor(ty: &str) -> &str {
     let mut t = ty.trim();
     loop {
         if let Some(rest) = t.strip_prefix('@') {
@@ -993,12 +1011,37 @@ fn fun_type_parts(ty: &str) -> Option<(Option<&str>, &str)> {
             t = rest.trim_start();
         } else if let Some(rest) = t.strip_suffix('?') {
             t = rest.trim_end();
-        } else if t.starts_with('(') && close(t, 0) == Some(t.len() - 1) {
+        } else if t.starts_with('(') && close_paren(t, 0) == Some(t.len() - 1) {
             t = t[1..t.len() - 1].trim();
         } else {
-            break;
+            return t;
         }
     }
+}
+
+/// The `)` that closes the `(` at byte `open` of `t`.
+fn close_paren(t: &str, open: usize) -> Option<usize> {
+    let mut depth = 0;
+    for (i, c) in t.bytes().enumerate().skip(open) {
+        match c {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The receiver and the parameter list of a function type: `T.(A, B) -> R` gives `T` and
+/// `A, B`. Annotations, `suspend`, outer parentheses and `?` are read through
+/// (`(@Composable T.() -> Unit)?`). `None` for a type that is not a function type.
+fn fun_type_parts(ty: &str) -> Option<(Option<&str>, &str)> {
+    let t = strip_type_decor(ty);
     // the first `->` outside parentheses and angle brackets
     let b = t.as_bytes();
     let mut depth = 0i32;
@@ -1892,7 +1935,11 @@ impl<'a> Resolver<'a> {
             return Some(t);
         }
         match name {
-            "let" | "also" | "takeIf" | "takeUnless" => recv(),
+            // `let { }` with no `x.`: kotlinc's `T.let` on the innermost implicit receiver
+            "let" | "also" | "takeIf" | "takeUnless" => {
+                let dotted = callee > 0 && f.t(callee - 1) == ".";
+                recv().or_else(|| (!dotted).then(|| self.this_type(f, callee))?)
+            }
             "forEachIndexed" | "mapIndexed" | "filterIndexed" if pos == 1 => {
                 recv().as_ref().and_then(iter_elem)
             }
@@ -1935,7 +1982,7 @@ impl<'a> Resolver<'a> {
             .map_or(part.as_str(), |(_, t)| t)
             .trim()
             .to_string();
-        self.type_text(&p.file, &part, p.at, &p.tparams)
+        self.fun_param_type(&p, &part)
     }
 
     /// The function-typed parameter a lambda goes to, of the function called at token `callee`
@@ -1960,37 +2007,69 @@ impl<'a> Resolver<'a> {
             (None, Some(i)) => d.params.get(i)?,
             (None, None) => d.params.last()?,
         };
-        let at = p.offset as usize;
-        if let Some((receiver, params)) = fun_type_parts(&p.ty) {
-            let (receiver, params) = (receiver.map(str::to_string), params.to_string());
-            return Some(FunParam {
-                tparams: g.type_params(d),
-                file: g.clone(),
-                at,
-                receiver,
-                params,
-            });
+        let mut file = g.clone();
+        let mut at = p.offset as usize;
+        let mut tparams = g.type_params(d);
+        let mut ty = p.ty.clone();
+        let (mut subst, mut site) = (Vec::new(), None);
+        // `b: Body` with `typealias Body = Html.() -> Unit`: read through aliases (multi-line,
+        // generic `Body<Html>`, annotated `@Composable Body`, an alias of an alias), as kotlinc
+        for _ in 0..8 {
+            if let Some((receiver, params)) = fun_type_parts(&ty) {
+                let (receiver, params) = (receiver.map(str::to_string), params.to_string());
+                return Some(FunParam {
+                    file,
+                    at,
+                    tparams,
+                    receiver,
+                    params,
+                    subst,
+                    site,
+                });
+            }
+            let named = strip_type_decor(&ty);
+            let (base, args) = match named.find('<') {
+                Some(i) if named.ends_with('>') => {
+                    (&named[..i], split_top(&named[i + 1..named.len() - 1]))
+                }
+                _ => (named, Vec::new()),
+            };
+            let r = self
+                .visible_types(&file, base.trim(), at)
+                .into_iter()
+                .next()?;
+            let (a, ai) = self.decl(&r)?;
+            let alias = &a.syms.decls[ai];
+            if alias.kind != Kind::TypeAlias {
+                return None;
+            }
+            let own = a.type_params(alias);
+            // `Body<Html>`: `T` of the alias stands for `Html`, spelled where `Body` is used
+            subst = own
+                .iter()
+                .zip(args)
+                .map(|((n, _), arg)| (n.clone(), arg))
+                .collect();
+            site = (!subst.is_empty()).then(|| (file.clone(), at, tparams.clone()));
+            ty = a.alias_text(&r)?;
+            // the alias's own type parameters stand for anything inside it
+            tparams = own.into_iter().map(|(n, _)| (n, String::new())).collect();
+            file = a;
+            at = r.1;
         }
-        // `b: Body` with `typealias Body = Html.() -> Unit`, nullable or not
-        let alias = p.ty.trim().trim_end_matches('?').trim();
-        let r = self.visible_types(&g, alias, at).into_iter().next()?;
-        let (a, ai) = self.decl(&r)?;
-        if a.syms.decls[ai].kind != Kind::TypeAlias {
-            return None;
+        None
+    }
+
+    /// The type of `text` spelled in the function type of `p`: a type parameter of a generic
+    /// typealias is the type argument given where the alias is used.
+    fn fun_param_type(&self, p: &FunParam, text: &str) -> Option<Ty> {
+        let base = text.trim().trim_end_matches('?').trim();
+        if let Some((_, arg)) = p.subst.iter().find(|(n, _)| n == base)
+            && let Some((g, at, tp)) = &p.site
+        {
+            return self.type_text(g, arg, *at, tp);
         }
-        let k = a.tok_at(r.1)?;
-        let eq = (k..a.toks.len()).find(|&e| a.t(e) == "=")?;
-        let from = a.end(eq);
-        let to = a.text[from..].find('\n').map_or(a.text.len(), |n| from + n);
-        let (receiver, params) = fun_type_parts(&a.text[from..to])?;
-        let (receiver, params) = (receiver.map(str::to_string), params.to_string());
-        Some(FunParam {
-            file: a,
-            at: r.1,
-            tparams: Vec::new(),
-            receiver,
-            params,
-        })
+        self.type_text(&p.file, text, p.at, &p.tparams)
     }
 
     /// Implicit `this` receivers at `at` from `apply` / `run` / `with(x)` / `buildX` / `T.() -> R`
@@ -1999,19 +2078,25 @@ impl<'a> Resolver<'a> {
         self.receivers_at(f, ti).0
     }
 
-    /// [`Resolver::lambda_receivers`], and whether one of them has a receiver whose members are
-    /// not known (`fun page(b: Html.() -> Unit)` with `Html` from a library): a call in it may
-    /// be that receiver's member, so it is not taken for the enclosing class's.
-    fn receivers_at(&self, f: &FileInfo, ti: usize) -> (Vec<Ty>, bool) {
+    /// [`Resolver::lambda_receivers`], and how many of them are inside the innermost lambda
+    /// whose receiver's members are not known (`fun page(b: Html.() -> Unit)` with `Html` from
+    /// a library, or a library call not known here): a call in it may be that receiver's
+    /// member, so it is not taken for an outer receiver's or the class's.
+    fn receivers_at(&self, f: &FileInfo, ti: usize) -> (Vec<Ty>, Option<usize>) {
         let mut out = Vec::new();
-        let mut unknown = false;
+        let mut unknown = None;
         let mut i = ti;
         while let Some((open, _)) = f.block_around(i) {
             i = open;
             if open == 0 {
                 break;
             }
-            if let Some(t) = self.dsl_receiver(f, open, &mut unknown) {
+            let mut u = false;
+            let t = self.dsl_receiver(f, open, &mut u);
+            if u && unknown.is_none() {
+                unknown = Some(out.len());
+            }
+            if let Some(t) = t {
                 out.push(t);
                 continue;
             }
@@ -2075,7 +2160,7 @@ impl<'a> Resolver<'a> {
         let call = lambda_call(f, open)?;
         // a project function first, also one named like a library call (`run`)
         if let Some(p) = self.fun_param_inputs(f, call.callee, call.name.as_deref(), call.index) {
-            let t = self.type_text(&p.file, p.receiver.as_deref()?, p.at, &p.tparams);
+            let t = self.fun_param_type(&p, p.receiver.as_deref()?);
             // a receiver whose members are not known here: a call in the lambda may be its
             *unknown |= match &t {
                 Some(Ty::Decl(_)) => false,
@@ -2084,9 +2169,38 @@ impl<'a> Resolver<'a> {
             };
             return t;
         }
-        // a library call whose lambda has no receiver, or one not known here, keeps the class
-        let k = known_lambda_call(f.name(call.callee)).filter(|_| call.trailing)?;
-        k.receiver.map(|r| Ty::Lib(r.into(), Vec::new()))
+        let name = f.name(call.callee);
+        if call.trailing
+            && let Some(k) = known_lambda_call(name)
+        {
+            // a known library call: its receiver, or none (`measureTime`, `repeat`), which
+            // keeps the class's members
+            return k.receiver.map(|r| Ty::Lib(r.into(), Vec::new()));
+        }
+        // a library call not known here (`createHTML().head { }`): its lambda may have a
+        // receiver whose members hide the class's, as kotlinc does, so a call in it stays
+        // unresolved. Not a library call known to give no receiver (`items.forEach { }`), nor
+        // `{ a -> }`, nor a declaration's body (`class A : B {`, `fun X.f() {`, `): a.T {`).
+        let dotted = call.callee > 0 && f.t(call.callee - 1) == ".";
+        *unknown |= call.trailing
+            && !no_receiver_lambda(name)
+            && !(call.callee > 0 && matches!(f.t(call.callee - 1), ":" | ","))
+            && !(dotted && name.starts_with(char::is_uppercase))
+            && !matches!(
+                name,
+                "get" | "set" | "init" | "field" | "by" | "constructor"
+            )
+            && !f
+                .locals
+                .iter()
+                .any(|l| l.lambda.is_some_and(|(o, _)| o == open))
+            && !f
+                .syms
+                .decls
+                .iter()
+                .any(|d| d.offset == f.start(call.callee))
+            && matches!(self.resolve_tok(f, call.callee), Res::None);
+        None
     }
 
     /// `this` at a place: the innermost lambda receiver, else the enclosing class.
@@ -2680,7 +2794,9 @@ impl<'a> Resolver<'a> {
         {
             receivers.push(t);
         }
-        for t in &receivers {
+        // in a library DSL lambda a call may be its receiver's: unresolved beats wrong
+        let class_calls = !(unknown.is_some() && args.is_some());
+        for (k, t) in receivers.iter().enumerate() {
             // a member of a library receiver (`append` in `buildString { }`)
             if let Ty::Lib(n, _) = t
                 && args.is_some()
@@ -2690,11 +2806,14 @@ impl<'a> Resolver<'a> {
             }
             let v = self.member_of(t, name, args);
             if !v.is_empty() {
-                return Res::Decls(v);
+                let outer = unknown.is_some_and(|u| k >= u);
+                return if class_calls || !outer {
+                    Res::Decls(v)
+                } else {
+                    Res::None
+                };
             }
         }
-        // in a library DSL lambda a call may be its receiver's: unresolved beats wrong
-        let class_calls = !(unknown && args.is_some());
         for c in f.classes_at(at) {
             let r = (f.path.clone(), f.syms.decls[c].offset);
             let v = self.member_of(&Ty::Decl(r.clone()), name, args);
@@ -2721,6 +2840,35 @@ impl<'a> Resolver<'a> {
             if self.is_object(&r) || f.syms.decls[c].has_modifier("companion") {
                 continue;
             }
+        }
+        // an extension called on an implicit receiver: like kotlinc, it beats a top-level
+        // function of the same name (`fun stage()` and `fun Job.stage()`, called in `Job`)
+        let classes = f.classes_at(at);
+        let this: Vec<Ty> = receivers
+            .iter()
+            .cloned()
+            .chain(
+                classes
+                    .iter()
+                    .map(|&c| Ty::Decl((f.path.clone(), f.syms.decls[c].offset))),
+            )
+            .collect();
+        for (k, t) in this.iter().enumerate() {
+            let v = self.extensions(f, name, Some(t), args, at);
+            if !v.is_empty() {
+                let outer = unknown.is_some_and(|u| k >= u);
+                return if class_calls || !outer {
+                    Res::Decls(v)
+                } else {
+                    Res::None
+                };
+            }
+        }
+        // like kotlinc: with an implicit receiver, the library's `T.run { }` (`let`, `apply`,
+        // ...) on it beats a top-level project function of that name
+        if args.is_some() && any_receiver_scope_fn(name) && (unknown.is_some() || !this.is_empty())
+        {
+            return Res::None;
         }
         if looks_type || args.is_some() {
             let types = self.visible_types(f, name, at);
@@ -2766,21 +2914,6 @@ impl<'a> Resolver<'a> {
                     })
                 })
                 .collect();
-            if !v.is_empty() {
-                return Res::Decls(v);
-            }
-        }
-        // an extension called on an implicit receiver
-        let this: Vec<Ty> = receivers
-            .into_iter()
-            .chain(
-                f.classes_at(at)
-                    .into_iter()
-                    .map(|c| Ty::Decl((f.path.clone(), f.syms.decls[c].offset))),
-            )
-            .collect();
-        for t in &this {
-            let v = self.extensions(f, name, Some(t), args, at);
             if !v.is_empty() {
                 return Res::Decls(v);
             }
@@ -3511,6 +3644,12 @@ fn known_lambda_call(name: &str) -> Option<KnownLambda> {
         | "lazy"
         | "measureTimeMillis"
         | "measureNanoTime"
+        | "measureTime"
+        | "measureTimedValue"
+        | "trace"
+        | "traceAsync"
+        | "Thread"
+        | "Runnable"
         | "runCatching"
         | "setContent"
         | "thread"
@@ -3528,6 +3667,101 @@ fn known_lambda_call(name: &str) -> Option<KnownLambda> {
         _ => return None,
     };
     Some(KnownLambda { receiver, it })
+}
+
+/// Library calls whose trailing lambda has no receiver (or none whose members could hide the
+/// class's): the known ones, the scope functions and the common collection, flow, result and
+/// view calls. A call in their lambda can be the class's. Any other library call's lambda may
+/// have a receiver not known here (kotlinc picks its members first), so it stays unresolved.
+fn no_receiver_lambda(name: &str) -> bool {
+    known_lambda_call(name).is_some_and(|k| k.receiver.is_none())
+        || any_receiver_scope_fn(name)
+        || matches!(
+            name,
+            "forEach"
+                | "forEachIndexed"
+                | "map"
+                | "mapIndexed"
+                | "mapNotNull"
+                | "mapTo"
+                | "filter"
+                | "filterIndexed"
+                | "filterNot"
+                | "first"
+                | "firstOrNull"
+                | "last"
+                | "lastOrNull"
+                | "single"
+                | "singleOrNull"
+                | "any"
+                | "all"
+                | "none"
+                | "find"
+                | "count"
+                | "sortedBy"
+                | "sortedByDescending"
+                | "flatMap"
+                | "associate"
+                | "associateBy"
+                | "associateWith"
+                | "groupBy"
+                | "sumOf"
+                | "maxOf"
+                | "minOf"
+                | "maxByOrNull"
+                | "minByOrNull"
+                | "distinctBy"
+                | "partition"
+                | "indexOfFirst"
+                | "indexOfLast"
+                | "takeWhile"
+                | "dropWhile"
+                | "fold"
+                | "reduce"
+                | "joinToString"
+                | "getOrPut"
+                | "getOrElse"
+                | "ifEmpty"
+                | "ifBlank"
+                | "removeIf"
+                | "removeAll"
+                | "retainAll"
+                | "update"
+                | "updateAndGet"
+                | "getAndUpdate"
+                | "collect"
+                | "collectLatest"
+                | "onEach"
+                | "mapLatest"
+                | "flatMapLatest"
+                | "distinctUntilChangedBy"
+                | "onSuccess"
+                | "onFailure"
+                | "mapCatching"
+                | "recover"
+                | "use"
+                | "withLock"
+                | "post"
+                | "postDelayed"
+                | "observe"
+                | "setOnClickListener"
+                | "setOnLongClickListener"
+                | "addOnSuccessListener"
+                | "addOnFailureListener"
+                | "addOnCompleteListener"
+                | "invokeOnCompletion"
+                | "doOnTextChanged"
+                | "doAfterTextChanged"
+        )
+}
+
+/// Library extensions on any `T` that take a lambda: called with no `x.` where there is an
+/// implicit receiver, kotlinc picks them over a top-level project function of the same name.
+fn any_receiver_scope_fn(name: &str) -> bool {
+    matches!(
+        name,
+        "run" | "apply" | "let" | "also" | "takeIf" | "takeUnless"
+    )
 }
 
 /// The members of a library receiver from [`known_lambda_call`] that a call in its lambda can
@@ -5314,8 +5548,8 @@ fun f(state: State, other: State) {
         assert_eq!(at(&r, "/p/S.kt", "add", 2), "-", "MutableList.add");
         assert_eq!(
             at(&r, "/p/S.kt", "title", 3),
-            "/p/S.kt:3",
-            "a library call not known here may give no receiver: the class's"
+            "-",
+            "a library call not known here may give a receiver whose `title` wins"
         );
         assert_eq!(
             at(&r, "/p/S.kt", "title", 4),
@@ -5355,14 +5589,192 @@ fun f(state: State, other: State) {
         );
     }
 
+    /// kotlinc 2.x on:
+    /// ```text
+    /// class Pipeline { fun stage(s: String) = println("Pipeline.stage") }
+    /// fun run(block: Pipeline.() -> Unit) = Pipeline().block()
+    /// fun let(block: (Pipeline) -> Unit) = block(Pipeline())
+    /// class Other { fun stage(s: String) = println("Other.stage") }
+    /// class Job { fun stage(s: String) = println("Job.stage")
+    ///     fun go() = run { stage("a") }; fun go3() = let { it.stage("let") } }
+    /// fun Other.go2() = run { stage("ext fun") }
+    /// fun main() { Job().go(); Other().go2(); with(Other()) { run { stage("with") } }
+    ///     Job().go3(); run { stage("top") }; let { it.stage("top let") } }
+    /// ```
+    /// prints Job.stage, Other.stage, Other.stage, Job.stage, Pipeline.stage, Pipeline.stage:
+    /// with an implicit receiver the library's `T.run` / `T.let` wins.
     #[test]
-    fn a_project_function_with_a_library_name_gives_its_own_lambda_receiver() {
+    fn a_library_scope_function_beats_a_top_level_project_one_with_a_receiver_like_kotlinc() {
         let (i, t) = project(&[(
             "/p/P.kt",
-            "package a\nclass Pipeline {\n    fun stage(s: String) {}\n}\nfun run(block: Pipeline.() -> Unit) {}\nclass Job {\n    fun stage(s: String) {}\n    fun go() = run { stage(\"a\") }\n}\n",
+            "package a\nclass Pipeline {\n    fun stage(s: String) {}\n}\nfun run(block: Pipeline.() -> Unit) {}\nfun let(block: (Pipeline) -> Unit) {}\nclass Other {\n    fun stage(s: String) {}\n}\nclass Job {\n    fun stage(s: String) {}\n    fun go() = run { stage(\"a\") }\n    fun go3() = let { it.stage(\"let\") }\n}\nfun Other.go2() = run { stage(\"ext fun\") }\nfun main() {\n    with(Other()) { run { stage(\"with\") } }\n    run { stage(\"top\") }\n    let { it.stage(\"top let\") }\n}\n",
         )]);
         let r = Resolver::new(&i, &t);
-        assert_eq!(at(&r, "/p/P.kt", "stage", 3), "/p/P.kt:3");
+        assert_eq!(at(&r, "/p/P.kt", "stage", 4), "/p/P.kt:11", "in a class");
+        assert_eq!(
+            at(&r, "/p/P.kt", "stage", 5),
+            "/p/P.kt:11",
+            "`let` in a class"
+        );
+        assert_eq!(
+            at(&r, "/p/P.kt", "stage", 6),
+            "/p/P.kt:8",
+            "in an extension"
+        );
+        assert_eq!(at(&r, "/p/P.kt", "stage", 7), "/p/P.kt:8", "in `with`");
+        assert_eq!(
+            at(&r, "/p/P.kt", "stage", 8),
+            "/p/P.kt:3",
+            "no receiver: the project's"
+        );
+        assert_eq!(
+            at(&r, "/p/P.kt", "stage", 9),
+            "/p/P.kt:3",
+            "`let`, no receiver"
+        );
+        assert_eq!(
+            at(&r, "/p/P.kt", "run", 2),
+            "-",
+            "the call itself is the library's"
+        );
+        assert_eq!(at(&r, "/p/P.kt", "run", 5), "/p/P.kt:5", "no receiver");
+    }
+
+    /// kotlinc 2.x on:
+    /// ```text
+    /// class Head; fun Head.title(s: String) = println("Head.title")
+    /// fun head(block: Head.() -> Unit) = Head().block()
+    /// class Page { fun title(s: String) = println("Page.title"); fun render() = head { title("Hi") } }
+    /// class H2 { fun title(s: String) = println("H2.title (member)") }
+    /// fun h2(block: H2.() -> Unit) = H2().block(); fun title(s: String) = println("top-level title")
+    /// fun main() { Page().render(); h2 { title("x") } }
+    /// ```
+    /// prints Head.title and H2.title (member): a lambda's receiver beats the class and a
+    /// top-level function. A library `head` is not indexed, so its receiver is not known: the
+    /// call stays unresolved instead of a guess. Library calls known to give no receiver
+    /// (`measureTime`, `forEach`) keep the class.
+    #[test]
+    fn an_unknown_library_receiver_lambda_leaves_class_calls_unresolved_like_kotlinc() {
+        let (i, t) = project(&[(
+            "/p/G.kt",
+            "package a\nclass Page {\n    fun title(s: String) {}\n    fun render() = createHTML().head { title(\"Hi\") }\n    fun plain() = head { title(\"Hi\") }\n    fun each(xs: List<String>) = xs.forEach { title(it) }\n    fun timed() = measureTime { title(\"t\") }\n    fun m() = head { mark() }\n    fun n() = mark()\n}\nfun Page.ext() = head { title(\"e\") }\nfun Page.mark() {}\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(
+            at(&r, "/p/G.kt", "title", 2),
+            "-",
+            "`createHTML().head {{ }}`"
+        );
+        assert_eq!(at(&r, "/p/G.kt", "title", 3), "-", "`head {{ }}`");
+        assert_eq!(at(&r, "/p/G.kt", "title", 4), "/p/G.kt:3", "forEach");
+        assert_eq!(at(&r, "/p/G.kt", "title", 5), "/p/G.kt:3", "measureTime");
+        assert_eq!(
+            at(&r, "/p/G.kt", "title", 6),
+            "-",
+            "an extension's receiver"
+        );
+        assert_eq!(
+            at(&r, "/p/G.kt", "mark", 1),
+            "-",
+            "an extension on the class"
+        );
+        assert_eq!(
+            at(&r, "/p/G.kt", "mark", 2),
+            "/p/G.kt:12",
+            "outside the lambda"
+        );
+    }
+
+    /// kotlinc 2.x on:
+    /// ```text
+    /// fun stage(s: String) = println("top-level stage")
+    /// class Job { fun go() = stage("x") }
+    /// fun Job.stage(s: String) = println("extension Job.stage")
+    /// ```
+    /// prints "extension Job.stage": an extension on the implicit receiver beats a top-level
+    /// function.
+    #[test]
+    fn an_extension_on_the_implicit_receiver_beats_a_top_level_function_like_kotlinc() {
+        let (i, t) = project(&[(
+            "/p/E.kt",
+            "package a\nfun stage(s: String) {}\nclass Job {\n    fun go() = stage(\"x\")\n}\nfun Job.stage(s: String) {}\nfun main() = stage(\"y\")\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/E.kt", "stage", 2), "/p/E.kt:6", "in the class");
+        assert_eq!(at(&r, "/p/E.kt", "stage", 4), "/p/E.kt:2", "no receiver");
+    }
+
+    /// kotlinc 2.x on:
+    /// ```text
+    /// class Html { fun title(s: String) = println("Html.title") }
+    /// typealias Multi =
+    ///     Html.() -> Unit
+    /// typealias Gen<T> = T.() -> Unit
+    /// typealias Base = Html.() -> Unit; typealias Alias2 = Base
+    /// typealias Plain = Html.() -> Unit
+    /// fun pMulti(h: Html, b: Multi) = h.b(); fun pGen(h: Html, b: Gen<Html>) = h.b()
+    /// fun pAlias2(h: Html, b: Alias2) = h.b(); fun pAnn(h: Html, b: @Composable Plain) = h.b()
+    /// class Site { fun title(s: String) = println("Site.title")
+    ///     fun go() { pMulti(Html()) { title("x") }; pGen(Html()) { title("x") }
+    ///         pAlias2(Html()) { title("x") }; pAnn(Html()) { title("x") } } }
+    /// ```
+    /// prints Html.title four times (`@Composable` a local `@Target(TYPE)` annotation).
+    #[test]
+    fn typealiased_receiver_lambdas_keep_their_receiver_like_kotlinc() {
+        let (i, t) = project(&[
+            (
+                "/p/H.kt",
+                "package a\nclass Html {\n    fun title(s: String) {}\n}\ntypealias Multi =\n    Html.() -> Unit\ntypealias Gen<T> = T.() -> Unit\ntypealias Base = Html.() -> Unit\ntypealias Alias2 = Base\ntypealias Plain = Html.() -> Unit\nfun pMulti(h: Html, b: Multi) {}\nfun pGen(h: Html, b: Gen<Html>) {}\nfun pAlias2(h: Html, b: Alias2) {}\nfun pAnn(h: Html, b: @Composable Plain) {}\n",
+            ),
+            (
+                "/p/S.kt",
+                "package a\nclass Site {\n    fun title(s: String) {}\n    fun a() = pMulti(Html()) { title(\"x\") }\n    fun b() = pGen(Html()) { title(\"x\") }\n    fun c() = pAlias2(Html()) { title(\"x\") }\n    fun d() = pAnn(Html()) { title(\"x\") }\n}\n",
+            ),
+        ]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(
+            at(&r, "/p/S.kt", "title", 2),
+            "/p/H.kt:3",
+            "a multi-line alias"
+        );
+        assert_eq!(
+            at(&r, "/p/S.kt", "title", 3),
+            "/p/H.kt:3",
+            "a generic alias"
+        );
+        assert_eq!(
+            at(&r, "/p/S.kt", "title", 4),
+            "/p/H.kt:3",
+            "an alias of an alias"
+        );
+        assert_eq!(
+            at(&r, "/p/S.kt", "title", 5),
+            "/p/H.kt:3",
+            "an annotated alias"
+        );
+    }
+
+    /// kotlinc 2.x on:
+    /// ```text
+    /// class Foo; class Item(val x: String)
+    /// fun Foo.map(b: () -> Unit) { println("Foo.map"); b() }
+    /// fun main() { println(listOf(Item("a")).map { it.x }); Foo().map { println("no it") } }
+    /// ```
+    /// prints [a], Foo.map, no it: on a list `map` is the library's and `it` is the element.
+    #[test]
+    fn a_project_extension_named_map_does_not_type_a_lists_it_like_kotlinc() {
+        let (i, t) = project(&[(
+            "/p/M.kt",
+            "package a\nclass Foo\nclass Item(val x: String)\nfun Foo.map(b: () -> Unit) {}\nfun main(list: List<Item>) {\n    list.map { it.x }\n    Foo().map { }\n}\n",
+        )]);
+        let r = Resolver::new(&i, &t);
+        assert_eq!(at(&r, "/p/M.kt", "map", 2), "-", "the library's map");
+        assert_eq!(
+            at(&r, "/p/M.kt", "x", 2),
+            "/p/M.kt:3",
+            "`it` is the element"
+        );
+        assert_eq!(at(&r, "/p/M.kt", "map", 3), "/p/M.kt:4", "Foo().map");
     }
 
     #[test]

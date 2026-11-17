@@ -312,6 +312,11 @@ mod script_tests {
     /// Runs `scripts/perf_check.py old new` with fake bench builds (shell scripts, `old` and
     /// `new`): (its output, whether it passed, what each run of the old one was asked to pin).
     fn perf_check(name: &str, old: &str, new: &str) -> (String, bool, String) {
+        perf_check_with(name, old, new, "")
+    }
+
+    /// [`perf_check`] with more arguments (`extra`, a Python list's items).
+    fn perf_check_with(name: &str, old: &str, new: &str, extra: &str) -> (String, bool, String) {
         let dir =
             std::env::temp_dir().join(format!("droid-lite-perf-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -336,7 +341,7 @@ mod script_tests {
             "import sys\nsys.path.insert(0, {scripts:?})\nimport perf_check as p\n\
              p.git = lambda *a: a[1].split('^')[0]\n\
              p.build = lambda sha: {{'old': {old:?}, 'new': {new:?}}}[sha]\n\
-             sys.argv = ['perf_check', 'old', 'new', '--project', {project:?}, '--rounds', '2']\n\
+             sys.argv = ['perf_check', 'old', 'new', '--project', {project:?}, '--rounds', '2', {extra}]\n\
              p.main()\n",
             scripts = repo.join("scripts").display().to_string(),
             old = old.display().to_string(),
@@ -386,14 +391,31 @@ mod script_tests {
     }
 
     #[test]
-    fn the_perf_check_does_not_compare_keystroke_times_of_an_old_build_that_picks_its_own_file() {
-        let (out, ok, _) = perf_check(
-            "own",
-            &bench_output("0.10", false),
-            &bench_output("9.40", true),
-        );
-        assert!(ok, "a different file is no slowdown: {out}");
+    fn the_perf_check_fails_keystroke_times_it_cannot_compare_unless_allowed() {
+        let (old, new) = (bench_output("0.10", false), bench_output("9.40", true));
+        let (out, ok, _) = perf_check("own", &old, &new);
+        assert!(!ok, "an old build that picks its own file: {out}");
         assert!(out.contains("not compared"), "{out}");
+        let (out, ok, _) = perf_check_with("own-allowed", &old, &new, "'--allow-uncompared'");
+        assert!(ok, "a different file is no slowdown when allowed: {out}");
+        assert!(out.contains("not compared"), "{out}");
+    }
+
+    #[test]
+    fn the_perf_check_fails_a_sub_millisecond_step_that_grows_many_times() {
+        let (out, ok, _) = perf_check(
+            "short",
+            &bench_output("0.10", true),
+            &bench_output("1.90", true),
+        );
+        assert!(!ok, "{out}");
+        assert!(out.contains("SLOWER"), "{out}");
+        let (out, ok, _) = perf_check(
+            "short-noise",
+            &bench_output("0.10", true),
+            &bench_output("0.14", true),
+        );
+        assert!(ok, "within the timer's noise: {out}");
     }
 
     #[test]

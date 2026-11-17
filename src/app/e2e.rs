@@ -5911,16 +5911,10 @@ fn e2e_an_action_waiting_for_a_save_shows_and_can_be_cancelled() {
     h.state_mut().tabs[i].mark_edited();
     h.state_mut().revert();
     steps(&mut h, 2);
-    assert!(
-        h.query_by_label("Waiting for save: Revert User.kt")
-            .is_some()
-    );
+    assert!(h.query_by_label("Waiting for save: Revert User.kt").is_some());
     h.get_by_label("Cancel Revert User.kt").click();
     steps(&mut h, 2);
-    assert!(
-        h.query_by_label("Waiting for save: Revert User.kt")
-            .is_none()
-    );
+    assert!(h.query_by_label("Waiting for save: Revert User.kt").is_none());
     unstick.send(()).unwrap();
     h.state_mut().wait_saves();
     assert!(tab(&h).text.ends_with("// more\n"), "not reverted");
@@ -5941,18 +5935,14 @@ fn e2e_an_edit_undone_while_an_action_waits_for_a_save_still_counts_as_a_change(
     a.settle_saves("git stash", counted(&runs));
     let i = a.active;
     // typed and typed away again: the same text, a newer version
-    a.tabs[i].text.push('x');
+    a.tabs[i].text.push_str("x");
     a.tabs[i].mark_edited();
     a.tabs[i].text.pop();
     a.tabs[i].mark_edited();
     unstick.send(()).unwrap();
     a.wait_saves();
     assert_eq!(runs.get(), 0);
-    assert!(
-        a.status.contains("a text changed meanwhile"),
-        "{}",
-        a.status
-    );
+    assert!(a.status.contains("a text changed meanwhile"), "{}", a.status);
 }
 
 #[test]

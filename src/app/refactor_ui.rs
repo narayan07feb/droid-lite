@@ -1,6 +1,6 @@
 //! Rename (with a preview), optimize imports, extract variable, and undo of the last refactoring.
 
-use super::{AfterSaves, App, tree, word_bounds};
+use super::{AfterSaves, App, GitCheck, tree, word_bounds};
 use crate::lsp;
 use crate::project::is_code;
 use crate::refactor;
@@ -323,22 +323,35 @@ impl App {
         what: &str,
         again: impl FnOnce(&mut App) + 'static,
     ) -> bool {
-        self.settle_saves_of(what, None, again)
+        self.settle_saves_of(what, what, None, again)
     }
 
-    /// [`App::settle_saves`] for a git action in the repository at `root`: it is dropped when
-    /// the branch, HEAD or the staged files move before it runs.
+    /// [`App::settle_saves`] for an action on one file: `key` (its kind and the file's full
+    /// path) tells it from the same action on a file of the same name elsewhere.
+    pub(super) fn settle_saves_keyed(
+        &mut self,
+        key: &str,
+        what: &str,
+        again: impl FnOnce(&mut App) + 'static,
+    ) -> bool {
+        self.settle_saves_of(key, what, None, again)
+    }
+
+    /// [`App::settle_saves_keyed`] for a git action in the repository at `root`: it is dropped
+    /// when the branch, HEAD or the staged files move before it runs.
     pub(super) fn settle_git_saves(
         &mut self,
+        key: &str,
         what: &str,
         root: &Path,
         again: impl FnOnce(&mut App) + 'static,
     ) -> bool {
-        self.settle_saves_of(what, Some(root), again)
+        self.settle_saves_of(key, what, Some(root), again)
     }
 
     fn settle_saves_of(
         &mut self,
+        key: &str,
         what: &str,
         git: Option<&Path>,
         again: impl FnOnce(&mut App) + 'static,
@@ -349,11 +362,17 @@ impl App {
         self.status = format!("{what} runs when the save on its way is done");
         // a typing pause due now is taken first: from here a version changes only with a text
         self.settle(true);
-        let git = git.map(|r| (r.to_path_buf(), crate::git::state_stamp(r)));
+        // the repository's state now, worked out off this thread
+        let git = git.map(|r| GitCheck {
+            root: r.to_path_buf(),
+            asked: super::Stamp::start(r, self.ctx.clone(), self.stamp),
+            now: None,
+        });
         // asked again (a second click): the newer one replaces it
-        self.after_saves.retain(|a| a.what != what);
+        self.after_saves.retain(|a| a.key != key);
         self.after_saves.push(AfterSaves {
             what: what.to_string(),
+            key: key.to_string(),
             revs: self.tab_revs(),
             git,
             run: Box::new(again),
@@ -361,10 +380,13 @@ impl App {
         false
     }
 
-    /// Takes the action `what` out of those waiting for the saves.
-    pub(super) fn cancel_after_saves(&mut self, what: &str) {
-        self.after_saves.retain(|a| a.what != what);
-        self.status = format!("{what} will not run");
+    /// Takes the action `key` out of those waiting for the saves.
+    pub(super) fn cancel_after_saves(&mut self, key: &str) {
+        let Some(i) = self.after_saves.iter().position(|a| a.key == key) else {
+            return;
+        };
+        let a = self.after_saves.remove(i);
+        self.status = format!("{} will not run", a.what);
     }
 
     /// Writes a file and keeps the open tab, the index and kotlin-lsp in step.

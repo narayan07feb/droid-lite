@@ -226,14 +226,73 @@ const SAVE_WAIT_ON_QUIT: std::time::Duration = std::time::Duration::from_secs(10
 
 /// An action that must come after the saves on their way (a revert, a refactor, a git command):
 /// it runs once they landed, unless an open tab's text changed meanwhile, or for a git action
-/// the branch or the git index moved. One per `what`: asking again replaces it.
+/// the branch or the git index moved. One per `key`: asking again replaces it.
 struct AfterSaves {
+    /// What it says in the status bar ("Revert User.kt").
     what: String,
+    /// What it is: its kind and the file's full path ("revert /p/a/User.kt").
+    key: String,
     /// The open tabs' text versions when it was asked for ([`App::tab_revs`]).
     revs: Vec<u64>,
-    /// A git action: the repository and its state then ([`crate::git::state_stamp`]).
-    git: Option<(PathBuf, Option<String>)>,
+    /// A git action: the repository, its state then and its state when it is to run.
+    git: Option<GitCheck>,
     run: Box<dyn FnOnce(&mut App)>,
+}
+
+/// The states ([`crate::git::state_stamp`]) a git action waiting for the saves is checked by,
+/// each worked out on a thread of its own, never the window's.
+struct GitCheck {
+    root: PathBuf,
+    asked: Stamp,
+    now: Option<Stamp>,
+}
+
+/// How a repository's state is worked out: [`crate::git::state_stamp`] (tests put in others).
+type StampFn = fn(&Path) -> Option<String>;
+
+enum Stamp {
+    Waiting(Receiver<Option<String>>),
+    /// `None`: git did not answer.
+    Got(Option<String>),
+}
+
+impl Stamp {
+    /// The state of the repository at `root`, worked out on a thread; a frame is asked for when
+    /// it is in.
+    fn start(root: &Path, ctx: Option<egui::Context>, stamp: StampFn) -> Stamp {
+        let (tx, rx) = channel();
+        let root = root.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(stamp(&root));
+            if let Some(c) = ctx {
+                c.request_repaint();
+            }
+        });
+        Stamp::Waiting(rx)
+    }
+
+    /// The state, once it is in.
+    fn poll(&mut self) -> Option<&Option<String>> {
+        if let Stamp::Waiting(rx) = self {
+            match rx.try_recv() {
+                Ok(s) => *self = Stamp::Got(s),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => *self = Stamp::Got(None),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            }
+        }
+        match self {
+            Stamp::Got(s) => Some(s),
+            Stamp::Waiting(_) => None,
+        }
+    }
+
+    /// Waits until the state is in (tests).
+    #[cfg(test)]
+    fn wait(&mut self) {
+        if let Stamp::Waiting(rx) = self {
+            *self = Stamp::Got(rx.recv().ok().flatten());
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -477,6 +536,10 @@ pub struct App {
     shift_down: bool,
     last_shift: Option<Instant>,
     status: String,
+    /// Why actions that waited for a save did not run: stays in the status bar until dismissed.
+    notice: Option<String>,
+    /// Works out a repository's state for git actions waiting for a save, off this thread.
+    stamp: StampFn,
     /// Dev check: `DROID_LITE_SHOT=out.png` saves a screenshot once indexing is done, then quits.
     shot: Option<(PathBuf, u32)>,
     refactor: Option<refactor_ui::Refactor>,
@@ -588,6 +651,9 @@ impl App {
         settings.apply(&cc.egui_ctx);
         crate::theme::style(&cc.egui_ctx);
         let index = crate::index::Shared::default();
+        // changes the worker cannot apply at the editor's priority wait for the next frame
+        let wake = cc.egui_ctx.clone();
+        index.on_wake(move || wake.request_repaint());
         let mut app = App {
             xref: xref::Xref::start(index.clone(), Some(cc.egui_ctx.clone())),
             project: None,
@@ -626,6 +692,8 @@ impl App {
             shift_down: false,
             last_shift: None,
             status: String::new(),
+            notice: None,
+            stamp: crate::git::state_stamp,
             shot: std::env::var_os("DROID_LITE_SHOT").map(|p| (PathBuf::from(p), 0)),
             refactor: None,
             undo: None,
@@ -1009,26 +1077,86 @@ impl App {
                 saver::Outcome::Failed(s) => self.status = s,
             }
         }
-        if self.saves_pending > 0 || self.after_saves.is_empty() {
+        self.run_after_saves();
+    }
+
+    /// Runs the first action waiting for the saves once they all landed, checked against the
+    /// texts and the repository as they are now, after the action before it ran. One per call:
+    /// the next frame takes the next. A git action waits for the repository's state, worked out
+    /// off this thread; a state moved by the git action that ran just before it counts as its
+    /// own (`git add .` then `git commit`).
+    fn run_after_saves(&mut self) {
+        if self.saves_pending > 0 {
             return;
         }
-        // the texts they were asked for against, before any of them ran
-        let revs = self.tab_revs();
-        // one at a time: one that runs may drop the rest (a checkout)
-        while self.saves_pending == 0 && !self.after_saves.is_empty() {
-            let a = self.after_saves.remove(0);
-            if a.revs != revs {
-                self.status = format!("{} did not run: a text changed meanwhile", a.what);
-            } else if let Some((root, stamp)) = &a.git
-                && crate::git::state_stamp(root) != *stamp
-            {
-                self.status = format!(
-                    "{} did not run: the branch or the staged files changed meanwhile",
-                    a.what
-                );
-            } else {
-                (a.run)(self);
+        let ctx = self.ctx.clone();
+        // the states the git actions were asked for in, all in first: one that runs moves on
+        // those asked for in the state it ran in
+        let asked_in = self
+            .after_saves
+            .iter_mut()
+            .filter_map(|a| a.git.as_mut())
+            .all(|g| g.asked.poll().is_some());
+        if !asked_in {
+            return; // a frame is asked for when it is in
+        }
+        let Some(a) = self.after_saves.first_mut() else {
+            return;
+        };
+        let mut state = None;
+        if let Some(g) = &mut a.git {
+            let stamp = self.stamp;
+            let now = g
+                .now
+                .get_or_insert_with(|| Stamp::start(&g.root, ctx.clone(), stamp));
+            let Some(now) = now.poll().cloned() else {
+                return; // a frame is asked for when it is in
+            };
+            let Some(asked) = g.asked.poll().cloned() else {
+                return;
+            };
+            state = Some((asked, now));
+        }
+        let a = self.after_saves.remove(0);
+        let why = if a.revs != self.tab_revs() {
+            Some("a text changed meanwhile")
+        } else {
+            match &state {
+                Some((None, _) | (_, None)) => Some("git did not answer"),
+                Some((asked, now)) if asked != now => {
+                    Some("the branch or the staged files changed meanwhile")
+                }
+                _ => None,
             }
+        };
+        match why {
+            Some(why) => {
+                let line = format!("{} did not run: {why}", a.what);
+                self.status = line.clone();
+                self.notice = Some(line);
+            }
+            None => {
+                let root = a.git.as_ref().map(|g| g.root.clone());
+                (a.run)(self);
+                // a git action asked for in the state this one ran in is checked against the
+                // state it left
+                if let (Some(root), Some((_, ran_in))) = (root, state) {
+                    for b in &mut self.after_saves {
+                        if let Some(g) = &mut b.git
+                            && g.root == root
+                            && g.asked.poll() == Some(&ran_in)
+                        {
+                            g.asked = Stamp::start(&root, ctx.clone(), self.stamp);
+                        }
+                    }
+                }
+            }
+        }
+        // one at a time: the next is checked against what this one left
+        if !self.after_saves.is_empty()
+            && let Some(c) = &ctx
+        {
+            c.request_repaint();
         }
     }
 
@@ -1046,13 +1174,38 @@ impl App {
         }
         let names: Vec<String> = self.after_saves.drain(..).map(|a| a.what).collect();
         self.status = format!("{} will not run: {why}", names.join(", "));
+        self.notice = Some(self.status.clone());
     }
 
-    /// Waits for every save sent so far and applies them (tests).
+    /// Waits until the states the waiting git actions were asked for in are in (tests: before
+    /// the repository is changed behind their back).
+    #[cfg(test)]
+    fn wait_asked(&mut self) {
+        for g in self.after_saves.iter_mut().filter_map(|a| a.git.as_mut()) {
+            g.asked.wait();
+        }
+    }
+
+    /// Waits for every save sent so far and applies them, and runs the actions that waited for
+    /// them (tests).
     #[cfg(test)]
     fn wait_saves(&mut self) {
-        saver::wait();
-        self.poll_saves();
+        loop {
+            saver::wait();
+            self.poll_saves();
+            if self.saves_pending > 0 {
+                continue;
+            }
+            if self.after_saves.is_empty() {
+                return;
+            }
+            for g in self.after_saves.iter_mut().filter_map(|a| a.git.as_mut()) {
+                g.asked.wait();
+                if let Some(now) = &mut g.now {
+                    now.wait();
+                }
+            }
+        }
     }
 
     fn close_tab(&mut self, i: usize) {
@@ -1065,7 +1218,8 @@ impl App {
                 }
             };
             let what = format!("Close {}", short_name(&t.path));
-            if !self.settle_saves(&what, again) {
+            let key = format!("close {}", t.path.display());
+            if !self.settle_saves_keyed(&key, &what, again) {
                 return;
             }
         }
@@ -1118,6 +1272,7 @@ impl App {
             return;
         };
         let what = format!("Revert {}", short_name(&p));
+        let key = format!("revert {}", p.display());
         let again = move |a: &mut App| {
             if let Some(i) = a.tabs.iter().position(|t| t.path == p) {
                 let active = std::mem::replace(&mut a.active, i);
@@ -1125,7 +1280,7 @@ impl App {
                 a.active = active;
             }
         };
-        if !self.settle_saves(&what, again) {
+        if !self.settle_saves_keyed(&key, &what, again) {
             return;
         }
         if let Some(t) = self.tabs.get_mut(self.active) {
@@ -2541,20 +2696,28 @@ impl App {
                     );
             }
             ui.label(RichText::new(&self.status).color(weak));
+            // why actions that waited for a save did not run, until dismissed
+            if let Some(n) = &self.notice {
+                ui.label(RichText::new(n).color(WARN));
+                if ui.small_button("Dismiss").clicked() {
+                    self.notice = None;
+                }
+            }
             // actions waiting for a save on its way, each with a way out
             let mut cancel = None;
             for a in &self.after_saves {
-                ui.label(RichText::new(format!("Waiting for save: {}", a.what)).color(WARN));
+                ui.label(RichText::new(format!("Waiting for save: {}", a.what)).color(WARN))
+                    .on_hover_text(&a.key);
                 if ui
                     .small_button(format!("Cancel {}", a.what))
                     .on_hover_text("Do not run it when the save is done")
                     .clicked()
                 {
-                    cancel = Some(a.what.clone());
+                    cancel = Some(a.key.clone());
                 }
             }
-            if let Some(what) = cancel {
-                self.cancel_after_saves(&what);
+            if let Some(key) = cancel {
+                self.cancel_after_saves(&key);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 14.0;

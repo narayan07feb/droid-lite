@@ -352,20 +352,26 @@ pub fn branch(dir: &Path) -> Option<String> {
 /// Where the repository at `dir` stands: HEAD's commit and ref, and what is staged (by blob, so
 /// a `git status` that only refreshes the index's file times leaves it). Two equal stamps: no
 /// commit, checkout, stash or staging between them.
+///
+/// Off the editor's thread: `None` when git did not answer within [`STAMP_TIMEOUT`].
 pub fn state_stamp(dir: &Path) -> Option<String> {
-    let head = git(dir)
-        .args(["rev-parse", "HEAD", "--symbolic-full-name", "HEAD"])
-        .output()
-        .ok()?;
-    let staged = git(dir)
-        .args(["diff", "--cached", "--raw", "--no-renames", "-z"])
-        .output()
-        .ok()?;
-    Some(format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&head.stdout),
-        String::from_utf8_lossy(&staged.stdout)
-    ))
+    stamp_with(|| git(dir), STAMP_TIMEOUT)
+}
+
+/// How long [`state_stamp`] waits for each git it runs.
+const STAMP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// [`state_stamp`] with the git that `cmd` makes, stopped after `timeout`.
+fn stamp_with(cmd: impl Fn() -> Command, timeout: std::time::Duration) -> Option<String> {
+    let run = |args: &[&str]| {
+        let mut c = cmd();
+        c.args(args);
+        let out = output_within(c, timeout, &Ctl::default(), usize::MAX).ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let head = run(&["rev-parse", "HEAD", "--symbolic-full-name", "HEAD"])?;
+    let staged = run(&["diff", "--cached", "--raw", "--no-renames", "-z"])?;
+    Some(format!("{head}\n{staged}"))
 }
 
 /// The commit HEAD points at, or `None` outside a repository or before the first commit.
@@ -743,7 +749,7 @@ fn ignored_overwrites(
     cmd.args(["pr", "diff", &number.to_string(), "--name-only"])
         .current_dir(root)
         .env("GH_PROMPT_DISABLED", "1");
-    let out = match output_within(cmd, DIFF_TIMEOUT, ctl) {
+    let out = match output_within(cmd, DIFF_TIMEOUT, ctl, MAX_GH_OUTPUT) {
         Ok(o) if o.status.success() => o,
         Err(Ended::Stopped) => return Err(stopped(number)),
         _ => return Ok(None),
@@ -837,7 +843,7 @@ pub fn checkout_pr(
         // never wait for a password or a question nobody sees
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GH_PROMPT_DISABLED", "1");
-    let out = output_within(cmd, timeout, ctl).map_err(|e| match e {
+    let out = output_within(cmd, timeout, ctl, MAX_GH_OUTPUT).map_err(|e| match e {
         Ended::Spawn(e) => gh_spawn_error(e),
         Ended::TimedOut => {
             "Check out timed out; the working tree may be part-switched: run git status".into()
@@ -860,13 +866,14 @@ pub fn checkout_pr(
 }
 
 /// Runs `cmd` in a process group of its own (its id in `ctl` while it runs), its stdout and
-/// stderr kept up to [`MAX_GH_OUTPUT`] bytes each. After `timeout`, or when `ctl` is stopped, the
+/// stderr kept up to `cap` bytes each. After `timeout`, or when `ctl` is stopped, the
 /// whole group (git that gh started too) gets SIGTERM, so git can remove its `index.lock`, and
 /// SIGKILL after [`STOP_GRACE`].
 fn output_within(
     mut cmd: Command,
     timeout: std::time::Duration,
     ctl: &Ctl,
+    cap: usize,
 ) -> Result<std::process::Output, Ended> {
     use std::io::Read;
     if ctl.stopped() {
@@ -890,7 +897,7 @@ fn output_within(
             if let Some(mut pipe) = pipe {
                 let mut buf = [0u8; 8192];
                 while let Ok(n @ 1..) = pipe.read(&mut buf) {
-                    let room = MAX_GH_OUTPUT.saturating_sub(kept.len());
+                    let room = cap.saturating_sub(kept.len());
                     kept.extend_from_slice(&buf[..n.min(room)]);
                 }
             }
@@ -1600,6 +1607,20 @@ mod tests {
         g(&["commit", "-q", "-m", "two"]);
         assert_ne!(state_stamp(&dir), staged, "a commit");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_state_stamp_whose_git_does_not_answer_gives_up_after_its_timeout() {
+        // a "git" that never answers
+        let hung = || {
+            let mut c = Command::new("sh");
+            c.args(["-c", "sleep 30", "sh"]);
+            c
+        };
+        assert_eq!(
+            stamp_with(hung, std::time::Duration::from_millis(200)),
+            None
+        );
     }
 
     #[test]

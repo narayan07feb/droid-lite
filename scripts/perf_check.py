@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compares the speed and memory of two versions of Droid Lite with `--bench` on one project.
 
-    scripts/perf_check.py <old-ref> [<new-ref>] [--project DIR] [--rounds N]
+    scripts/perf_check.py <old-ref> [<new-ref>] [--project DIR] [--rounds N] [--allow-uncompared]
 
 The new version is HEAD when not given. The project is --project, else
 `git config droidlite.perfProject`. Each version is built once (release, memstats) and kept
@@ -10,6 +10,9 @@ alternate old/new and swap who goes first each round, because run order biases s
 Each version gets a warm-up run first (library cache, file cache).
 
 Exit 1 when a step is slower or keeps more memory than the limits below; the table says which.
+Exit 1 too when the per-keystroke step cannot be compared (the two builds re-indexed different
+files), unless --allow-uncompared is given (the hook gives it only for an old build from before
+the pinned file).
 """
 
 import argparse
@@ -28,10 +31,17 @@ LINE = re.compile(r"^(.{34}) +(-?[\d.]+) ms(?: +([+-][\d.]+) MB heap)?")
 # the file the per-keystroke step re-indexes (builds from before 2026-11-18 do not print it)
 KEYSTROKE_FILE = re.compile(r"^  keystroke file: (.*)$")
 KEYSTROKE = "re-index one file (per keystroke)"
-# a step fails when it is both this much slower in ratio and in absolute time
-SLOWER_RATIO, SLOWER_MS = 1.15, 2.0
+# a step fails when it is both this much slower in ratio and in absolute time; the absolute
+# limit is half the old time for short steps (a 0.1 ms step may not grow to 2 ms unflagged),
+# never below SLOWER_MS_FLOOR (timer noise) nor above SLOWER_MS
+SLOWER_RATIO, SLOWER_MS, SLOWER_MS_FLOOR = 1.15, 2.0, 0.05
 # and when it keeps both this much more memory in ratio and in MB
 HEAP_RATIO, HEAP_MB = 1.05, 2.0
+
+
+def slower_ms(old_ms):
+    """How many ms slower a step that took `old_ms` may get before it fails."""
+    return min(SLOWER_MS, max(SLOWER_MS_FLOOR, old_ms / 2))
 
 
 def git(*args):
@@ -87,6 +97,8 @@ def main():
     ap.add_argument("new", nargs="?", default="HEAD")
     ap.add_argument("--project")
     ap.add_argument("--rounds", type=int, default=7)
+    ap.add_argument("--allow-uncompared", action="store_true",
+                    help="pass when the per-keystroke step cannot be compared")
     a = ap.parse_args()
     project = a.project or subprocess.run(
         ["git", "config", "droidlite.perfProject"], cwd=ROOT, capture_output=True, text=True
@@ -133,7 +145,7 @@ def main():
         elif step == KEYSTROKE and not same_input:
             flag = "  not compared"
         else:
-            if n_ms > o_ms * SLOWER_RATIO and n_ms - o_ms > SLOWER_MS:
+            if n_ms > o_ms * SLOWER_RATIO and n_ms - o_ms > slower_ms(o_ms):
                 flag += "  SLOWER"
             if n_mb > max(o_mb, 0) * HEAP_RATIO and n_mb - o_mb > HEAP_MB:
                 flag += "  MORE MEMORY"
@@ -144,6 +156,8 @@ def main():
     print(f"\nold {old[:8]}, new {new[:8]}, {a.rounds} rounds, medians")
     if pinned:
         print(f"per-keystroke file (both): {pinned}")
+    if not same_input and not a.allow_uncompared:
+        failed.append(KEYSTROKE + " (not compared; --allow-uncompared to pass)")
     if failed:
         print(f"perf check FAILED: {', '.join(failed)}")
         sys.exit(1)

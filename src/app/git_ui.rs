@@ -249,12 +249,14 @@ impl App {
             return;
         }
         if self.saves_pending > 0 {
-            let path = match &r {
-                Revert::Working { path, .. } | Revert::Branch { path, .. } => path,
+            let (path, kind) = match &r {
+                Revert::Working { path, .. } => (path, "working"),
+                Revert::Branch { path, .. } => (path, "branch"),
             };
             let what = format!("Git revert {}", super::short_name(path));
+            let key = format!("git revert {kind} {}", path.display());
             let at = root.to_path_buf();
-            self.settle_git_saves(&what, root, move |a| a.revert_file(&at, r));
+            self.settle_git_saves(&key, &what, root, move |a| a.revert_file(&at, r));
             return;
         }
         let (path, res) = match r {
@@ -294,7 +296,8 @@ impl App {
         let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
         let again =
             move |a: &mut App| a.git_command(&owned.iter().map(String::as_str).collect::<Vec<_>>());
-        if !self.settle_git_saves(&format!("git {}", args.join(" ")), &root, again) {
+        let what = format!("git {}", args.join(" "));
+        if !self.settle_git_saves(&what, &what, &root, again) {
             return;
         }
         match git::run(&root, args) {

@@ -28,6 +28,9 @@ pub struct Index {
     /// Generations up to this one belong to an index this one replaced (another project, or the
     /// same one read again): nothing changed since then can be told.
     floor: u64,
+    /// Counts the indexes [`Shared::set`] put in: a file read again for one never goes into
+    /// the next.
+    epoch: u64,
 }
 
 /// How many file changes the index remembers.
@@ -41,9 +44,20 @@ const CHANGES_KEPT: usize = 2048;
 pub struct Shared {
     index: Arc<std::sync::RwLock<Index>>,
     queue: Arc<std::sync::Mutex<Vec<Change>>>,
-    /// Files a failed change took out, to read again from disk on the worker ([`Shared::rescan`]).
-    rescan: Arc<std::sync::Mutex<Vec<PathBuf>>>,
+    /// Files a failed change took out, to read again from disk on the worker ([`Shared::rescan`]),
+    /// each with the index it was taken out of ([`Index::epoch`]): one of an index
+    /// [`Shared::set`] replaced since is not put into the new one.
+    rescan: Arc<std::sync::Mutex<Vec<(u64, PathBuf)>>>,
+    /// A failed change may have left names without their file: the name maps are rebuilt from
+    /// the files on the worker ([`Shared::rescan`]), never under the lock on the editor's thread.
+    repair: Arc<std::sync::atomic::AtomicBool>,
+    /// Asks the editor for a frame ([`Shared::on_wake`]): this thread cannot apply the queued
+    /// changes at the editor's priority, its next frame does.
+    wake: Arc<std::sync::Mutex<Option<Wake>>>,
 }
+
+/// What [`Shared::on_wake`] calls.
+type Wake = Box<dyn Fn() + Send>;
 
 /// What a change changes, which says what to do when it fails halfway.
 enum Of {
@@ -94,16 +108,25 @@ impl Shared {
     }
     /// Applies the queued changes if the index is free; returns whether none are left. The
     /// queue is let go before they run: queueing another never waits for them. A change that
-    /// panics is logged and skipped; the ones after it still go in. What a change of one file
-    /// left half done is taken out with the file, which the worker reads again from disk; what
-    /// any other change left half done is mended from the files the index holds.
+    /// panics is logged and skipped; the ones after it still go in. The file a change of one
+    /// file left half done is taken out, and the worker reads it again from disk; names any
+    /// failed change left without their file are dropped when the worker rebuilds the name maps.
     pub fn flush(&self) -> bool {
-        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-        if queue.is_empty() {
+        if self
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
             return true;
         }
-        // the editor may wait on this lock: its holder runs at the editor's priority
+        // the editor may wait on this lock: its holder runs at the editor's priority, taken
+        // before the queue's lock so queueing never waits for it
         let Some(_boost) = Boost::start() else {
+            // the editor's next frame applies them
+            if let Some(wake) = &*self.wake.lock().unwrap_or_else(|e| e.into_inner()) {
+                wake();
+            }
             return false;
         };
         let mut index = match self.index.try_write() {
@@ -111,8 +134,7 @@ impl Shared {
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return false,
         };
-        let changes = std::mem::take(&mut *queue);
-        drop(queue);
+        let changes = std::mem::take(&mut *self.queue.lock().unwrap_or_else(|e| e.into_inner()));
         let mut again = Vec::new();
         for (of, f) in changes {
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut index)));
@@ -120,15 +142,15 @@ impl Shared {
                 continue;
             }
             eprintln!("droid-lite: an index change failed; the others go on");
-            let mended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &of {
-                Of::Any => index.mend(),
-                Of::File(p) | Of::Rescan(p) => index.purge(p),
-            }));
-            if mended.is_err() {
-                eprintln!("droid-lite: the index could not be mended after it");
+            // what is cheap now: the file out; the name maps are rebuilt on the worker
+            if let Of::File(p) | Of::Rescan(p) = &of {
+                index.take_out(p);
             }
+            index.floor = index.generation;
+            index.changes.clear();
+            self.repair.store(true, std::sync::atomic::Ordering::SeqCst);
             if let Of::File(p) = of {
-                again.push(p);
+                again.push((index.epoch, p));
             }
         }
         drop(index);
@@ -140,42 +162,100 @@ impl Shared {
         }
         true
     }
-    /// Whether files wait to be read again ([`Shared::rescan`]).
-    pub fn rescan_due(&self) -> bool {
-        !self
-            .rescan
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
+    /// Calls `wake` when a thread that cannot apply the queued changes leaves them for the
+    /// editor (Linux: a worker below the editor's priority cannot raise it again).
+    pub fn on_wake(&self, wake: impl Fn() + Send + 'static) {
+        *self.wake.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(wake));
     }
-    /// Reads the files a failed change took out again from disk (on the worker, never the
-    /// editor's thread) and puts each back, unless a newer change put it in meanwhile.
+    /// Whether the worker has files to read again or name maps to rebuild ([`Shared::rescan`]).
+    pub fn rescan_due(&self) -> bool {
+        self.repair.load(std::sync::atomic::Ordering::SeqCst)
+            || !self
+                .rescan
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+    }
+    /// On the worker, never the editor's thread: reads the files a failed change took out again
+    /// from disk and puts each back (unless a newer change put it in meanwhile, or another index
+    /// replaced that one), then rebuilds the name maps a failed change may have broken.
     pub fn rescan(&self) {
         let files = std::mem::take(&mut *self.rescan.lock().unwrap_or_else(|e| e.into_inner()));
-        for p in files {
-            let Ok(text) = std::fs::read_to_string(&p) else {
-                continue;
-            };
-            let Ok(syms) = std::panic::catch_unwind(|| scan_file(&p, &text)) else {
-                continue;
-            };
+        let read: Vec<_> = files
+            .into_iter()
+            .filter_map(|(epoch, p)| {
+                let text = std::fs::read_to_string(&p).ok()?;
+                let syms = std::panic::catch_unwind(|| scan_file(&p, &text)).ok()?;
+                Some((epoch, p, syms))
+            })
+            .collect();
+        #[cfg(test)]
+        if let Some(f) = test_hooks::WHILE_READING_AGAIN.take() {
+            f();
+        }
+        for (epoch, p, syms) in read {
             let of = Of::Rescan(p.clone());
             self.queue(
                 of,
                 Box::new(move |i| {
-                    if !i.files.contains_key(&p) {
+                    if i.epoch == epoch && !i.files.contains_key(&p) {
                         i.insert_scanned(p, syms);
                     }
                 }),
             );
         }
+        self.repair();
+    }
+    /// Rebuilds the name maps from the files, off the lock; they go in only when nothing
+    /// changed the index meanwhile (else they are rebuilt again next time). A rebuild that
+    /// fails keeps the maps the index has.
+    fn repair(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if !self.repair.swap(false, SeqCst) {
+            return;
+        }
+        self.flush();
+        let (files, generation) = {
+            let i = self.read();
+            (i.files.clone(), i.generation)
+        };
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut n = Index::default();
+            for (p, f) in files {
+                n.insert_scanned(p, f);
+            }
+            n
+        }));
+        let Ok(n) = built else {
+            eprintln!("droid-lite: the index's names could not be rebuilt; they stay as they are");
+            return;
+        };
+        let due = self.repair.clone();
+        self.change(move |i| {
+            if i.generation != generation {
+                due.store(true, SeqCst);
+                return;
+            }
+            i.by_name = n.by_name;
+            i.subtypes = n.subtypes;
+            i.shared = n.shared;
+            i.generation += 1;
+            i.floor = i.generation;
+            i.changes.clear();
+        });
     }
     /// Replaces the index. Generations keep counting up from the old one's, so a result cached
-    /// against the old index is never taken for one of the new.
+    /// against the old index is never taken for one of the new. Files the old one waits to read
+    /// again are not read into it.
     pub fn set(&self, mut index: Index) {
+        self.rescan
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.change(move |i| {
             index.generation += i.generation + 1;
             index.floor = index.generation;
+            index.epoch = i.epoch + 1;
             index.changes.clear();
             *i = index;
         });
@@ -210,7 +290,7 @@ impl Shared {
 /// Runs the thread at the editor's priority while it lives: a thread below it (the worker)
 /// that holds the index's write lock would make the editor wait behind lower work. `None` where
 /// that cannot be done (Linux: an unprivileged thread cannot lower its nice value again); the
-/// editor's next frame applies the changes then.
+/// editor's next frame applies the changes then ([`Shared::on_wake`]).
 struct Boost {
     #[cfg(target_os = "macos")]
     was: Option<(libc::qos_class_t, i32)>,
@@ -218,6 +298,10 @@ struct Boost {
 
 impl Boost {
     fn start() -> Option<Boost> {
+        #[cfg(test)]
+        if test_hooks::boost_refused() {
+            return None;
+        }
         #[cfg(target_os = "macos")]
         {
             use libc::qos_class_t::*;
@@ -238,12 +322,53 @@ impl Boost {
         }
         #[cfg(target_os = "linux")]
         {
-            let nice =
-                unsafe { libc::getpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t) };
-            (nice <= 0).then_some(Boost {})
+            // below the editor: niced past the process's first thread (the editor's); a whole
+            // process started with `nice` is not
+            let (me, editor) = unsafe {
+                (
+                    libc::getpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t),
+                    libc::getpriority(libc::PRIO_PROCESS, libc::getpid() as libc::id_t),
+                )
+            };
+            (!below_the_editor(me, editor)).then_some(Boost {})
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         Some(Boost {})
+    }
+}
+
+/// Whether a thread at nice value `me` runs below the editor's thread at `editor`.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn below_the_editor(me: i32, editor: i32) -> bool {
+    me > editor
+}
+
+/// Ways for tests to make this thread's next index steps fail or wait.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::{Cell, RefCell};
+    use std::sync::mpsc::{Receiver, Sender};
+
+    thread_local! {
+        /// [`super::Boost::start`] refuses on this thread (Linux below the editor).
+        pub static NO_BOOST: Cell<bool> = const { Cell::new(false) };
+        /// [`super::Index::insert_scanned`] panics on this thread.
+        pub static PANIC_ON_INSERT: Cell<bool> = const { Cell::new(false) };
+        /// [`super::Boost::start`] says it started on the first and waits for the second.
+        pub static BOOST_GATE: RefCell<Option<(Sender<()>, Receiver<()>)>> =
+            const { RefCell::new(None) };
+        /// Runs in [`super::Shared::rescan`] after the files were read, before they are put in.
+        pub static WHILE_READING_AGAIN: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn boost_refused() -> bool {
+        BOOST_GATE.with_borrow(|g| {
+            if let Some((entered, go)) = g {
+                let _ = entered.send(());
+                let _ = go.recv_timeout(std::time::Duration::from_secs(30));
+            }
+        });
+        NO_BOOST.get()
     }
 }
 
@@ -303,6 +428,8 @@ impl Index {
 
     /// Adds a file whose symbols were already scanned (e.g. on a worker thread).
     pub fn insert_scanned(&mut self, path: PathBuf, syms: impl Into<Arc<FileSyms>>) {
+        #[cfg(test)]
+        assert!(!test_hooks::PANIC_ON_INSERT.get(), "a bug while inserting");
         let syms = syms.into();
         self.remove(&path);
         let shared: Arc<Path> = Arc::from(path.as_path());
@@ -377,37 +504,13 @@ impl Index {
         self.generation += 1;
     }
 
-    /// Drops every trace of `path`, also what a change cut short left in (a name that points to
-    /// a file not in `files`): every name is looked at, so only for that.
-    fn purge(&mut self, path: &Path) {
+    /// Takes `path` out of the files after a change of it failed halfway; names it left behind
+    /// stay until the name maps are rebuilt ([`Shared::rescan`]), and lookups skip them.
+    fn take_out(&mut self, path: &Path) {
         self.files.remove(path);
         self.shared.remove(path);
-        self.by_name.retain(|_, v| {
-            v.retain(|(p, _)| **p != *path);
-            !v.is_empty()
-        });
-        self.subtypes.retain(|_, v| {
-            v.retain(|p| **p != *path);
-            !v.is_empty()
-        });
         self.generation += 1;
         self.log_change(Arc::from(path));
-    }
-
-    /// Rebuilds the name maps from the files after a change that failed halfway (it may have
-    /// left a name pointing to a file not in `files`, or a file without its names). Nothing
-    /// changed since can be told any more: results cached before are worked out again.
-    fn mend(&mut self) {
-        self.by_name.clear();
-        self.subtypes.clear();
-        self.shared.clear();
-        let files: Vec<(PathBuf, Arc<FileSyms>)> = self.files.drain().collect();
-        for (p, f) in files {
-            self.insert_scanned(p, f);
-        }
-        self.generation += 1;
-        self.floor = self.generation;
-        self.changes.clear();
     }
 
     /// Drops every file under `dir` (a deleted folder): one range of the sorted paths, not a scan
@@ -440,12 +543,14 @@ impl Index {
         name: &str,
     ) -> impl Iterator<Item = (&'a PathBuf, &'a FileSyms, &'a Decl)> + 'a {
         self.by_name
-            .get(name)
+            .get_key_value(name)
             .into_iter()
-            .flatten()
-            .filter_map(move |(p, i)| {
+            .flat_map(|(name, v)| v.iter().map(move |at| (name, at)))
+            .filter_map(move |(name, (p, i))| {
                 let (p, f) = self.files.get_key_value(&**p)?;
-                Some((p, &**f, f.decls.get(*i as usize)?))
+                // a name a failed change left behind may point at another declaration now
+                let d = f.decls.get(*i as usize).filter(|d| d.name == *name)?;
+                Some((p, &**f, d))
             })
     }
 
@@ -984,12 +1089,167 @@ mod tests {
         );
         drop(reading);
         shared.settle();
+        assert_eq!(shared.read().named("B").count(), 0, "lookups skip it");
+        assert!(shared.rescan_due(), "the worker rebuilds the names");
+        shared.rescan();
+        shared.settle();
         let i = shared.read();
         assert_eq!(i.named("A").count(), 1, "other files stay");
         assert!(
             !i.by_name.contains_key("B"),
             "a name of a file not in the index"
         );
+    }
+
+    #[test]
+    fn a_failed_change_leaves_the_rebuild_of_the_names_to_the_worker() {
+        let shared = Shared::default();
+        shared.update(Path::new("/p/A.kt"), "package a\nclass A\n");
+        let reading = shared.read();
+        shared.change(|i| {
+            i.by_name
+                .entry("Z".into())
+                .or_default()
+                .push((Arc::from(Path::new("/p/Z.kt")), 0));
+            panic!("cut short");
+        });
+        drop(reading);
+        // the flush (the editor's, maybe) only notes it
+        shared.settle();
+        assert!(
+            shared.read().by_name.contains_key("Z"),
+            "not rebuilt in the flush"
+        );
+        assert!(shared.rescan_due());
+        shared.rescan();
+        shared.settle();
+        assert!(
+            !shared.read().by_name.contains_key("Z"),
+            "rebuilt by the worker"
+        );
+        assert!(!shared.rescan_due());
+    }
+
+    #[test]
+    fn a_rebuild_of_the_names_that_fails_keeps_the_files_and_their_names() {
+        let shared = Shared::default();
+        shared.update(Path::new("/p/A.kt"), "package a\nclass A\n");
+        shared.update(Path::new("/p/B.kt"), "package a\nclass B\n");
+        test_hooks::PANIC_ON_INSERT.set(true);
+        // a change of no one file fails, and so does the rebuild after it
+        shared.change(|_| panic!("cut short"));
+        shared.settle();
+        shared.rescan();
+        shared.settle();
+        test_hooks::PANIC_ON_INSERT.set(false);
+        let i = shared.read();
+        assert_eq!(i.named("A").count(), 1);
+        assert_eq!(i.named("B").count(), 1);
+    }
+
+    #[test]
+    fn a_name_left_behind_never_points_at_another_declaration() {
+        let shared = Shared::default();
+        shared.update(Path::new("/p/A.kt"), "package a\nclass A\n");
+        // a dangling "Z" at A.kt's first declaration, which is A
+        shared.change(|i| {
+            i.by_name
+                .entry("Z".into())
+                .or_default()
+                .push((Arc::from(Path::new("/p/A.kt")), 0));
+        });
+        shared.settle();
+        assert_eq!(shared.read().named("Z").count(), 0);
+    }
+
+    #[test]
+    fn a_file_waiting_to_be_read_again_is_not_read_into_the_next_index() {
+        let shared = Shared::default();
+        let b = on_disk("rescan-set", "package a\nclass B\n");
+        fail_change_of(&shared, &b);
+        // another project opens before the worker reads B again
+        shared.set(Index::default());
+        shared.settle();
+        shared.rescan();
+        shared.settle();
+        let _ = std::fs::remove_dir_all(b.parent().unwrap());
+        assert_eq!(shared.read().named("B").count(), 0);
+    }
+
+    #[test]
+    fn a_file_read_again_after_another_index_was_set_stays_out_of_it() {
+        let shared = Shared::default();
+        let b = on_disk("rescan-set-late", "package a\nclass B\n");
+        fail_change_of(&shared, &b);
+        // the new index goes in while the worker reads B again from disk
+        let other = shared.clone();
+        test_hooks::WHILE_READING_AGAIN.set(Some(Box::new(move || {
+            other.set(Index::default());
+            other.settle();
+        })));
+        shared.rescan();
+        shared.settle();
+        let _ = std::fs::remove_dir_all(b.parent().unwrap());
+        assert_eq!(shared.read().named("B").count(), 0);
+    }
+
+    #[test]
+    fn queueing_never_waits_for_a_flush_that_takes_the_editors_priority() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let shared = Shared::default();
+        let reading = shared.read();
+        shared.change(|_| {});
+        drop(reading);
+        let (entered_tx, entered) = channel();
+        let (go, go_rx) = channel();
+        let inner = shared.clone();
+        let flusher = std::thread::spawn(move || {
+            test_hooks::BOOST_GATE.set(Some((entered_tx, go_rx)));
+            inner.flush()
+        });
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        // the flusher is taking the editor's priority: queueing goes on meanwhile
+        let (done_tx, done) = channel();
+        let q = shared.clone();
+        std::thread::spawn(move || {
+            q.change(|i| i.generation += 50);
+            let _ = done_tx.send(());
+        });
+        let queued = done.recv_timeout(Duration::from_secs(10));
+        let _ = go.send(());
+        flusher.join().unwrap();
+        assert!(queued.is_ok(), "queueing waited for the flush");
+        shared.settle();
+        assert!(shared.read().generation >= 50);
+    }
+
+    #[test]
+    fn a_thread_that_cannot_take_the_editors_priority_wakes_the_editor() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let shared = Shared::default();
+        let woke = Arc::new(AtomicUsize::new(0));
+        let w = woke.clone();
+        shared.on_wake(move || {
+            w.fetch_add(1, Ordering::SeqCst);
+        });
+        test_hooks::NO_BOOST.set(true);
+        shared.change(|i| i.generation += 7);
+        test_hooks::NO_BOOST.set(false);
+        assert_eq!(woke.load(Ordering::SeqCst), 1);
+        assert_eq!(shared.read().generation, 0, "left for the editor");
+        assert!(shared.flush());
+        assert_eq!(shared.read().generation, 7);
+    }
+
+    #[test]
+    fn a_thread_niced_past_the_editor_is_below_it_and_a_niced_process_is_not() {
+        assert!(below_the_editor(10, 0), "the worker");
+        assert!(
+            !below_the_editor(5, 5),
+            "the editor of a process started with nice 5"
+        );
+        assert!(!below_the_editor(0, 0));
     }
 
     /// A file on disk with `text`, in its own folder (removed by the caller).
@@ -1050,6 +1310,8 @@ mod tests {
             panic!("cut short");
         });
         drop(reading);
+        shared.settle();
+        shared.rescan();
         shared.settle();
         let i = shared.read();
         assert!(
