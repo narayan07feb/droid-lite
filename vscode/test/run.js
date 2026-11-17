@@ -259,7 +259,14 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   const props = pkg.contributes.configuration.properties;
   check('enginePath is a machine setting', props['droidLite.enginePath'].scope === 'machine');
   check('logcatMaxLines setting', props['droidLite.logcatMaxLines'].default === 20000);
-  check('version 0.5.8', pkg.version === '0.5.8');
+  check('version 0.5.9', pkg.version === '0.5.9');
+  // ▶ and ■ on a case in the Droid Lite sidebar: inline, by the node's contextValue, not in the palette
+  const inline = (cmd, ctx) => pkg.contributes.menus['view/item/context'].some((m) => m.command === cmd && m.group === 'inline'
+    && m.when === `view == droidLite.testPlugins && viewItem == ${ctx}`);
+  const hidden = (cmd) => pkg.contributes.menus.commandPalette.some((m) => m.command === cmd && m.when === 'false');
+  check('▶ and ■ on sidebar cases', inline('droidLite.runTestCase', 'droidLiteCase') && inline('droidLite.stopTestCase', 'droidLiteCaseRunning')
+    && hidden('droidLite.runTestCase') && hidden('droidLite.stopTestCase')
+    && ['droidLite.runTestCase', 'droidLite.stopTestCase'].every((c) => pkg.contributes.commands.some((x) => x.command === c && x.icon)));
   check('Allow… on a test item that needs an OK', pkg.contributes.menus['testing/item/context']
     .some((m) => m.command === 'droidLite.allowTestPlugin' && /testId =~ \/\^needs-ok:\//.test(m.when)));
 

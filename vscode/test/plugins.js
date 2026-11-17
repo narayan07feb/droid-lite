@@ -40,13 +40,15 @@ fs.writeFileSync(path.join(toolsDir, 'plugin.json'), JSON.stringify({
 }));
 fs.writeFileSync(path.join(toolsDir, 'tools.sh'), `#!/bin/sh
 case "$1" in
-  list) echo '[{"id":"group","label":"two children"},{"id":"term","label":"ignores TERM"},{"id":"left","label":"leaves a child"},
-    {"id":"long","label":"one huge line"},{"id":"garbage","label":"garbage place","file":5,"line":"x"},{"id":"flood","label":"floods"},{"id":"big","label":"12 MB"}]' ;;
+  list) echo '[{"id":"group","label":"two children","detail":"sleeps"},{"id":"term","label":"ignores TERM"},{"id":"left","label":"leaves a child"},
+    {"id":"long","label":"one huge line"},{"id":"garbage","label":"garbage place","file":5,"line":"x"},{"id":"flood","label":"floods"},{"id":"big","label":"12 MB"},
+    {"id":"grp2","label":"g2","children":[{"id":"kid","label":"kid"}]},{"id":"kid","label":"kid again"}]' ;;
   run) case "$3" in
     group) sleep 300 & echo $! >> "$2/pids"; sleep 300 & echo $! >> "$2/pids"; wait ;;
     term) trap '' TERM; echo $$ >> "$2/pids"; sleep 300 & echo $! >> "$2/pids"; wait ;;
     left) sleep 300 & echo $! >> "$2/left"; exit 0 ;;
     long) head -c 200000 /dev/zero | tr '\\0' x; echo; echo after ;;
+    grp2) echo '{"case":"kid","status":"running"}' ;;
     garbage) echo '{"case":"garbage","status":"failed","message":{"a":1},"file":["x"],"line":{}}'; exit 1 ;;
     big) line=$(head -c 60000 /dev/zero | tr '\\0' x); i=0; while [ $i -lt 200 ]; do echo "$line"; i=$((i+1)); done; echo after ;;
     flood) seq 30000 | sed 's/.*/{"status":"passed","label":"step"}/'; seq 30000 | sed 's/.*/{"case":"flood","status":"failed","message":"m"}/'; exit 1 ;;
@@ -88,7 +90,9 @@ const approve = (folder) => {
 class Pos { constructor(l, c) { this.line = l; this.character = c; } }
 const commands = {};
 let ctrl;
-let profile;
+let profile; // the Run profile's handler
+let runProfile; // the profile itself
+const made = new WeakSet(); // the controller's test items
 let tree; // the sidebar
 let visibility; // its visibility listener
 const fired = []; // sidebar refreshes (the element, undefined = whole tree)
@@ -99,11 +103,27 @@ const fake = {
   Location: class { constructor(uri, pos) { this.uri = uri; this.range = { start: pos }; } },
   Uri: { file: (p) => ({ fsPath: p }), parse: (u) => ({ url: u }) },
   EventEmitter: class { constructor() { this.event = () => ({}); } fire(e) { fired.push(e); } },
-  ThemeIcon: class { constructor(id) { this.id = id; } },
+  ThemeIcon: class { constructor(id, color) { this.id = id; this.color = color; } },
+  ThemeColor: class { constructor(id) { this.id = id; } },
   TreeItem: class { constructor(label, state) { this.label = label; this.state = state; } },
-  TreeItemCollapsibleState: { Expanded: 2, Collapsed: 1 },
+  TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
   TestMessage: class { constructor(m) { this.message = m; } },
   TestRunProfileKind: { Run: 1 },
+  // like VS Code: a request holds only the controller's own test items
+  TestRunRequest: class {
+    constructor(include, exclude, prof) {
+      if (include?.some((i) => !made.has(i))) throw new Error('TestRunRequest: not a test item of this controller');
+      Object.assign(this, { include, exclude, profile: prof });
+    }
+  },
+  CancellationTokenSource: class {
+    constructor() {
+      const ls = new Set();
+      this.token = { isCancellationRequested: false, onCancellationRequested: (l) => { ls.add(l); return { dispose: () => ls.delete(l) }; } };
+      this.cancel = () => { if (!this.token.isCancellationRequested) { this.token.isCancellationRequested = true; ls.forEach((l) => l()); } };
+      this.dispose = () => ls.clear();
+    }
+  },
   tests: {
     createTestController: () => {
       const items = new Map();
@@ -116,12 +136,13 @@ const fake = {
         // like VS Code: an id with a NUL character is refused (0.5.7 shipped such ids, no tests loaded)
         createTestItem: (id, label, uri) => {
           if (id.includes('\0')) throw new Error(`Test IDs may not include the "${id}" symbol`);
-          const i = { id, label, uri, children: coll() }; items.set(id, i); return i;
+          const i = { id, label, uri, children: coll() }; items.set(id, i); made.add(i); return i;
         },
-        createRunProfile: (_n, _k, run) => { profile = run; },
-        createTestRun: () => {
+        createRunProfile: (_n, _k, run) => { profile = run; runProfile = { runHandler: run }; return runProfile; },
+        createTestRun: (request) => {
           const ev = [];
-          return { ev, started: (i) => ev.push(['started', i.id]), passed: (i) => ev.push(['passed', i.id]), failed: (i, m) => ev.push(['failed', i.id, m.message]), skipped: (i) => ev.push(['skipped', i.id]), errored: (i, m) => ev.push(['errored', i.id, m.message]), appendOutput: (t) => ev.push(['out', t.trim()]), end: () => ev.push(['end']) };
+          ctrl.lastRequest = request;
+          return ctrl.lastRun = { ev, started: (i) => ev.push(['started', i.id]), passed: (i) => ev.push(['passed', i.id]), failed: (i, m) => ev.push(['failed', i.id, m.message]), skipped: (i) => ev.push(['skipped', i.id]), errored: (i, m) => ev.push(['errored', i.id, m.message]), appendOutput: (t) => ev.push(['out', t.trim()]), end: () => ev.push(['end']) };
         },
         dispose() {},
       };
@@ -246,6 +267,42 @@ const later = async (f) => {
   ev = await go(undefined);
   assert.deepStrictEqual(ev, []);
   assert.ok(fake.info.includes('Pick a case'), fake.info);
+
+  // the sidebar shows the same cases under each plugin (Tests (N), from the same list), with the last
+  // results of any run; ▶ runs a case through the Run profile's own handler
+  const nodeOf = (n) => tree.getTreeItem(n);
+  const casesOf = async (label) => {
+    const r = (await tree.getChildren()).find((x) => x.label === label);
+    const sec = (await tree.getChildren(r)).find((k) => k.tests);
+    return { sec, top: sec ? (await tree.getChildren(sec)).map(nodeOf) : [] };
+  };
+  const { sec: exSection, top } = await casesOf('Example tests');
+  const loginNode = top.find((n) => n.label === 'Login');
+  const [okNode, badNode] = (await tree.getChildren(loginNode)).map(nodeOf);
+  const soloNode = top.find((n) => n.label === 'solo case');
+  const solo = root.children.get(tests.caseId(ex, 'solo'));
+  check('the sidebar shows the plugin\'s groups and cases under Tests (N), no ▶ on the section', exSection?.label === 'Tests (3)'
+    && !exSection.contextValue && top.map((n) => n.label).join() === 'Login,solo case' && okNode?.label === 'passes'
+    && badNode?.label === 'fails' && okNode.testItem === ok && loginNode.testItem === login && soloNode.testItem === solo);
+  check('Test Explorer results show on the sidebar cases, a failure\'s message on hover', okNode.iconPath.id === 'pass'
+    && badNode.iconPath.id === 'error' && /failed: exit code 1/.test(badNode.tooltip) && !/exit code/.test(okNode.tooltip)
+    && soloNode.iconPath.id === 'circle-outline');
+  check('a click on a case opens its file at its line', okNode.command?.command === 'vscode.open'
+    && okNode.command.arguments[0].fsPath === path.join(project, 'flows/login.yaml')
+    && okNode.command.arguments[1].selection.start.line === 1 && !loginNode.command);
+  fired.length = 0;
+  let lastReq = ctrl.lastRequest;
+  await commands['droidLite.runTestCase'](soloNode);
+  check('▶ on a sidebar case runs it through the Run profile\'s handler (a Test Explorer run)', ctrl.lastRequest !== lastReq
+    && ctrl.lastRequest instanceof fake.TestRunRequest && ctrl.lastRequest.include.length === 1 && ctrl.lastRequest.include[0] === solo
+    && ctrl.lastRequest.profile === runProfile && ctrl.lastRun.ev.some((e) => e[0] === 'passed' && e[1] === solo.id)
+    && ctrl.lastRun.ev.at(-1)[0] === 'end');
+  check('and updates its icon', fired.includes(soloNode) && nodeOf(soloNode).iconPath.id === 'pass'
+    && nodeOf(soloNode).contextValue === 'droidLiteCase');
+  lastReq = ctrl.lastRequest;
+  await commands['droidLite.runTestCase'](loginNode);
+  check('a group without an id has no ▶ and runs nothing', nodeOf(loginNode).contextValue === undefined
+    && ctrl.lastRequest === lastReq && okNode.contextValue === 'droidLiteCase');
   assert.ok(commands['droidLite.addTestPlugin'] && commands['droidLite.removeTestPlugin'] && commands['droidLite.testAction']);
   // Remove with no user plugins folder at all: the plugin comes with the project
   fake.info = '';
@@ -262,6 +319,16 @@ const later = async (f) => {
   check('a case with a garbage place loads', !tools.error && toolCase('garbage') && !toolCase('garbage').uri);
   ev = await go([toolCase('garbage')]);
   check('a result with a garbage place is reported', quiet(ev).some((e) => e[0] === 'failed' && e[1] === toolCase('garbage').id));
+  // a case still running when its run ends has no result: no spinner left in the sidebar
+  ev = await go([toolCase('grp2')]);
+  const g2Node = (await casesOf('Tools')).top.find((n) => n.label === 'g2');
+  const kidNode = nodeOf((await tree.getChildren(g2Node))[0]);
+  check('a case still running when its run ends shows no result', quiet(ev).some((e) => e[0] === 'started' && e[1] === tests.caseId(idOf('tools'), 'kid'))
+    && nodeOf(g2Node).iconPath.id === 'pass' && kidNode.label === 'kid' && kidNode.iconPath.id === 'circle-outline');
+  // a case listed twice (in a group and in "all") has ▶ in both places
+  const kidAgain = (await casesOf('Tools')).top.find((n) => n.label === 'kid again');
+  check('a case listed twice has ▶ in both places', kidNode.contextValue === 'droidLiteCase' && kidAgain?.contextValue === 'droidLiteCase'
+    && kidAgain.testItem !== kidNode.testItem && kidAgain.testItem.id === kidNode.testItem.id);
 
   // cancel: SIGTERM reaches every process of the run's group; the listener goes with the run
   let tok = token();
@@ -274,6 +341,22 @@ const later = async (f) => {
   check('cancel ends every process of the group', !group.some(alive));
   check('the cancel listener is disposed when the run ends', tok.ls.size === 0);
   check('a cancelled case is skipped', quiet(ev).some((e) => e[0] === 'skipped' && e[1] === toolCase('group').id));
+  // ■ in the sidebar while a case runs cancels that run: its group ends, the case shows skipped
+  const groupNode = (await casesOf('Tools')).top.find((n) => n.label === 'two children');
+  check('a case\'s detail is its description and in its tooltip', groupNode?.description === 'sleeps' && groupNode.tooltip.includes('sleeps'));
+  const sideRun = commands['droidLite.runTestCase'](groupNode);
+  await until('two more children', () => pidsIn(pids).length === 4);
+  const sideGroup = pidsIn(pids).slice(2);
+  check('a running case shows ■ and the running icon', nodeOf(groupNode).contextValue === 'droidLiteCaseRunning'
+    && nodeOf(groupNode).iconPath.id === 'sync~spin');
+  commands['droidLite.runTestCase'](groupNode); // not awaited: a second run would last 300 s
+  await sleep(300);
+  check('▶ again while it runs starts nothing', pidsIn(pids).length === 4);
+  commands['droidLite.stopTestCase'](groupNode);
+  await Promise.race([sideRun, sleep(3000)]);
+  await until('the group to end', () => !sideGroup.some(alive), 3000).catch(() => {});
+  check('■ stops it: its group ends, the case shows skipped and ▶ again', !sideGroup.some(alive)
+    && nodeOf(groupNode).iconPath.id === 'circle-slash' && nodeOf(groupNode).contextValue === 'droidLiteCase');
 
   // a group that ignores SIGTERM gets SIGKILL
   fs.rmSync(pids);
@@ -366,7 +449,10 @@ const later = async (f) => {
   fs.rmSync(pids);
   // plugins added or removed: the watchers start again
   const firstWatch = pidsIn(path.join(toolsState, 'watch'));
+  const oldNode = (await casesOf('Tools')).top.find((n) => n.label === 'two children');
   await api.load();
+  check('after a reload an old case node has no ▶, the new one has', oldNode?.testItem && nodeOf(oldNode).contextValue === undefined
+    && (await casesOf('Tools')).top.find((n) => n.label === 'two children')?.contextValue === 'droidLiteCase');
   await until('a new watcher', () => pidsIn(path.join(toolsState, 'watch')).length === 2);
   await until('the old watcher to end', () => !firstWatch.some(alive), 2000).catch(() => {});
   check('load restarts the watchers', firstWatch.length === 1 && !firstWatch.some(alive));
@@ -529,6 +615,21 @@ const later = async (f) => {
   const gateRow = (await tree.getChildren()).find((r) => r.label === 'Gate');
   check('and in the sidebar, with only Allow…', gateRow?.description === 'Needs your OK'
     && (await tree.getChildren(gateRow)).map((i) => `${i.label}>${i.command?.command}`).join() === 'Allow…>droidLite.allowTestPlugin');
+  // the whole sidebar (views not opened: they would run): its ▶ nodes
+  const runnableNodes = async (node) => {
+    const out = [];
+    for (const k of await tree.getChildren(node)) {
+      const n = nodeOf(k);
+      if (n.view) continue;
+      if (/^droidLiteCase/.test(n.contextValue || '')) out.push(n);
+      out.push(...await runnableNodes(k));
+    }
+    return out;
+  };
+  lastReq = ctrl.lastRequest;
+  await commands['droidLite.runTestCase']({ testItem: gateRoot });
+  check('a project plugin not allowed has nothing runnable in the sidebar', (await runnableNodes()).map((n) => n.label).join() === 'new'
+    && ctrl.lastRequest === lastReq);
   visibility({ visible: true }); // watchers start
   commands['droidLite.testAction']({ folder: gateId, name: 'Gate', spec: gateSpec }, gateSpec.actions[0]);
   ev = await go([gateRoot]);
@@ -617,9 +718,15 @@ const later = async (f) => {
     fs.rmSync(marks, { force: true });
     output.length = 0;
     const p = await gatePlugin();
+    const gNode = (await casesOf('Gate')).top.find((n) => n.label === 'g');
+    const wasRunnable = gNode?.contextValue === 'droidLiteCase';
     fs.writeFileSync(path.join(gateDir, 'lib', 'helper.sh'), `echo ${k}\n`);
     const said = await refuse(p);
     await sleep(300);
+    lastReq = ctrl.lastRequest;
+    await commands['droidLite.runTestCase'](gNode);
+    check(`${k}: its sidebar cases lose ▶ and run nothing`, wasRunnable && nodeOf(gNode).contextValue === undefined
+      && ctrl.lastRequest === lastReq && !fs.existsSync(marks));
     check(`${k}: a file changed since the OK runs nothing and asks for the OK again`, !fs.existsSync(marks)
       && String(said).includes(changedMsg) && gateNeedsOk() && ctrl.items.get(`needs-ok:${gateId}`).error.startsWith(changedMsg)
       && !(await tree.getChildren()).some((r) => r.label === 'Gate' && r.plugin));

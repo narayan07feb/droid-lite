@@ -1,11 +1,12 @@
 // Droid Lite test plugins (docs/PLUGINS.md) in VS Code's Test Explorer: the same plugin.json files
 // the app reads (<config>/plugins/<name>/ and <project>/.droid-lite/plugins/<name>/), so a plugin
-// added in either one shows in both. Cases come from `list`, runs from `run` (JSON lines), extra
-// lists (`views`), buttons (`actions`), `links` and the live state (`watch`) go in the Droid Lite
-// sidebar. A project plugin runs nothing until the user allows it once for that project (shared
-// with the app: <config>/approved-plugins.json, see `approve`); any change to a file in its folder
-// asks again, checked before every command it runs. The user's own plugins need no OK. <config> is
-// $DROID_LITE_CONFIG_DIR (when set and not empty, as in the app), else ~/.config/droid-lite.
+// added in either one shows in both. Cases come from `list`, runs from `run` (JSON lines); the cases
+// (with ▶, ■ and the last results), extra lists (`views`), buttons (`actions`), `links` and the live
+// state (`watch`) go in the Droid Lite sidebar too. A project plugin runs nothing until the user
+// allows it once for that project (shared with the app: <config>/approved-plugins.json, see
+// `approve`); any change to a file in its folder asks again, checked before every command it runs.
+// The user's own plugins need no OK. <config> is $DROID_LITE_CONFIG_DIR (when set and not empty, as
+// in the app), else ~/.config/droid-lite.
 const vscode = require('vscode');
 const cp = require('child_process');
 const crypto = require('crypto');
@@ -496,11 +497,16 @@ function setup(ctx, projectOf) {
   const sidebar = new vscode.EventEmitter();
   let plugins = [];
   const meta = new Map(); // test item id -> { plugin, caseId }
+  let current = new WeakSet(); // the test items of the newest load (a case listed twice has two)
   // keyed by the plugin's folder (its id), never its name
   const live = new Map(); // plugin -> latest watch state
   const pluginRows = new Map(); // plugin -> its sidebar row (to refresh only that row)
   const viewCache = new Map(); // plugin + view name -> its entries until that view is refreshed
   const actions = new Map(); // plugin + action name -> its running process
+  // the case tree in the sidebar: the Test Explorer's items (no second `list`), with results
+  const results = new Map(); // test item id -> { state, message } of its last run
+  const active = new Map(); // test item id -> the cancel source of the run it was picked for
+  const nodes = new WeakMap(); // test item -> its sidebar node
   let watchers = [];
   let watching = false; // the sidebar shows
   const fireRow = (folder) => { const r = pluginRows.get(folder); if (r) sidebar.fire(r); };
@@ -513,6 +519,7 @@ function setup(ctx, projectOf) {
       if (loc) item.range = new vscode.Range(loc.range.start, loc.range.start);
       item.description = c.detail;
       meta.set(id, { plugin, caseId: c.id });
+      current.add(item);
       parent.add(item);
       addCases(plugin, item.children, c.children);
     }
@@ -567,6 +574,7 @@ function setup(ctx, projectOf) {
     plugins = readPlugins(project);
     for (const p of plugins) if (p.hash) p.revoke = (why) => revoke(p, why);
     meta.clear();
+    current = new WeakSet();
     ctrl.items.replace([]);
     await Promise.all(plugins.map(async (p) => {
       const label = p.name || path.basename(p.folder);
@@ -586,6 +594,7 @@ function setup(ctx, projectOf) {
       if (error) root.error = `list: ${error.message}`;
       else addCases(p, root.children, cases);
       root.busy = false;
+      fireRow(p.folder); // its Tests section
     }));
     if (stale()) return;
     viewCache.clear();
@@ -602,6 +611,7 @@ function setup(ctx, projectOf) {
       try { start(resolve); } catch (e) { run.errored(item, new vscode.TestMessage(e.message)); resolve(); }
     });
     function start(resolve) {
+      forget(item); // the results of its cases are of an older run
       run.started(item);
       const byCase = new Map();
       const walk = (i) => { const c = meta.get(i.id)?.caseId; if (c) byCase.set(c, i); i.children.forEach(walk); };
@@ -655,19 +665,55 @@ function setup(ctx, projectOf) {
     }
   }
 
-  ctrl.createRunProfile('Run', vscode.TestRunProfileKind.Run, async (request, token) => {
+  // a run's results also go to the sidebar's case tree (its icons and tooltips)
+  const showNode = (item) => { const n = nodes.get(item); if (n) sidebar.fire(n); };
+  const tracked = (run) => {
+    const started = new Set();
+    const set = (item, state, msg) => {
+      const message = msg && String(msg.message ?? '');
+      const was = results.get(item.id);
+      if (was?.state === state && was.message === message) return;
+      if (state === 'running') started.add(item);
+      results.set(item.id, { state, message });
+      showNode(item);
+    };
+    return {
+      started: (i) => { run.started(i); set(i, 'running'); },
+      passed: (i, d) => { run.passed(i, d); set(i, 'passed'); },
+      skipped: (i) => { run.skipped(i); set(i, 'skipped'); },
+      failed: (i, m, d) => { run.failed(i, m, d); set(i, 'failed', m); },
+      errored: (i, m, d) => { run.errored(i, m, d); set(i, 'errored', m); },
+      appendOutput: (...a) => run.appendOutput(...a),
+      end: () => {
+        // a case still running when its run ended has no result
+        for (const i of started) if (results.get(i.id)?.state === 'running') { results.delete(i.id); showNode(i); }
+        run.end();
+      },
+    };
+  };
+  const forget = (item) => { results.delete(item.id); showNode(item); item.children.forEach(forget); };
+
+  const profile = ctrl.createRunProfile('Run', vscode.TestRunProfileKind.Run, async (request, token) => {
     // device tests are long and drive a phone: run only what was picked, never "everything"
     if (!request.include?.length) {
       vscode.window.showInformationMessage('Pick a case or group in the Test Explorer to run it.');
       return;
     }
-    const run = ctrl.createTestRun(request);
+    const run = tracked(ctrl.createTestRun(request));
+    // the sidebar's Stop cancels it too
+    const cts = new vscode.CancellationTokenSource();
+    const link = token.onCancellationRequested(() => cts.cancel());
+    if (token.isCancellationRequested) cts.cancel();
+    for (const i of request.include) { active.set(i.id, cts); showNode(i); }
     try {
       for (const item of request.include) {
-        if (token.isCancellationRequested) break;
-        await runOne(run, item, token);
+        if (cts.token.isCancellationRequested) break;
+        await runOne(run, item, cts.token);
       }
     } finally {
+      link.dispose();
+      for (const i of request.include) { if (active.get(i.id) === cts) active.delete(i.id); showNode(i); }
+      cts.dispose();
       run.end(); // else the Test Explorer shows it running forever
     }
   }, true);
@@ -699,10 +745,39 @@ function setup(ctx, projectOf) {
     watchers = [];
   }
 
-  // sidebar: per plugin its live state, views, actions and links
+  // a case or group the Run profile would run: an item of the newest load with an id, its plugin
+  // loaded and allowed to run (a project plugin not allowed, or revoked, has no spec)
+  const runnable = (item) => {
+    const m = current.has(item) && meta.get(item.id);
+    return Boolean(m?.caseId && m.plugin.spec?.run && plugins.includes(m.plugin));
+  };
+  const ICON = { passed: ['pass', 'testing.iconPassed'], failed: ['error', 'testing.iconFailed'], errored: ['error', 'testing.iconErrored'],
+    skipped: ['circle-slash', 'testing.iconSkipped'], running: ['sync~spin'] };
+  // a case's node, kept per test item (a result redraws only it), its state read when it is drawn:
+  // the result icon, ▶ or ■ (package.json: view/item/context, by contextValue), a click opens its file
+  const caseNode = (item) => {
+    let n = nodes.get(item);
+    if (!n) {
+      n = new vscode.TreeItem(item.label, item.children.size ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None);
+      n.testItem = item;
+      if (item.uri) n.command = { command: 'vscode.open', title: 'Open', arguments: [item.uri, { selection: item.range }] };
+      nodes.set(item, n);
+    }
+    const r = results.get(item.id);
+    const [icon, color] = ICON[r?.state] || [item.children.size ? 'list-tree' : 'circle-outline'];
+    n.iconPath = new vscode.ThemeIcon(icon, color && new vscode.ThemeColor(color));
+    n.description = item.description;
+    n.tooltip = [item.label, item.description, r && `${r.state}${r.message ? `: ${r.message}` : ''}`].filter(Boolean).join('\n');
+    n.contextValue = !runnable(item) ? undefined : active.has(item.id) ? 'droidLiteCaseRunning' : 'droidLiteCase';
+    return n;
+  };
+  const cases = (coll) => { let n = 0; coll.forEach((i) => { n += i.children.size ? cases(i.children) : 1; }); return n; };
+  const childNodes = (coll) => { const out = []; coll.forEach((i) => out.push(caseNode(i))); return out; };
+
+  // sidebar: per plugin its live state, cases, views, actions and links
   const tree = {
     onDidChangeTreeData: sidebar.event,
-    getTreeItem: (e) => e,
+    getTreeItem: (e) => (e.testItem ? caseNode(e.testItem) : e),
     async getChildren(node) {
       const item = (label, icon, command, args, description) => {
         const i = new vscode.TreeItem(label);
@@ -732,6 +807,8 @@ function setup(ctx, projectOf) {
         return rows;
       }
       if (node.pending) return [item('Allow…', 'unlock', 'droidLite.allowTestPlugin', [node.pending])];
+      if (node.tests) return node.tests.error ? [item(node.tests.error, 'warning')] : childNodes(node.tests.children);
+      if (node.testItem) return childNodes(node.testItem.children);
       if (node.plugin && !node.plugin.spec) return []; // asks for the OK again
       if (node.plugin && !node.view) {
         const p = node.plugin;
@@ -743,6 +820,16 @@ function setup(ctx, projectOf) {
           s.tooltip = stateRows.map((r) => r.join(': ')).join('\n');
           out.push(s);
           for (const r of stateRows) out.push(item(r[0], 'blank', undefined, undefined, r[1]));
+        }
+        // then its cases, as the app's Tests tab; no ▶ here (never every device test)
+        const root = p.spec.list && ctrl.items.get(`plugin:${p.folder}`);
+        if (root) {
+          const s = new vscode.TreeItem(root.busy || root.error ? 'Tests' : `Tests (${cases(root.children)})`,
+            root.busy ? vscode.TreeItemCollapsibleState.None : vscode.TreeItemCollapsibleState.Expanded);
+          s.iconPath = new vscode.ThemeIcon('beaker');
+          if (root.busy) s.description = 'loading…';
+          s.tests = root;
+          out.push(s);
         }
         for (const v of p.spec.views || []) {
           const i = new vscode.TreeItem(v.name, vscode.TreeItemCollapsibleState.Collapsed);
@@ -817,6 +904,15 @@ function setup(ctx, projectOf) {
       const proc = actions.get(`${p.folder}\u0000${a.name}`);
       if (proc) stop(proc);
     }),
+    // ▶ on a case or group in the sidebar: the Run profile's own handler, so the result shows in the
+    // Test Explorer too; ■ cancels the run it was picked for (from either place)
+    vscode.commands.registerCommand('droidLite.runTestCase', async (node) => {
+      const it = node?.testItem;
+      if (!runnable(it) || active.has(it.id)) return;
+      const source = new vscode.CancellationTokenSource();
+      try { await profile.runHandler(new vscode.TestRunRequest([it], undefined, profile), source.token); } finally { source.dispose(); }
+    }),
+    vscode.commands.registerCommand('droidLite.stopTestCase', (node) => active.get(node?.testItem?.id)?.cancel()),
     vscode.commands.registerCommand('droidLite.refreshTestView', (node) => {
       viewCache.delete(`${node.plugin.folder}\u0000${node.view.name}`);
       sidebar.fire(node);
@@ -892,7 +988,7 @@ function setup(ctx, projectOf) {
         return vscode.window.showErrorMessage(`${file}: ${e.message}`);
       }
       await load();
-      vscode.window.showInformationMessage(`Added ${name}: its cases are in the Test Explorer.`);
+      vscode.window.showInformationMessage(`Added ${name}: its cases are in the Test Explorer and the sidebar.`);
     }),
     // Remove drops only the link, never the tool's folder
     vscode.commands.registerCommand('droidLite.removeTestPlugin', async (p) => {
