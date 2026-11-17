@@ -23,6 +23,7 @@ pub(super) fn config_guard() -> MutexGuard<'static, ()> {
     let _ = std::fs::remove_dir_all(&dir);
     // SAFETY: the SERIAL lock is held, so no other test reads the environment meanwhile.
     unsafe { std::env::set_var("DROID_LITE_CONFIG_DIR", &dir) };
+    unsafe { std::env::set_var("DROID_LITE_UNSAVED_DIR", dir.join("unsaved")) };
     lock
 }
 
@@ -101,6 +102,8 @@ impl Fixture {
         let _ = std::fs::remove_dir_all(&config);
         // SAFETY: the SERIAL lock is held, so no other test reads the environment meanwhile.
         unsafe { std::env::set_var("DROID_LITE_CONFIG_DIR", &config) };
+        // and its own crash backup folder, never ~/Library/Application Support
+        unsafe { std::env::set_var("DROID_LITE_UNSAVED_DIR", config.join("unsaved")) };
         // tests never start the kotlin-lsp installed on this Mac; the LSP test sets the fake one
         unsafe { std::env::set_var("DROID_LITE_LSP", "/nonexistent/droid-lite-no-lsp") };
         // nor any real phone: adb is missing unless a Logcat test sets the fake one
@@ -4609,12 +4612,14 @@ fn e2e_pull_requests_of_one_project_never_show_in_another() {
     click_check_out(&mut h, "#7 Only in A");
     assert!(h.state().prs.note.is_some());
     let pid_file = bin.join("gh.pid");
-    wait(&mut h, "gh runs", |_| pid_file.exists());
-    let child: i32 = std::fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    // the shell creates the file before it writes the pid
+    let pid = || {
+        std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|t| t.trim().parse::<i32>().ok())
+    };
+    wait(&mut h, "gh runs", |_| pid().is_some());
+    let child = pid().unwrap();
     let ctx = h.ctx.clone();
     h.state_mut().open_project(&b, &ctx);
     wait(&mut h, "B open", |a| {
@@ -4663,11 +4668,14 @@ fn e2e_pull_requests_of_one_project_never_show_in_another() {
     assert_eq!(h.state().branch.as_deref(), Some("trunk"));
     assert!(h.state().prs.note.is_none());
     assert_eq!(crate::git::branch(&f.root), a_branch, "A did not switch");
-    // SAFETY: signal 0 only checks whether the process lives
-    assert!(
-        unsafe { libc::kill(child, 0) } != 0,
-        "gh's child was killed too"
-    );
+    // SAFETY: signal 0 only checks whether the process lives (a killed child is gone once
+    // launchd has reaped it)
+    let gone = || unsafe { libc::kill(child, 0) } != 0;
+    let until = std::time::Instant::now() + Duration::from_secs(1);
+    while !gone() && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(gone(), "gh's child was killed too");
     // back in A while an old checkout of A is still being stopped: a new one waits for it
     let open = |h: &mut Harness<'static, App>, root: &Path| {
         let ctx = h.ctx.clone();
@@ -4682,7 +4690,7 @@ fn e2e_pull_requests_of_one_project_never_show_in_another() {
         a.prs.lists.contains_key(&crate::git::PrFilter::Mine)
     });
     click_check_out(&mut h, "#7 Only in A");
-    wait(&mut h, "gh runs", |_| pid_file.exists());
+    wait(&mut h, "gh runs", |_| pid().is_some());
     open(&mut h, &b);
     open(&mut h, &f.root);
     assert!(h.state().checkout_busy(), "A's files may still change");
@@ -5149,4 +5157,365 @@ fn e2e_a_running_check_out_locks_edits_and_commands_and_quit_stops_it() {
     );
     drop(h);
     let _ = std::fs::remove_dir_all(&bin);
+}
+
+fn set_mode(p: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Another small project next to the fixture, for project switches.
+fn other_project(name: &str) -> PathBuf {
+    let b = std::env::temp_dir().join(format!("droid-lite-e2e-{name}-b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&b);
+    std::fs::create_dir_all(b.join("app/src/main/java/b")).unwrap();
+    std::fs::write(b.join("settings.gradle.kts"), "include(\":app\")\n").unwrap();
+    std::fs::write(b.join("app/src/main/java/b/B.kt"), "package b\nclass B\n").unwrap();
+    b.canonicalize().unwrap()
+}
+
+/// The text of each backup in the unsaved folder of fixture `f`.
+fn unsaved_backups(f: &Fixture) -> Vec<String> {
+    std::fs::read_dir(f.config.join("unsaved"))
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(e.ok()?.path()).ok()?).ok()?;
+            Some(v["text"].as_str()?.to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn e2e_a_copy_that_cannot_be_kept_keeps_the_window_and_the_project_open() {
+    let f = Fixture::new("copyfail");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    h.state_mut().settings.autosave = false;
+    let a = h.state().active;
+    h.state_mut().tabs[a].text.push_str("// typed\n");
+    let typed = tab(&h).text.clone();
+    // local history cannot be written
+    let history = f.config.join("history");
+    std::fs::create_dir_all(&history).unwrap();
+    set_mode(&history, 0o555);
+    let why = format!("Could not keep a copy of {}: ", user.display());
+    // Keep a copy and close: the window stays open and says why
+    assert!(ask_to_close(&mut h));
+    steps(&mut h, 2);
+    h.get_by_label("Keep a copy and close").click();
+    steps(&mut h, 3);
+    assert!(!h.state().close_ok && h.state().close_asked, "the window stays open");
+    assert!(h.state().status.starts_with(&why), "{}", h.state().status);
+    assert!(h.state().copy_error.as_deref().is_some_and(|e| e.starts_with(&why)));
+    assert!(h.query_all_by_label_contains(&why).count() >= 2, "the window says why too");
+    h.get_by_label("Cancel").click();
+    steps(&mut h, 2);
+    assert!(h.state().copy_error.is_none());
+    // Keep a copy and switch: this project stays open
+    let b = other_project("copyfail");
+    let ctx = h.ctx.clone();
+    h.state_mut().open_project(&b, &ctx);
+    steps(&mut h, 2);
+    h.get_by_label("Keep a copy and switch").click();
+    steps(&mut h, 3);
+    assert_eq!(h.state().project.as_ref().map(|p| p.root.clone()), Some(f.root.clone()));
+    assert!(h.state().indexing.is_none() && h.state().switch_to.is_some());
+    assert_eq!(tab(&h).text, typed);
+    assert!(h.state().status.starts_with(&why), "{}", h.state().status);
+    h.get_by_label("Cancel").click();
+    steps(&mut h, 2);
+    // Revert and closing the tab keep the edits as well
+    h.state_mut().revert();
+    assert_eq!(tab(&h).text, typed);
+    let a = h.state().active;
+    h.state_mut().tabs[a].deleted = true;
+    h.state_mut().close_tab(a);
+    assert_eq!(tab(&h).text, typed, "the tab stays open");
+    h.state_mut().tabs[a].deleted = false;
+    // a forced quit: the edits go to the unsaved folder instead
+    eframe::App::on_exit(h.state_mut());
+    assert_eq!(unsaved_backups(&f), vec![typed.clone()]);
+    set_mode(&history, 0o755);
+    // the next start puts them back in their tab
+    drop(h);
+    let mut h = f.harness();
+    wait(&mut h, "recovered", |a| {
+        a.toast_texts().contains(&"Recovered unsaved edits for User.kt")
+    });
+    let t = h.state().tabs.iter().find(|t| t.path == user).unwrap();
+    assert_eq!(t.text, typed);
+    assert!(t.dirty(), "recovered edits are not saved yet");
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), USER_KT, "the file is not touched");
+    let _ = std::fs::remove_dir_all(&b);
+}
+
+#[test]
+fn e2e_save_never_overwrites_another_version_it_could_not_keep() {
+    let f = Fixture::new("savecopyfail");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    h.state_mut().settings.autosave = false;
+    let history = f.config.join("history");
+    std::fs::create_dir_all(&history).unwrap();
+    set_mode(&history, 0o555);
+    // the disk has what was loaded: no copy is needed, the save goes on
+    let a = h.state().active;
+    h.state_mut().tabs[a].text.push_str("// one\n");
+    h.state_mut().save();
+    assert!(std::fs::read_to_string(&user).unwrap().ends_with("// one\n"));
+    // another version on disk that cannot be kept: not overwritten
+    h.state_mut().tabs[a].text.push_str("// two\n");
+    let theirs = "package com.demo.data\n\nclass Theirs\n";
+    std::fs::write(&user, theirs).unwrap();
+    h.state_mut().save();
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs);
+    assert!(
+        h.state().status.starts_with(&format!("Could not keep a copy of {}", user.display())),
+        "{}",
+        h.state().status
+    );
+    assert!(tab(&h).dirty());
+    set_mode(&history, 0o755);
+    h.state_mut().save();
+    assert!(std::fs::read_to_string(&user).unwrap().ends_with("// two\n"));
+    assert_eq!(newest_version(&user).as_deref(), Some(theirs));
+}
+
+#[test]
+fn e2e_save_of_a_clean_tab_never_overwrites_a_change_on_disk() {
+    let f = Fixture::new("savecleanchanged");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    // changed on disk; the watcher has not told the tab yet (nor will it here)
+    h.state_mut().watcher = None;
+    let theirs = "package com.demo.data\n\nclass Theirs\n";
+    std::fs::write(&user, theirs).unwrap();
+    h.state_mut().save();
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs);
+    assert_eq!(h.state().status, "File changed on disk; reload or keep yours");
+    assert!(tab(&h).disk_changed);
+    // Keep mine: then ⌘S writes it, and the other version is in local history
+    steps(&mut h, 2);
+    h.get_by_label("Keep mine").click();
+    steps(&mut h, 2);
+    h.state_mut().save();
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), USER_KT);
+    assert_eq!(newest_version(&user).as_deref(), Some(theirs));
+}
+
+#[test]
+fn e2e_a_file_that_cannot_be_read_never_blanks_its_tab() {
+    let f = Fixture::new("unreadable");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(&user, [0xff, 0xfe, b'x']).unwrap();
+    wait(&mut h, "unreadable", |a| a.tabs[a.active].unreadable.is_some());
+    assert_eq!(tab(&h).text, USER_KT, "the tab keeps its text");
+    assert!(tab(&h).disk_changed);
+    steps(&mut h, 2);
+    h.get_by_label_contains("cannot be read as text now (it is not UTF-8 text)");
+    // ⌘S does not write over it unasked
+    h.state_mut().save();
+    assert_eq!(std::fs::read(&user).unwrap(), [0xff, 0xfe, b'x']);
+    // a version in local history that is not UTF-8 is not restored: it says why
+    super::comfort::record_text(&user, &[0xff, 0xfe]).unwrap();
+    h.state_mut().history_for = Some(user.clone());
+    steps(&mut h, 2);
+    h.get_all_by_label("Restore").next().unwrap().click();
+    steps(&mut h, 2);
+    assert!(h.state().status.contains("is not UTF-8 text"), "{}", h.state().status);
+    assert_eq!(tab(&h).text, USER_KT);
+}
+
+#[test]
+fn e2e_disk_changes_apply_in_the_order_they_happened() {
+    let f = Fixture::new("diskorder");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    let (tx1, rx1) = channel();
+    let (tx2, rx2) = channel();
+    h.state_mut().disk_rx.extend([rx1, rx2]);
+    let change = |t: &str| vec![super::disk::DiskChange::File(user.clone(), t.into(), None)];
+    // the newer batch is read first: it waits for the older one
+    tx2.send(change("// newer\n")).unwrap();
+    steps(&mut h, 2);
+    assert_eq!(tab(&h).text, USER_KT);
+    tx1.send(change("// older\n")).unwrap();
+    steps(&mut h, 2);
+    assert_eq!(tab(&h).text, "// newer\n");
+    assert!(h.state().disk_rx.is_empty());
+}
+
+#[test]
+fn e2e_own_late_save_event_is_not_a_change_on_disk() {
+    let f = Fixture::new("latesave");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    let a = h.state().active;
+    h.state_mut().tabs[a].text.push_str("// one\n");
+    h.state_mut().save();
+    let saved = tab(&h).text.clone();
+    h.state_mut().tabs[a].text.push_str("// two\n");
+    // the watcher reports that save after more typing
+    let (tx, rx) = channel();
+    h.state_mut().disk_rx.push(rx);
+    tx.send(vec![super::disk::DiskChange::File(user.clone(), saved, None)]).unwrap();
+    steps(&mut h, 2);
+    assert!(!tab(&h).disk_changed, "no changed-on-disk bar");
+    assert!(tab(&h).text.ends_with("// two\n"));
+    // a successful save clears the bars
+    h.state_mut().tabs[a].disk_changed = true;
+    h.state_mut().tabs[a].deleted = true;
+    h.state_mut().save();
+    assert!(!tab(&h).disk_changed && !tab(&h).deleted);
+}
+
+#[test]
+fn e2e_undo_of_a_rename_never_overwrites_a_new_file_at_the_old_name() {
+    let f = Fixture::new("undorename");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    let person = f.path("app/src/main/java/com/demo/data/Person.kt");
+    std::fs::write(&person, "class Person\n").unwrap();
+    // User.kt was made again after the rename to Person.kt
+    h.state_mut().undo = Some(refactor_ui::Undo::of(&user, &person, Vec::new()));
+    h.state_mut().undo_refactor();
+    assert!(h.state().status.contains("exists again"), "{}", h.state().status);
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), USER_KT);
+    assert_eq!(std::fs::read_to_string(&person).unwrap(), "class Person\n");
+    assert!(h.state().undo.is_some(), "the undo can run later");
+    // a file it cannot write back is reported, not "Undid"
+    std::fs::remove_file(&user).unwrap();
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    set_mode(&card, 0o444);
+    let files = vec![(card.clone(), "x".into())];
+    h.state_mut().undo = Some(refactor_ui::Undo::of(&user, &person, files));
+    h.state_mut().undo_refactor();
+    set_mode(&card, 0o644);
+    assert!(user.exists() && !person.exists());
+    assert!(
+        h.state()
+            .status
+            .starts_with("Undid rename test only in part: Cannot write"),
+        "{}",
+        h.state().status
+    );
+    assert_eq!(std::fs::read_to_string(&card).unwrap(), CARD_KT);
+}
+
+#[test]
+fn e2e_unsaved_edits_are_backed_up_and_recovered_after_a_crash() {
+    let f = Fixture::new("crashbackup");
+    let mut h = f.harness();
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    h.state_mut().settings.autosave = false;
+    assert!(unsaved_backups(&f).is_empty(), "nothing without edits");
+    let a = h.state().active;
+    h.state_mut().tabs[a].text.push_str("// one\n");
+    h.state_mut().tabs[a].mark_edited();
+    steps(&mut h, 2);
+    let one = tab(&h).text.clone();
+    assert_eq!(unsaved_backups(&f), vec![one.clone()]);
+    // more typing is written at most every 30 s
+    h.state_mut().tabs[a].text.push_str("// two\n");
+    h.state_mut().tabs[a].mark_edited();
+    steps(&mut h, 2);
+    assert_eq!(unsaved_backups(&f), vec![one.clone()]);
+    h.state_mut().backup.written_at = None; // 30 s later
+    steps(&mut h, 2);
+    let two = tab(&h).text.clone();
+    assert_eq!(unsaved_backups(&f), vec![two.clone()]);
+    // the app ends without on_exit (a crash): the next start puts the edits back
+    drop(h);
+    let mut h = f.harness();
+    wait(&mut h, "recovered", |a| {
+        a.toast_texts().contains(&"Recovered unsaved edits for User.kt")
+    });
+    assert_eq!(h.state().tabs.iter().find(|t| t.path == user).unwrap().text, two);
+    // once saved, the backup goes
+    let i = h.state().tabs.iter().position(|t| t.path == user).unwrap();
+    h.state_mut().active = i;
+    h.state_mut().save();
+    h.state_mut().backup.written_at = None;
+    steps(&mut h, 2);
+    assert!(unsaved_backups(&f).is_empty());
+}
+
+#[test]
+fn e2e_translations_and_history_restore_wait_for_a_checkout() {
+    let f = Fixture::new("checkoutlock");
+    let strings = |dir: &str, text: &str| {
+        let p = f.path(&format!("app/src/main/res/{dir}/strings.xml"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let xml = format!("<resources>\n    <string name=\"hi\">{text}</string>\n</resources>\n");
+        std::fs::write(&p, xml).unwrap();
+        p
+    };
+    strings("values", "Hi");
+    let hindi = strings("values-hi", "Namaste");
+    let mut h = f.harness();
+    wait(&mut h, "resources", |a| a.res.get("string", "hi").len() == 2);
+    let ctx = h.ctx.clone();
+    h.state_mut().run(Action::Translations, &ctx);
+    steps(&mut h, 3);
+    let root = f.root.clone();
+    let _reply = h.state_mut().prs.add_stopping(&root, 7);
+    assert!(h.state().checkout_busy());
+    // the columns are the sorted folders: values, values-hi
+    h.state_mut().write_translation("hi".into(), 1, "Alvida");
+    assert_eq!(h.state().status, super::prs_ui::WAIT_CHECKOUT);
+    assert!(std::fs::read_to_string(&hindi).unwrap().contains("Namaste"));
+    // local history Restore waits too
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    super::comfort::record_text(&user, b"old").unwrap();
+    open(&mut h, &user);
+    h.state_mut().translations.open = false;
+    h.state_mut().history_for = Some(user.clone());
+    steps(&mut h, 2);
+    h.get_all_by_label("Restore").next().unwrap().click();
+    steps(&mut h, 2);
+    assert_eq!(h.state().status, super::prs_ui::WAIT_CHECKOUT);
+    assert_eq!(tab(&h).text, USER_KT);
+}
+
+#[test]
+fn e2e_a_stopped_checkout_reply_waits_while_the_project_opens() {
+    let f = Fixture::new("heldreply");
+    let mut h = f.harness();
+    let root = f.root.clone();
+    let reply = h.state_mut().prs.add_stopping(&root, 7);
+    // the project is opening again when the stop is confirmed
+    let project = h.state_mut().project.take();
+    let (_opening, rx) = channel();
+    h.state_mut().indexing = Some(rx);
+    reply
+        .send(super::prs_ui::Checkout {
+            root: root.clone(),
+            number: 7,
+            result: Err("Check out of #7 was stopped".into()),
+            branch: crate::git::branch(&root),
+            head: None,
+        })
+        .unwrap();
+    steps(&mut h, 2);
+    assert_eq!(h.state().prs.stopping_count(), 1, "the reply waits");
+    h.state_mut().project = project;
+    h.state_mut().indexing = None;
+    assert!(h.state().checkout_busy(), "busy until the stop shows");
+    steps(&mut h, 2);
+    assert!(!h.state().checkout_busy());
+    assert_eq!(
+        h.state().prs.note,
+        Some(("Check out of #7 was stopped".to_string(), true))
+    );
 }

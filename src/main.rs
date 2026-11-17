@@ -48,6 +48,7 @@ fn main() -> eframe::Result {
         bench(std::path::Path::new(&dir));
         return Ok(());
     }
+    app::install_crash_backup();
     let open = std::env::args()
         .nth(1)
         .map(std::path::PathBuf::from)

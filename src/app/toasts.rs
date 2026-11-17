@@ -53,6 +53,12 @@ impl App {
         }
     }
 
+    /// The texts of the notes up now.
+    #[cfg(test)]
+    pub(super) fn toast_texts(&self) -> Vec<&str> {
+        self.toasts.iter().map(|t| t.text.as_str()).collect()
+    }
+
     pub(super) fn toasts_ui(&mut self, ctx: &egui::Context) {
         self.toasts.retain(|t| t.at.elapsed() < SHOWN);
         let Some(next) = self.toasts.iter().map(|t| SHOWN - t.at.elapsed()).min() else {

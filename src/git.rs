@@ -841,7 +841,7 @@ fn output_within(
                 } else {
                     Ended::TimedOut
                 };
-                end_group(&mut child, pgid);
+                end_group(&mut child, pgid, STOP_GRACE);
                 ctl.pgid.store(0, std::sync::atomic::Ordering::SeqCst);
                 return Err(why);
             }
@@ -861,9 +861,10 @@ fn output_within(
     })
 }
 
-/// SIGTERM to the group `child` leads, then SIGKILL to what is left of it after [`STOP_GRACE`];
-/// `child` is reaped.
-fn end_group(child: &mut std::process::Child, pgid: i32) {
+/// SIGTERM to the group `child` leads, then SIGKILL to what is left of it after `grace`,
+/// again until the group is empty (a process forked while the signal went out escapes one
+/// SIGKILL), for [`KILL_LIMIT`] at most; `child` is reaped. Only then is the checkout stopped.
+fn end_group(child: &mut std::process::Child, pgid: i32, grace: std::time::Duration) {
     #[cfg(unix)]
     {
         // SAFETY: kill(2) on the group this child leads; it has not been reaped yet, so the id
@@ -871,7 +872,7 @@ fn end_group(child: &mut std::process::Child, pgid: i32) {
         unsafe {
             libc::kill(-pgid, libc::SIGTERM);
         }
-        let until = std::time::Instant::now() + STOP_GRACE;
+        let until = std::time::Instant::now() + grace;
         let mut reaped = false;
         while std::time::Instant::now() < until {
             reaped = reaped || child.try_wait().is_ok_and(|s| s.is_some());
@@ -885,10 +886,24 @@ fn end_group(child: &mut std::process::Child, pgid: i32) {
         unsafe {
             libc::kill(-pgid, libc::SIGKILL);
         }
+        // the leader is reaped first: its zombie would keep the group alive
+        let _ = child.wait();
+        let until = std::time::Instant::now() + KILL_LIMIT;
+        // SAFETY: as above; signal 0 only checks whether the group still has a process
+        while unsafe { libc::kill(-pgid, 0) } == 0 && std::time::Instant::now() < until {
+            // SAFETY: as above
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// How long [`end_group`] goes on killing a group that is not empty yet.
+const KILL_LIMIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A pull request's whole diff (`gh pr diff`), split into one diff per file.
 pub fn pr_diff(root: &Path, number: u64) -> Result<Vec<(String, String)>, String> {
@@ -1215,6 +1230,22 @@ pub fn now() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_stopped_group_is_empty_even_while_it_forks() {
+        for _ in 0..10 {
+            // every process ignores SIGTERM and forks all the time
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", "trap '' TERM; while :; do sleep 30 & done"]);
+            std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+            let mut child = cmd.spawn().unwrap();
+            let pgid = child.id() as i32;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            super::end_group(&mut child, pgid, std::time::Duration::ZERO);
+            // SAFETY: signal 0 only checks whether the group still has a process
+            assert_ne!(unsafe { libc::kill(-pgid, 0) }, 0, "a process of the group lives");
+        }
+    }
+
     use super::*;
 
     #[test]

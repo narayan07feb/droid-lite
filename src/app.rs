@@ -2,6 +2,7 @@
 
 mod android;
 mod assist;
+mod backup;
 mod capture_ui;
 mod comfort;
 mod disk;
@@ -73,6 +74,8 @@ struct Tab {
     /// Changed on disk while this tab had unsaved edits.
     disk_changed: bool,
     deleted: bool,
+    /// The file on disk cannot be read as text now (why): the editor keeps this tab's text.
+    unreadable: Option<String>,
     /// A library source opened from a jar: navigate and copy, never edit or save.
     readonly: bool,
     git: git_ui::TabBlame,
@@ -450,6 +453,10 @@ pub struct App {
     close_ok: bool,
     /// A project switch that waits for the unsaved-edits choice ([`App::guard_switch`]).
     switch_to: Option<PathBuf>,
+    /// Why "Keep a copy" could not keep a copy (shown in the Unsaved edits window).
+    copy_error: Option<String>,
+    /// The crash backup of unsaved edits.
+    backup: backup::Backup,
     show_settings: bool,
     /// Hash of the last saved session, and when it was written.
     session_saved: (u64, Instant),
@@ -564,6 +571,8 @@ impl App {
             close_asked: false,
             close_ok: false,
             switch_to: None,
+            copy_error: None,
+            backup: Default::default(),
             show_settings: false,
             session_saved: (0, Instant::now()),
             history_for: None,
@@ -630,8 +639,16 @@ impl App {
     /// branch run on a worker thread; `poll` installs the result. Unsaved edits of the old
     /// project's tabs go to local history first.
     fn switch_project(&mut self, dir: &Path, ctx: &egui::Context) {
+        // a copy that cannot be kept keeps this project open, with the reason
+        let failed = self.keep_copies(&self.unsaved_tabs());
+        if !failed.is_empty() {
+            self.switch_to = Some(dir.to_path_buf());
+            self.copy_failed(failed);
+            return;
+        }
         self.switch_to = None;
-        self.keep_copies(&self.unsaved_tabs());
+        self.copy_error = None;
+        self.backups_kept(&[]);
         for t in std::mem::take(&mut self.tabs) {
             self.forget_tab(&t);
         }
@@ -702,6 +719,7 @@ impl App {
         if self.tabs.is_empty() {
             self.restore_session();
         }
+        self.recover_unsaved();
         if self.tabs.iter().any(|t| is_code(&t.path)) {
             self.start_lsp();
         }
@@ -781,6 +799,7 @@ impl App {
                 selection: 0..0,
                 disk_changed: false,
                 deleted: false,
+                unreadable: None,
                 readonly: crate::libs::is_archive_path(path),
                 git: Default::default(),
                 rev: 0,
@@ -834,13 +853,40 @@ impl App {
             self.status = "Library sources are read-only".into();
             return;
         }
-        if tab.text != tab.saved || !tab.path.exists() {
-            comfort::record_history(&tab.path);
+        // what is on disk goes to local history before it is replaced
+        match std::fs::read(&tab.path) {
+            Ok(disk) if disk == tab.text.as_bytes() => {}
+            Ok(disk) => {
+                // changed on disk since it was loaded or saved here (the watcher may not know yet)
+                let theirs = disk != tab.saved.as_bytes();
+                if theirs && !tab.dirty() {
+                    tab.disk_changed = true;
+                    self.status = "File changed on disk; reload or keep yours".into();
+                    return;
+                }
+                if let Err(e) = comfort::record_text(&tab.path, &disk)
+                    && theirs
+                {
+                    self.status = format!(
+                        "{}. Not saved: the other version on disk stays",
+                        comfort::copy_failed(&tab.path, &e)
+                    );
+                    return;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                self.status = format!("Save failed: cannot read {}: {e}", tab.path.display());
+                return;
+            }
         }
-        match std::fs::write(&tab.path, &tab.text) {
+        match write_atomic(&tab.path, tab.text.as_bytes()) {
             Ok(()) => {
                 self.git.changes_stale = true;
                 tab.saved = tab.text.clone();
+                tab.disk_changed = false;
+                tab.deleted = false;
+                tab.unreadable = None;
                 if !self.previews.saved.contains(&tab.path) {
                     self.previews.saved.push(tab.path.clone());
                 }
@@ -864,11 +910,15 @@ impl App {
                 );
                 return;
             }
-            let t = self.tabs.remove(i);
-            if t.dirty() {
-                // its edits stay in local history
-                comfort::record_text(&t.path, t.text.as_bytes());
+            // its edits stay in local history, or the tab stays open
+            let t = &self.tabs[i];
+            if t.dirty()
+                && let Err(e) = comfort::record_text(&t.path, t.text.as_bytes())
+            {
+                self.status = comfort::copy_failed(&t.path, &e);
+                return;
             }
+            let t = self.tabs.remove(i);
             self.forget_tab(&t);
             self.active = self.active.min(self.tabs.len().saturating_sub(1));
         }
@@ -893,11 +943,14 @@ impl App {
         }
     }
 
-    /// Drops the active tab's edits; they stay in local history.
+    /// Drops the active tab's edits; they stay in local history (else they stay in the tab).
     fn revert(&mut self) {
         if let Some(t) = self.tabs.get_mut(self.active) {
-            if t.dirty() {
-                comfort::record_text(&t.path, t.text.as_bytes());
+            if t.dirty()
+                && let Err(e) = comfort::record_text(&t.path, t.text.as_bytes())
+            {
+                self.status = comfort::copy_failed(&t.path, &e);
+                return;
             }
             t.text = t.saved.clone();
             t.reanalyse();
@@ -3970,8 +4023,10 @@ impl eframe::App for App {
         if self.settings.autosave && stopped.is_empty() {
             self.autosave();
         }
-        // a forced quit never loses typing: what is still unsaved goes to local history
-        self.keep_copies(&self.unsaved_tabs());
+        // a forced quit never loses typing: what is still unsaved goes to local history, else to
+        // the unsaved folder (and the log)
+        let failed = self.keep_copies(&self.unsaved_tabs());
+        self.backups_kept(&failed);
         // every plugin list, view, run and watch (and tools they left running) is killed now
         // (their Drop), not left to threads that end with the app
         self.tests = Default::default();
@@ -3996,6 +4051,7 @@ impl eframe::App for App {
         self.guard_close(&ctx);
         self.guard_switch(&ctx);
         self.save_session(false);
+        self.backup_tick(&ctx);
         watch.stage("shortcuts", || self.shortcuts(&ctx));
         self.usages_popup_keys(&ctx);
         self.fix_popup_keys(&ctx);
@@ -4697,6 +4753,51 @@ pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     e2e::SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Unsaved edits survive a crash, SIGTERM and SIGINT ([`backup`]); for the window, not `serve`.
+pub fn install_crash_backup() {
+    backup::install_panic_hook();
+    #[cfg(unix)]
+    backup::install_signal_handler();
+}
+
+/// Writes `bytes` to `path` so a failure (a full disk) never leaves it half written: a temp file
+/// in the same folder, synced, then renamed over it with the file's permissions (through a
+/// symlink to its target). A file that cannot be written is refused as before; in a folder that
+/// cannot take the temp file, the file is written in place.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let perms = match std::fs::metadata(&target) {
+        Ok(m) => {
+            // a read-only file stays read-only (a rename would replace it)
+            std::fs::OpenOptions::new().write(true).open(&target)?;
+            Some(m.permissions())
+        }
+        Err(_) => None,
+    };
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = target.with_file_name(format!(".{name}.droid-lite-{}.tmp", std::process::id()));
+    let mut f = match std::fs::File::create(&tmp) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return std::fs::write(&target, bytes);
+        }
+        Err(e) => return Err(e),
+    };
+    let written = f
+        .write_all(bytes)
+        .and_then(|()| perms.map_or(Ok(()), |p| f.set_permissions(p)))
+        .and_then(|()| f.sync_all())
+        .and_then(|()| std::fs::rename(&tmp, &target));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
 /// `~/.config/droid-lite` (or `$DROID_LITE_CONFIG_DIR`). Tests never touch the user's folder:
 /// without the variable they get no config folder at all.
 fn config_dir() -> Option<PathBuf> {
@@ -4773,6 +4874,71 @@ fn with_recent(mut list: Vec<PathBuf>, root: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The child half of the full-disk test: runs only in the process it starts.
+    #[test]
+    fn write_atomic_child() {
+        let Some(file) = std::env::var_os("DL_FULL_DISK_FILE") else {
+            return;
+        };
+        std::fs::write(PathBuf::from(&file).with_extension("ran"), "").unwrap();
+        // SAFETY: this process runs only this test; a write past 16 bytes fails (EFBIG) as on a
+        // full disk, instead of ending the process
+        unsafe {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let limit = libc::rlimit {
+                rlim_cur: 16,
+                rlim_max: 16,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+        }
+        assert!(write_atomic(Path::new(&file), &[b'n'; 100]).is_err());
+    }
+
+    #[test]
+    fn a_save_that_fails_halfway_leaves_the_file_as_it_was() {
+        let dir = std::env::temp_dir().join(format!("droid-lite-full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("A.kt");
+        std::fs::write(&file, "class A").unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "app::tests::write_atomic_child", "--test-threads=1"])
+            .env("DL_FULL_DISK_FILE", &file)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        let ran = file.with_extension("ran").exists();
+        let kept = std::fs::read_to_string(&file).unwrap();
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(status.success() && ran, "{status:?}");
+        assert_eq!(kept, "class A", "the old text is still there");
+        assert_eq!(left.len(), 2, "no temp file is left: {left:?}");
+    }
+
+    #[test]
+    fn a_save_keeps_the_file_mode_and_never_writes_a_read_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("droid-lite-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("gradlew");
+        std::fs::write(&file, "old").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o750)).unwrap();
+        write_atomic(&file, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o750);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(write_atomic(&file, b"newer").is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn an_empty_config_dir_variable_counts_as_unset() {

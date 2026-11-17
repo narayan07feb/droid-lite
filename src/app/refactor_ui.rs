@@ -74,6 +74,18 @@ pub(super) struct Undo {
     moved: Option<(PathBuf, PathBuf)>,
 }
 
+impl Undo {
+    /// The undo of a refactoring that moved `from` to `to` and changed `files` (their old text).
+    #[cfg(test)]
+    pub(super) fn of(from: &Path, to: &Path, files: Vec<(PathBuf, String)>) -> Undo {
+        Undo {
+            label: "rename test".into(),
+            files,
+            moved: Some((from.to_path_buf(), to.to_path_buf())),
+        }
+    }
+}
+
 impl Preview {
     #[cfg(test)]
     pub(super) fn source_name(&self) -> &str {
@@ -296,18 +308,27 @@ impl App {
     }
 
     /// Writes a file and keeps the open tab, the index and kotlin-lsp in step.
+    /// What is on disk and typing it replaces go to local history first, else nothing is written.
     fn write_file(&mut self, path: &Path, text: &str) -> bool {
-        super::comfort::record_history(path);
-        if let Err(e) = std::fs::write(path, text) {
+        let typed = self
+            .tabs
+            .iter()
+            .find(|t| t.path == path && t.dirty())
+            .map(|t| t.text.clone());
+        // typing since a refactor that is undone stays in local history
+        let kept = super::comfort::record_history(path).and_then(|()| {
+            typed.map_or(Ok(()), |t| super::comfort::record_text(path, t.as_bytes()))
+        });
+        if let Err(e) = kept {
+            self.status = super::comfort::copy_failed(path, &e);
+            return false;
+        }
+        if let Err(e) = super::write_atomic(path, text.as_bytes()) {
             self.status = format!("Cannot write {}: {e}", path.display());
             return false;
         }
         self.index.update(path, text);
         if let Some(t) = self.tabs.iter_mut().find(|t| t.path == path) {
-            if t.dirty() {
-                // typing since a refactor that is undone stays in local history
-                super::comfort::record_text(path, t.text.as_bytes());
-            }
             t.text = text.to_string();
             t.saved = text.to_string();
             t.cursor = t.cursor.min(text.len());
@@ -342,15 +363,33 @@ impl App {
             return;
         }
         let Some(u) = self.undo.take() else { return };
-        if let Some((from, to)) = &u.moved
-            && std::fs::rename(to, from).is_ok()
-        {
+        // a file at the old name again (made since) is never replaced: the undo waits
+        if let Some((from, to)) = &u.moved {
+            let why = if from.exists() {
+                Some(format!("{} exists again", from.display()))
+            } else {
+                std::fs::rename(to, from)
+                    .err()
+                    .map(|e| format!("cannot move {} back: {e}", to.display()))
+            };
+            if let Some(why) = why {
+                self.status = format!("Cannot undo {}: {why}", u.label);
+                self.undo = Some(u);
+                return;
+            }
             self.moved(to, from);
         }
+        let mut failed = Vec::new();
         for (path, text) in &u.files {
-            self.write_file(path, text);
+            if !self.write_file(path, text) {
+                failed.push(std::mem::take(&mut self.status));
+            }
         }
-        self.status = format!("Undid {}", u.label);
+        self.status = if failed.is_empty() {
+            format!("Undid {}", u.label)
+        } else {
+            format!("Undid {} only in part: {}", u.label, failed.join("; "))
+        };
     }
 
     pub(super) fn optimize_imports(&mut self) {

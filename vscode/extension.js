@@ -9,6 +9,7 @@ const preview = require('./preview');
 let engine; // { proc, pending, nextId }
 let ready; // Promise of the initialize reply
 let indexing; // that promise while the engine has not answered it (one initialize at a time)
+let indexingSince = 0; // when it was sent
 let recording; // serial while a screen recording runs (UNKNOWN: record_start did not answer)
 let saving = false; // a recording is being saved (record_stop may take ~16 min): device calls wait
 const UNKNOWN = '?';
@@ -60,7 +61,7 @@ function start(ctx) {
 // initialize: how long each project call waits for the index; the initialize itself is never sent
 // again while the engine works on it (a big project may take minutes)
 const limits = {
-  initialize: 600000, ping: 15000, update: 15000, remove: 15000, lenses: 15000, stability: 15000, implementations: 15000,
+  initialize: 600000, ping: 15000, probe: 5000, update: 15000, remove: 15000, lenses: 15000, stability: 15000, implementations: 15000,
   previews: 180000, devices: 60000, adb: 60000, screenshot: 60000, record_start: 60000, record_stop: 1080000, // engine worst case ~976 s (pull capped at 15 min)
 };
 // an engine that ran past a request's limit may hang: it is stopped (stdin closed, SIGKILL after
@@ -71,6 +72,25 @@ function restart(e, why) {
   const kill = setTimeout(() => e.proc.kill('SIGKILL'), 2000);
   kill.unref?.();
   e.proc.once('exit', () => clearTimeout(kill));
+}
+
+// a call past its limit may only wait behind a long one: the engine is restarted when it does not
+// answer a ping in limits.probe either. Never while it indexes (every request waits behind
+// initialize, up to limits.initialize) or saves a recording (record_stop may take ~16 min)
+const busy = () => saving || (indexing && Date.now() - indexingSince < limits.initialize);
+function probe(e, why) {
+  if (busy() || e.probing || engine !== e) return;
+  e.probing = true;
+  const id = e.nextId++;
+  const end = (hung) => () => {
+    clearTimeout(timer);
+    e.pending.delete(id);
+    e.probing = false;
+    if (hung && !busy() && engine === e) restart(e, why);
+  };
+  const timer = setTimeout(end(true), limits.probe);
+  e.pending.set(id, { resolve: end(false), reject: end(false) });
+  e.proc.stdin.write(JSON.stringify({ id, method: 'ping', params: {} }) + '\n');
 }
 
 // a previews call starts its limit again on each progress line, for any file (a first run downloads
@@ -99,7 +119,7 @@ function call(ctx, method, params = {}) {
         progress?.dispose();
         const why = `Droid Lite engine did not answer ${method} in ${(left < ms ? cap : ms) / 1000} s`;
         reject(new Error(why));
-        restart(e, why);
+        probe(e, why);
       }, Math.min(ms, left));
     };
     const progress = cap && events.event((m) => { if (m.event === 'preview_status') arm(); });
@@ -195,7 +215,7 @@ function project(ctx, method, params) {
     const dir = root();
     const r = dir ? call(ctx, 'initialize', { root: dir }) : Promise.reject(new Error('Open a folder first'));
     ready = r;
-    if (dir) { indexing = r; onIndexing(); }
+    if (dir) { indexing = r; indexingSince = Date.now(); onIndexing(); }
     const settled = () => { if (indexing === r) { indexing = undefined; onIndexing(); } };
     // a failed index is not kept: the next project call tries again (an engine that stops fails it)
     r.then(() => { settled(); changed.fire(); if (ready === r) onIndexed(); },

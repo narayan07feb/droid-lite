@@ -257,7 +257,10 @@ impl App {
 
     /// Writes one cell: in place when the folder has the string, else added to that folder's
     /// `strings.xml` next to the default one.
-    fn write_translation(&mut self, key: String, col: usize, text: &str) {
+    pub(super) fn write_translation(&mut self, key: String, col: usize, text: &str) {
+        if self.refuse_during_checkout() {
+            return;
+        }
         let Some((_, table)) = &self.translations.table else {
             return;
         };

@@ -259,7 +259,7 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   const props = pkg.contributes.configuration.properties;
   check('enginePath is a machine setting', props['droidLite.enginePath'].scope === 'machine');
   check('logcatMaxLines setting', props['droidLite.logcatMaxLines'].default === 20000);
-  check('version 0.5.6', pkg.version === '0.5.6');
+  check('version 0.5.7', pkg.version === '0.5.7');
   check('Allow… on a test item that needs an OK', pkg.contributes.menus['testing/item/context']
     .some((m) => m.command === 'droidLite.allowTestPlugin' && /testId =~ \/\^needs-ok:\//.test(m.when)));
 
@@ -483,13 +483,30 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
     'implementations', 'previews', 'devices', 'adb', 'screenshot', 'record_start', 'record_stop']
     .every((m) => ext.limits[m] > 0) && ext.limits.initialize === 600000 && ext.limits.update === 15000
     && ext.limits.lenses === 15000 && ext.limits.record_stop === 1080000);
+  // a call past its limit on an engine that still answers a ping (it was only busy): kept
+  check('a ping after a time-out waits 5 s at most', ext.limits.probe === 5000);
+  ext.limits.probe = 300;
   fs.writeFileSync(silent, '["lenses"]');
   ext.limits.lenses = 100;
+  const pings = () => requests().filter((r) => r.method === 'ping').length;
+  const pingsBefore = pings();
   const lensResult = await Promise.race([provider.provideCodeLenses(doc('Api.kt')), sleep(2000).then(() => 'stuck')]);
   check('a never-answered lenses call ends', Array.isArray(lensResult));
-  ext.limits.lenses = 15000;
+  await until('the ping after the time-out', () => pings() > pingsBefore, 2000).catch(() => {});
+  await sleep(500);
+  const busyPid = requests().filter((r) => r.method === 'lenses').at(-1).pid;
+  check('a timed-out call first pings the engine', pings() === pingsBefore + 1
+    && requests().filter((r) => r.method === 'ping').at(-1).pid === busyPid);
   fs.rmSync(silent);
-  // the engine that ran past the limit is stopped: the next call goes to a new one
+  await provider.provideCodeLenses(doc('Api.kt'));
+  check('an engine that answers the ping is not restarted',
+    requests().filter((r) => r.method === 'lenses').at(-1).pid === busyPid);
+  // one that does not answer the ping either is stopped: the next call goes to a new one
+  fs.writeFileSync(silent, '["lenses","ping"]');
+  await Promise.race([provider.provideCodeLenses(doc('Api.kt')), sleep(2000)]);
+  ext.limits.lenses = 15000;
+  await sleep(500);
+  fs.rmSync(silent);
   const hungPid = requests().filter((r) => r.method === 'lenses').at(-1).pid;
   await provider.provideCodeLenses(doc('Api.kt'));
   const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
@@ -677,6 +694,21 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   check('folder changes load the test plugins again, for the new folder', testPlugins.loads === testLoads + 2
     && typeof testPlugins.project === 'function' && testPlugins.project() === dir);
 
+  // a call past its limit while the engine indexes waits like the others: no ping, no restart
+  fs.writeFileSync(silent, '["initialize","devices"]');
+  ext.limits.devices = 100;
+  errors.length = 0;
+  commands['droidLite.reindex']();
+  await until('the initialize', () => requests().at(-1)?.method === 'initialize');
+  const indexingPid = requests().at(-1).pid;
+  await commands['droidLite.screenshot']();
+  await sleep(ext.limits.probe + 300);
+  check('a time-out while indexing fails only that call', errors.some((m) => /did not answer devices/.test(m))
+    && alive(indexingPid) && !requests().some((r) => r.method === 'ping' && r.pid === indexingPid));
+  ext.limits.devices = 60000;
+  process.kill(indexingPid); // ends the initialize that is never answered
+  await sleep(200);
+
   // a big project: one initialize while the engine works on it, however long; later calls wait for it
   fs.writeFileSync(silent, '["initialize"]');
   ext.limits.initialize = 200;
@@ -729,7 +761,7 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   let polled = devicesCalls();
   await until('the polls to go on', () => devicesCalls() > polled + 1, 3000);
   await commands['droidLite.recordStart']();
-  fs.writeFileSync(delayFile, '{"record_stop":1000}');
+  fs.writeFileSync(delayFile, '{"record_stop":2000}');
   infos.length = 0;
   const saved = commands['droidLite.recordStop']();
   await sleep(100);
@@ -740,7 +772,19 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   check('no devices poll while a recording is saved', devicesCalls() === polled);
   check('a screenshot during the save waits for nothing: the user is told to wait',
     requests().filter((r) => r.method === 'screenshot').length === shots && infos.some((m) => /still being saved/.test(m)));
+  // a call that runs past its limit while the recording is saved does not restart the engine
+  const savingPid = requests().filter((r) => r.method === 'record_stop').at(-1).pid;
+  fs.writeFileSync(silent, '["lenses","ping"]');
+  ext.limits.lenses = 100;
+  await provider.provideCodeLenses(doc('Api.kt'));
+  await sleep(500);
+  check('no ping and no restart while a recording is saved', alive(savingPid)
+    && !requests().some((r) => r.method === 'ping' && r.pid === savingPid));
+  ext.limits.lenses = 15000;
+  fs.rmSync(silent);
   await saved;
+  check('the save ends on the same engine', alive(savingPid)
+    && requests().filter((r) => r.method === 'lenses').at(-1).pid === savingPid);
   await until('the polls after the save', () => devicesCalls() > polled, 2000).catch(() => {});
   check('the polls come back after the save', devicesCalls() > polled);
   fs.rmSync(delayFile);
@@ -754,17 +798,20 @@ const titles = async (d) => (await provider.provideCodeLenses(d)).map((l) => [l.
   cfg.enginePath = hung;
   ext.limits.devices = 100;
   errors.length = 0;
-  const hungIndex = commands['droidLite.reindex'](); // its initialize is never answered
-  await until('the hung engine', () => fs.existsSync(hungMark));
-  const hungEngine = Number(fs.readFileSync(hungMark, 'utf8'));
+  process.kill(requests().at(-1).pid); // the next call starts the hung engine
+  await sleep(200);
   const hungAt = Date.now();
-  await commands['droidLite.screenshot']();
+  const hungShot = commands['droidLite.screenshot'](); // not a project call: no initialize
+  await until('the hung engine', () => fs.existsSync(hungMark) && fs.readFileSync(hungMark, 'utf8').trim());
+  const hungEngine = Number(fs.readFileSync(hungMark, 'utf8'));
+  await hungShot;
   check('a call to a hung engine fails at its limit', errors.some((m) => /did not answer devices/.test(m)));
-  await hungIndex; // failed with the engine, not after limits.initialize
   check('a hung engine is not killed at once', alive(hungEngine));
   await until('the hung engine to be killed', () => !alive(hungEngine), 4000).catch(() => {});
-  check('a hung engine is killed after 2 s', !alive(hungEngine) && Date.now() - hungAt >= 2000);
+  check('a hung engine is killed 2 s after its ping went unanswered',
+    !alive(hungEngine) && Date.now() - hungAt >= ext.limits.devices + ext.limits.probe + 2000);
   ext.limits.devices = 60000;
+  ext.limits.probe = 5000;
   cfg.enginePath = fakeEngine;
 
   for (const s of [...ctx.subscriptions, ...ctx2.subscriptions]) s.dispose?.();

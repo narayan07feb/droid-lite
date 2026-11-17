@@ -80,6 +80,23 @@ impl PrsState {
         };
     }
 
+    /// A checkout of `root` being stopped, whose reply the test sends.
+    #[cfg(test)]
+    pub(super) fn add_stopping(
+        &mut self,
+        root: &Path,
+        number: u64,
+    ) -> std::sync::mpsc::Sender<Checkout> {
+        let (tx, rx) = channel();
+        self.stopping.push(Running {
+            root: root.to_path_buf(),
+            number,
+            ctl: Default::default(),
+            rx,
+        });
+        tx
+    }
+
     /// How many checkouts of closed projects are still being stopped.
     #[cfg(test)]
     pub(super) fn stopping_count(&self) -> usize {
@@ -355,7 +372,11 @@ impl App {
             self.prs.checkout = None;
             self.checked_out(reply);
         }
-        // a stopped checkout reports once gh has ended; only its own project shows it
+        // a stopped checkout reports once gh has ended; only its own project shows it. While a
+        // project opens its reply waits (it may be that project's), and the checkout stays busy
+        if self.indexing.is_some() {
+            return self.poll_pr_files();
+        }
         let mut ended = Vec::new();
         self.prs.stopping.retain(|r| match r.rx.try_recv() {
             Ok(reply) => {
@@ -368,6 +389,10 @@ impl App {
         for reply in ended {
             self.checked_out(reply);
         }
+        self.poll_pr_files();
+    }
+
+    fn poll_pr_files(&mut self) {
         if let Some(rx) = &self.prs.files_rx
             && let Ok((n, files)) = rx.try_recv()
         {
