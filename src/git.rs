@@ -297,7 +297,7 @@ pub struct Change {
     pub staged: bool,
 }
 
-/// What the Pull request tab shows: uncommitted work, and what this branch changed against its base.
+/// What the Current changes tab shows: uncommitted work, and what this branch changed against its base.
 #[derive(Clone, Debug, Default)]
 pub struct Changes {
     pub working: Vec<Change>,
@@ -338,7 +338,7 @@ pub fn parse_pr_list(json: &[u8]) -> Vec<OpenPr> {
 
 /// Open pull requests of the repository (newest first), for the base PR picker.
 pub fn open_prs(root: &Path) -> Vec<OpenPr> {
-    Command::new("gh")
+    Command::new(gh_program())
         .args([
             "pr",
             "list",
@@ -390,9 +390,11 @@ pub struct PrItem {
     pub review: String,
     /// Reviewers whose latest review approves it.
     pub approvals: u32,
+    /// The PR's branch (`headRefName`).
+    pub head: String,
 }
 
-/// `gh pr list --json number,title,author,isDraft,url,reviewDecision,latestReviews` output.
+/// `gh pr list --json number,title,author,isDraft,url,reviewDecision,latestReviews,headRefName` output.
 /// GitHub leaves `reviewDecision` empty when the branch rules ask for no review: then the
 /// reviewers' latest reviews decide (any change request wins over approvals).
 pub fn parse_pr_items(json: &[u8]) -> Vec<PrItem> {
@@ -421,22 +423,56 @@ pub fn parse_pr_items(json: &[u8]) -> Vec<PrItem> {
                 draft: v["isDraft"].as_bool().unwrap_or(false),
                 url: v["url"].as_str().unwrap_or("").to_string(),
                 review: review.to_string(),
+                head: v["headRefName"].as_str().unwrap_or("").to_string(),
             })
         })
         .collect()
 }
 
-/// Runs `gh` in `root` (off the UI thread: it uses the network); its stdout, or its first error line.
+/// The `gh` program: `DROID_LITE_GH` (tests point it at a fake), else `gh` from the PATH.
+pub fn gh_program() -> std::ffi::OsString {
+    std::env::var_os("DROID_LITE_GH").unwrap_or_else(|| "gh".into())
+}
+
+/// Why `gh` could not start: not installed is said plainly.
+fn gh_spawn_error(e: std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        "The GitHub CLI (gh) is not installed: brew install gh, then gh auth login".into()
+    } else {
+        format!("gh: {e}")
+    }
+}
+
+/// Why `gh` failed: the sign-in hint, else its first error line, past git's fetch progress
+/// ("From github.com:…").
+fn gh_failure(out: &std::process::Output) -> String {
+    let e = String::from_utf8_lossy(&out.stderr);
+    // gh exits with 4 when it needs a sign-in
+    if out.status.code() == Some(4) || e.contains("gh auth login") {
+        return "Not signed in to GitHub: run gh auth login in a terminal".into();
+    }
+    let words = "error|fatal|failed|could not|not found|denied";
+    let lines = || e.lines().map(str::trim).filter(|l| !l.is_empty());
+    lines()
+        .find(|l| {
+            let l = l.to_lowercase();
+            words.split('|').any(|w| l.contains(w))
+        })
+        .or_else(|| lines().next())
+        .unwrap_or("gh failed")
+        .to_string()
+}
+
+/// Runs `gh` in `root` (off the UI thread: it uses the network); its stdout, or why it failed.
 fn gh(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = Command::new("gh")
+    let out = Command::new(gh_program())
         .args(args)
         .current_dir(root)
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("gh: {e}"))?;
+        .map_err(gh_spawn_error)?;
     if !out.status.success() {
-        let e = String::from_utf8_lossy(&out.stderr);
-        return Err(e.lines().next().unwrap_or("gh failed").to_string());
+        return Err(gh_failure(&out));
     }
     Ok(out.stdout)
 }
@@ -450,13 +486,49 @@ pub fn list_prs(root: &Path, filter: PrFilter) -> Result<Vec<PrItem>, String> {
     };
     let mut args = vec!["pr", "list", "--state", "open", "--limit", "100"];
     args.extend(who);
-    args.extend(["--json", "number,title,author,isDraft,url,reviewDecision,latestReviews"]);
+    args.extend([
+        "--json",
+        "number,title,author,isDraft,url,reviewDecision,latestReviews,headRefName",
+    ]);
     let prs = gh(root, &args).map(|o| parse_pr_items(&o))?;
     // decided here, not by GitHub's search, so it matches the ✓ in the other lists
     Ok(match filter {
         PrFilter::Approved => prs.into_iter().filter(|p| p.review == "APPROVED").collect(),
         _ => prs,
     })
+}
+
+/// Checks out pull request `number` with `<gh> pr checkout` (`gh` is the program, a fake in
+/// tests) and returns the branch it is on now. Never loses work: when tracked files have
+/// uncommitted changes it refuses and lists them (untracked files do not count).
+pub fn checkout_pr(root: &Path, number: u64, gh: &std::ffi::OsStr) -> Result<String, String> {
+    let mut dirty: Vec<PathBuf> = Vec::new();
+    for c in status(root).into_iter().filter(|c| c.code != '?') {
+        if !dirty.contains(&c.path) {
+            dirty.push(c.path);
+        }
+    }
+    if !dirty.is_empty() {
+        let mut msg = String::from("Commit or stash your changes first:");
+        for p in dirty.iter().take(10) {
+            let rel = p.strip_prefix(root).unwrap_or(p);
+            msg.push_str(&format!("\n{}", rel.display()));
+        }
+        if dirty.len() > 10 {
+            msg.push_str(&format!("\n… and {} more", dirty.len() - 10));
+        }
+        return Err(msg);
+    }
+    let out = Command::new(gh)
+        .args(["pr", "checkout", &number.to_string()])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(gh_spawn_error)?;
+    if !out.status.success() {
+        return Err(gh_failure(&out));
+    }
+    branch(root).ok_or_else(|| "Checked out, but git shows no branch".into())
 }
 
 /// A pull request's whole diff (`gh pr diff`), split into one diff per file.
@@ -504,7 +576,7 @@ fn ref_exists(root: &Path, r: &str) -> bool {
 pub fn resolve_base(root: &Path, choice: &str) -> Result<String, String> {
     let branch = match pr_number(choice) {
         Some(n) => {
-            let out = Command::new("gh")
+            let out = Command::new(gh_program())
                 .args(["pr", "view", &n.to_string(), "--json", "headRefName"])
                 .current_dir(root)
                 .stdin(Stdio::null())
@@ -591,7 +663,7 @@ pub fn status(root: &Path) -> Vec<Change> {
 /// The branch the current one is compared with: the PR's base when `gh` answers, else
 /// `origin/HEAD`, else the first of origin/develop, origin/main, origin/master that exists.
 pub fn base_branch(root: &Path) -> (Option<String>, Option<String>) {
-    if let Ok(out) = Command::new("gh")
+    if let Ok(out) = Command::new(gh_program())
         .args(["pr", "view", "--json", "number,title,baseRefName"])
         .current_dir(root)
         .stdin(Stdio::null())
@@ -775,7 +847,7 @@ mod tests {
     #[test]
     fn sidebar_pr_items_are_read() {
         let prs = parse_pr_items(
-            br#"[{"number":7,"title":"Fix","author":{"login":"ana"},"isDraft":true,"url":"https://x/7","reviewDecision":"APPROVED"},{"title":"no number"},{"number":8}]"#,
+            br#"[{"number":7,"title":"Fix","author":{"login":"ana"},"isDraft":true,"url":"https://x/7","reviewDecision":"APPROVED","headRefName":"fix"},{"title":"no number"},{"number":8}]"#,
         );
         assert_eq!(prs.len(), 2);
         assert_eq!(
@@ -788,6 +860,7 @@ mod tests {
                 url: "https://x/7".into(),
                 review: "APPROVED".into(),
                 approvals: 0,
+                head: "fix".into(),
             }
         );
         assert_eq!(
@@ -978,6 +1051,74 @@ mod tests {
         g(&["commit", "-q", "-m", "B"]);
         assert!(status(&dir).iter().all(|c| c.code == '?'));
         assert!(run(&dir, &["checkout", "nope"]).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn checkout_pr_runs_gh_and_never_loses_work() {
+        let dir = std::env::temp_dir().join(format!("droid-lite-git-co-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let g = |args: &[&str]| run(&repo, args).unwrap();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.name", "T"]);
+        g(&["config", "user.email", "t@example.com"]);
+        for i in 0..12 {
+            std::fs::write(repo.join(format!("F{i}.kt")), "a\n").unwrap();
+        }
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "base"]);
+        // a fake gh: PR 7 checks out, 8 fails after git's progress lines, 9 needs a sign-in
+        let gh = dir.join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\n[ \"$1 $2\" = \"pr checkout\" ] || exit 3\ncase \"$3\" in\n  7) git checkout -q -b pr-7;;\n  8) echo 'From github.com:x/y' >&2; echo 'failed to run git: fatal: no ref pull/8' >&2; exit 1;;\n  *) echo 'please run:  gh auth login' >&2; exit 4;;\nesac\n",
+        )
+        .unwrap();
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&gh)
+            .status()
+            .unwrap();
+        let gh = gh.as_os_str();
+        // untracked files do not block; a gh failure shows its error line, not the progress
+        std::fs::write(repo.join("New.kt"), "n\n").unwrap();
+        assert_eq!(
+            checkout_pr(&repo, 8, gh),
+            Err("failed to run git: fatal: no ref pull/8".into())
+        );
+        assert_eq!(
+            checkout_pr(&repo, 9, gh),
+            Err("Not signed in to GitHub: run gh auth login in a terminal".into())
+        );
+        assert!(
+            checkout_pr(&repo, 7, "/nonexistent/droid-lite-gh".as_ref())
+                .unwrap_err()
+                .contains("not installed")
+        );
+        assert_eq!(branch(&repo).as_deref(), Some("main"));
+        // changed tracked files: refused, nothing switches, up to 10 files listed
+        std::fs::write(repo.join("F0.kt"), "b\n").unwrap();
+        g(&["add", "F0.kt"]);
+        std::fs::write(repo.join("F0.kt"), "c\n").unwrap(); // staged and unstaged: listed once
+        let err = checkout_pr(&repo, 7, gh).unwrap_err();
+        assert_eq!(err, "Commit or stash your changes first:\nF0.kt");
+        for i in 1..12 {
+            std::fs::write(repo.join(format!("F{i}.kt")), "b\n").unwrap();
+        }
+        let err = checkout_pr(&repo, 7, gh).unwrap_err();
+        let lines: Vec<&str> = err.lines().collect();
+        assert_eq!(lines.len(), 12, "{err}");
+        assert_eq!(lines[1], "F0.kt");
+        assert_eq!(lines[11], "… and 2 more");
+        assert_eq!(branch(&repo).as_deref(), Some("main"));
+        // a clean tree checks out and reports the new branch
+        g(&["reset", "-q", "--hard"]);
+        assert_eq!(checkout_pr(&repo, 7, gh), Ok("pr-7".into()));
+        assert_eq!(branch(&repo).as_deref(), Some("pr-7"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -280,7 +280,8 @@ enum Bottom {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Right {
     Compose,
-    PullRequest,
+    /// Current changes: the branch / PR's files and uncommitted work.
+    Changes,
 }
 
 /// What the Compose panel shows for one composable; rebuilt only when its inputs change.
@@ -587,7 +588,7 @@ impl App {
         }
         if std::env::var_os("DROID_LITE_BLAME").is_some() {
             app.git.show_column = true;
-            app.right = Right::PullRequest;
+            app.right = Right::Changes;
         }
         if let Ok(q) = std::env::var("DROID_LITE_SEARCH") {
             app.search = Some(Search {
@@ -1989,7 +1990,7 @@ impl App {
                     .on_hover_text(format!("{b}\nShow this branch's changes"))
                     .clicked()
                 {
-                    self.right = Right::PullRequest;
+                    self.right = Right::Changes;
                     self.show_right = true;
                     self.focus = false;
                 }
@@ -3908,7 +3909,7 @@ impl eframe::App for App {
         self.poll_capture(&ctx);
         self.rescan_resources(&ctx);
         self.poll_libs();
-        self.refresh_changes(&ctx); // git status for tree colours, not only the Pull request tab
+        self.refresh_changes(&ctx); // git status for tree colours, not only the Current changes tab
         self.watch_focus(&ctx);
         self.save_session(false);
         watch.stage("shortcuts", || self.shortcuts(&ctx));
@@ -3969,8 +3970,8 @@ impl eframe::App for App {
                         for (r, label) in [
                             (Right::Compose, format!("{}  Compose", ic::CUBE)),
                             (
-                                Right::PullRequest,
-                                format!("{}  Pull request", ic::GIT_PULL_REQUEST),
+                                Right::Changes,
+                                format!("{}  Current changes", ic::GIT_PULL_REQUEST),
                             ),
                         ] {
                             if tabs.tab(ui, self.right == r, label).clicked() {
@@ -3988,7 +3989,7 @@ impl eframe::App for App {
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| self.compose_panel(ui));
                         }
-                        Right::PullRequest => {
+                        Right::Changes => {
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| self.git_panel(ui));

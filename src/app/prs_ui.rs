@@ -1,5 +1,6 @@
 //! The sidebar's Pull requests view: your open PRs and the ones waiting for your review (through
 //! `gh`, off the UI thread). A PR opens to its changed files; a file shows its diff in the diff panel.
+//! "Check out" switches the project to a PR's branch (`gh pr checkout`), never over uncommitted work.
 
 use super::App;
 use crate::git::{self, PrFilter, PrItem};
@@ -22,6 +23,10 @@ pub(super) struct PrsState {
     pub open: Option<(u64, Option<Files>)>,
     /// The files of PR number `.0`; a reply for a PR closed since then is dropped.
     files_rx: Option<Receiver<(u64, Files)>>,
+    /// "Checking out #7…", then its result or why it was refused; `true` for an error.
+    pub note: Option<(String, bool)>,
+    /// The running `gh pr checkout`: the PR number and the new branch or the error.
+    checkout_rx: Option<Receiver<(u64, Result<String, String>)>>,
 }
 
 /// Opens a link in Google Chrome, else the default browser.
@@ -94,6 +99,12 @@ impl App {
             self.prs.lists.insert(*f, list);
             self.prs.list_rx = None;
         }
+        if let Some(rx) = &self.prs.checkout_rx
+            && let Ok((n, res)) = rx.try_recv()
+        {
+            self.prs.checkout_rx = None;
+            self.checked_out(n, res);
+        }
         if let Some(rx) = &self.prs.files_rx
             && let Ok((n, files)) = rx.try_recv()
         {
@@ -105,6 +116,20 @@ impl App {
             self.prs.files_rx = None;
         }
         ui.separator();
+        if let Some((text, error)) = &self.prs.note {
+            ui.horizontal(|ui| {
+                if self.prs.checkout_rx.is_some() {
+                    ui.spinner();
+                }
+                let t = RichText::new(text);
+                ui.label(if *error {
+                    t.color(crate::highlight::WARN)
+                } else {
+                    t
+                });
+            });
+            ui.separator();
+        }
         let list = match self.prs.lists.get(&filter) {
             None => {
                 ui.label(RichText::new("Loading pull requests…").weak());
@@ -129,6 +154,8 @@ impl App {
         }
         let mut toggle = None;
         let mut diff = None;
+        let mut checkout = None;
+        let busy = self.prs.checkout_rx.is_some();
         egui::ScrollArea::vertical()
             .id_salt("prs")
             .auto_shrink([false, false])
@@ -173,9 +200,13 @@ impl App {
                     if r.clicked() {
                         toggle = Some(p.number);
                     }
-                    // the second line: author, draft, review state
+                    // the second line: author, draft, review state; Check out at the right
                     ui.horizontal(|ui| {
                         ui.add_space(18.0);
+                        if self.branch.as_deref() == Some(p.head.as_str()) {
+                            ui.label(RichText::new("● current").small().color(APPROVED))
+                                .on_hover_text(format!("{} is checked out", p.head));
+                        }
                         ui.label(RichText::new(&p.author).weak().small());
                         if p.draft {
                             ui.label(RichText::new("Draft").weak().small());
@@ -188,6 +219,18 @@ impl App {
                             };
                             ui.label(RichText::new(t).small().color(c));
                         }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_enabled(
+                                    !busy,
+                                    egui::Button::new(RichText::new("Check out").small()),
+                                )
+                                .on_hover_text(format!("gh pr checkout {}", p.number))
+                                .clicked()
+                            {
+                                checkout = Some(p.number);
+                            }
+                        });
                     });
                     let Some((_, files)) = opened else { continue };
                     match files {
@@ -234,9 +277,9 @@ impl App {
             } else {
                 self.prs.open = Some((n, None));
                 let (tx, rx) = channel();
-                let c = ui.ctx().clone();
+                let (r, c) = (root.clone(), ui.ctx().clone());
                 std::thread::spawn(move || {
-                    let _ = tx.send((n, git::pr_diff(&root, n)));
+                    let _ = tx.send((n, git::pr_diff(&r, n)));
                     c.request_repaint();
                 });
                 self.prs.files_rx = Some(rx);
@@ -244,6 +287,37 @@ impl App {
         }
         if let Some((title, text)) = diff {
             self.show_diff_text(title, text);
+        }
+        if let Some(n) = checkout {
+            let text = format!("Checking out #{n}…");
+            self.status = text.clone();
+            self.prs.note = Some((text, false));
+            let (tx, rx) = channel();
+            let c = ui.ctx().clone();
+            std::thread::spawn(move || {
+                let _ = tx.send((n, git::checkout_pr(&root, n, &git::gh_program())));
+                c.request_repaint();
+            });
+            self.prs.checkout_rx = Some(rx);
+        }
+    }
+
+    /// After `gh pr checkout`: the branch name, the Current changes tab, tree colours and the PR
+    /// lists refresh here; the tree and open files follow the files on disk (the watcher).
+    fn checked_out(&mut self, n: u64, res: Result<String, String>) {
+        match res {
+            Ok(branch) => {
+                let text = format!("Checked out #{n} ({branch})");
+                self.branch = Some(branch);
+                self.git.changes_stale = true;
+                self.prs.lists.clear();
+                self.status = text.clone();
+                self.prs.note = Some((text, false));
+            }
+            Err(e) => {
+                self.status = e.lines().next().unwrap_or_default().to_string();
+                self.prs.note = Some((e, true));
+            }
         }
     }
 }

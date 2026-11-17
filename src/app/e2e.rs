@@ -105,6 +105,8 @@ impl Fixture {
         unsafe { std::env::set_var("DROID_LITE_LSP", "/nonexistent/droid-lite-no-lsp") };
         // nor any real phone: adb is missing unless a Logcat test sets the fake one
         unsafe { std::env::set_var("DROID_LITE_ADB", "/nonexistent/droid-lite-no-adb") };
+        // nor GitHub: gh is missing unless a pull request test sets the fake one
+        unsafe { std::env::set_var("DROID_LITE_GH", "/nonexistent/droid-lite-no-gh") };
         // previews draw by themselves: every test gets the stand-in worker and its own preview folder,
         // never the real JVM worker or ~/Library/Caches
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -594,8 +596,8 @@ fn e2e_git_blame_history_and_commit_diff() {
             .as_ref()
             .is_some_and(|b| b.line(2).is_some_and(|c| c.is_uncommitted()))
     });
-    // Pull request tab: history and the commit's diff
-    h.get_by_label(&format!("{}  Pull request", ic::GIT_PULL_REQUEST))
+    // Current changes tab: history and the commit's diff
+    h.get_by_label(&format!("{}  Current changes", ic::GIT_PULL_REQUEST))
         .click();
     wait(&mut h, "history", |a| a.git_history_len() == 1);
     h.get_by_label("Initial commit");
@@ -1490,7 +1492,7 @@ fn e2e_git_tab_lists_changes_stage_commit_and_branch() {
         "package com.demo.ui\n",
     )
     .unwrap();
-    h.get_by_label(&format!("{}  Pull request", ic::GIT_PULL_REQUEST))
+    h.get_by_label(&format!("{}  Current changes", ic::GIT_PULL_REQUEST))
         .click();
     wait(&mut h, "changes", |a| {
         a.git
@@ -1613,7 +1615,7 @@ fn e2e_pull_request_tab_compares_with_the_picked_base() {
     git(&["commit", "-q", "-am", "second PR"]);
     h.state_mut().branch = Some("second".into());
     h.state_mut().git.changes_stale = true;
-    h.get_by_label(&format!("{}  Pull request", ic::GIT_PULL_REQUEST))
+    h.get_by_label(&format!("{}  Current changes", ic::GIT_PULL_REQUEST))
         .click();
     let files = |a: &App| a.git.changes.as_ref().map(|c| c.branch.len());
     wait(&mut h, "automatic base", |a| files(a) == Some(2));
@@ -1749,7 +1751,7 @@ fn e2e_revert_each_file() {
     std::fs::write(&new, "package com.demo.ui\n").unwrap();
     h.state_mut().branch = Some("feature".into());
     h.state_mut().git.changes_stale = true;
-    h.get_by_label(&format!("{}  Pull request", ic::GIT_PULL_REQUEST))
+    h.get_by_label(&format!("{}  Current changes", ic::GIT_PULL_REQUEST))
         .click();
     let counts = |a: &App| {
         a.git
@@ -2851,7 +2853,7 @@ fn drag(h: &mut Harness<'static, App>, from: egui::Pos2, to: egui::Pos2) {
 }
 
 #[test]
-fn e2e_pull_request_panel_resizes_both_ways() {
+fn e2e_current_changes_panel_resizes_both_ways() {
     let f = Fixture::new("prwidth");
     let mut h = f.harness();
     let git = |args: &[&str]| {
@@ -2873,7 +2875,7 @@ fn e2e_pull_request_panel_resizes_both_ways() {
     git(&["add", "."]);
     h.state_mut().branch = Some(branch.into());
     h.state_mut().git.changes_stale = true;
-    h.get_by_label(&format!("{}  Pull request", ic::GIT_PULL_REQUEST))
+    h.get_by_label(&format!("{}  Current changes", ic::GIT_PULL_REQUEST))
         .click();
     wait(&mut h, "changes", |a| {
         a.git.changes.as_ref().is_some_and(|c| c.working.len() == 1)
@@ -2896,7 +2898,7 @@ fn e2e_pull_request_panel_resizes_both_ways() {
             .x
     };
     for (dx, what) in [
-        (110.0, "narrower"),
+        (100.0, "narrower"), // the tab row (Compose, Current changes) sets the narrowest
         (-300.0, "wider"),
         (200.0, "narrower again"),
     ] {
@@ -4102,9 +4104,9 @@ fn e2e_ux_audit() {
                 if root.is_none() {
                     continue;
                 }
-                h.state_mut().right = Right::PullRequest;
+                h.state_mut().right = Right::Changes;
                 h.state_mut().show_right = true;
-                shot(&mut h, "2-pull-request");
+                shot(&mut h, "2-current-changes");
                 h.state_mut().right = Right::Compose;
                 for (i, b) in [Bottom::Build, Bottom::Find, Bottom::Logcat, Bottom::Tests, Bottom::Performance]
                     .into_iter()
@@ -4275,6 +4277,7 @@ fn e2e_sidebar_pull_requests_open_a_file_diff_beside_the_editor() {
         url: String::new(),
         review: if n == 7 { "APPROVED".into() } else { String::new() },
         approvals: u32::from(n == 7) * 2,
+        head: String::new(),
     };
     {
         let s = h.state_mut();
@@ -4325,4 +4328,145 @@ fn e2e_sidebar_pull_requests_open_a_file_diff_beside_the_editor() {
         .click();
     steps(&mut h, 2);
     assert!(!h.state().prs.shown);
+}
+
+/// Clicks the Check out button of the PR titled `title` (on the line below the title).
+fn click_check_out(h: &mut Harness<'static, App>, title: &str) {
+    steps(h, 2); // the layout settles first (a note above the list moves the rows)
+    let y = h.get_by_label(title).rect().center().y;
+    let pos = h
+        .get_all_by_label("Check out")
+        .map(|n| n.rect().center())
+        .filter(|p| p.y > y)
+        .min_by(|a, b| a.y.total_cmp(&b.y))
+        .expect("a Check out button below the title");
+    click_at(h, pos, egui::PointerButton::Primary);
+}
+
+#[test]
+fn e2e_check_out_a_pull_request_from_the_sidebar() {
+    let f = Fixture::new("prcheckout");
+    let git = |args: &[&str]| crate::git::run(&f.root, args).unwrap();
+    // the PR's branch: User.kt differs there
+    let start = crate::git::branch(&f.root).unwrap();
+    git(&["checkout", "-q", "-b", "pr-7"]);
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    std::fs::write(&user, USER_KT.replace("var age", "val age")).unwrap();
+    git(&["commit", "-q", "-am", "PR 7"]);
+    git(&["checkout", "-q", &start]);
+    // a fake gh: lists PR 7 (branch pr-7) and 8; checks out 7, fails on 8
+    let bin = std::env::temp_dir().join(format!("droid-lite-fake-gh-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&bin);
+    std::fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        "#!/bin/sh\necho \"$*\" >> \"$0.log\"\ncase \"$1 $2 $3\" in\n  'pr list '*) echo '[{\"number\":7,\"title\":\"Fix login\",\"headRefName\":\"pr-7\"},{\"number\":8,\"title\":\"Add cards\",\"headRefName\":\"pr-8\"}]';;\n  'pr checkout 7') git checkout -q pr-7;;\n  'pr checkout 8') echo 'From github.com:demo/demo' >&2; echo 'GraphQL: Could not resolve to a PullRequest with the number of 8.' >&2; exit 1;;\n  *) exit 2;;\nesac\n",
+    )
+    .unwrap();
+    std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(&gh)
+        .status()
+        .unwrap();
+    // SAFETY: the SERIAL lock (held by the fixture) keeps other tests out of the environment.
+    unsafe { std::env::set_var("DROID_LITE_GH", &gh) };
+    let mut h = f.harness();
+    open(&mut h, &user);
+    let checkout_done = |a: &App| {
+        a.prs
+            .note
+            .as_ref()
+            .is_some_and(|(t, _)| !t.starts_with("Checking"))
+    };
+    // the renamed right-panel tab
+    assert!(
+        h.query_by_label(&format!("{}  Pull request", ic::GIT_PULL_REQUEST))
+            .is_none()
+    );
+    h.get_by_label(&format!("{}  Current changes", ic::GIT_PULL_REQUEST))
+        .click();
+    steps(&mut h, 3);
+    assert_eq!(h.state().right, Right::Changes);
+    h.get_by_label(&format!("{}  Pull requests", ic::GIT_PULL_REQUEST))
+        .click();
+    wait(
+        &mut h,
+        "the PR list from gh",
+        |a| matches!(a.prs.lists.get(&crate::git::PrFilter::Mine), Some(Ok(l)) if l.len() == 2),
+    );
+    steps(&mut h, 3);
+    assert!(h.query_by_label("#7 Fix login").is_some());
+    assert!(
+        h.query_by_label("● current").is_none(),
+        "pr-7 is not checked out yet"
+    );
+    // uncommitted work in a tracked file: refused, the branch stays, the file is listed
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    std::fs::write(&card, format!("{CARD_KT}// mine\n")).unwrap();
+    click_check_out(&mut h, "#7 Fix login");
+    wait(&mut h, "refusal", |a| {
+        a.prs.note.as_ref().is_some_and(|(_, err)| *err)
+    });
+    let (note, _) = h.state().prs.note.clone().unwrap();
+    assert_eq!(
+        note,
+        "Commit or stash your changes first:\napp/src/main/java/com/demo/ui/UserCard.kt"
+    );
+    steps(&mut h, 2);
+    assert!(
+        h.query_by_label(&note).is_some(),
+        "the refusal is on screen"
+    );
+    assert_eq!(crate::git::branch(&f.root).as_deref(), Some(start.as_str()));
+    assert!(tab(&h).text.contains("var age"));
+    // a clean tree: gh checks out, the branch, the open file and the list follow
+    git(&["checkout", "-q", "--", "."]);
+    h.state_mut().prs.note = None;
+    click_check_out(&mut h, "#7 Fix login");
+    wait(&mut h, "checked out", checkout_done);
+    assert_eq!(
+        h.state().prs.note,
+        Some(("Checked out #7 (pr-7)".to_string(), false))
+    );
+    assert_eq!(h.state().branch.as_deref(), Some("pr-7"));
+    assert_eq!(h.state().status, "Checked out #7 (pr-7)");
+    wait(&mut h, "the open file reloads from disk", |a| {
+        a.tabs[a.active].text.contains("val age")
+    });
+    wait(&mut h, "the list reloads", |a| {
+        a.prs.lists.contains_key(&crate::git::PrFilter::Mine)
+    });
+    steps(&mut h, 3);
+    let calls = std::fs::read_to_string(bin.join("gh.log")).unwrap();
+    assert_eq!(
+        calls.lines().filter(|l| l.contains("--author @me")).count(),
+        2,
+        "the list reloads after the checkout: {calls}"
+    );
+    // the list asks gh for each PR's branch, which the current marker compares with
+    assert!(
+        calls
+            .lines()
+            .filter(|l| l.contains("--author @me"))
+            .all(|l| l.contains("headRefName")),
+        "{calls}"
+    );
+    assert!(
+        h.query_by_label("● current").is_some(),
+        "the checked-out PR is marked"
+    );
+    // gh fails: its error line, not git's progress
+    h.state_mut().prs.note = None;
+    click_check_out(&mut h, "#8 Add cards");
+    wait(&mut h, "failure", checkout_done);
+    assert_eq!(
+        h.state().prs.note,
+        Some((
+            "GraphQL: Could not resolve to a PullRequest with the number of 8.".to_string(),
+            true
+        ))
+    );
+    assert_eq!(h.state().branch.as_deref(), Some("pr-7"));
+    let _ = std::fs::remove_dir_all(&bin);
 }

@@ -47,7 +47,7 @@ pub(super) struct GitState {
     /// Uncommitted files and the branch's changes (refreshed in the background).
     pub changes: Option<git::Changes>,
     changes_rx: Option<Receiver<git::Changes>>,
-    /// Set by file-system events and git commands; the next Pull request tab frame refreshes.
+    /// Set by file-system events and git commands; the next Current changes tab frame refreshes.
     pub changes_stale: bool,
     commit_message: String,
     /// Open pull requests for the base PR picker (loaded when the picker opens).
@@ -404,7 +404,7 @@ impl App {
         }
     }
 
-    /// The Pull request tab: the branch / pull request's files, uncommitted changes (stage, commit),
+    /// The Current changes tab: the branch / pull request's files, uncommitted changes (stage, commit),
     /// branch switch, and the open file's history.
     pub(super) fn git_panel(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
