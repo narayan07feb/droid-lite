@@ -26,6 +26,11 @@ const MAX_CLASSES: usize = 40;
 /// How many library functions of the name are read to match an extension's receiver.
 const MAX_EXTENSION_FILES: usize = 30;
 
+/// The project's compile SDK by project root, shared with the lookup workers.
+/// A walk step: candidate classes (name, nested guess), depth, which start it came from.
+type Step = (Vec<(String, bool)>, usize, usize);
+type ApiCache = Arc<std::sync::Mutex<Option<(PathBuf, Option<u32>)>>>;
+
 /// Downloads of sources, and lookups on a worker.
 #[derive(Default)]
 pub(super) struct Fetches {
@@ -45,8 +50,8 @@ pub(super) struct Fetches {
     pub usages_again: Option<LibCall>,
     /// Find usages' searches: a newer one makes an older one stop.
     pub usages_gen: Arc<AtomicU64>,
-    /// The project's compile SDK, read once per project root.
-    api: Option<(PathBuf, Option<u32>)>,
+    /// The project's compile SDK, read once per project root (on a worker).
+    api: ApiCache,
     /// How many downloads ran (tests check a cached source is not downloaded again).
     pub started: usize,
 }
@@ -83,8 +88,8 @@ enum Looked {
     Fetch(Fetch, Jump),
     /// No source can be had: a stub (its path, text and the member's offset) and why.
     Stub(PathBuf, String, Option<usize>, String),
-    /// Not found: why.
-    NotFound(String),
+    /// Not found: why, and the call (one with a fallback is looked up by name).
+    NotFound(String, Option<LibCall>),
     /// Find usages: nothing to fetch.
     Nothing,
 }
@@ -101,6 +106,9 @@ pub(super) struct LookupBase {
     root: PathBuf,
     sdk: Option<PathBuf>,
     api: Option<u32>,
+    /// The project's compile SDK, shared: the first lookup of a project reads it from `scripts`.
+    api_cache: ApiCache,
+    scripts: Vec<PathBuf>,
     libs: Arc<Libraries>,
     /// Downloads that may not run (again): done but the class was not in them (None), or failed
     /// lately (the error), for the stub's note.
@@ -153,7 +161,7 @@ impl App {
         self.cancel_lib_jump();
         self.fetches.prefetch = None;
         self.fetches.usages_again = None;
-        self.fetches.api = None;
+        self.fetches.api = Default::default();
     }
 
     /// The imports of the open file (where a class known only by its simple name may be nested).
@@ -169,23 +177,20 @@ impl App {
         let p = self.project.as_ref()?;
         let root = p.root.clone();
         let sdk = libsrc::sdk_dir();
-        let api = match &self.fetches.api {
-            Some((r, api)) if *r == root => *api,
-            _ => {
-                let scripts: Vec<PathBuf> = p
-                    .files
-                    .iter()
-                    .filter(|f| f.extension().is_some_and(|e| e == "kts" || e == "gradle"))
-                    .cloned()
-                    .collect();
-                // read once per project; the scripts are small
-                let api = sdk
-                    .as_ref()
-                    .and_then(|s| libsrc::compile_sdk(&root, &scripts, s));
-                self.fetches.api = Some((root.clone(), api));
-                api
-            }
-        };
+        // the compile SDK is read on the worker the first time (build scripts can be many)
+        let api = self
+            .fetches
+            .api
+            .lock()
+            .ok()
+            .and_then(|a| a.as_ref().filter(|(r, _)| *r == root).map(|(_, api)| *api))
+            .flatten();
+        let scripts: Vec<PathBuf> = p
+            .files
+            .iter()
+            .filter(|f| f.extension().is_some_and(|e| e == "kts" || e == "gradle"))
+            .cloned()
+            .collect();
         let blocked = self
             .fetches
             .ended
@@ -200,6 +205,8 @@ impl App {
             root,
             sdk,
             api,
+            api_cache: self.fetches.api.clone(),
+            scripts,
             libs: self.libs.clone(),
             blocked,
         })
@@ -316,7 +323,14 @@ impl App {
             Some(Looked::Fetch(fetch, jump)) => self.start_fetch(fetch, jump, true),
             Some(Looked::Found(hits)) => self.open_found(hits),
             Some(Looked::Stub(path, text, at, why)) => self.open_stub(path, text, at, why),
-            Some(Looked::NotFound(why)) => self.status = why,
+            Some(Looked::NotFound(why, call)) => match call.filter(|c| c.fallback) {
+                // not a member of the project class's library supertype: by name, as before
+                Some(c) => {
+                    self.status = why;
+                    self.goto_named(c.member);
+                }
+                None => self.status = why,
+            },
             Some(Looked::Nothing) | None => {}
         }
     }
@@ -375,6 +389,16 @@ type CallKey = (Option<PathBuf>, String, Option<String>, String);
 /// A declaration: its file and offset.
 type Decl = (PathBuf, usize);
 
+/// How a library Find usages came out.
+pub(super) enum UsagesState {
+    /// Each call checked against the declaration.
+    Exact,
+    /// The declaration's source is downloading: calls on the same class for now.
+    Downloading,
+    /// The declaration has no source (a stub, not found, or several fit): calls on the same class.
+    NoSource,
+}
+
 /// Find usages of a library call, exactly: the candidate calls (same member, as many arguments,
 /// argument types that can match) that lead to the same declaration as `target`. When the target's
 /// declaration cannot be read yet (its source is missing), the candidates on the same class are
@@ -385,7 +409,7 @@ pub(super) fn exact_usages(
     target_imports: Vec<String>,
     cands: Vec<(super::FoundLine, LibCall)>,
     stale: impl Fn() -> bool,
-) -> Option<(Vec<super::FoundLine>, bool)> {
+) -> Option<(Vec<super::FoundLine>, UsagesState)> {
     let decl = |call: LibCall, imports: Vec<String>| -> Option<Decl> {
         let l = Lookup {
             jump: Jump { call, imports },
@@ -397,7 +421,20 @@ pub(super) fn exact_usages(
             _ => None,
         }
     };
-    let want = decl(target.clone(), target_imports);
+    let target_look = Lookup {
+        jump: Jump {
+            call: target.clone(),
+            imports: target_imports,
+        },
+        fetch_only: false,
+        base: base.clone(),
+    }
+    .run();
+    let (want, state) = match target_look {
+        Looked::Found(h) if h.len() == 1 => (Some((h[0].0.clone(), h[0].1)), UsagesState::Exact),
+        Looked::Fetch(..) => (None, UsagesState::Downloading),
+        _ => (None, UsagesState::NoSource),
+    };
     let mut known: HashMap<CallKey, Option<Decl>> = HashMap::new();
     let mut imports: HashMap<PathBuf, Vec<String>> = HashMap::new();
     let mut out = Vec::new();
@@ -440,7 +477,7 @@ pub(super) fn exact_usages(
             out.push(line);
         }
     }
-    Some((out, want.is_none()))
+    Some((out, state))
 }
 
 /// A finished lookup from `slot`; a lookup that died (a bug in it) clears the slot and says so.
@@ -493,6 +530,25 @@ impl Lookup {
     /// else the download that would bring a missing source, or the stub. Find usages
     /// (`fetch_only`) walks the same way and only answers what to fetch.
     fn run(mut self) -> Looked {
+        if self.base.api.is_none()
+            && let Some(sdk) = &self.base.sdk
+        {
+            let known = self.base.api_cache.lock().ok().and_then(|a| {
+                a.as_ref()
+                    .filter(|(r, _)| *r == self.base.root)
+                    .map(|(_, api)| *api)
+            });
+            self.base.api = match known {
+                Some(api) => api,
+                None => {
+                    let api = libsrc::compile_sdk(&self.base.root, &self.base.scripts, sdk);
+                    if let Ok(mut a) = self.base.api_cache.lock() {
+                        *a = Some((self.base.root.clone(), api));
+                    }
+                    api
+                }
+            };
+        }
         if self.jump.call.builtin {
             // a Kotlin type: a standard library extension (its members have no source to read)
             if self.fetch_only {
@@ -514,14 +570,18 @@ impl Lookup {
             Some(q) => vec![vec![(q.clone(), false)]],
             None => self.candidates().into_iter().map(|c| vec![c]).collect(),
         };
-        let mut queue: VecDeque<(Vec<(String, bool)>, usize)> =
-            starts.into_iter().map(|c| (c, 0)).collect();
+        // (classes, depth, which start it came from)
+        let mut queue: VecDeque<Step> = starts
+            .into_iter()
+            .enumerate()
+            .map(|(k, c)| (c, 0, k))
+            .collect();
         let mut seen: HashSet<String> = HashSet::new();
         let mut seen_names: Vec<String> = Vec::new();
         let mut levels: Vec<Level> = Vec::new();
         let mut loose: Vec<(PathBuf, usize, String)> = Vec::new();
         let mut missing: Option<(Fetch, Option<ClassFile>, String, usize)> = None;
-        while let Some((cands, depth)) = queue.pop_front() {
+        while let Some((cands, depth, origin)) = queue.pop_front() {
             if seen.len() >= MAX_CLASSES {
                 break;
             }
@@ -540,7 +600,8 @@ impl Lookup {
             let path = match source {
                 Source::Text(p) => p,
                 Source::Missing(fetch, stub) => {
-                    if missing.is_none() {
+                    // a guessed receiver class other than the surest one: not worth a download
+                    if missing.is_none() && origin == 0 {
                         missing = Some((fetch, stub, simple, depth));
                     }
                     continue; // its supertypes cannot be read either
@@ -574,7 +635,7 @@ impl Lookup {
                         .map(|s| (s, false))
                         .collect();
                     if !sup.is_empty() {
-                        queue.push_back((sup, depth + 1));
+                        queue.push_back((sup, depth + 1, origin));
                     }
                 }
             }
@@ -593,9 +654,15 @@ impl Lookup {
             None => Vec::new(),
         };
         let exact_depth = best.map_or(usize::MAX, |(_, std::cmp::Reverse(d))| d);
-        // a class without source as near as the match (or nearer) may declare it: fetch it first
+        // a class without source as near as the match (or nearer) may declare it, and a farther
+        // one may fit better when the match is not a perfect fit: fetch it first
+        let known_args = call
+            .args
+            .as_ref()
+            .map_or(0, |a| a.iter().filter(|x| !x.is_empty()).count());
+        let perfect = best.is_some_and(|(s, _)| s >= 100 * known_args);
         if let Some((fetch, stub, class, depth)) = missing
-            && (exact.is_empty() || depth <= exact_depth)
+            && (exact.is_empty() || depth <= exact_depth || !perfect)
         {
             let state = self.base.blocked.get(&fetch.key()).cloned().or_else(|| {
                 // its result is on disk already (an earlier session): running it again brings
@@ -644,7 +711,7 @@ impl Lookup {
             )
         };
         match self.extensions(&receivers, Some(&why)) {
-            Looked::NotFound(_) if !loose.is_empty() && !self.fetch_only => Looked::Found(loose),
+            Looked::NotFound(..) if !loose.is_empty() && !self.fetch_only => Looked::Found(loose),
             Looked::Fetch(f, j) => Looked::Fetch(f, j),
             _ if self.fetch_only => Looked::Nothing,
             other => other,
@@ -729,7 +796,7 @@ impl Lookup {
                 binary.join(", ")
             ));
         }
-        Looked::NotFound(msg)
+        Looked::NotFound(msg, Some(self.jump.call.clone()))
     }
 
     /// A library argument (known by its name only) gets its supertypes from its source, so a
@@ -899,7 +966,10 @@ impl Lookup {
             Some((s, libsrc::stub(&bytes, &note)?))
         });
         let Some((s, text)) = made else {
-            return Looked::NotFound(format!("{why}; no class file to show either"));
+            return Looked::NotFound(
+                format!("{why}; no class file to show either"),
+                Some(self.jump.call.clone()),
+            );
         };
         let path = PathBuf::from(format!(
             "{}!/{}.java (no source)",

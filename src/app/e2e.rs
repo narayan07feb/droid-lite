@@ -8150,8 +8150,7 @@ fn sdk_fixture(name: &str, sources: bool) -> Option<(Fixture, PathBuf, PathBuf)>
     let f = Fixture::new(name);
     let sdk = f.config.join("sdk");
     if !fake_sdk(&sdk, sources) {
-        eprintln!("no javac: skipped");
-        return None;
+        panic!("javac is needed for the library tests (install a JDK)");
     }
     // SAFETY: the fixture holds the SERIAL lock.
     unsafe { std::env::set_var("DROID_LITE_ANDROID_SDK", &sdk) };
@@ -8435,8 +8434,7 @@ fn maven_fixture_with(
     let f = Fixture::new(name);
     let home = f.config.join("gradle-home");
     let Some(classes) = crate::classfile::tests::javac(&f.config.join("javac"), java) else {
-        eprintln!("no javac: skipped");
-        return None;
+        panic!("javac is needed for the library tests (install a JDK)");
     };
     let zip = |path: &Path, files: &[(String, Vec<u8>)]| {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -8651,8 +8649,7 @@ fn two_lib_fixture(name: &str, java: &[(&str, &str)], in_base: &[&str], kt: &str
     let f = Fixture::new(name);
     let home = f.config.join("gradle-home");
     let Some(classes) = crate::classfile::tests::javac(&f.config.join("javac"), java) else {
-        eprintln!("no javac: skipped");
-        return None;
+        panic!("javac is needed for the library tests (install a JDK)");
     };
     let zip = |path: &Path, files: &[(String, Vec<u8>)]| {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -8796,4 +8793,113 @@ fn e2e_goto_weighs_the_whole_hierarchy_and_java_twins_and_trusts_an_existing_sou
     goto_at(&mut h, &tracker, "requestLocationUpdates(provider", 1);
     wait(&mut h, "the stub", |a| a.tabs[a.active].path.to_string_lossy().ends_with("(no source)"));
     assert_eq!(h.state().fetches.started, 0, "the sources are installed: no sdkmanager run");
+}
+
+#[test]
+fn e2e_goto_inherited_library_members_imported_kotlin_names_and_sibling_arguments() {
+    let Some((f, sdk, _tracker)) = sdk_fixture("gotoinherit", true) else { return };
+    // LocationManager gains listen(Context); Service is a Context too
+    let lm = sdk.join("sources/android-34/android/location/LocationManager.java");
+    std::fs::write(&lm, LM_JAVA.replace("    public java.util.List<String> getAllProviders() { return null; }", "    public java.util.List<String> getAllProviders() { return null; }\n    public void listen(android.content.Context c) {}")).unwrap();
+    let svc = sdk.join("sources/android-34/android/app/Service.java");
+    std::fs::write(&svc, "package android.app;\n\nimport android.content.Context;\n\npublic class Service extends Context {}\n").unwrap();
+    let file = f.path("app/src/main/java/com/demo/loc/Mine.kt");
+    std::fs::write(
+        &file,
+        "package com.demo.loc\n\nimport android.app.Activity\nimport android.app.Service\nimport android.location.LocationListener\nimport android.location.LocationManager\n\nclass MyManager : LocationManager() {\n    fun go(l: LocationListener) {\n        requestLocationUpdates(\"gps\", 0, 0f, l)\n    }\n}\n\nfun LocationManager.mine() {}\n\nfun use(m: MyManager, l: LocationListener, act: Activity, svc: Service, lm: LocationManager) {\n    m.requestLocationUpdates(\"gps\", 0, 0f, l)\n    m.mine()\n    lm.listen(act)\n    lm.listen(svc)\n}\n",
+    )
+    .unwrap();
+    let mut h = f.harness();
+    // through a project subclass: LocationManager's, not Tracker's requestLocationUpdates()
+    goto_at(&mut h, &file, "m.requestLocationUpdates(", 3);
+    wait(&mut h, "LocationManager.java", |a| a.tabs[a.active].path == lm);
+    steps(&mut h, 3);
+    assert!(tab(&h).text[tab(&h).cursor..].contains("LocationListener listener)"));
+    // inherited, called without a receiver inside the subclass
+    goto_at(&mut h, &file, "requestLocationUpdates(\"gps\", 0, 0f, l)\n    }", 1);
+    wait(&mut h, "LocationManager.java again", |a| a.tabs[a.active].path == lm);
+    // a project extension on the library supertype, not in the library: found in the project
+    goto_at(&mut h, &file, "m.mine()", 3);
+    wait(&mut h, "the extension", |a| {
+        let t = &a.tabs[a.active];
+        t.path == file && t.text[t.cursor..].starts_with("mine() {}")
+    });
+    // Find usages of listen(act) also lists listen(svc): both are a Context
+    open(&mut h, &file);
+    place_cursor(&mut h, "listen(act)", 1);
+    key(&mut h, Modifiers::ALT, Key::F7);
+    wait(&mut h, "usages", |a| a.find_rx.is_none() && a.found.iter().any(|l| l.line == 20));
+    let lines: Vec<usize> = h.state().found.iter().map(|l| l.line).collect();
+    assert_eq!(lines, [19, 20], "listen(act) and listen(svc): both take a Context");
+    drop(h);
+    drop(f);
+    // an imported library class named like a Kotlin type is that class
+    let result = ("demo/geo/Result.java", "package demo.geo;\n\npublic class Result {\n    public int value(int dflt) { return dflt; }\n}\n");
+    let kt = "package com.demo.loc\n\nimport demo.geo.Result\n\nfun f(r: Result) {\n    r.value(1)\n}\n";
+    let Some((f, file)) = maven_fixture("gotoresult", &[result], Some(&[result]), kt) else { return };
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    goto_at(&mut h, &file, "value(", 1);
+    wait(&mut h, "Result.java", |a| a.tabs[a.active].path.to_string_lossy().ends_with("!/demo/geo/Result.java"));
+    wait(&mut h, "the lookup", |a| !a.lib_reading());
+    steps(&mut h, 3);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("value(int dflt)"));
+}
+
+#[test]
+fn e2e_find_usages_reruns_when_the_download_ends_before_its_list() {
+    let Some((f, sdk, tracker)) = sdk_fixture("gotousagesrace", false) else { return };
+    // a fast stand-in sdkmanager: the download may end before the approximate list
+    let tool = f.config.join("sdkmanager");
+    let dest = sdk.join("sources/android-34");
+    let mut script = String::from("#!/bin/sh\n");
+    for (rel, text) in [
+        ("android/location/LocationManager.java", LM_JAVA),
+        ("android/content/Context.java", CONTEXT_JAVA),
+        ("android/app/Activity.java", ACTIVITY_JAVA),
+    ] {
+        let src = f.config.join(rel.replace('/', "_"));
+        std::fs::write(&src, text).unwrap();
+        let to = dest.join(rel);
+        script.push_str(&format!("mkdir -p '{}' && cp '{}' '{}'\n", to.parent().unwrap().display(), src.display(), to.display()));
+    }
+    std::fs::write(&tool, script).unwrap();
+    std::process::Command::new("chmod").arg("+x").arg(&tool).status().unwrap();
+    // SAFETY: the fixture holds the SERIAL lock.
+    unsafe { std::env::set_var("DROID_LITE_SDKMANAGER", &tool) };
+    let mut h = f.harness();
+    open(&mut h, &tracker);
+    wait(&mut h, "resolved", |a| {
+        let t = &a.tabs[a.active];
+        a.xref.for_file(&t.path, t.rev).is_some()
+    });
+    place_cursor(&mut h, "getSystemService(\"a\")", 1);
+    key(&mut h, Modifiers::ALT, Key::F7);
+    // whichever ends first, the list ends exact
+    wait(&mut h, "exact", |a| a.found.iter().any(|l| l.line == 30) && a.lib_usages_note.is_none());
+    let lines: Vec<usize> = h.state().found.iter().map(|l| l.line).collect();
+    assert_eq!(lines, [29, 30]);
+    assert!(h.state().fetches.usages_again.is_none());
+    // the exact order of the race: the download ended after the search began, then the
+    // approximate list arrives; it is searched again at once, not left waiting
+    let started = std::time::Instant::now();
+    h.state_mut()
+        .fetches
+        .ended
+        .insert("race".into(), (Ok(()), started + std::time::Duration::from_millis(1)));
+    let call = crate::resolve::LibCall {
+        class: "Context".into(),
+        qualified: Some("android.content.Context".into()),
+        stars: Vec::new(),
+        member: "getSystemService".into(),
+        args: Some(vec![vec!["String".into()]]),
+        builtin: false,
+        fallback: false,
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(super::libsrc_ui::UsagesState::Downloading).unwrap();
+    h.state_mut().lib_usages_note = Some((call, started, rx));
+    h.step();
+    assert!(h.state().fetches.usages_again.is_none(), "searched again, not waiting");
+    assert!(!h.state().status.contains("approximate"), "{}", h.state().status);
 }

@@ -199,7 +199,21 @@ pub fn repos(root: &Path) -> Vec<String> {
         let Ok(t) = std::fs::read_to_string(root.join(f)) else {
             continue;
         };
+        // only inside `repositories { … }` (a URL elsewhere is an API base or a doc link)
+        let mut depth = 0i32;
+        let mut inside: Option<i32> = None;
         for line in t.lines().map(str::trim).filter(|l| !l.starts_with("//")) {
+            if inside.is_none() && line.starts_with("repositories") {
+                inside = Some(depth);
+            }
+            depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+            let here = inside.is_some();
+            if inside.is_some_and(|d| depth <= d) && !line.starts_with("repositories") {
+                inside = None;
+            }
+            if !here {
+                continue;
+            }
             if line.contains("google()") {
                 add(&mut out, "https://dl.google.com/dl/android/maven2");
             }
@@ -615,13 +629,16 @@ pub fn supertypes(text: &str, class: &str) -> Vec<Vec<String>> {
 /// The `:` of a Kotlin supertype list (outside brackets).
 fn top_level_colon(head: &str) -> Option<usize> {
     let mut depth = 0i32;
+    let mut prev = ' ';
     for (i, c) in head.char_indices() {
         match c {
             '(' | '<' => depth += 1,
-            ')' | '>' => depth -= 1,
+            ')' => depth -= 1,
+            '>' if prev != '-' => depth -= 1, // not the `->` of a function type
             ':' if depth == 0 => return Some(i),
             _ => {}
         }
+        prev = c;
     }
     None
 }
@@ -629,16 +646,19 @@ fn top_level_colon(head: &str) -> Option<usize> {
 /// Splits at commas outside brackets.
 fn split_top(s: &str) -> Vec<&str> {
     let (mut out, mut depth, mut from) = (Vec::new(), 0i32, 0);
+    let mut prev = ' ';
     for (i, c) in s.char_indices() {
         match c {
             '(' | '<' => depth += 1,
-            ')' | '>' => depth -= 1,
+            ')' => depth -= 1,
+            '>' if prev != '-' => depth -= 1, // not the `->` of a function type
             ',' if depth == 0 => {
                 out.push(&s[from..i]);
                 from = i + 1;
             }
             _ => {}
         }
+        prev = c;
     }
     out.push(&s[from..]);
     out
@@ -980,17 +1000,23 @@ pub fn kotlin_supers(t: &str) -> &'static [&'static str] {
 }
 
 /// Two arguments' types (each its type and supertypes) can be the same parameter: one is the other
-/// or among its supertypes, or both are whole numbers (a literal `0` and `0L` call one `long`).
+/// or among its supertypes, both are whole numbers (a literal `0` and `0L` call one `long`), or one
+/// is a library type whose supertypes are not known here (an `Activity` and a `Service` may both
+/// be a `Context`): which declaration each call means is checked after, by looking it up.
 pub fn same_type(a: &[String], b: &[String]) -> bool {
     let whole = |x: &[String]| {
         x.first()
             .is_some_and(|t| matches!(t.as_str(), "Int" | "Long" | "Short" | "Byte"))
+    };
+    let unknown_supers = |x: &[String]| {
+        x.len() == 1 && x[0].starts_with(char::is_uppercase) && java_primitive(&x[0]).is_none()
     };
     a.is_empty()
         || b.is_empty()
         || a.first().is_some_and(|t| b.contains(t))
         || b.first().is_some_and(|t| a.contains(t))
         || whole(a) && whole(b)
+        || unknown_supers(a) && unknown_supers(b)
 }
 
 /// The class file `entry` from a jar, or from the `classes.jar` inside an `.aar`; None when it
@@ -1008,18 +1034,34 @@ pub fn class_bytes(archive: &Path, entry: &str) -> Option<Vec<u8>> {
         std::io::Read::read_to_end(&mut std::io::Read::take(e, MAX_CLASS), &mut v).ok()?;
         Some(v)
     }
-    let mut z = zip::ZipArchive::new(std::fs::File::open(archive).ok()?).ok()?;
     if archive.extension().is_some_and(|e| e == "aar") {
-        let jar = {
-            let e = z.by_name("classes.jar").ok()?;
-            let mut v = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::Read::take(e, MAX_AAR_JAR), &mut v).ok()?;
-            v
-        };
-        let mut inner = zip::ZipArchive::new(std::io::Cursor::new(jar)).ok()?;
+        let jar = aar_classes(archive)?;
+        let mut inner = zip::ZipArchive::new(std::io::Cursor::new(&jar[..])).ok()?;
         return read(&mut inner, entry);
     }
+    let mut z = zip::ZipArchive::new(std::fs::File::open(archive).ok()?).ok()?;
     read(&mut z, entry)
+}
+
+/// An `.aar`'s `classes.jar`, read once and kept for the last few aars (a lookup asks the same
+/// aar many times).
+fn aar_classes(aar: &Path) -> Option<std::sync::Arc<Vec<u8>>> {
+    static KEPT: std::sync::Mutex<Vec<(PathBuf, std::sync::Arc<Vec<u8>>)>> =
+        std::sync::Mutex::new(Vec::new());
+    if let Some((_, j)) = KEPT.lock().ok()?.iter().find(|(p, _)| p == aar) {
+        return Some(j.clone());
+    }
+    let mut z = zip::ZipArchive::new(std::fs::File::open(aar).ok()?).ok()?;
+    let e = z.by_name("classes.jar").ok()?;
+    let mut v = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(e, MAX_AAR_JAR), &mut v).ok()?;
+    let j = std::sync::Arc::new(v);
+    let mut kept = KEPT.lock().ok()?;
+    if kept.len() >= 3 {
+        kept.remove(0);
+    }
+    kept.push((aar.to_path_buf(), j.clone()));
+    Some(j)
 }
 
 /// The class file `entry` is in the jar (or the `.aar`'s `classes.jar`).
@@ -1058,6 +1100,10 @@ fn match_score(param: &str, arg: &[String], tparams: &[String]) -> Option<usize>
     }
     if let Some(d) = arg.iter().skip(1).position(|a| *a == p) {
         return Some(89 - d.min(39));
+    }
+    // a Kotlin number is a Java Number and Comparable
+    if kotlin_supers(own).contains(&p.as_str()) {
+        return Some(80);
     }
     // Kotlin converts only a number literal, and only between whole numbers; the argument's type
     // does not say it was a literal, so any Int may (a variable that does not fit would not
@@ -1264,6 +1310,7 @@ mod tests {
                     .collect(),
             ),
             builtin: false,
+            fallback: false,
         }
     }
 
@@ -1407,6 +1454,43 @@ mod tests {
         assert_eq!(m.offsets, [two.find("build(int a)").unwrap()]);
         let m = find_member(Path::new("X.java"), two, "Other.Builder", &c);
         assert_eq!(m.offsets, [two.find("build(int b)").unwrap()]);
+    }
+
+    #[test]
+    fn a_kotlin_number_is_a_java_number() {
+        let int = ["Int".to_string()];
+        assert_eq!(match_score("Number", &int, &[]), Some(80));
+        assert_eq!(match_score("Comparable", &int, &[]), Some(80));
+        assert_eq!(match_score("String", &int, &[]), None);
+    }
+
+    #[test]
+    fn arrows_literals_and_repository_blocks() {
+        let kt = "package a\n\nclass A(val f: () -> Unit) : B(), C {\n}\n";
+        assert_eq!(
+            supertypes(kt, "A").len(),
+            2,
+            "the `->` of a function type is no bracket"
+        );
+        let d = std::env::temp_dir().join(format!("dl-repos-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("settings.gradle.kts"), "val api = uri(\"https://api.example.com/v1\")\ndependencyResolutionManagement {\n    repositories {\n        google()\n        maven { url = uri(\"https://repo.example.com/maven\") }\n    }\n}\n").unwrap();
+        // SAFETY: a unit test; the env var is put back
+        let saved = std::env::var_os("DROID_LITE_MAVEN_REPOS");
+        unsafe { std::env::remove_var("DROID_LITE_MAVEN_REPOS") };
+        let r = repos(&d);
+        if let Some(s) = saved {
+            unsafe { std::env::set_var("DROID_LITE_MAVEN_REPOS", s) };
+        }
+        assert_eq!(
+            r,
+            [
+                "https://dl.google.com/dl/android/maven2",
+                "https://repo.example.com/maven"
+            ],
+            "not the API URL"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

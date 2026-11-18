@@ -614,8 +614,8 @@ pub struct App {
     libs_rx: Option<Receiver<crate::libs::Libraries>>,
     /// Downloads of library and SDK sources for Go to declaration.
     fetches: libsrc_ui::Fetches,
-    /// A library Find usages under way: its call, and whether its list came out approximate.
-    lib_usages_note: Option<(crate::resolve::LibCall, Receiver<bool>)>,
+    /// A library Find usages under way: its call, when it started, and how its list came out.
+    lib_usages_note: Option<(crate::resolve::LibCall, Instant, Receiver<libsrc_ui::UsagesState>)>,
     compose_view: Option<ComposeView>,
     previews: Previews,
     /// The Compose panel's structure sections (composables, UI tree, …) are shown; per project.
@@ -1443,6 +1443,24 @@ impl App {
             }
             _ => self.index.read().definitions(&word, &path),
         };
+        self.goto_defs(word, path, at, defs);
+    }
+
+    /// The declarations of `word` by name (imported and nearby ones first): for a call through a
+    /// project class's library supertype that the library does not declare (a project or standard
+    /// library function).
+    pub(super) fn goto_named(&mut self, word: String) {
+        let Some(t) = self.tabs.get(self.active) else {
+            return;
+        };
+        let (path, at) = (t.path.clone(), t.cursor);
+        let defs = self.index.read().definitions(&word, &path);
+        self.goto_defs(word, path, at, defs);
+    }
+
+    /// Opens `defs` for `word` at `at` of `path`: one opens, several go to the picker, none looks in
+    /// the libraries; on the declaration itself, its usages.
+    fn goto_defs(&mut self, word: String, path: PathBuf, at: usize, defs: Vec<Hit>) {
         // ⌘-click on the declaration itself lists where it is used, like Android Studio
         if defs.iter().any(|d| d.path == path && d.offset == at)
             && let Some(ctx) = self.ctx.clone()
@@ -1506,6 +1524,9 @@ impl App {
         self.lsp_found = None;
         // The project search always runs: kotlin-lsp answers empty or with one file while it
         // still imports a big Gradle project. Its answer is merged in when it comes.
+        // a newer search: an older library search no longer runs again after a download
+        self.fetches.usages_again = None;
+        self.lib_usages_note = None;
         // a library member: the same library call elsewhere, and its source fetched for the
         // declaration (as Go to declaration does)
         if let Some(crate::resolve::Res::Lib(call)) = self.resolved_at(at) {
@@ -1560,6 +1581,8 @@ impl App {
     /// Find References of one declaration, on the worker: the places that mean it, plus layouts
     /// and the manifest for a class.
     fn search_usages(&mut self, word: String, target: crate::resolve::DeclRef, ctx: &egui::Context) {
+        self.fetches.usages_again = None;
+        self.lib_usages_note = None;
         let Some(p) = &self.project else { return };
         let root = p.root.clone();
         let is_type = self
@@ -1640,17 +1663,17 @@ impl App {
             // the lookups read sources: on their own thread, not the code insight worker
             std::thread::spawn(move || {
                 let stale = || generation.load(std::sync::atomic::Ordering::Relaxed) != mine;
-                if let Some((found, approximate)) =
+                if let Some((found, state)) =
                     libsrc_ui::exact_usages(base, target, imports, cands, stale)
                 {
-                    let _ = note_tx.send(approximate);
+                    let _ = note_tx.send(state);
                     let _ = tx.send(found);
                 }
                 c.request_repaint();
             });
         });
         self.find_rx = Some(rx);
-        self.lib_usages_note = Some((call, note_rx));
+        self.lib_usages_note = Some((call, Instant::now(), note_rx));
         self.bottom = Bottom::Find;
     }
 
@@ -4855,18 +4878,34 @@ impl eframe::App for App {
         self.rescan_resources(&ctx);
         self.poll_libs();
         self.poll_fetches();
-        if let Some((call, rx)) = &self.lib_usages_note
-            && let Ok(approximate) = rx.try_recv()
+        if let Some((call, started, rx)) = &self.lib_usages_note
+            && let Ok(state) = rx.try_recv()
         {
-            if approximate {
-                // its declaration's source is still downloading: searched again once it is here
-                self.fetches.usages_again = Some(call.clone());
-                self.status = format!(
-                    "References to `{}.{}` are approximate until its source is downloaded",
-                    call.class, call.member
-                );
-            }
+            let (call, started) = (call.clone(), *started);
             self.lib_usages_note = None;
+            match state {
+                libsrc_ui::UsagesState::Exact => {}
+                libsrc_ui::UsagesState::Downloading => {
+                    // the download may have ended already, before this list: search again now
+                    if self.fetches.ended.values().any(|(_, at)| *at >= started)
+                        && let Some(ctx) = self.ctx.clone()
+                    {
+                        self.search_lib_usages(call, &ctx);
+                    } else {
+                        self.fetches.usages_again = Some(call.clone());
+                        self.status = format!(
+                            "References to `{}.{}` are approximate until its source is downloaded",
+                            call.class, call.member
+                        );
+                    }
+                }
+                libsrc_ui::UsagesState::NoSource => {
+                    self.status = format!(
+                        "References to `{}.{}`: calls on the same class (its source is not available)",
+                        call.class, call.member
+                    );
+                }
+            }
         }
         self.poll_prs();
         self.refresh_changes(&ctx); // git status for tree colours, not only the Current changes tab

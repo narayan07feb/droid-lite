@@ -870,7 +870,8 @@ fn java_members(src: &str, out: &mut FileSyms) {
         while s.is(j, "[") && s.is(j + 1, "]") {
             j += 2;
         }
-        if s.kind(j) != Some(Tok::Ident) {
+        // a Kotlin-only keyword (`value`, `data`, `open`…) is a plain name in Java
+        if !matches!(s.kind(j), Some(Tok::Ident | Tok::Keyword)) {
             i = j.max(i + 1);
             continue;
         }
@@ -1147,6 +1148,19 @@ typealias Users = List<User>
         assert!(supers("Plain").is_empty());
         let j = scan("public class Foo extends Bar implements Baz, java.io.Closeable {\n}\n");
         assert_eq!(find(&j, "Foo").supers, vec!["Bar", "Baz", "Closeable"]);
+    }
+
+    #[test]
+    fn java_members_named_like_kotlin_keywords_are_kept() {
+        let syms = scan_file(
+            std::path::Path::new("R.java"),
+            "package a;\n\nclass R {\n    public int value(int value) { return value; }\n    String data;\n}\n",
+        );
+        let names: Vec<&str> = syms.decls.iter().map(|d| d.name.as_str()).collect();
+        assert!(
+            names.contains(&"value") && names.contains(&"data"),
+            "{names:?}"
+        );
     }
 
     #[test]

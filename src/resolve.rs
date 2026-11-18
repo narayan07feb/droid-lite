@@ -50,12 +50,17 @@ pub struct LibCall {
     /// Packages the file imports with `*` (where an unqualified `class` may live).
     pub stars: Vec<String>,
     pub member: String,
-    /// The arguments of a call (None: not called, e.g. a property): each argument's type and
-    /// supertypes by simple name, or an empty list when its type is not known.
+    /// The arguments of a call (None: not called, e.g. a property): each argument's type by
+    /// simple name, then its supertypes when it is a project type (a library type's are read from
+    /// its source when needed), or an empty list when its type is not known.
     pub args: Option<Vec<Vec<String>>>,
     /// The receiver is a Kotlin built-in type (String, List, Int…): its member or standard
     /// library extension, whose sources are not read; never a project declaration.
     pub builtin: bool,
+    /// Reached through a project class's library supertype (`finish()` in an Activity, or
+    /// `tracker.x` on a LocationManager subclass): when the library has no such member it may be
+    /// a function of the project or the standard library, found by name as before.
+    pub fallback: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2600,21 +2605,26 @@ impl<'a> Resolver<'a> {
                 (class.contains('.') && class.starts_with(char::is_lowercase))
                     .then(|| class.clone())
             });
-        // `getSystemService<T>(…)`: the arguments follow the type arguments
+        // `getSystemService<T>(…)`: the arguments follow the type arguments; a `<` that is a
+        // less-than (`x.size < foo(1)`) leaves the name without arguments
         let mut open = i + 1;
         if f.t(open) == "<" && !f.java {
             let mut depth = 0;
-            while open < f.toks.len() {
-                match f.t(open) {
+            let mut k = open;
+            while k < f.toks.len() {
+                match f.t(k) {
                     "<" => depth += 1,
                     ">" => depth -= 1,
                     "(" | ")" | "{" | "}" | "=" | ";" => break,
                     _ => {}
                 }
-                open += 1;
+                k += 1;
                 if depth == 0 {
                     break;
                 }
+            }
+            if depth == 0 {
+                open = k;
             }
         }
         // a trailing lambda after the parentheses (or instead of them) is one more argument
@@ -2655,6 +2665,8 @@ impl<'a> Resolver<'a> {
                 .chain(lambda.then(Vec::new))
                 .collect()
         });
+        // an imported class that shares a Kotlin type's name (a library `Result`) is that class
+        let builtin = qualified.is_none() && is_kotlin_type(&class) && java_twin(&class).is_none();
         let qualified = qualified.or_else(|| java_twin(&class).map(String::from));
         LibCall {
             class: class.rsplit('.').next().unwrap_or(&class).to_string(),
@@ -2664,7 +2676,8 @@ impl<'a> Resolver<'a> {
             args,
             // a Kotlin type with a Java twin (ArrayList, StringBuilder, Exception…) has the Java
             // class's members: looked up there like any SDK class
-            builtin: is_kotlin_type(&class) && java_twin(&class).is_none(),
+            builtin,
+            fallback: false,
         }
     }
 
@@ -3065,7 +3078,29 @@ impl<'a> Resolver<'a> {
                 return Res::Decls(v);
             }
         }
+        // nothing in the project: a member the class inherits from a library supertype
+        // (`finish()` in an Activity), looked up in its source
+        if !looks_type && !any_receiver_scope_fn(name) {
+            for &c in &classes {
+                let t = Ty::Decl((f.path.clone(), f.syms.decls[c].offset));
+                if let Some(call) = self.inherited_lib_call(f, i, &t, name) {
+                    return Res::Lib(call);
+                }
+            }
+        }
         Res::None
+    }
+
+    /// `name` on project type `t` taken as a member of its nearest library supertype (not a
+    /// Kotlin type), marked to fall back to the name search when the library has none.
+    fn inherited_lib_call(&self, f: &FileInfo, i: usize, t: &Ty, name: &str) -> Option<LibCall> {
+        let lib = self.hierarchy_up(t).into_iter().find_map(|s| match s {
+            Ty::Lib(n, _) if n != "Any" && !is_kotlin_type(&n) => Some(n),
+            _ => None,
+        })?;
+        let mut call = self.lib_call(f, i, &lib, name);
+        call.fallback = true;
+        Some(call)
     }
 
     /// Whether `name` is a member extension on `Modifier` of a library lambda's receiver
@@ -3205,6 +3240,13 @@ impl<'a> Resolver<'a> {
             }
             if let Some(class) = t.lib().filter(|l| *l != "Any") {
                 return Res::Lib(self.lib_call(f, i, class, name));
+            }
+            // a project class without that member: inherited from its library supertype
+            if matches!(t, Ty::Decl(_))
+                && !any_receiver_scope_fn(name)
+                && let Some(call) = self.inherited_lib_call(f, i, t, name)
+            {
+                return Res::Lib(call);
             }
             if matches!(t, Ty::Decl(_)) || t.lib().is_some_and(|l| l != "Any") {
                 return Res::None;
@@ -4293,7 +4335,11 @@ fn num_type(lit: &str) -> &'static str {
     let hex = l.starts_with("0x") || l.starts_with("0b");
     if !hex && l.ends_with('f') {
         "Float"
-    } else if l.ends_with('l') {
+    } else if l.ends_with('l')
+        || !hex
+            && l.chars().all(|c| c.is_ascii_digit() || c == '_')
+            && l.replace('_', "").parse::<i64>().is_ok_and(|n| n > i64::from(i32::MAX))
+    {
         "Long"
     } else if !hex && (l.contains('.') || l.contains('e') || l.ends_with('d')) {
         "Double"
@@ -4952,6 +4998,14 @@ mod tests {
                 format!("{}:{}", p.display(), t[..o].matches('\n').count() + 1)
             })
             .collect()
+    }
+
+    #[test]
+    fn a_literal_past_int_is_long() {
+        assert_eq!(num_type("3000000000"), "Long");
+        assert_eq!(num_type("3_000_000_000"), "Long");
+        assert_eq!(num_type("2147483647"), "Int");
+        assert_eq!(num_type("0xFFFFFFFFF"), "Int", "hex is not read here");
     }
 
     #[test]
