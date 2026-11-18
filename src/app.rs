@@ -572,8 +572,10 @@ pub struct App {
     selected_composable: Option<String>,
     textures: HashMap<PathBuf, (SystemTime, egui::TextureHandle)>,
     shift_down: bool,
-    /// A diff jump opened this file: go to its first (true) or last change once it is compared.
-    land_jump: Option<(PathBuf, bool)>,
+    /// A diff jump to another file, waiting for that file's compare.
+    land_jump: Option<diff_view::Land>,
+    /// The Next / Previous change shortcuts as text, for the keymap they were made for.
+    jump_keys: Option<(keymap::Keymap, [String; 2])>,
     last_shift: Option<Instant>,
     status: String,
     /// Why actions that waited for a save did not run, each with how often in a row it came:
@@ -736,6 +738,7 @@ impl App {
             textures: HashMap::new(),
             shift_down: false,
             land_jump: None,
+            jump_keys: None,
             last_shift: None,
             status: String::new(),
             notices: Vec::new(),
@@ -1970,6 +1973,18 @@ impl App {
 
     // ---------- keyboard ----------
 
+    /// The Next / Previous change shortcuts as text (made once per keymap, not every frame).
+    pub(super) fn change_keys(&mut self) -> [String; 2] {
+        if self.jump_keys.as_ref().is_none_or(|(k, _)| *k != self.keymap) {
+            let t = [
+                keymap::text(self.keymap, Action::NextChange),
+                keymap::text(self.keymap, Action::PrevChange),
+            ];
+            self.jump_keys = Some((self.keymap, t));
+        }
+        self.jump_keys.as_ref().map(|(_, t)| t.clone()).unwrap_or_default()
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) {
         for (action, chord) in keymap::bindings(self.keymap) {
             if ctx.input_mut(|i| i.consume_shortcut(&chord)) {
@@ -2041,6 +2056,12 @@ impl App {
     /// The path of the open file and the declaration around the cursor, like Android Studio's
     /// navigation bar: `app › src › … › UserCard.kt › UserCard`. Click a declaration to jump to it.
     fn breadcrumb(&mut self, ui: &mut Ui) -> egui::Id {
+        // while the docked diff panel is on screen the keys move through it, not this tab
+        let jump_keys = if self.has_diff() && !self.focus {
+            [String::new(), String::new()]
+        } else {
+            self.change_keys()
+        };
         let Some(t) = self.tabs.get(self.active) else {
             return ui.next_auto_id();
         };
@@ -2076,10 +2097,6 @@ impl App {
         let mut diff_ctl = None;
         let blocked = self.diff_blocked();
         let shortcut = keymap::text(self.keymap, Action::ToggleDiff);
-        let jump_keys = [
-            keymap::text(self.keymap, Action::NextChange),
-            keymap::text(self.keymap, Action::PrevChange),
-        ];
         let r = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             for d in inside.iter().filter_map(|d| d.container.as_ref()).take(1) {

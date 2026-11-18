@@ -7900,9 +7900,11 @@ fn e2e_diff_jump_passes_over_a_file_without_changes_and_lands_in_an_open_tab() {
     assert_eq!(at_line(h.state()), (gradle.clone(), 0));
     // Alt+F7 is Find references, not a jump
     let cur = tab(&h).diff.cur;
+    h.state_mut().bottom = super::Bottom::Problems;
     key(&mut h, Modifiers::ALT, Key::F7);
     assert_eq!(tab(&h).diff.cur, cur);
     assert_eq!(at_line(h.state()).0, gradle);
+    assert!(h.state().bottom == super::Bottom::Find, "Find references ran");
     // past the change: User.kt has no changes and is passed over; UserCard.kt is open already
     key(&mut h, Modifiers::NONE, Key::F7);
     wait(&mut h, "landed in UserCard.kt", |a| {
@@ -7941,4 +7943,85 @@ fn e2e_diff_jump_starts_from_the_cursor_after_it_moved_and_skips_a_hidden_panel(
     key(&mut h, Modifiers::NONE, Key::F7);
     assert_eq!(at_line(h.state()), (user, 5), "the tab diff moved");
     assert_eq!(h.state().git.panel_cur, None);
+}
+
+#[test]
+fn e2e_diff_walk_passes_over_a_file_it_cannot_open_and_comes_back_when_nothing_is_left() {
+    let f = Fixture::new("diffwalk");
+    let gradle = f.path("app/build.gradle.kts");
+    let bin = f.path("app/src/main/java/com/demo/data/Blob.dat");
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    // git order: build.gradle.kts, User.kt, UserCard.kt (line ends only), then the untracked
+    // Blob.dat (not text)
+    std::fs::write(&gradle, "plugins { id(\"com.android.application\") }\n").unwrap();
+    std::fs::write(&bin, [0xff, 0xfe, 0x00, 0x81]).unwrap();
+    std::fs::write(&user, USER_KT.replace("var age", "val age")).unwrap();
+    std::fs::write(&card, CARD_KT.replace('\n', "\r\n")).unwrap();
+    let mut h = f.harness();
+    open(&mut h, &gradle);
+    // the library index ends with a status line of its own: let it finish first
+    wait(&mut h, "git status and libraries", |a| {
+        a.git.changes.as_ref().is_some_and(|c| c.repo && c.working.len() == 4) && a.libs_rx.is_none()
+    });
+    h.get_by_label("Diff").click();
+    wait(&mut h, "compared", |a| diff_view(a).is_some_and(|v| v.change_rows.len() == 1));
+    key(&mut h, Modifiers::NONE, Key::F7);
+    key(&mut h, Modifiers::NONE, Key::F7);
+    wait(&mut h, "landed in User.kt", |a| {
+        a.tabs[a.active].path == user && a.tabs[a.active].diff.cur == Some(0)
+    });
+    // past User.kt's only change: UserCard.kt has no changes, Blob.dat cannot be opened and
+    // nothing comes after it, so the walk goes back to User.kt and says what it passed over
+    steps(&mut h, 3);
+    key(&mut h, Modifiers::NONE, Key::F7);
+    wait(&mut h, "back in User.kt", |a| {
+        a.tabs[a.active].path == user && a.land_jump.is_none() && a.status.starts_with("That was")
+    });
+    let s = &h.state().status;
+    assert!(s.contains("UserCard.kt (no changes)") && s.contains("Blob.dat (cannot open)"), "{s}");
+    assert_eq!(at_line(h.state()), (user, 2), "where the walk started");
+}
+
+#[test]
+fn e2e_diff_jump_details_alias_keys_dropped_walk_and_panel_previous() {
+    let f = Fixture::new("diffjumpdetails");
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    std::fs::write(&user, USER_KT.replace("var age", "val age").replace("emptyList()", "listOf()")).unwrap();
+    let mut h = f.harness();
+    open(&mut h, &user);
+    wait(&mut h, "git status", |a| a.git.changes.as_ref().is_some_and(|c| c.repo));
+    h.get_by_label("Diff").click();
+    wait(&mut h, "compared", |a| diff_counts(a) == Some((0, 0, 2)));
+    // Cmd+Shift+} / { (the shifted keys) are Next / Previous change too
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::CloseCurlyBracket);
+    assert_eq!(at_line(h.state()), (user.clone(), 2));
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::CloseCurlyBracket);
+    assert_eq!(at_line(h.state()), (user.clone(), 5));
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::OpenCurlyBracket);
+    assert_eq!(at_line(h.state()), (user.clone(), 2));
+    // a walk waiting for a file that is no longer the active tab is dropped
+    h.state_mut().land_jump = Some(super::diff_view::Land {
+        path: card,
+        forward: true,
+        origin: (user.clone(), 0),
+        passed: Vec::new(),
+    });
+    steps(&mut h, 2);
+    assert!(h.state().land_jump.is_none());
+    assert_eq!(at_line(h.state()).0, user);
+    // no PR base: every file would say so, so F7 says it once and stays
+    h.get_by_label("PR base").click();
+    wait(&mut h, "no base", |a| a.tabs[a.active].diff.note.as_ref().is_some_and(|n| n.starts_with("No base")));
+    key(&mut h, Modifiers::NONE, Key::F7);
+    assert!(h.state().status.starts_with("No base"), "{}", h.state().status);
+    assert_eq!(at_line(h.state()).0, user);
+    assert!(h.state().land_jump.is_none());
+    // the panel: Previous with nothing picked goes to its last change
+    let text = "@@ -1,3 +1,3 @@\n-a\n+A\n b\n-c\n+C\n d\n-e\n+E\n";
+    h.state_mut().show_diff_text("Diff: three".into(), text.into());
+    steps(&mut h, 3);
+    key(&mut h, Modifiers::SHIFT, Key::F7);
+    h.get_by_label("Change 3 of 3");
 }

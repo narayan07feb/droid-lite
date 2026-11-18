@@ -231,11 +231,16 @@ impl App {
     /// centres the change and flashes it.
     pub(super) fn panel_jump(&mut self, forward: bool) {
         let ch = self.panel_changes();
-        match super::diff_view::step(&ch, self.git.panel_cur, 0, forward) {
+        // nothing picked yet: Next starts at the first change, Previous at the last
+        let from = if forward { 0 } else { usize::MAX };
+        match super::diff_view::step(&ch, self.git.panel_cur, from, forward) {
             super::diff_view::Step::At(i) => {
                 self.git.panel_cur = Some(i);
                 self.git.panel_flash = Some((ch[i].clone(), Instant::now()));
                 self.git.panel_scroll = Some(ch[i].start);
+                if let Some(ctx) = &self.ctx {
+                    ctx.request_repaint();
+                }
             }
             super::diff_view::Step::OtherFile => {
                 self.status = match (ch.is_empty(), forward) {
@@ -784,10 +789,7 @@ impl App {
         }
         let mut open = !ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let mut jump = None;
-        let keys = [
-            crate::keymap::text(self.keymap, crate::keymap::Action::NextChange),
-            crate::keymap::text(self.keymap, crate::keymap::Action::PrevChange),
-        ];
+        let keys = self.change_keys();
         let Some((title, lines)) = &self.git.commit else {
             return;
         };

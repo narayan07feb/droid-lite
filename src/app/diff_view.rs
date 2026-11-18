@@ -398,6 +398,7 @@ impl TabDiff {
             self.for_key = None;
             self.left = None;
             self.cur = None;
+            self.flash = None;
         }
     }
 
@@ -533,7 +534,11 @@ pub(super) fn jump_buttons(ui: &mut Ui, keys: [&str; 2]) -> Option<bool> {
         let key = keys[usize::from(!fwd)];
         if ui
             .add(egui::Button::new(RichText::new(icon).small()).frame(false))
-            .on_hover_text(format!("{tip}  {key}"))
+            .on_hover_text(if key.is_empty() {
+                tip.to_string()
+            } else {
+                format!("{tip}  {key}")
+            })
             .clicked()
         {
             out = Some(fwd);
@@ -610,7 +615,7 @@ impl App {
             && let Ok(r) = rx.try_recv()
         {
             d.rx = None;
-            d.cur = None; // the changes may have moved
+            (d.cur, d.flash) = (None, None); // the changes may have moved
             match r {
                 Ok(a) => (d.view, d.note) = (Some(Arc::new(a)), None),
                 Err(e) => (d.view, d.note) = (None, Some(e)),
@@ -667,16 +672,17 @@ impl App {
     }
 
     /// A file opened by a jump from another file: once compared, go to its first (forward) or last
-    /// change; a file with a note or without changes is passed over to the one after it. Another
-    /// tab made active meanwhile drops the jump.
+    /// change. A file with a note or without changes is passed over to the one after it; a missing
+    /// PR base stops the walk (every file would say the same). Another tab made active meanwhile
+    /// drops the jump.
     pub(super) fn finish_land(&mut self) {
-        let Some((path, forward)) = self.land_jump.clone() else {
+        let Some(land) = &self.land_jump else {
             return;
         };
         let Some(t) = self
             .tabs
             .get_mut(self.active)
-            .filter(|t| t.path == path && t.diff.on)
+            .filter(|t| t.path == land.path && t.diff.on)
         else {
             self.land_jump = None;
             return;
@@ -684,21 +690,29 @@ impl App {
         if t.diff.rx.is_some() || (t.diff.view.is_none() && t.diff.note.is_none()) {
             return; // still comparing
         }
-        self.land_jump = None;
+        let Some(mut land) = self.land_jump.take() else {
+            return;
+        };
         let n = t.diff.view.as_ref().map_or(0, |v| v.change_rows.len());
         if n == 0 {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let why = t.diff.note.clone().unwrap_or_else(|| "no changes".into());
-            self.other_changed_file(forward, true);
-            if !self.status.starts_with("That was") {
-                self.status = format!("Passed over {name}: {why}");
+            let note = t.diff.note.clone();
+            if let Some(no_base) = note.as_ref().filter(|n| n.starts_with("No base")) {
+                self.status = no_base.clone();
+                return;
             }
+            let against = t.diff.against;
+            land.passed.push(format!(
+                "{} ({})",
+                file_name(&land.path),
+                note.unwrap_or_else(|| "no changes".into())
+            ));
+            self.walk_files(land.path.clone(), against, land);
             return;
         }
-        t.diff.cur = Some(if forward { 0 } else { n - 1 });
+        t.diff.cur = Some(if land.forward { 0 } else { n - 1 });
+        if !land.passed.is_empty() {
+            self.status = format!("Passed over {}", land.passed.join(", "));
+        }
         self.go_to_change();
     }
 
@@ -715,7 +729,7 @@ impl App {
         }
         let Some(v) = t.diff.view.clone() else {
             if t.diff.note.is_some() && t.diff.rx.is_none() {
-                self.other_changed_file(forward, false); // nothing to step through here
+                self.other_changed_file(forward); // nothing to step through here
             } else {
                 self.status = "Comparing…".into();
             }
@@ -724,17 +738,19 @@ impl App {
         let line = t.text[..t.cursor.min(t.text.len())].matches('\n').count();
         let at_row = v.row_of_new.get(line).copied().unwrap_or(v.rows.len());
         // the cursor moved away from the change the last jump went to: start from the cursor
+        // (the row after a removal-only change is where the cursor sits for it)
         let cur = t.diff.cur.filter(|&c| {
-            v.change_rows
-                .get(c)
-                .is_some_and(|r| (r.start..=r.end).contains(&at_row))
+            v.change_rows.get(c).is_some_and(|r| {
+                r.start <= at_row
+                    && (at_row < r.end || at_row == r.end && v.rows[r.start].new.is_none())
+            })
         });
         match step(&v.change_rows, cur, at_row, forward) {
             Step::At(i) => {
                 self.tabs[self.active].diff.cur = Some(i);
                 self.go_to_change();
             }
-            Step::OtherFile => self.other_changed_file(forward, false),
+            Step::OtherFile => self.other_changed_file(forward),
         }
     }
 
@@ -763,15 +779,31 @@ impl App {
         }
     }
 
-    /// Opens the next (or previous) file of the changes the diff compares with (uncommitted files
-    /// against the last commit, the branch's files against the PR base), with Diff on; it lands on
-    /// that file's first (last) change once compared ([`App::finish_land`]).
-    /// `passing`: a hop past a file without changes (Back keeps only the walk's start).
-    fn other_changed_file(&mut self, forward: bool, passing: bool) {
+    /// Past the last (first) change of the active tab: the next (previous) changed file.
+    fn other_changed_file(&mut self, forward: bool) {
         let Some(t) = self.tabs.get(self.active) else {
             return;
         };
-        let (path, against) = (t.path.clone(), t.diff.against);
+        if let Some(no_base) = t.diff.note.as_ref().filter(|n| n.starts_with("No base")) {
+            self.status = no_base.clone(); // every file would say the same
+            return;
+        }
+        let (from, against) = (t.path.clone(), t.diff.against);
+        let land = Land {
+            path: from.clone(),
+            forward,
+            origin: (from.clone(), t.cursor),
+            passed: Vec::new(),
+        };
+        self.walk_files(from, against, land);
+    }
+
+    /// Opens the next (or previous) file after `from` of the changes the diff compares with
+    /// (uncommitted files against the last commit, the branch's files against the PR base), with
+    /// Diff on, and lands on its first (last) change once compared ([`App::finish_land`]). A file
+    /// that cannot be opened is passed over. Back gets one entry, the walk's start; when no file is
+    /// left, the walk goes back to its start and says so.
+    fn walk_files(&mut self, from: PathBuf, against: Against, mut land: Land) {
         let files: Vec<PathBuf> = self
             .git
             .changes
@@ -785,35 +817,67 @@ impl App {
             .filter(|c| c.code != 'D')
             .map(|c| c.path.clone())
             .collect();
-        let here = files.iter().position(|p| *p == path);
-        let next = match (here, forward) {
-            (Some(i), true) => files.get(i + 1),
-            (Some(i), false) => i.checked_sub(1).and_then(|i| files.get(i)),
-            (None, true) => files.first(),
-            (None, false) => files.last(),
+        let here = files.iter().position(|p| *p == from);
+        let order: Vec<PathBuf> = match (here, land.forward) {
+            (Some(i), true) => files[i + 1..].to_vec(),
+            (Some(i), false) => files[..i].iter().rev().cloned().collect(),
+            (None, true) => files,
+            (None, false) => files.into_iter().rev().collect(),
         };
-        let Some(next) = next.cloned() else {
-            self.status = if forward {
-                "That was the last change of the last changed file".into()
-            } else {
-                "That was the first change of the first changed file".into()
-            };
-            return;
-        };
-        // one Back entry for the walk: only the first hop records where it started
-        if passing {
+        for next in order {
             self.show_file(&next, None);
-        } else {
-            self.open_file(&next, None);
-        }
-        if let Some(t) = self.tabs.get_mut(self.active).filter(|t| t.path == next) {
+            if self.tabs.get(self.active).is_none_or(|t| t.path != next) {
+                land.passed
+                    .push(format!("{} (cannot open)", file_name(&next)));
+                continue;
+            }
+            if from == land.origin.0 {
+                // the first hop from where the walk started: Back returns there
+                super::push_capped(&mut self.history, land.origin.clone());
+                self.forward.clear();
+            }
+            let t = &mut self.tabs[self.active];
             t.diff.set(true, against);
-            t.diff.cur = None;
-            self.land_jump = Some((next, forward));
+            land.path = next;
+            self.land_jump = Some(land);
             self.finish_land(); // an open tab compared already goes now
             self.save_session(true);
+            return;
         }
+        let (origin, cursor) = land.origin.clone();
+        if self.tabs.get(self.active).is_none_or(|t| t.path != origin) {
+            self.show_file(&origin, Some(cursor));
+        }
+        let mut s = if land.forward {
+            "That was the last change of the last changed file".to_string()
+        } else {
+            "That was the first change of the first changed file".to_string()
+        };
+        if !land.passed.is_empty() {
+            s.push_str(&format!(" (passed over {})", land.passed.join(", ")));
+        }
+        self.status = s;
     }
+}
+
+/// A walk to another changed file ([`App::walk_files`]).
+#[derive(Clone, Debug)]
+pub(super) struct Land {
+    /// The file it opened, which it lands in once compared.
+    pub path: PathBuf,
+    /// To the next file's first change (true), or the previous file's last.
+    pub forward: bool,
+    /// Where the walk started (file and cursor): Back goes there, and so does a walk with no file
+    /// left.
+    pub origin: (PathBuf, usize),
+    /// Files passed over, with why.
+    pub passed: Vec<String>,
+}
+
+fn file_name(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// An older version's file and commit sha.
@@ -1029,17 +1093,13 @@ fn flash_rects(
     let Some((rows, strength)) = flash else {
         return;
     };
-    let ys: Vec<f32> = v
+    // rows go down the screen in order: the first and the last row bound the change
+    let ends = v
         .rows
-        .get(rows.clone())
-        .into_iter()
-        .flatten()
-        .map(|r| at.row_y(v, r))
-        .collect();
-    if let (Some(top), Some(bottom)) = (
-        ys.iter().copied().reduce(f32::min),
-        ys.iter().copied().reduce(f32::max),
-    ) {
+        .get(rows.start)
+        .zip(rows.end.checked_sub(1).and_then(|l| v.rows.get(l)));
+    if let Some((first, last)) = ends {
+        let (top, bottom) = (at.row_y(v, first), at.row_y(v, last));
         let rect = Rect::from_min_max(
             Pos2::new(x, top),
             Pos2::new(clip.right(), bottom + at.row_h),
