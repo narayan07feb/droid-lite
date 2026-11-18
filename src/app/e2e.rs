@@ -8275,6 +8275,45 @@ fn e2e_goto_a_jump_left_while_downloading_does_not_pull_back_and_find_usages_fet
     let Some((f, sdk, tracker)) = sdk_fixture("gotosdkleave", false) else { return };
     // a slow stand-in sdkmanager (1 s) that installs the sources
     let tool = f.config.join("sdkmanager");
+    let dest = sdk.join("sources/android-34");
+    let mut script = String::from("#!/bin/sh\nsleep 1\n");
+    for (rel, text) in [
+        ("android/location/LocationManager.java", LM_JAVA),
+        ("android/content/Context.java", CONTEXT_JAVA),
+        ("android/app/Activity.java", ACTIVITY_JAVA),
+    ] {
+        let src = f.config.join(rel.replace('/', "_"));
+        std::fs::write(&src, text).unwrap();
+        let to = dest.join(rel);
+        script.push_str(&format!("mkdir -p '{}' && cp '{}' '{}'\n", to.parent().unwrap().display(), src.display(), to.display()));
+    }
+    std::fs::write(&tool, script).unwrap();
+    std::process::Command::new("chmod").arg("+x").arg(&tool).status().unwrap();
+    // SAFETY: the fixture holds the SERIAL lock.
+    unsafe { std::env::set_var("DROID_LITE_SDKMANAGER", &tool) };
+    let mut h = f.harness();
+    // Find usages before the source is here: approximate (the same class only), then exact once
+    // its own download ends (Context.getSystemService is also called through Activity)
+    open(&mut h, &tracker);
+    wait(&mut h, "resolved", |a| {
+        let t = &a.tabs[a.active];
+        a.xref.for_file(&t.path, t.rev).is_some()
+    });
+    place_cursor(&mut h, "getSystemService(\"a\")", 1);
+    key(&mut h, Modifiers::ALT, Key::F7);
+    wait(&mut h, "approximate", |a| a.status.contains("approximate") && a.found.iter().any(|l| l.line == 29));
+    let lines: Vec<usize> = h.state().found.iter().map(|l| l.line).collect();
+    assert_eq!(lines, [29], "approximate: the same class only");
+    assert_eq!(tab(&h).path, tracker, "Find usages does not open the declaration");
+    wait(&mut h, "exact", |a| a.found.iter().any(|l| l.line == 30));
+    let lines: Vec<usize> = h.state().found.iter().map(|l| l.line).collect();
+    assert_eq!(lines, [29, 30], "searched again once the source is here");
+    assert_eq!(h.state().fetches.started, 1);
+    drop(h);
+    drop(f);
+    // a jump left while downloading (another tab made active by any path): no pull back
+    let Some((f, sdk, tracker)) = sdk_fixture("gotosdkleave2", false) else { return };
+    let tool = f.config.join("sdkmanager");
     let src = f.config.join("LocationManager.java");
     std::fs::write(&src, LM_JAVA).unwrap();
     let dest = sdk.join("sources/android-34/android/location");
@@ -8285,19 +8324,11 @@ fn e2e_goto_a_jump_left_while_downloading_does_not_pull_back_and_find_usages_fet
     let mut h = f.harness();
     goto_at(&mut h, &tracker, "requestLocationUpdates(provider", 1);
     assert!(h.state().status.starts_with("Downloading"), "{}", h.state().status);
-    // the user opens another file before it ends: the download ends, nothing pulls them back
     let user = f.path("app/src/main/java/com/demo/data/User.kt");
-    open(&mut h, &user);
+    h.state_mut().show_file(&user, None); // not open_file: like a tab key or a restored session
     wait(&mut h, "downloaded", |a| !a.fetches.ended.is_empty());
     steps(&mut h, 10);
     assert_eq!(tab(&h).path, user);
-    // Find usages on a library call fetches its source without opening it (already here now)
-    open(&mut h, &tracker);
-    place_cursor(&mut h, "requestLocationUpdates(provider", 1);
-    key(&mut h, Modifiers::ALT, Key::F7);
-    wait(&mut h, "usages", |a| a.find_rx.is_none() && !a.found.is_empty());
-    assert_eq!(tab(&h).path, tracker, "Find usages does not open the declaration");
-    assert_eq!(h.state().fetches.started, 1);
 }
 
 #[test]
@@ -8563,23 +8594,6 @@ fn e2e_goto_a_loose_overload_nearby_does_not_hide_the_exact_one_further_up() {
 }
 
 #[test]
-fn e2e_goto_fetches_a_nearer_class_without_source_before_taking_a_farther_match() {
-    // the cache's jar has Parent but not Child; Child overrides foo: it must be fetched and opened
-    let child = ("demo/geo/Child.java", "package demo.geo;\n\npublic class Child extends Parent {\n    @Override public void foo(Thing t, String s) {}\n}\n");
-    let full = [THING, PARENT, child];
-    let kt = "package com.demo.loc\n\nimport demo.geo.Child\nimport demo.geo.Thing\n\nfun f(c: Child, t: Thing) {\n    c.foo(t, \"x\")\n}\n";
-    let Some((f, file)) = maven_fixture_with("gotonearer", &full, Some(&full), kt, false, Some(&[THING, PARENT])) else { return };
-    let mut h = f.harness();
-    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
-    goto_at(&mut h, &file, "foo(", 1);
-    wait(&mut h, "Child.java", |a| a.tabs[a.active].path.to_string_lossy().ends_with("!/demo/geo/Child.java"));
-    wait(&mut h, "the lookup", |a| !a.lib_reading());
-    steps(&mut h, 3);
-    assert!(tab(&h).text[tab(&h).cursor..].starts_with("foo(Thing t, String s)"));
-    assert_eq!(h.state().fetches.started, 1);
-}
-
-#[test]
 fn e2e_goto_an_extension_by_its_receiver_and_a_stub_from_an_aar() {
     let other = ("demo/geo/Other.java", "package demo.geo;\n\npublic class Other {}\n");
     let ext_kt = ("demo/geo/Ext.kt", "package demo.geo\n\nfun Other.spin(n: Int) {}\nfun Locator.spin(n: Int) {}\n");
@@ -8630,20 +8644,156 @@ fn e2e_goto_a_javax_library_class_is_looked_up_in_the_libraries_not_only_the_sdk
     assert!(tab(&h).text[tab(&h).cursor..].starts_with("enter(int level)"));
 }
 
+/// Two libraries: `demo.lib:base` (its classes and their sources in the Gradle cache) holding the
+/// classes of `java` whose path starts with one of `in_base`, and `demo.lib:geo` (classes only;
+/// its sources jar, of the rest, in the repository folder). Returns the fixture and Find.kt.
+fn two_lib_fixture(name: &str, java: &[(&str, &str)], in_base: &[&str], kt: &str) -> Option<(Fixture, PathBuf)> {
+    let f = Fixture::new(name);
+    let home = f.config.join("gradle-home");
+    let Some(classes) = crate::classfile::tests::javac(&f.config.join("javac"), java) else {
+        eprintln!("no javac: skipped");
+        return None;
+    };
+    let zip = |path: &Path, files: &[(String, Vec<u8>)]| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut z = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for (n, b) in files {
+            z.start_file(n.as_str(), zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut z, b).unwrap();
+        }
+        z.finish().unwrap();
+    };
+    let base = |n: &str| in_base.iter().any(|b| n.starts_with(b));
+    let (b, g): (Vec<_>, Vec<_>) = classes.into_iter().partition(|(n, _)| base(n));
+    let cache = home.join("caches/modules-2/files-2.1/demo.lib");
+    zip(&cache.join("base/1.0/aaa/base-1.0.jar"), &b);
+    let src = |want: bool| -> Vec<(String, Vec<u8>)> {
+        java.iter()
+            .filter(|(n, _)| base(n) == want)
+            .map(|(n, t)| (n.to_string(), t.as_bytes().to_vec()))
+            .collect()
+    };
+    zip(&cache.join("base/1.0/bbb/base-1.0-sources.jar"), &src(true));
+    zip(&cache.join("geo/1.0/ccc/geo-1.0.jar"), &g);
+    let repo = f.config.join("repo");
+    zip(&repo.join("demo/lib/geo/1.0/geo-1.0-sources.jar"), &src(false));
+    // SAFETY: the fixture holds the SERIAL lock.
+    unsafe {
+        std::env::set_var("DROID_LITE_GRADLE_HOME", &home);
+        std::env::set_var("DROID_LITE_MAVEN_REPOS", format!("file://{}", repo.display()));
+    }
+    std::fs::create_dir_all(f.path("gradle")).unwrap();
+    std::fs::write(
+        f.path("gradle/libs.versions.toml"),
+        "[libraries]\ndemo-geo = { module = \"demo.lib:geo\", version = \"1.0\" }\ndemo-base = { module = \"demo.lib:base\", version = \"1.0\" }\n",
+    )
+    .unwrap();
+    let file = f.path("app/src/main/java/com/demo/loc/Find.kt");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, kt).unwrap();
+    Some((f, file))
+}
+
+#[test]
+fn e2e_goto_fetches_a_nearer_class_without_source_before_taking_a_farther_match() {
+    // Child (geo: sources only in the repository) overrides Parent's foo (base: sources here)
+    let child = ("demo/geo/Child.java", "package demo.geo;\n\npublic class Child extends Parent {\n    @Override public void foo(Thing t, String s) {}\n}\n");
+    let java = [THING, PARENT, child];
+    let kt = "package com.demo.loc\n\nimport demo.geo.Child\nimport demo.geo.Thing\n\nfun f(c: Child, t: Thing) {\n    c.foo(t, \"x\")\n}\n";
+    let Some((f, file)) = two_lib_fixture("gotonearer", &java, &["demo/geo/Thing", "demo/geo/Parent"], kt) else { return };
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 2);
+    goto_at(&mut h, &file, "foo(", 1);
+    wait(&mut h, "Child.java", |a| a.tabs[a.active].path.to_string_lossy().ends_with("!/demo/geo/Child.java"));
+    wait(&mut h, "the lookup", |a| !a.lib_reading());
+    steps(&mut h, 3);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("foo(Thing t, String s)"));
+    assert_eq!(h.state().fetches.started, 1);
+}
+
 #[test]
 fn e2e_goto_fetches_a_supertype_without_source_at_the_level_of_the_match() {
-    // Child extends Parent implements Iface; Parent and Iface are one level up; the cache's jar
-    // has Child and Parent but not Iface: Iface must be fetched before Parent's foo is taken
+    // Child extends Parent implements Iface: Child and Parent in base (sources here), Iface in geo
+    // (sources only in the repository). Iface is as near as Parent's foo: it is fetched first.
     let iface = ("demo/geo/Iface.java", "package demo.geo;\n\npublic interface Iface {\n    default void foo(Thing t, String s) {}\n}\n");
     let child = ("demo/geo/Child.java", "package demo.geo;\n\npublic class Child extends Parent implements Iface {}\n");
-    let full = [THING, PARENT, iface, child];
+    let java = [THING, PARENT, iface, child];
     let kt = "package com.demo.loc\n\nimport demo.geo.Child\nimport demo.geo.Thing\n\nfun f(c: Child, t: Thing) {\n    c.foo(t, \"x\")\n}\n";
-    let Some((f, file)) = maven_fixture_with("gotolevel", &full, Some(&full), kt, false, Some(&[THING, PARENT, child])) else { return };
+    let Some((f, file)) = two_lib_fixture("gotolevel", &java, &["demo/geo/Thing", "demo/geo/Parent", "demo/geo/Child"], kt) else { return };
     let mut h = f.harness();
-    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 2);
     goto_at(&mut h, &file, "foo(", 1);
     wait(&mut h, "fetched", |a| a.fetches.started == 1 && a.fetches.ended.len() == 1);
     wait(&mut h, "the lookup", |a| !a.lib_reading());
     steps(&mut h, 3);
     assert_eq!(h.state().fetches.started, 1, "Iface's source was fetched before deciding");
+}
+
+#[test]
+fn e2e_goto_an_extension_whose_library_sources_must_be_downloaded() {
+    // Locator and Base in base (sources here); the extension in geo (sources only in the repo)
+    let ext_java = ("demo/geo/ExtKt.java", "package demo.geo;\n\npublic final class ExtKt {\n    public static void spin(Locator l, int n) {}\n}\n");
+    let java = [("demo/geo/Locator.java", GEO_JAVA), ("demo/geo/Base.java", GEO_BASE), ext_java];
+    let Some((f, file)) = two_lib_fixture(
+        "gotoextfetch",
+        &java,
+        &["demo/geo/Locator", "demo/geo/Base"],
+        "package com.demo.loc\n\nimport demo.geo.Locator\n\nfun find(l: Locator) {\n    l.spin(2)\n}\n",
+    ) else {
+        return;
+    };
+    // the repository's geo sources jar holds the Kotlin file, not the Java facade
+    let repo = f.config.join("repo/demo/lib/geo/1.0/geo-1.0-sources.jar");
+    {
+        let mut z = zip::ZipWriter::new(std::fs::File::create(&repo).unwrap());
+        z.start_file("demo/geo/Ext.kt", zip::write::SimpleFileOptions::default()).unwrap();
+        std::io::Write::write_all(&mut z, b"package demo.geo\n\nfun Locator.spin(n: Int) {}\n").unwrap();
+        z.finish().unwrap();
+    }
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 2);
+    goto_at(&mut h, &file, "spin(", 1);
+    wait(&mut h, "Ext.kt", |a| a.tabs[a.active].path.to_string_lossy().ends_with("!/demo/geo/Ext.kt"));
+    wait(&mut h, "the lookup", |a| !a.lib_reading());
+    steps(&mut h, 3);
+    assert!(tab(&h).text[..tab(&h).cursor].ends_with("fun Locator."));
+    assert_eq!(h.state().fetches.started, 1);
+}
+
+#[test]
+fn e2e_goto_weighs_the_whole_hierarchy_and_java_twins_and_trusts_an_existing_sources_folder() {
+    // Child declares foo(Object), Parent foo(String): javac takes Parent's for foo("x")
+    let parent = ("demo/geo/Parent.java", "package demo.geo;\n\npublic class Parent {\n    public void foo(String s) {}\n}\n");
+    let child = ("demo/geo/Child.java", "package demo.geo;\n\npublic class Child extends Parent {\n    public void foo(Object o) {}\n}\n");
+    let kt = "package com.demo.loc\n\nimport demo.geo.Child\n\nfun f(c: Child) {\n    c.foo(\"x\")\n}\n";
+    let Some((f, file)) = maven_fixture("gotowhole", &[parent, child], Some(&[parent, child]), kt) else { return };
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    goto_at(&mut h, &file, "foo(", 1);
+    wait(&mut h, "Parent.java", |a| a.tabs[a.active].path.to_string_lossy().ends_with("!/demo/geo/Parent.java"));
+    wait(&mut h, "the lookup", |a| !a.lib_reading());
+    steps(&mut h, 3);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("foo(String s)"));
+    drop(h);
+    drop(f);
+    // a Kotlin type with a Java twin: StringBuilder.append goes to the Java member
+    let Some((f, sdk, tracker)) = sdk_fixture("gototwin", true) else { return };
+    let sb = sdk.join("sources/android-34/java/lang/StringBuilder.java");
+    std::fs::create_dir_all(sb.parent().unwrap()).unwrap();
+    std::fs::write(&sb, "package java.lang;\n\npublic final class StringBuilder {\n    public StringBuilder append(long l) { return this; }\n    public StringBuilder append(int i) { return this; }\n}\n").unwrap();
+    std::fs::write(&tracker, TRACKER_KT.replace("    fun trim() {}", "    fun build() {\n        val sb = StringBuilder()\n        sb.append(1)\n    }")).unwrap();
+    let mut h = f.harness();
+    goto_at(&mut h, &tracker, "append(1)", 1);
+    wait(&mut h, "StringBuilder.java", |a| a.tabs[a.active].path == sb);
+    steps(&mut h, 3);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("append(int i)"), "{}", h.state().status);
+    drop(h);
+    drop(f);
+    // the SDK's sources folder is there but lacks the class: no download, the stub
+    let Some((f, sdk, tracker)) = sdk_fixture("gotonorefetch", true) else { return };
+    std::fs::remove_file(sdk.join("sources/android-34/android/location/LocationManager.java")).unwrap();
+    let mut h = f.harness();
+    goto_at(&mut h, &tracker, "requestLocationUpdates(provider", 1);
+    wait(&mut h, "the stub", |a| a.tabs[a.active].path.to_string_lossy().ends_with("(no source)"));
+    assert_eq!(h.state().fetches.started, 0, "the sources are installed: no sdkmanager run");
 }

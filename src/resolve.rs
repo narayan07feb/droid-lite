@@ -2482,6 +2482,15 @@ impl<'a> Resolver<'a> {
                 {
                     return Some(Ty::Lib("Array".into(), vec![Ty::Decl(e)]));
                 }
+                // `StringBuilder()`, `Handler(looper)`: a library class's constructor (a project
+                // class or function was found above) gives that class
+                if (callee == 0 || f.t(callee - 1) != ".")
+                    && name.starts_with(char::is_uppercase)
+                    && f.t(open) == "("
+                    && (f.imports.named.contains_key(&name) || java_twin(&name).is_some())
+                {
+                    return Some(Ty::Lib(name.clone(), Vec::new()));
+                }
                 let recv = if callee > 0 && f.t(callee - 1) == "." {
                     let mut e = callee - 1;
                     if e > 0 && f.t(e - 1) == "?" {
@@ -2646,13 +2655,16 @@ impl<'a> Resolver<'a> {
                 .chain(lambda.then(Vec::new))
                 .collect()
         });
+        let qualified = qualified.or_else(|| java_twin(&class).map(String::from));
         LibCall {
             class: class.rsplit('.').next().unwrap_or(&class).to_string(),
             qualified,
             stars: f.imports.stars.clone(),
             member: name.to_string(),
             args,
-            builtin: is_kotlin_type(&class),
+            // a Kotlin type with a Java twin (ArrayList, StringBuilder, Exception…) has the Java
+            // class's members: looked up there like any SDK class
+            builtin: is_kotlin_type(&class) && java_twin(&class).is_none(),
         }
     }
 
@@ -4259,6 +4271,22 @@ fn is_kotlin_type(t: &str) -> bool {
     )
 }
 
+/// The Java class a Kotlin type is, when Kotlin keeps the Java class's members on it.
+fn java_twin(t: &str) -> Option<&'static str> {
+    Some(match t.split('<').next().unwrap_or(t) {
+        "ArrayList" => "java.util.ArrayList",
+        "HashMap" => "java.util.HashMap",
+        "LinkedHashMap" => "java.util.LinkedHashMap",
+        "HashSet" => "java.util.HashSet",
+        "LinkedHashSet" => "java.util.LinkedHashSet",
+        "StringBuilder" => "java.lang.StringBuilder",
+        "Throwable" => "java.lang.Throwable",
+        "Exception" => "java.lang.Exception",
+        "Error" => "java.lang.Error",
+        _ => return None,
+    })
+}
+
 /// The type of a number literal: `0f` Float, `0L` Long, `1.5` / `1e3` Double, else Int.
 fn num_type(lit: &str) -> &'static str {
     let l = lit.to_ascii_lowercase();
@@ -4267,7 +4295,7 @@ fn num_type(lit: &str) -> &'static str {
         "Float"
     } else if l.ends_with('l') {
         "Long"
-    } else if !hex && (l.contains('.') || l.contains('e')) {
+    } else if !hex && (l.contains('.') || l.contains('e') || l.ends_with('d')) {
         "Double"
     } else {
         "Int"

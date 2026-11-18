@@ -117,7 +117,6 @@ pub fn parse(bytes: &[u8]) -> Option<ClassInfo> {
             }
             r.at = end;
         }
-        // public (0x1) static (0x8), not synthetic (0x1000)
         // public (0x1) or protected (0x4), not synthetic (0x1000)
         if m_access & 0x1000 == 0
             && m_access & 0x0005 != 0
@@ -126,6 +125,7 @@ pub fn parse(bytes: &[u8]) -> Option<ClassInfo> {
         {
             methods.push((m_name.clone(), m_desc, m_access));
         }
+        // public (0x1) static (0x8), not synthetic (0x1000)
         if m_access & 0x1009 == 0x0009 && !m_name.starts_with('<') && !m_name.contains('$') {
             statics.push((m_name, composable));
         }

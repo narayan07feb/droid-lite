@@ -614,6 +614,8 @@ pub struct App {
     libs_rx: Option<Receiver<crate::libs::Libraries>>,
     /// Downloads of library and SDK sources for Go to declaration.
     fetches: libsrc_ui::Fetches,
+    /// A library Find usages under way: its call, and whether its list came out approximate.
+    lib_usages_note: Option<(crate::resolve::LibCall, Receiver<bool>)>,
     compose_view: Option<ComposeView>,
     previews: Previews,
     /// The Compose panel's structure sections (composables, UI tree, …) are shown; per project.
@@ -765,6 +767,7 @@ impl App {
             libs: Default::default(),
             libs_rx: None,
             fetches: Default::default(),
+            lib_usages_note: None,
             compose_view: None,
             previews: Previews::default(),
             show_structure: false,
@@ -1602,8 +1605,10 @@ impl App {
     }
 
     /// Find references of a library member: the calls the worker reads as the same member, kept
-    /// when they lead to the same declaration ([`libsrc_ui::exact_usages`]).
-    fn search_lib_usages(&mut self, call: crate::resolve::LibCall, ctx: &egui::Context) {
+    /// when they lead to the same declaration ([`libsrc_ui::exact_usages`]). While the
+    /// declaration's source is missing the list is approximate (the status says so); it is made
+    /// again when a download ends.
+    pub(super) fn search_lib_usages(&mut self, call: crate::resolve::LibCall, ctx: &egui::Context) {
         let Some(p) = &self.project else { return };
         let root = p.root.clone();
         let open: HashMap<PathBuf, std::sync::Arc<str>> = self
@@ -1624,17 +1629,28 @@ impl App {
             })
             .unwrap_or_default();
         let (tx, rx) = channel();
+        let (note_tx, note_rx) = channel();
         let c = ctx.clone();
         self.status = format!("Searching for `{}.{}`…", call.class, call.member);
         let target = call.clone();
-        self.xref.find_lib_usages("find", call, open, root, move |cands| {
+        // a newer search makes this one stop
+        let generation = self.fetches.usages_gen.clone();
+        let mine = generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        self.xref.find_lib_usages("find", call.clone(), open, root, move |cands| {
             // the lookups read sources: on their own thread, not the code insight worker
             std::thread::spawn(move || {
-                let _ = tx.send(libsrc_ui::exact_usages(base, target, imports, cands));
+                let stale = || generation.load(std::sync::atomic::Ordering::Relaxed) != mine;
+                if let Some((found, approximate)) =
+                    libsrc_ui::exact_usages(base, target, imports, cands, stale)
+                {
+                    let _ = note_tx.send(approximate);
+                    let _ = tx.send(found);
+                }
                 c.request_repaint();
             });
         });
         self.find_rx = Some(rx);
+        self.lib_usages_note = Some((call, note_rx));
         self.bottom = Bottom::Find;
     }
 
@@ -4839,6 +4855,19 @@ impl eframe::App for App {
         self.rescan_resources(&ctx);
         self.poll_libs();
         self.poll_fetches();
+        if let Some((call, rx)) = &self.lib_usages_note
+            && let Ok(approximate) = rx.try_recv()
+        {
+            if approximate {
+                // its declaration's source is still downloading: searched again once it is here
+                self.fetches.usages_again = Some(call.clone());
+                self.status = format!(
+                    "References to `{}.{}` are approximate until its source is downloaded",
+                    call.class, call.member
+                );
+            }
+            self.lib_usages_note = None;
+        }
         self.poll_prs();
         self.refresh_changes(&ctx); // git status for tree colours, not only the Current changes tab
         self.watch_focus(&ctx);

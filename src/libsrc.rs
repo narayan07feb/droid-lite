@@ -206,13 +206,14 @@ pub fn repos(root: &Path) -> Vec<String> {
             if line.contains("mavenCentral()") {
                 add(&mut out, "https://repo.maven.apache.org/maven2");
             }
-            for key in ["maven(\"", "uri(\"", "url \"", "url '"] {
+            for key in ["maven(\"", "uri(\"", "url \"", "url '", "url = \""] {
                 if let Some(i) = line.find(key) {
                     let rest = &line[i + key.len()..];
                     if let Some(end) = rest.find(['"', '\'']) {
                         let u = &rest[..end];
-                        // https only: a plain-http repository is not trusted for code
-                        if u.starts_with("https://") {
+                        // https only (a plain-http repository is not trusted for code), and no
+                        // URL with a password in it (it would show in the command line)
+                        if u.starts_with("https://") && !u.contains('@') {
                             add(&mut out, u);
                         }
                     }
@@ -256,6 +257,15 @@ impl Fetch {
             Fetch::Sdk { api, .. } => format!("Android {api} SDK sources"),
             Fetch::Maven { coords, .. } => format!("{coords} sources"),
         }
+    }
+}
+
+/// The download's result is on disk already (the SDK's sources folder, the cached jar): running it
+/// again would bring nothing new.
+pub fn already_there(f: &Fetch) -> bool {
+    match f {
+        Fetch::Sdk { sdk, api } => sdk.join(format!("sources/android-{api}")).is_dir(),
+        Fetch::Maven { coords, .. } => cached_sources_jar(coords).is_some_and(|j| j.is_file()),
     }
 }
 
@@ -328,7 +338,8 @@ pub fn fetch(f: &Fetch) -> Result<(), String> {
                 }
                 tried += 1;
                 let status = std::process::Command::new("curl")
-                    .args(["-fsSL", "--max-time", "120", "--max-filesize", "209715200"])
+                    // -g: the URL is taken as written (no curl globbing)
+                    .args(["-fsSLg", "--max-time", "120", "--max-filesize", "209715200"])
                     .args(["--proto", if file { "=file" } else { "=https" }])
                     .args(["--proto-redir", if file { "=file" } else { "=https" }])
                     .arg("-o")
@@ -337,7 +348,13 @@ pub fn fetch(f: &Fetch) -> Result<(), String> {
                     .stdin(std::process::Stdio::null())
                     .status()
                     .map_err(|e| format!("curl did not start: {e}"))?;
-                let zip = std::fs::read(&part).is_ok_and(|b| b.starts_with(b"PK\x03\x04"));
+                let zip = {
+                    let mut magic = [0u8; 4];
+                    std::fs::File::open(&part)
+                        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic))
+                        .is_ok()
+                        && magic == *b"PK\x03\x04"
+                };
                 if status.success() && zip && std::fs::rename(&part, &dest).is_ok() {
                     return Ok(());
                 }
@@ -640,26 +657,43 @@ pub fn class_entry(qualified: &str) -> String {
         .to_string()
 }
 
-/// The declarations a call means in a library source, best first, and whether they are a sure
-/// match: `exact` when the parameter types were weighed (the most specific overload, or every one
-/// when no argument's type is known), not when only the count or the name fit.
+/// The declarations a call means in a library source, best first, whether they are a sure match
+/// (`exact`: the parameter types were weighed, or the name says it for a property) and how well
+/// the arguments fit them (`score`, to weigh them against a supertype's overloads).
 #[derive(Debug, Default, PartialEq)]
 pub struct Members {
     pub offsets: Vec<usize>,
     pub exact: bool,
+    pub score: usize,
 }
 
 /// The declarations of `call.member` in `class` of a library source (`text` of `path`): those
 /// whose parameters take the arguments' types (exact); else those that take as many arguments;
-/// else every one of that name. A Kotlin property read as a Java getter (`manager.allProviders`
+/// else every one of that name. `class` may be a nested path (`Outer.Builder`): only the members
+/// inside that class's body count. A Kotlin property read as a Java getter (`manager.allProviders`
 /// for `getAllProviders()`) finds the getter.
 pub fn find_member(path: &Path, text: &str, class: &str, call: &LibCall) -> Members {
     let syms = crate::kotlin::scan_file(path, text);
-    // a member of the class itself, not a top-level function of the file
+    let simple = class.rsplit('.').next().unwrap_or(class);
+    // the class's body: for `Outer.Builder` the Builder inside Outer, not another file's or class's
+    let outer = class.rsplit('.').nth(1);
+    let body = syms
+        .decls
+        .iter()
+        .filter(|d| d.kind.is_type() && d.name == simple)
+        .find(|d| match outer {
+            Some(o) => d
+                .container
+                .as_deref()
+                .is_some_and(|c| c.rsplit('.').next() == Some(o)),
+            None => true,
+        })
+        .and_then(|d| d.body.clone().or_else(|| brace_body(text, d.offset)));
     let in_class = |d: &&crate::kotlin::Decl| {
         d.container
             .as_deref()
-            .is_some_and(|c| c.rsplit('.').next() == Some(class))
+            .is_some_and(|c| c.rsplit('.').next() == Some(simple))
+            && body.as_ref().is_none_or(|b| b.contains(&d.offset))
     };
     let named = |name: &str| -> Vec<&crate::kotlin::Decl> {
         syms.decls
@@ -688,13 +722,68 @@ pub fn find_member(path: &Path, text: &str, class: &str, call: &LibCall) -> Memb
         return Members {
             offsets: ds.iter().map(|d| d.offset).collect(),
             exact,
+            score: 0,
         };
     };
-    rank(&ds, args)
+    let class_params = class_offset(text, simple)
+        .map(|at| type_params(&text[at + simple.len()..]))
+        .unwrap_or_default();
+    rank(&ds, args, |d| {
+        let mut v = class_params.clone();
+        v.extend(method_type_params(text, d.offset));
+        v
+    })
 }
 
-/// The overloads `ds` that `args` fit best (see [`Members`]).
-fn rank(ds: &[&crate::kotlin::Decl], args: &[Vec<String>]) -> Members {
+/// The `{ … }` that follows `from` (a class's body when the scanner kept none): its range, by
+/// counting braces outside strings, chars and comments.
+fn brace_body(text: &str, from: usize) -> Option<std::ops::Range<usize>> {
+    let start = from + text[from..].find('{')?;
+    let b = text.as_bytes();
+    let (mut depth, mut i) = (0usize, start);
+    while i < b.len() {
+        match b[i] {
+            b'"' | b'\'' => {
+                // a string or char: to its closing quote
+                let q = b[i];
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start..i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The overloads `ds` that `args` fit best (see [`Members`]); `tparams(d)`: the type parameters
+/// declared for `d` (they take any argument).
+fn rank(
+    ds: &[&crate::kotlin::Decl],
+    args: &[Vec<String>],
+    tparams: impl Fn(&crate::kotlin::Decl) -> Vec<String>,
+) -> Members {
     let count = |d: &&&crate::kotlin::Decl| {
         let ps = &d.params;
         let required = ps.iter().filter(|p| !p.has_default && !p.vararg).count();
@@ -706,6 +795,7 @@ fn rank(ds: &[&crate::kotlin::Decl], args: &[Vec<String>]) -> Members {
     let scored: Vec<(usize, usize)> = by_count
         .iter()
         .filter_map(|d| {
+            let tp = tparams(d);
             let mut score = 0;
             for (a, p) in args.iter().zip(&d.params) {
                 if a.is_empty() {
@@ -717,7 +807,7 @@ fn rank(ds: &[&crate::kotlin::Decl], args: &[Vec<String>]) -> Members {
                 } else {
                     p.ty.as_str()
                 };
-                score += match_score(ty, a)?;
+                score += match_score(ty, a, &tp)?;
             }
             Some((d.offset, score))
         })
@@ -730,6 +820,7 @@ fn rank(ds: &[&crate::kotlin::Decl], args: &[Vec<String>]) -> Members {
                 .map(|(o, _)| o)
                 .collect(),
             exact: true,
+            score: best,
         };
     }
     let offsets = if by_count.is_empty() {
@@ -740,7 +831,57 @@ fn rank(ds: &[&crate::kotlin::Decl], args: &[Vec<String>]) -> Members {
     Members {
         offsets,
         exact: false,
+        score: 0,
     }
+}
+
+/// The names of the type parameters a `<…>` at the start of `s` declares (`<K, V : Any>` gives K
+/// and V; `<T extends Foo>` gives T).
+fn type_params(s: &str) -> Vec<String> {
+    let s = s.trim_start();
+    let Some(rest) = s.strip_prefix('<') else {
+        return Vec::new();
+    };
+    let mut depth = 1;
+    let mut end = rest.len();
+    for (i, c) in rest.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    split_top(&rest[..end])
+        .into_iter()
+        .filter_map(|p| {
+            let p = p
+                .trim()
+                .trim_start_matches("reified ")
+                .trim_start_matches("in ")
+                .trim_start_matches("out ");
+            let name: String = p
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect()
+}
+
+/// The type parameters a method declares: the `<…>` before its name on its line
+/// (`public <TResult> Task<TResult> continueWith(` gives TResult).
+fn method_type_params(text: &str, offset: usize) -> Vec<String> {
+    let line = text[..offset].rfind('\n').map_or(0, |i| i + 1);
+    let head = &text[line..offset];
+    head.find('<')
+        .map(|i| type_params(&head[i..]))
+        .unwrap_or_default()
 }
 
 /// Top-level extension functions `fun Receiver.member(…)` in a library source whose receiver is
@@ -761,10 +902,11 @@ pub fn find_extension(path: &Path, text: &str, receivers: &[String], call: &LibC
         })
         .collect();
     match &call.args {
-        Some(args) => rank(&ds, args),
+        Some(args) => rank(&ds, args, |d| method_type_params(text, d.offset)),
         None => Members {
             exact: !ds.is_empty(),
             offsets: ds.iter().map(|d| d.offset).collect(),
+            score: 0,
         },
     }
 }
@@ -830,6 +972,9 @@ pub fn kotlin_supers(t: &str) -> &'static [&'static str] {
             "Iterable",
         ],
         "Int" | "Long" | "Short" | "Byte" | "Double" | "Float" => &["Number", "Comparable"],
+        "IntRange" | "LongRange" | "CharRange" => &["IntProgression", "ClosedRange", "Iterable"],
+        "Sequence" => &["Sequence"],
+        "Pair" | "Triple" => &["Serializable"],
         _ => &[],
     }
 }
@@ -899,7 +1044,7 @@ const MAX_AAR_JAR: u64 = 64 * 1024 * 1024;
 /// step for a supertype, 50 a widening (a number literal), 40 a box (`Int` to `Integer`), 10 a
 /// parameter that takes anything (`Object`, a type parameter, a function type for a lambda),
 /// None when it does not take it.
-fn match_score(param: &str, arg: &[String]) -> Option<usize> {
+fn match_score(param: &str, arg: &[String], tparams: &[String]) -> Option<usize> {
     if param.contains("->") {
         return Some(10); // a function type: what a lambda is, whose type is not read
     }
@@ -940,9 +1085,10 @@ fn match_score(param: &str, arg: &[String]) -> Option<usize> {
     if p.is_empty()
         || p == "Object"
         || p == "Any"
+        || tparams.contains(&p)
         || (p.len() == 1 && p.starts_with(char::is_uppercase))
     {
-        return Some(10);
+        return Some(10); // anything, or a type parameter
     }
     None
 }
@@ -1196,7 +1342,7 @@ mod tests {
     }
 
     fn accepts_(param: &str, arg: &[String]) -> bool {
-        match_score(param, arg).is_some()
+        match_score(param, arg, &[]).is_some()
     }
 
     #[test]
@@ -1218,9 +1364,9 @@ mod tests {
         let f = fm(Path::new("H.java"), h, "H", &c);
         assert!(f.len() == 1 && h[f[0]..].starts_with("f(Mid m)"));
         // String and String[] are told apart; IntArray is int[]; a lambda fits a function type
-        assert!(match_score("String[]", &s(&["String"])).is_none());
-        assert_eq!(match_score("int[]", &s(&["IntArray"])), Some(100));
-        assert!(match_score("(Int) -> Unit", &s(&[])).is_some());
+        assert!(match_score("String[]", &s(&["String"]), &[]).is_none());
+        assert_eq!(match_score("int[]", &s(&["IntArray"]), &[]), Some(100));
+        assert!(match_score("(Int) -> Unit", &s(&[]), &[]).is_some());
         // a real tie: two declarations that fit as well
         let t2 = "class T {\n    void g(Object a) {}\n    void g(Object b) {}\n}\n";
         let mut c = call("g", &[&["Thing"]]);
@@ -1243,6 +1389,24 @@ mod tests {
             &s(&["PendingIntent", "Parcelable"])
         ));
         assert!(same_type(&s(&["Leaf", "Base"]), &s(&["Base"])));
+    }
+
+    #[test]
+    fn type_parameters_of_any_name_and_nested_classes_of_one_name() {
+        // `TResult` is a type parameter of the method: it takes any argument
+        let task = "class Task {\n    public <TResult> void put(TResult value) {}\n}\n";
+        let mut c = call("put", &[&["Thing"]]);
+        c.class = "Task".into();
+        let m = find_member(Path::new("Task.java"), task, "Task", &c);
+        assert!(m.exact && m.offsets.len() == 1, "{m:?}");
+        // two nested Builders in one file: Outer.Builder is Outer's
+        let two = "class Outer {\n    static class Builder {\n        void build(int a) {}\n    }\n}\nclass Other {\n    static class Builder {\n        void build(int b) {}\n    }\n}\n";
+        let mut c = call("build", &[&["Int"]]);
+        c.class = "Builder".into();
+        let m = find_member(Path::new("X.java"), two, "Outer.Builder", &c);
+        assert_eq!(m.offsets, [two.find("build(int a)").unwrap()]);
+        let m = find_member(Path::new("X.java"), two, "Other.Builder", &c);
+        assert_eq!(m.offsets, [two.find("build(int b)").unwrap()]);
     }
 
     #[test]

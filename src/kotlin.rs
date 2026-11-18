@@ -966,7 +966,8 @@ fn java_params(s: &Scanner, open: usize) -> Vec<Param> {
             };
         }
         let last = k.saturating_sub(1);
-        if last > a && s.kind(last) == Some(Tok::Ident) {
+        // a Kotlin-only keyword (`value`, `data`, `open`…) is a plain name in Java
+        if last > a && matches!(s.kind(last), Some(Tok::Ident | Tok::Keyword)) {
             let ty = s.join(a, last);
             out.push(Param {
                 name: s.text(last).to_string(),
