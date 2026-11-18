@@ -140,6 +140,13 @@ impl Fixture {
                 "/nonexistent/droid-lite-no-gradle",
             )
         };
+        // nor read the real Android SDK, run sdkmanager or download library sources
+        unsafe {
+            std::env::set_var("DROID_LITE_ANDROID_SDK", "/nonexistent/droid-lite-no-sdk");
+            std::env::set_var("DROID_LITE_SDKMANAGER", "/nonexistent/droid-lite-no-sdkmanager");
+            std::env::set_var("DROID_LITE_MAVEN_REPOS", "file:///nonexistent/droid-lite-no-repo");
+            std::env::set_var("DROID_LITE_SOURCES_DIR", config.join("sources"));
+        }
         Fixture {
             root,
             config,
@@ -8089,4 +8096,227 @@ fn e2e_diff_panel_counts_rows_of_the_layout_it_shows_and_a_new_diff() {
     h.state_mut().show_diff_text("Diff: one".into(), "@@ -1 +1 @@\n-a\n+A\n".into());
     steps(&mut h, 3);
     h.get_by_label("1 change");
+}
+
+const LM_JAVA: &str = "package android.location;\n\nimport android.app.PendingIntent;\n\npublic class LocationManager {\n    public void requestLocationUpdates(String provider, long minTimeMs, float minDistanceM, PendingIntent pendingIntent) {}\n    public void requestLocationUpdates(String provider, long minTimeMs, float minDistanceM, LocationListener listener) {}\n    public java.util.List<String> getAllProviders() { return null; }\n}\n";
+
+const TRACKER_KT: &str = "package com.demo.loc\n\nimport android.location.LocationListener\nimport android.location.LocationManager\n\ninterface Updates {\n    fun requestLocationUpdates()\n}\n\nclass Tracker(private val listener: LocationListener) : Updates {\n    private var locationManager: LocationManager? = null\n\n    override fun requestLocationUpdates() {\n        val manager = locationManager\n        val provider = \"gps\"\n        if (manager != null) {\n            manager.requestLocationUpdates(provider, 0, 0f, listener)\n        }\n    }\n\n    fun show(a: Int) {}\n    fun show(a: String) {}\n\n    fun start() {\n        show(\"x\")\n        requestLocationUpdates()\n    }\n}\n";
+
+/// A fake Android SDK in `dir` for API 34: `android.jar` with LocationManager (compiled), and its
+/// source when `sources`. False when this Mac has no javac.
+fn fake_sdk(dir: &Path, sources: bool) -> bool {
+    let Some(classes) = crate::classfile::tests::javac(
+        &dir.join("javac"),
+        &[
+            ("android/location/LocationManager.java", LM_JAVA),
+            (
+                "android/location/LocationListener.java",
+                "package android.location; public interface LocationListener { void onLocationChanged(Object l); }",
+            ),
+            ("android/app/PendingIntent.java", "package android.app; public class PendingIntent {}"),
+        ],
+    ) else {
+        return false;
+    };
+    let jar = dir.join("platforms/android-34/android.jar");
+    std::fs::create_dir_all(jar.parent().unwrap()).unwrap();
+    let mut z = zip::ZipWriter::new(std::fs::File::create(&jar).unwrap());
+    for (n, b) in &classes {
+        z.start_file(n.as_str(), zip::write::SimpleFileOptions::default()).unwrap();
+        std::io::Write::write_all(&mut z, b).unwrap();
+    }
+    z.finish().unwrap();
+    if sources {
+        let s = dir.join("sources/android-34/android/location/LocationManager.java");
+        std::fs::create_dir_all(s.parent().unwrap()).unwrap();
+        std::fs::write(s, LM_JAVA).unwrap();
+    }
+    true
+}
+
+/// A fixture with Tracker.kt, compileSdk 34 and the fake SDK; None without javac.
+fn sdk_fixture(name: &str, sources: bool) -> Option<(Fixture, PathBuf, PathBuf)> {
+    let f = Fixture::new(name);
+    let sdk = f.config.join("sdk");
+    if !fake_sdk(&sdk, sources) {
+        eprintln!("no javac: skipped");
+        return None;
+    }
+    // SAFETY: the fixture holds the SERIAL lock.
+    unsafe { std::env::set_var("DROID_LITE_ANDROID_SDK", &sdk) };
+    std::fs::write(f.path("app/build.gradle.kts"), "plugins { id(\"com.android.application\") }\nandroid {\n    compileSdk = 34\n}\n").unwrap();
+    let tracker = f.path("app/src/main/java/com/demo/loc/Tracker.kt");
+    std::fs::create_dir_all(tracker.parent().unwrap()).unwrap();
+    std::fs::write(&tracker, TRACKER_KT).unwrap();
+    Some((f, sdk, tracker))
+}
+
+/// F3 at `needle` (+ `extra`) in `file`, once the background resolver has read the file.
+fn goto_at(h: &mut Harness<'static, App>, file: &Path, needle: &str, extra: usize) {
+    open(h, file);
+    wait(h, "resolved", |a| {
+        let t = &a.tabs[a.active];
+        a.xref.for_file(&t.path, t.rev).is_some()
+    });
+    place_cursor(h, needle, extra);
+    key(h, Modifiers::NONE, Key::F3);
+}
+
+#[test]
+fn e2e_goto_on_an_sdk_call_opens_its_exact_overload_not_a_project_function_of_that_name() {
+    let Some((f, sdk, tracker)) = sdk_fixture("gotosdk", true) else { return };
+    let mut h = f.harness();
+    // manager: LocationManager, provider: String, 0, 0f, listener: LocationListener
+    goto_at(&mut h, &tracker, "requestLocationUpdates(provider", 1);
+    let lm = sdk.join("sources/android-34/android/location/LocationManager.java");
+    assert_eq!(tab(&h).path, lm, "{}", h.state().status);
+    assert!(
+        tab(&h).text[tab(&h).cursor..].starts_with(
+            "requestLocationUpdates(String provider, long minTimeMs, float minDistanceM, LocationListener listener)"
+        ),
+        "the LocationListener overload, not the PendingIntent one with as many parameters"
+    );
+    assert!(tab(&h).readonly, "SDK sources are read-only");
+    // same count, different types, in the project: the String overload
+    goto_at(&mut h, &tracker, "show(\"x\")", 1);
+    assert_eq!(tab(&h).path, tracker);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("show(a: String)"));
+    // an unqualified call still goes to the project's own function
+    goto_at(&mut h, &tracker, "requestLocationUpdates()\n    }\n}", 1);
+    assert_eq!(tab(&h).path, tracker);
+    assert!(tab(&h).text[..tab(&h).cursor].ends_with("override fun "));
+    assert!(h.state().fetches.started == 0, "nothing to download");
+    // Find usages on the SDK call: that library call only, not the project's same-named function
+    open(&mut h, &tracker);
+    place_cursor(&mut h, "requestLocationUpdates(provider", 1);
+    key(&mut h, Modifiers::ALT, Key::F7);
+    wait(&mut h, "usages", |a| a.find_rx.is_none() && !a.found.is_empty());
+    let lines: Vec<usize> = h.state().found.iter().map(|l| l.line).collect();
+    assert_eq!(lines, [17], "only manager.requestLocationUpdates(provider, 0, 0f, listener)");
+    assert!(h.state().found_title.contains("LocationManager.requestLocationUpdates"));
+}
+
+#[test]
+fn e2e_goto_downloads_missing_sdk_sources_once_then_uses_them() {
+    let Some((f, sdk, tracker)) = sdk_fixture("gotosdkfetch", false) else { return };
+    // a stand-in sdkmanager: logs each run and installs the sources
+    let log = f.config.join("sdkmanager.log");
+    let tool = f.config.join("sdkmanager");
+    let src = f.config.join("LocationManager.java");
+    std::fs::write(&src, LM_JAVA).unwrap();
+    let dest = sdk.join("sources/android-34/android/location");
+    std::fs::write(
+        &tool,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\nmkdir -p '{}' && cp '{}' '{}/'\n",
+            log.display(),
+            dest.display(),
+            src.display(),
+            dest.display()
+        ),
+    )
+    .unwrap();
+    std::process::Command::new("chmod").arg("+x").arg(&tool).status().unwrap();
+    // SAFETY: the fixture holds the SERIAL lock.
+    unsafe { std::env::set_var("DROID_LITE_SDKMANAGER", &tool) };
+    let mut h = f.harness();
+    goto_at(&mut h, &tracker, "requestLocationUpdates(provider", 1);
+    assert!(h.state().status.starts_with("Downloading Android 34 SDK sources"), "{}", h.state().status);
+    let lm = sdk.join("sources/android-34/android/location/LocationManager.java");
+    wait(&mut h, "downloaded and opened", |a| a.tabs[a.active].path == lm);
+    steps(&mut h, 3);
+    assert!(tab(&h).text[tab(&h).cursor..].contains("LocationListener listener)"));
+    assert!(!tab(&h).text[tab(&h).cursor..tab(&h).cursor + 120].contains("PendingIntent"));
+    let runs = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(runs.lines().collect::<Vec<_>>(), [format!("--sdk_root={} sources;android-34", sdk.display())]);
+    // again: the sources are there now, no second download
+    goto_at(&mut h, &tracker, "requestLocationUpdates(provider", 1);
+    assert_eq!(tab(&h).path, lm);
+    assert_eq!(h.state().fetches.started, 1);
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn e2e_goto_without_any_source_shows_the_class_file_stub_at_the_overload() {
+    let Some((f, _sdk, tracker)) = sdk_fixture("gotostub", false) else { return };
+    let tool = f.config.join("sdkmanager");
+    std::fs::write(&tool, "#!/bin/sh\necho 'Failed to find package' >&2\nexit 1\n").unwrap();
+    std::process::Command::new("chmod").arg("+x").arg(&tool).status().unwrap();
+    // SAFETY: the fixture holds the SERIAL lock.
+    unsafe { std::env::set_var("DROID_LITE_SDKMANAGER", &tool) };
+    let mut h = f.harness();
+    goto_at(&mut h, &tracker, "requestLocationUpdates(provider", 1);
+    wait(&mut h, "the stub", |a| a.tabs[a.active].path.to_string_lossy().ends_with("(no source)"));
+    steps(&mut h, 3);
+    let t = tab(&h);
+    assert!(t.readonly);
+    assert!(t.text.contains("no source"), "says why");
+    assert!(
+        t.text[t.cursor..].starts_with("requestLocationUpdates(String p0, long p1, float p2, LocationListener p3)"),
+        "{}",
+        &t.text[t.cursor..]
+    );
+    assert!(h.state().status.contains("Failed to find package"), "{}", h.state().status);
+}
+
+#[test]
+fn e2e_goto_downloads_a_librarys_sources_jar_once_then_uses_the_cache() {
+    let f = Fixture::new("gotomaven");
+    let home = f.config.join("gradle-home");
+    let java = "package demo.geo;\n\npublic class Locator {\n    public void locate(String name, long timeout) {}\n    public void locate(String name, Object tag) {}\n}\n";
+    let Some(classes) = crate::classfile::tests::javac(&f.config.join("javac"), &[("demo/geo/Locator.java", java)]) else {
+        eprintln!("no javac: skipped");
+        return;
+    };
+    let zip = |path: &Path, files: &[(String, Vec<u8>)]| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut z = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for (n, b) in files {
+            z.start_file(n.as_str(), zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut z, b).unwrap();
+        }
+        z.finish().unwrap();
+    };
+    // the Gradle cache has the classes only; the project's repository has the sources jar
+    zip(&home.join("caches/modules-2/files-2.1/demo.lib/geo/1.0/aaa/geo-1.0.jar"), &classes);
+    let repo = f.config.join("repo");
+    zip(
+        &repo.join("demo/lib/geo/1.0/geo-1.0-sources.jar"),
+        &[("demo/geo/Locator.java".into(), java.as_bytes().to_vec())],
+    );
+    // SAFETY: the fixture holds the SERIAL lock.
+    unsafe {
+        std::env::set_var("DROID_LITE_GRADLE_HOME", &home);
+        std::env::set_var("DROID_LITE_MAVEN_REPOS", format!("file://{}", repo.display()));
+    }
+    std::fs::create_dir_all(f.path("gradle")).unwrap();
+    std::fs::write(
+        f.path("gradle/libs.versions.toml"),
+        "[libraries]\ndemo-geo = { module = \"demo.lib:geo\", version = \"1.0\" }\n",
+    )
+    .unwrap();
+    let file = f.path("app/src/main/java/com/demo/loc/Find.kt");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &file,
+        "package com.demo.loc\n\nimport demo.geo.Locator\n\nfun find(l: Locator) {\n    l.locate(\"home\", 5L)\n}\n",
+    )
+    .unwrap();
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    goto_at(&mut h, &file, "locate(", 1);
+    assert!(h.state().status.starts_with("Downloading demo.lib:geo:1.0 sources"), "{}", h.state().status);
+    wait(&mut h, "downloaded and opened", |a| {
+        a.tabs[a.active].path.to_string_lossy().ends_with("geo-1.0-sources.jar!/demo/geo/Locator.java")
+    });
+    steps(&mut h, 3);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("locate(String name, long timeout)"), "the long overload");
+    assert!(tab(&h).readonly);
+    let cached = f.config.join("sources/demo.lib/geo/1.0/geo-1.0-sources.jar");
+    assert!(cached.is_file(), "kept in the sources cache");
+    // again, with the repository gone: straight from the cache
+    std::fs::remove_dir_all(&repo).unwrap();
+    goto_at(&mut h, &file, "locate(", 1);
+    assert!(tab(&h).path.to_string_lossy().ends_with("geo-1.0-sources.jar!/demo/geo/Locator.java"));
+    assert_eq!(h.state().fetches.started, 1);
 }

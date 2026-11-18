@@ -13,6 +13,7 @@ mod find;
 mod git_ui;
 mod gutter;
 mod libs_ui;
+mod libsrc_ui;
 mod logcat_ui;
 mod perf;
 mod prs_ui;
@@ -130,7 +131,7 @@ impl Tab {
             disk_changed: false,
             deleted: false,
             unreadable: None,
-            readonly: crate::libs::is_archive_path(path),
+            readonly: crate::libs::is_archive_path(path) || crate::libsrc::read_only_source(path),
             git: Default::default(),
             diff: Default::default(),
             rev: new_rev(),
@@ -610,6 +611,8 @@ pub struct App {
     /// Library symbols from the Gradle cache.
     libs: crate::libs::Libraries,
     libs_rx: Option<Receiver<crate::libs::Libraries>>,
+    /// Downloads of library and SDK sources for Go to declaration.
+    fetches: libsrc_ui::Fetches,
     compose_view: Option<ComposeView>,
     previews: Previews,
     /// The Compose panel's structure sections (composables, UI tree, …) are shown; per project.
@@ -760,6 +763,7 @@ impl App {
             res_stale: false,
             libs: Default::default(),
             libs_rx: None,
+            fetches: Default::default(),
             compose_view: None,
             previews: Previews::default(),
             show_structure: false,
@@ -1423,6 +1427,12 @@ impl App {
                 self.open_file(&path, Some(o));
                 return;
             }
+            // a member of a library or SDK type: its exact declaration there, never a project
+            // declaration that only shares the name
+            Some(crate::resolve::Res::Lib(call)) => {
+                self.goto_lib_call(call);
+                return;
+            }
             _ => self.index.read().definitions(&word, &path),
         };
         // ⌘-click on the declaration itself lists where it is used, like Android Studio
@@ -1488,6 +1498,14 @@ impl App {
         self.lsp_found = None;
         // The project search always runs: kotlin-lsp answers empty or with one file while it
         // still imports a big Gradle project. Its answer is merged in when it comes.
+        // a library member: the same library call elsewhere, and its source fetched for the
+        // declaration (as Go to declaration does)
+        if let Some(crate::resolve::Res::Lib(call)) = self.resolved_at(at) {
+            self.found_title = format!("References to `{}.{}` (library)", call.class, call.member);
+            self.search_lib_usages(call.clone(), ctx);
+            self.lib_source(call, false);
+            return;
+        }
         match self.ref_target(at) {
             Some(t) => self.search_usages(word, t, ctx),
             None => {
@@ -1574,6 +1592,26 @@ impl App {
                 let _ = tx.send(found);
                 c.request_repaint();
             });
+        self.find_rx = Some(rx);
+        self.bottom = Bottom::Find;
+    }
+
+    /// Find references of a library member, on the worker ([`xref::Xref::find_lib_usages`]).
+    fn search_lib_usages(&mut self, call: crate::resolve::LibCall, ctx: &egui::Context) {
+        let Some(p) = &self.project else { return };
+        let root = p.root.clone();
+        let open: HashMap<PathBuf, std::sync::Arc<str>> = self
+            .tabs
+            .iter()
+            .map(|t| (t.path.clone(), std::sync::Arc::from(t.text.as_str())))
+            .collect();
+        let (tx, rx) = channel();
+        let c = ctx.clone();
+        self.status = format!("Searching for `{}.{}`…", call.class, call.member);
+        self.xref.find_lib_usages("find", call, open, root, move |found| {
+            let _ = tx.send(found);
+            c.request_repaint();
+        });
         self.find_rx = Some(rx);
         self.bottom = Bottom::Find;
     }
@@ -4777,6 +4815,7 @@ impl eframe::App for App {
         self.poll_capture(&ctx);
         self.rescan_resources(&ctx);
         self.poll_libs();
+        self.poll_fetches();
         self.poll_prs();
         self.refresh_changes(&ctx); // git status for tree colours, not only the Current changes tab
         self.watch_focus(&ctx);

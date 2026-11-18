@@ -32,8 +32,26 @@ pub enum Res {
     Decls(Vec<DeclRef>),
     /// A local variable, parameter or lambda parameter declared at this offset of the same file.
     Local(usize),
+    /// A member of a library type called on a value of that type (`manager.requestLocationUpdates(…)`
+    /// with `manager: LocationManager`): never a project declaration of the same name.
+    Lib(LibCall),
     /// Not a project declaration (a library), or not found.
     None,
+}
+
+/// A library member call, as far as the code tells: enough to find the exact declaration in the
+/// library's (or the Android SDK's) source.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LibCall {
+    /// The receiver's type: its simple name, and its qualified name when an import gives it.
+    pub class: String,
+    pub qualified: Option<String>,
+    /// Packages the file imports with `*` (where an unqualified `class` may live).
+    pub stars: Vec<String>,
+    pub member: String,
+    /// The arguments of a call (None: not called, e.g. a property): each argument's type and
+    /// supertypes by simple name, or an empty list when its type is not known.
+    pub args: Option<Vec<Vec<String>>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2220,7 +2238,7 @@ impl<'a> Resolver<'a> {
                 .decls
                 .iter()
                 .any(|d| d.offset == f.start(call.callee))
-            && matches!(self.resolve_tok(f, call.callee), Res::None);
+            && matches!(self.resolve_tok(f, call.callee), Res::None | Res::Lib(_));
         None
     }
 
@@ -2278,7 +2296,7 @@ impl<'a> Resolver<'a> {
         }
         match f.kind(last) {
             Some(Tok::Str) => return Some(Ty::Lib("String".into(), vec![])),
-            Some(Tok::Num) => return Some(Ty::Lib("Int".into(), vec![])),
+            Some(Tok::Num) => return Some(Ty::Lib(num_type(f.t(last)).into(), vec![])),
             _ => {}
         }
         match f.t(last) {
@@ -2346,7 +2364,7 @@ impl<'a> Resolver<'a> {
                     let l = f.locals.iter().find(|l| l.at == at)?;
                     self.local_type(f, l)
                 }
-                Res::None => {
+                Res::None | Res::Lib(_) => {
                     if f.t(last) == "it" {
                         return self.it_type(f, last);
                     }
@@ -2550,6 +2568,50 @@ impl<'a> Resolver<'a> {
         match self.resolve_tok_inner(f, i) {
             Res::Decls(v) if v.len() > 1 => Res::Decls(self.by_arg_types(f, i, v)),
             r => r,
+        }
+    }
+
+    /// `x.name(…)` on a value of library type `class`: the call as [`LibCall`].
+    fn lib_call(&self, f: &FileInfo, i: usize, class: &str, name: &str) -> LibCall {
+        let class = class.split('<').next().unwrap_or(class).trim().to_string();
+        let qualified = f
+            .imports
+            .named
+            .get(&class)
+            .and_then(|v| v.first().cloned())
+            .or_else(|| class.contains('.').then(|| class.clone()));
+        let open = i + 1;
+        let args = (f.t(open) == "(").then(|| {
+            split_args_tokens(f, open)
+                .into_iter()
+                .map(|(s, e)| {
+                    if f.t(s + 1) == "=" {
+                        return Vec::new(); // a named argument
+                    }
+                    let Some(ty) = self.type_of_expr(f, s, e) else {
+                        return Vec::new();
+                    };
+                    let mut names: Vec<String> = Vec::new();
+                    for t in self.hierarchy_up(&ty) {
+                        let n = match &t {
+                            Ty::Lib(n, _) => Some(n.clone()),
+                            Ty::Decl(r) => self.decl(r).map(|(g, gi)| g.syms.decls[gi].name.clone()),
+                            _ => None,
+                        };
+                        if let Some(n) = n.filter(|n| !names.contains(n)) {
+                            names.push(n);
+                        }
+                    }
+                    names
+                })
+                .collect()
+        });
+        LibCall {
+            class: class.rsplit('.').next().unwrap_or(&class).to_string(),
+            qualified,
+            stars: f.imports.stars.clone(),
+            member: name.to_string(),
+            args,
         }
     }
 
@@ -3088,7 +3150,10 @@ impl<'a> Resolver<'a> {
                     return Res::Decls(found);
                 }
             }
-            if matches!(t, Ty::Decl(_)) || t.lib().is_some_and(|l| l != "Any") {
+            if let Some(class) = t.lib().filter(|l| *l != "Any") {
+                return Res::Lib(self.lib_call(f, i, class, name));
+            }
+            if matches!(t, Ty::Decl(_)) {
                 return Res::None;
             }
         }
@@ -4136,6 +4201,21 @@ fn is_comparison(f: &FileInfo, s: usize, e: usize) -> bool {
 }
 
 /// Token ranges of the arguments of the call whose `(` is token `open`.
+/// The type of a number literal: `0f` Float, `0L` Long, `1.5` / `1e3` Double, else Int.
+fn num_type(lit: &str) -> &'static str {
+    let l = lit.to_ascii_lowercase();
+    let hex = l.starts_with("0x") || l.starts_with("0b");
+    if !hex && l.ends_with('f') {
+        "Float"
+    } else if l.ends_with('l') {
+        "Long"
+    } else if !hex && (l.contains('.') || l.contains('e')) {
+        "Double"
+    } else {
+        "Int"
+    }
+}
+
 fn split_args_tokens(f: &FileInfo, open: usize) -> Vec<(usize, usize)> {
     let Some(close) = f.pair(open) else {
         return Vec::new();
@@ -4764,7 +4844,8 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" "),
             Res::Local(_) => "local".into(),
-            Res::None => "-".into(),
+            // not a project declaration either (the library call is checked on its own)
+            Res::Lib(_) | Res::None => "-".into(),
         }
     }
 

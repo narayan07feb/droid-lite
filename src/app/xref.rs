@@ -616,6 +616,57 @@ impl Xref {
     }
 }
 
+impl Xref {
+    /// Find usages of a library member (`LocationManager.requestLocationUpdates` called with that
+    /// many arguments): the places the resolver reads as that same library call, never project
+    /// declarations that share the name.
+    pub fn find_lib_usages(
+        &mut self,
+        kind: &'static str,
+        call: crate::resolve::LibCall,
+        open: HashMap<PathBuf, Arc<str>>,
+        root: PathBuf,
+        reply: impl FnOnce(Vec<FoundLine>) + Send + 'static,
+    ) {
+        self.submit(kind, move |s, stale| {
+            let files = s.code_files(&root);
+            let texts = Texts::new(open);
+            let cache = Cache::default();
+            let arity = |c: &crate::resolve::LibCall| c.args.as_ref().map(Vec::len);
+            let mut found = Vec::new();
+            for f in files.iter() {
+                if stale() {
+                    return;
+                }
+                let Some(text) = texts.read(f) else { continue };
+                if !text.contains(call.member.as_str()) {
+                    continue;
+                }
+                let at: Vec<usize> = s.resolve(&texts, &cache, |r| {
+                    let Some(fi) = r.file(f) else {
+                        return Vec::new();
+                    };
+                    crate::refactor::occurrences(&text, &call.member)
+                        .iter()
+                        .map(|o| o.start)
+                        .filter(|&o| {
+                            matches!(r.resolve(&fi, o), Res::Lib(c)
+                                if c.class == call.class && c.member == call.member && arity(&c) == arity(&call))
+                        })
+                        .collect()
+                });
+                found.extend(at.into_iter().map(|o| super::found_line(f, &text, o)));
+            }
+            if !stale() {
+                reply(found);
+                if let Some(c) = &s.ctx {
+                    c.request_repaint();
+                }
+            }
+        });
+    }
+}
+
 /// Runs one task; a panic is logged and the task dropped (its reply channel closes, so whoever
 /// waits sees it ended), and the worker goes on with the next.
 fn run(state: &State, kind: &'static str, task: Task) {
@@ -1104,6 +1155,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" "),
             Some(Res::Local(_)) => "local".into(),
+            Some(Res::Lib(c)) => format!("lib:{}.{}", c.class, c.member),
             Some(Res::None) | None => "-".into(),
         }
     }

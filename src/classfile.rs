@@ -9,6 +9,8 @@ pub struct ClassInfo {
     pub kind: ClassKind,
     /// Public static methods: (name, is @Composable).
     pub statics: Vec<(String, bool)>,
+    /// Every public method that is not synthetic: (name, descriptor), for a stub without source.
+    pub methods: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,10 +94,11 @@ pub fn parse(bytes: &[u8]) -> Option<ClassInfo> {
         skip_attributes(&mut r)?;
     }
     let mut statics = Vec::new();
+    let mut methods = Vec::new();
     for _ in 0..r.u2()? {
         let m_access = r.u2()?;
         let m_name = text(r.u2()?).unwrap_or_default();
-        r.skip(2)?; // descriptor
+        let m_desc = text(r.u2()?).unwrap_or_default();
         let mut composable = false;
         for _ in 0..r.u2()? {
             let a_name = text(r.u2()?).unwrap_or_default();
@@ -114,6 +117,9 @@ pub fn parse(bytes: &[u8]) -> Option<ClassInfo> {
             r.at = end;
         }
         // public (0x1) static (0x8), not synthetic (0x1000)
+        if m_access & 0x1001 == 0x0001 && !m_name.starts_with('<') && !m_name.contains('$') {
+            methods.push((m_name.clone(), m_desc));
+        }
         if m_access & 0x1009 == 0x0009 && !m_name.starts_with('<') && !m_name.contains('$') {
             statics.push((m_name, composable));
         }
@@ -132,6 +138,7 @@ pub fn parse(bytes: &[u8]) -> Option<ClassInfo> {
         public: access & 0x0001 != 0 && access & 0x1000 == 0,
         kind,
         statics,
+        methods,
     })
 }
 
