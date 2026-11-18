@@ -73,7 +73,7 @@ struct Jump {
     /// Downloads this jump has run (each brings it back to look again): capped.
     downloads: u8,
     /// Where it was asked (file, offset): for the name search when the libraries have nothing.
-    from: Option<(PathBuf, usize)>,
+    from: Option<Origin>,
 }
 
 /// `java.lang` classes common in Android code (a receiver of these needs the SDK's sources).
@@ -100,6 +100,9 @@ const JAVA_LANG: &[&str] = &[
     "StringBuffer",
 ];
 
+/// Where a jump was asked: file, the name's start, the file's version.
+type Origin = (PathBuf, usize, u64);
+
 /// The downloads one jump may run (a class's SDK sources, then a library's): no chain.
 const MAX_JUMP_DOWNLOADS: u8 = 2;
 
@@ -121,7 +124,7 @@ enum Looked {
     Stub(PathBuf, String, Option<usize>, String),
     /// Not found: why, and the call with where it was asked (one with a fallback is looked up
     /// by name there).
-    NotFound(String, Option<(LibCall, Option<(PathBuf, usize)>)>),
+    NotFound(String, Option<(LibCall, Option<Origin>)>),
     /// Find usages: nothing to fetch.
     Nothing,
 }
@@ -141,6 +144,8 @@ pub(super) struct LookupBase {
     /// The project's compile SDK, shared: the first lookup of a project reads it from `scripts`.
     api_cache: ApiCache,
     scripts: Vec<PathBuf>,
+    /// The project's repositories, read once per lookup (on its worker).
+    repos: std::sync::OnceLock<Vec<String>>,
     libs: Arc<Libraries>,
     /// Downloads that may not run (again): done but the class was not in them (None), or failed
     /// lately (the error), for the stub's note.
@@ -163,7 +168,10 @@ impl App {
             imports: self.active_imports(),
             downloads: 0,
             // the name's start, for the name search if the libraries have nothing
-            from: self.tabs.get(self.active).map(|t| (t.path.clone(), at)),
+            from: self
+                .tabs
+                .get(self.active)
+                .map(|t| (t.path.clone(), at, t.rev)),
         };
         self.fetches.from = self.tabs.get(self.active).map(|t| t.path.clone());
         self.look(jump, false);
@@ -262,6 +270,7 @@ impl App {
             api,
             api_cache: self.fetches.api.clone(),
             scripts,
+            repos: std::sync::OnceLock::new(),
             libs: self.libs.clone(),
             blocked,
         })
@@ -375,9 +384,15 @@ impl App {
             Some(Looked::Fetch(fetch, jump)) => self.start_fetch(fetch, jump, true),
             Some(Looked::Found(hits)) => self.open_found(hits),
             Some(Looked::Stub(path, text, at, why)) => self.open_stub(path, text, at, why),
-            Some(Looked::NotFound(why, Some((c, Some((path, at)))))) if c.fallback => {
+            Some(Looked::NotFound(why, Some((c, Some((path, at, rev))))))
+                if c.fallback
+                    && self
+                        .tabs
+                        .get(self.active)
+                        .is_some_and(|t| t.path == path && t.rev == rev) =>
+            {
                 // not a library member after all (a name of the project's or the standard
-                // library's): the name search, as before
+                // library's): the name search, as before (not after an edit: `at` may be stale)
                 self.status = why;
                 self.goto_named(c.member, path, at);
             }
@@ -436,7 +451,7 @@ impl App {
 
 /// A call as Find usages tells calls apart: its file (only when the class is not qualified, as
 /// the file's imports then decide), receiver class (simple, qualified) and argument types.
-type CallKey = (Option<PathBuf>, String, Option<String>, String);
+type CallKey = (Option<PathBuf>, String, Option<String>, String, bool);
 /// A declaration: its file and offset.
 type Decl = (PathBuf, usize);
 
@@ -530,6 +545,7 @@ pub(super) fn exact_usages(
                     c.class.clone(),
                     c.qualified.clone(),
                     format!("{:?}", c.args),
+                    c.java, // a Java caller widens numbers further
                 );
                 let got = match known.get(&key) {
                     Some(g) => g.clone(),
@@ -844,7 +860,9 @@ impl Lookup {
                     None => "No Android SDK found (set ANDROID_HOME or open the SDK in Android Studio once)".to_string(),
                     Some(_) => "The project's compileSdk was not found in its build files".to_string(),
                 };
-                Looked::NotFound(format!("`{}.{}`: {why}", call.class, call.member), c)
+                // no call: the name search must not run (the library could not be asked)
+                let _ = c;
+                Looked::NotFound(format!("`{}.{}`: {why}", call.class, call.member), None)
             }
             Looked::NotFound(w, Some((mut c, from))) if seen.is_empty() && !c.builtin => {
                 c.fallback = true;
@@ -890,7 +908,7 @@ impl Lookup {
             if paths.is_empty() {
                 let f = Fetch::Maven {
                     coords: s.artifact.to_string(),
-                    repos: libsrc::repos(&self.base.root),
+                    repos: self.repos(),
                 };
                 // one download for an extension per jump: the class file cannot tell which
                 // receiver a function takes, so no chain through every library of that name
@@ -1011,6 +1029,14 @@ impl Lookup {
         self.jump.call.args = Some(out);
     }
 
+    /// The project's repositories (its build files are read once per lookup).
+    fn repos(&self) -> Vec<String> {
+        self.base
+            .repos
+            .get_or_init(|| libsrc::repos(&self.base.root))
+            .clone()
+    }
+
     /// The receiver may be an Android or Java platform class: imported from one by name or by a
     /// star (`android.location.*`), or a common `java.lang` class.
     fn may_be_platform(&self) -> bool {
@@ -1117,7 +1143,7 @@ impl Lookup {
         };
         let fetch = Fetch::Maven {
             coords: s.artifact.to_string(),
-            repos: libsrc::repos(&self.base.root),
+            repos: self.repos(),
         };
         Some(Source::Missing(fetch, Some(stub)))
     }

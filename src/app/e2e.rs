@@ -9141,3 +9141,66 @@ fn e2e_goto_right_after_an_edit_waits_for_the_resolver_instead_of_guessing_by_na
     let lm = sdk.join("sources/android-34/android/location/LocationManager.java");
     wait(&mut h, "LocationManager.java", |a| a.tabs[a.active].path == lm);
 }
+
+#[test]
+fn e2e_goto_on_a_name_the_resolver_left_unresolved_never_waits() {
+    let Some((f, sdk, tracker)) = sdk_fixture("gotonowait", true) else { return };
+    let mut h = f.harness();
+    open(&mut h, &tracker);
+    wait(&mut h, "resolved", |a| {
+        let t = &a.tabs[a.active];
+        a.xref.for_file(&t.path, t.rev).is_some()
+    });
+    // a class name in an import line: the file is read, so the jump goes on at once
+    place_cursor(&mut h, "LocationManager\nimport android.content", 0);
+    h.state_mut().goto_definition();
+    assert!(h.state().goto_pending.is_none(), "{}", h.state().status);
+    steps(&mut h, 30);
+    assert!(!h.state().status.starts_with("Reading the file"), "{}", h.state().status);
+    // a dotted name in a read-only SDK source: no resolver reads it, no wait either
+    goto_at(&mut h, &tracker, "requestLocationUpdates(provider", 1);
+    let lm = sdk.join("sources/android-34/android/location/LocationManager.java");
+    wait(&mut h, "LocationManager.java", |a| a.tabs[a.active].path == lm);
+    place_cursor(&mut h, "util.List", 5);
+    h.state_mut().goto_definition();
+    assert!(h.state().goto_pending.is_none(), "a read-only tab does not wait");
+}
+
+#[test]
+fn e2e_without_an_sdk_an_inherited_member_never_opens_a_project_function_of_its_name() {
+    let Some((f, _sdk, _tracker)) = sdk_fixture("gotoinheritnosdk", true) else { return };
+    // SAFETY: the fixture holds the SERIAL lock.
+    unsafe { std::env::set_var("DROID_LITE_ANDROID_SDK", "/nonexistent/droid-lite-no-sdk") };
+    let file = f.path("app/src/main/java/com/demo/loc/MyAct.kt");
+    std::fs::write(
+        &file,
+        "package com.demo.loc\n\nimport android.app.Activity\n\nclass MyAct : Activity()\n\nfun go(a: MyAct) {\n    a.getSystemService(\"x\")\n}\n",
+    )
+    .unwrap();
+    let other = f.path("app/src/main/java/com/demo/loc/Other.kt");
+    std::fs::write(&other, "package com.demo.loc\n\nclass Other {\n    fun getSystemService(name: String) {}\n}\n").unwrap();
+    let mut h = f.harness();
+    goto_at(&mut h, &file, "getSystemService(", 1);
+    wait(&mut h, "the message", |a| a.status.contains("No Android SDK found"));
+    steps(&mut h, 10);
+    assert_eq!(tab(&h).path, file, "not Other.getSystemService");
+}
+
+#[test]
+fn e2e_find_usages_right_after_an_edit_waits_for_the_resolver_too() {
+    let Some((f, _sdk, tracker)) = sdk_fixture("refsafteredit", true) else { return };
+    let mut h = f.harness();
+    open(&mut h, &tracker);
+    wait(&mut h, "resolved", |a| {
+        let t = &a.tabs[a.active];
+        a.xref.for_file(&t.path, t.rev).is_some()
+    });
+    place_cursor(&mut h, "fun trim() {}", 13);
+    type_text(&mut h, " ");
+    place_cursor(&mut h, "getSystemService(\"a\")", 1);
+    // asked before any frame runs: this version of the file cannot be read yet
+    let ctx = h.state().ctx.clone().expect("a context");
+    h.state_mut().find_references(&ctx);
+    assert!(h.state().status.starts_with("Reading the file"), "{}", h.state().status);
+    wait(&mut h, "the library search", |a| a.found_title.contains("(library)"));
+}

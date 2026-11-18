@@ -614,9 +614,9 @@ pub struct App {
     libs_rx: Option<Receiver<crate::libs::Libraries>>,
     /// Downloads of library and SDK sources for Go to declaration.
     fetches: libsrc_ui::Fetches,
-    /// A Go to declaration waiting for the resolver's reading of this version of the file:
-    /// (file, version, the name's start, when asked).
-    goto_pending: Option<(PathBuf, u64, usize, Instant)>,
+    /// A Go to declaration (or a Find usages: true) waiting for the resolver's reading of this
+    /// version of the file: (file, version, the name's start, when asked, find usages).
+    goto_pending: Option<(PathBuf, u64, usize, Instant, bool)>,
     /// A library Find usages under way: its call, when it started, and how its list came out.
     lib_usages_note: Option<(crate::resolve::LibCall, Instant, Receiver<libsrc_ui::UsagesState>)>,
     compose_view: Option<ComposeView>,
@@ -1432,21 +1432,7 @@ impl App {
         if self.goto_android_reference(&word, at) {
             return;
         }
-        // a member call (`x.name`) in a file the resolver has not read in this version yet: its
-        // answer comes in a moment; the name alone could be any class's member (a project function
-        // of the same name), so the jump waits for it
-        let t = &self.tabs[self.active];
-        let code = path
-            .extension()
-            .is_some_and(|e| e == "kt" || e == "java" || e == "kts");
-        if code
-            && at > 0
-            && t.text[..at].trim_end().ends_with('.')
-            && self.resolved_at(at).is_none()
-            && self.project.is_some()
-        {
-            self.goto_pending = Some((path, t.rev, at, Instant::now()));
-            self.status = format!("Reading the file to find `{word}`…");
+        if self.wait_for_resolver(&word, at, false) {
             return;
         }
         // what the name means here, from the worker's reading of the file; until that is ready,
@@ -1470,8 +1456,8 @@ impl App {
 
     /// A waiting Go to declaration: run when the resolver has read the file (or after 3 s, by
     /// name as before); dropped when the cursor, the file or its text changed.
-    fn poll_goto_pending(&mut self) {
-        let Some((path, rev, at, asked)) = self.goto_pending.clone() else {
+    fn poll_goto_pending(&mut self, ctx: &egui::Context) {
+        let Some((path, rev, at, asked, refs)) = self.goto_pending.clone() else {
             return;
         };
         let here = self.tabs.get(self.active).is_some_and(|t| {
@@ -1481,17 +1467,42 @@ impl App {
             self.goto_pending = None;
             return;
         }
-        let ready = self.xref.for_file(&path, rev).is_some();
-        if ready {
-            self.goto_definition();
-        } else if asked.elapsed() > std::time::Duration::from_secs(3) {
-            // the resolver is slow on this file: by name, as before it was there
+        if self.xref.for_file(&path, rev).is_some() {
+            // read: run it now (it does not wait again, the file is read)
             self.goto_pending = None;
-            if let Some((word, _)) = self.word_at_cursor() {
-                let defs = self.index.read().definitions(&word, &path);
-                self.goto_defs(word, path, at, defs);
+            if refs {
+                self.find_references(ctx);
+            } else {
+                self.goto_definition();
             }
+        } else if asked.elapsed() > std::time::Duration::from_secs(10) {
+            // never by name here: that could be another class's member (a project function)
+            self.goto_pending = None;
+            self.status = "The file is still being read: try again in a moment".into();
         }
+    }
+
+    /// A member name (`x.name`) in a project source the resolver has not read in this version
+    /// yet: its answer comes in a moment, and the name alone could be any class's member (a
+    /// project function of the same name), so the jump (or Find usages) waits for it. True when
+    /// it waits. Only for a file the resolver reads (a project source, not a read-only one); a
+    /// read file goes on, whatever the resolver made of the name.
+    fn wait_for_resolver(&mut self, word: &str, at: usize, refs: bool) -> bool {
+        let Some(t) = self.tabs.get(self.active) else {
+            return false;
+        };
+        let read = self.xref.for_file(&t.path, t.rev).is_some();
+        let resolved_here = !t.readonly
+            && t.path
+                .extension()
+                .is_some_and(|e| e == "kt" || e == "java" || e == "kts")
+            && self.project.as_ref().is_some_and(|p| p.files.contains(&t.path));
+        if read || !resolved_here || at == 0 || !t.text[..at].trim_end().ends_with('.') {
+            return false;
+        }
+        self.goto_pending = Some((t.path.clone(), t.rev, at, Instant::now(), refs));
+        self.status = format!("Reading the file to find `{word}`…");
+        true
     }
 
     /// The declarations of `word` by name (imported and nearby ones first): for a call through a
@@ -1563,6 +1574,12 @@ impl App {
             self.status = "Put the cursor on a name to find its references".into();
             return;
         };
+        self.goto_pending = None;
+        // the last edit goes to the resolver now (it may be what this search waits for)
+        self.settle(true);
+        if self.wait_for_resolver(&word, at, true) {
+            return;
+        }
         self.found_title = format!("References to `{word}`");
         self.bottom = Bottom::Find;
         self.lsp_found = None;
@@ -1952,7 +1969,7 @@ impl App {
 
     fn poll(&mut self, ctx: &egui::Context) {
         self.poll_previews(ctx);
-        self.poll_goto_pending();
+        self.poll_goto_pending(ctx);
         if let Some(rx) = &self.indexing
             && let Ok((project, index, branch, tree, res)) = rx.try_recv()
         {

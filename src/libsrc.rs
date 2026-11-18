@@ -41,7 +41,9 @@ pub fn sdk_dir() -> Option<PathBuf> {
 
 /// The project's compile SDK: the highest number given to `compileSdk` (any case, also a version
 /// catalog key like `branchCompileSdk = "36"`, or `compileSdk { version = release(36) }`) in its
-/// build scripts and catalog, comments left out; else the newest platform the SDK has.
+/// build scripts and catalog, comments left out; else the newest platform the SDK has. One number
+/// for the whole project: a module on a lower compileSdk reads the higher one's sources (the
+/// classes and members it uses are in them too).
 pub fn compile_sdk(root: &Path, scripts: &[PathBuf], sdk: &Path) -> Option<u32> {
     let catalog = root.join("gradle/libs.versions.toml");
     let found = scripts
@@ -138,10 +140,13 @@ pub fn read_only_source(path: &Path) -> bool {
 pub fn sources_cache() -> PathBuf {
     std::env::var_os("DROID_LITE_SOURCES_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-                .join("Library/Caches/droid-lite/sources")
-        })
+        .unwrap_or_else(
+            || match std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+                Some(home) => PathBuf::from(home).join("Library/Caches/droid-lite/sources"),
+                // never a folder relative to where the app runs
+                None => std::env::temp_dir().join("droid-lite-sources"),
+            },
+        )
 }
 
 /// `group:name:version`, each part a plain Maven name (letters, digits, `.`, `_`, `-`; not `.`
