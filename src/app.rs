@@ -1742,6 +1742,7 @@ impl App {
         let Some(base) = self.lookup_base() else { return };
         // the same imports as Go to declaration reads
         let imports = self.active_imports();
+        let package = self.active_package();
         let (tx, rx) = channel();
         let (note_tx, note_rx) = channel();
         let c = ctx.clone();
@@ -1755,7 +1756,7 @@ impl App {
             std::thread::spawn(move || {
                 let stale = || generation.load(std::sync::atomic::Ordering::Relaxed) != mine;
                 if let Some((found, state)) =
-                    libsrc_ui::exact_usages(base, target, imports, cands, stale)
+                    libsrc_ui::exact_usages(base, target, imports, package, cands, stale)
                 {
                     let _ = note_tx.send(state);
                     let _ = tx.send(found);

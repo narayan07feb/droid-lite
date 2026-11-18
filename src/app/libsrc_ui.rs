@@ -74,6 +74,8 @@ impl Fetches {
 struct Jump {
     call: LibCall,
     imports: Vec<String>,
+    /// The package of the file it was asked in (a class under the same root is the project's).
+    package: String,
     /// Downloads this jump has run (each brings it back to look again): capped.
     downloads: u8,
     /// Where it was asked (file, offset): for the name search when the libraries have nothing.
@@ -106,6 +108,13 @@ const JAVA_LANG: &[&str] = &[
 
 /// Where a jump was asked: file, the name's start, the file's version.
 type Origin = (PathBuf, usize, u64);
+
+/// `q` is under the same two-part root as `package` (`com.demo.gen.X` and `com.demo.loc`): a
+/// class of the project's own (a generated one), not a library's.
+fn same_root(q: &str, package: &str) -> bool {
+    let root = |s: &str| s.split('.').take(2).collect::<Vec<_>>().join(".");
+    !package.is_empty() && root(q) == root(package)
+}
 
 /// The downloads one jump may run (a class's SDK sources, then a library's): no chain.
 const MAX_JUMP_DOWNLOADS: u8 = 2;
@@ -172,6 +181,7 @@ impl App {
         let jump = Jump {
             call,
             imports: self.active_imports(),
+            package: self.active_package(),
             downloads: 0,
             // the name's start, for the name search if the libraries have nothing
             from: self
@@ -189,6 +199,7 @@ impl App {
         let jump = Jump {
             call,
             imports: self.active_imports(),
+            package: self.active_package(),
             downloads: 0,
             from: None,
         };
@@ -234,6 +245,19 @@ impl App {
     }
 
     /// The imports of the open file (where a class known only by its simple name may be nested).
+    /// The package of the open file.
+    pub(super) fn active_package(&self) -> String {
+        self.tabs
+            .get(self.active)
+            .and_then(|t| {
+                t.text
+                    .lines()
+                    .find_map(|l| l.trim().strip_prefix("package "))
+                    .map(|p| p.trim_end_matches(';').trim().to_string())
+            })
+            .unwrap_or_default()
+    }
+
     pub(super) fn active_imports(&self) -> Vec<String> {
         self.tabs
             .get(self.active)
@@ -487,7 +511,14 @@ fn declares(info: &crate::classfile::ClassInfo, member: &str) -> bool {
         format!("is{cap}"),
         format!("set{cap}"),
     ];
-    info.methods.iter().any(|(n, _, _)| names.contains(n))
+    // a Kotlin function with an inline-class parameter (Dp, Duration) is `name-<hash>` there
+    let mangled = |n: &str| {
+        n.split_once('-')
+            .is_some_and(|(base, _)| names.iter().any(|x| x == base))
+    };
+    info.methods
+        .iter()
+        .any(|(n, _, _)| names.contains(n) || mangled(n))
         || info.fields.iter().any(|f| f == member)
 }
 
@@ -511,6 +542,7 @@ pub(super) fn exact_usages(
     base: LookupBase,
     target: LibCall,
     target_imports: Vec<String>,
+    target_package: String,
     cands: Vec<(super::FoundLine, LibCall)>,
     stale: impl Fn() -> bool,
 ) -> Option<(Vec<super::FoundLine>, UsagesState)> {
@@ -519,6 +551,7 @@ pub(super) fn exact_usages(
             jump: Jump {
                 call,
                 imports,
+                package: String::new(),
                 downloads: 0,
                 from: None,
             },
@@ -534,6 +567,7 @@ pub(super) fn exact_usages(
         jump: Jump {
             call: target.clone(),
             imports: target_imports,
+            package: target_package,
             downloads: 0,
             from: None,
         },
@@ -811,6 +845,8 @@ impl Lookup {
                 .blocked
                 .get(&f.key())
                 .cloned()
+                // a download done this session whose result was deleted runs again
+                .filter(|e| e.is_some() || libsrc::already_there(f))
                 .or_else(|| libsrc::already_there(f).then_some(None))
         };
         let can_fetch = self.jump.downloads < MAX_JUMP_DOWNLOADS;
@@ -906,6 +942,17 @@ impl Lookup {
             // a platform class (android.x.Y) absent from the SDK (newer than the compile SDK):
             // never a project function of the name
             Looked::NotFound(w, Some(_)) if seen.is_empty() && self.may_be_platform() => {
+                Looked::NotFound(w, None)
+            }
+            // an imported class of another (library) package, just not indexed (the Gradle cache
+            // not synced): never a project function of the name
+            Looked::NotFound(w, Some(_))
+                if seen.is_empty()
+                    && call
+                        .qualified
+                        .as_deref()
+                        .is_some_and(|q| !same_root(q, &self.jump.package)) =>
+            {
                 Looked::NotFound(w, None)
             }
             Looked::NotFound(w, Some((mut c, from))) if seen.is_empty() && !c.builtin => {
@@ -1277,5 +1324,20 @@ mod tests {
         );
         assert_eq!(super::outers("a.B"), ["a.B"]);
         assert_eq!(super::class_path("a.b.Outer.Builder"), "Outer.Builder");
+    }
+
+    #[test]
+    fn a_kotlin_function_with_an_inline_class_parameter_is_declared_by_its_mangled_name() {
+        let info = crate::classfile::ClassInfo {
+            name: "a/Box".into(),
+            public: true,
+            kind: crate::classfile::ClassKind::Class,
+            statics: Vec::new(),
+            methods: vec![("setSize-0680j_4".into(), "(F)V".into(), 1)],
+            fields: Vec::new(),
+            supers: Vec::new(),
+        };
+        assert!(super::declares(&info, "setSize"));
+        assert!(!super::declares(&info, "set"));
     }
 }

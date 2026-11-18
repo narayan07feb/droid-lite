@@ -9323,3 +9323,39 @@ fn e2e_goto_on_an_android_class_the_sdk_lacks_never_opens_a_project_function() {
     let t = tab(&h);
     assert!(!t.text[t.cursor..].starts_with("measure() {}"), "not Mine.measure: {}", h.state().status);
 }
+
+#[test]
+fn e2e_goto_downloads_again_when_its_sources_were_deleted_in_the_session() {
+    let kt = "package com.demo.loc\n\nimport demo.geo.Locator\n\nfun find(l: Locator) {\n    l.locate(\"home\", 5L)\n}\n";
+    let java = [("demo/geo/Locator.java", GEO_JAVA), ("demo/geo/Base.java", GEO_BASE)];
+    let Some((f, file)) = maven_fixture("gotodeleted", &java, Some(&java), kt) else { return };
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    goto_at(&mut h, &file, "locate(", 1);
+    wait(&mut h, "Locator.java", |a| a.tabs[a.active].path.to_string_lossy().ends_with("!/demo/geo/Locator.java"));
+    let jar = crate::libsrc::cached_sources_jar("demo.lib:geo:1.0").unwrap();
+    std::fs::remove_file(&jar).unwrap();
+    let i = h.state().active;
+    h.state_mut().tabs.remove(i);
+    h.state_mut().active = 0;
+    steps(&mut h, 3);
+    goto_at(&mut h, &file, "locate(", 1);
+    wait(&mut h, "downloaded again", |a| a.fetches.started == 2);
+    wait(&mut h, "Locator.java again", |a| a.tabs[a.active].path.to_string_lossy().ends_with("!/demo/geo/Locator.java"));
+}
+
+#[test]
+fn e2e_goto_on_an_imported_library_class_not_indexed_yet_never_opens_a_project_function() {
+    let Some((f, _sdk, _tracker)) = sdk_fixture("gotonotsynced", true) else { return };
+    let file = f.path("app/src/main/java/com/demo/loc/Api.kt");
+    std::fs::write(
+        &file,
+        "package com.demo.loc\n\nimport com.squareup.retrofit2.Retrofit\n\nfun g(r: Retrofit) {\n    r.create(1)\n}\n\nclass Mine {\n    fun create(n: Int) {}\n}\n",
+    )
+    .unwrap();
+    let mut h = f.harness();
+    goto_at(&mut h, &file, "create(1)", 0);
+    steps(&mut h, 20);
+    let t = tab(&h);
+    assert!(!t.text[t.cursor..].starts_with("create(n: Int) {}"), "not Mine.create: {}", h.state().status);
+}

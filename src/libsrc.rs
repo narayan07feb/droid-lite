@@ -188,6 +188,11 @@ pub fn repos(root: &Path) -> Vec<String> {
             .filter(|s| !s.is_empty())
             .collect();
     }
+    repos_in(root)
+}
+
+/// The repositories the build files of `root` name.
+fn repos_in(root: &Path) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let add = |out: &mut Vec<String>, u: &str| {
         let u = u.trim_end_matches('/').to_string();
@@ -991,7 +996,8 @@ fn rank(
     let by_count: Vec<&&crate::kotlin::Decl> = ds.iter().filter(count).collect();
     // like the compiler, the most specific overload: an exact parameter type beats one that takes
     // anything (`Object`, a type parameter); several equally specific ones are all returned
-    let scored: Vec<(usize, usize, usize)> = by_count
+    // (offset, score, weakest argument, takes a vararg)
+    let scored: Vec<(usize, usize, usize, bool)> = by_count
         .iter()
         .filter_map(|d| {
             let tp = tparams(d);
@@ -1011,9 +1017,20 @@ fn rank(
                 score += s;
                 worst = worst.min(s);
             }
-            Some((d.offset, score, worst))
+            Some((d.offset, score, worst, d.params.iter().any(|p| p.vararg)))
         })
         .collect();
+    // like javac and kotlinc, a fixed-arity overload that fits is chosen before any vararg one
+    // (`of(E)` over `of(E...)`)
+    let scored: Vec<(usize, usize, usize)> = if scored.iter().any(|s| !s.3) {
+        scored
+            .into_iter()
+            .filter(|s| !s.3)
+            .map(|(o, s, w, _)| (o, s, w))
+            .collect()
+    } else {
+        scored.into_iter().map(|(o, s, w, _)| (o, s, w)).collect()
+    };
     if let Some(best) = scored.iter().map(|(_, s, _)| *s).max() {
         let worst = scored
             .iter()
@@ -1382,7 +1399,9 @@ fn match_score(
     if p == twin && java_primitive(own).is_some() {
         return Some(60);
     }
+    // a Kotlin literal fits any whole-number type; javac never narrows an int (to short or byte)
     let widen: &[&str] = match own.as_str() {
+        "Int" if java => &["long"],
         "Int" => &["long", "short", "byte"],
         "String" => &["CharSequence"],
         _ => &[],
@@ -1400,8 +1419,13 @@ fn match_score(
         "Char" | "Short" | "Byte" => &["int", "long", "float", "double"],
         _ => &[],
     };
+    // the nearer type first, like javac (an int: float before double)
     if java && let Some(k) = java_widen.iter().position(|w| *w == p) {
-        return Some(if own != "Int" && k == 0 { 50 } else { 45 });
+        return Some(if own != "Int" && k == 0 {
+            50
+        } else {
+            45 - k.min(4)
+        });
     }
     let boxed: &[&str] = match own.as_str() {
         "Int" => &["Long", "Short", "Byte"],
@@ -1771,6 +1795,29 @@ mod tests {
     }
 
     #[test]
+    fn a_fixed_arity_overload_before_a_vararg_one_and_javac_s_widening_order() {
+        let list = "public interface List<E> {\n    public static <E> List<E> of(E e1) { return null; }\n    public static <E> List<E> of(E... es) { return null; }\n}\n";
+        let mut c = call("of", &[&["String"]]);
+        c.class = "List".into();
+        let f = fm(Path::new("List.java"), list, "List", &c);
+        assert!(
+            f.len() == 1 && list[f[0]..].starts_with("of(E e1)"),
+            "{f:?}"
+        );
+        let int = ["Int".to_string()];
+        let js = |p: &str| match_score(p, &int, &[], true, true);
+        assert!(
+            js("long") > js("float") && js("float") > js("double"),
+            "javac: long, float, double"
+        );
+        assert_eq!(js("short"), None, "javac never narrows an int");
+        assert!(
+            match_score("short", &int, &[], false, true).is_some(),
+            "a Kotlin literal may be a short"
+        );
+    }
+
+    #[test]
     fn a_kotlin_number_is_a_java_number() {
         let int = ["Int".to_string()];
         assert_eq!(match_score("Number", &int, &[], false, true), Some(40));
@@ -1839,19 +1886,13 @@ mod tests {
         let d = std::env::temp_dir().join(format!("dl-repos-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("settings.gradle.kts"), "val api = uri(\"https://api.example.com/v1\")\ndependencyResolutionManagement {\n    repositories {\n        google()\n        maven { url = uri(\"https://repo.example.com/maven\") }\n        maven { url = uri(\"https://private.example.com/m?token=secret\") }\n        /* maven { url = uri(\"https://old.example.com/maven\") } */\n    }\n}\n").unwrap();
-        // SAFETY: a unit test; the env var is put back
-        let saved = std::env::var_os("DROID_LITE_MAVEN_REPOS");
-        unsafe { std::env::remove_var("DROID_LITE_MAVEN_REPOS") };
-        let r = repos(&d);
+        let r = repos_in(&d);
         std::fs::write(
             d.join("settings.gradle.kts"),
             "repositories { google() }\nval api = uri(\"https://api.example.com/v1\")\n",
         )
         .unwrap();
-        let one_line = repos(&d);
-        if let Some(s) = saved {
-            unsafe { std::env::set_var("DROID_LITE_MAVEN_REPOS", s) };
-        }
+        let one_line = repos_in(&d);
         assert_eq!(
             r,
             [
