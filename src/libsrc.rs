@@ -229,7 +229,8 @@ pub fn repos(root: &Path) -> Vec<String> {
                         let u = &rest[..end];
                         // https only (a plain-http repository is not trusted for code), and no
                         // URL with a password in it (it would show in the command line)
-                        if u.starts_with("https://") && !u.contains('@') {
+                        // no credentials, tokens or fragments (the URL shows in `ps`)
+                        if u.starts_with("https://") && !u.contains(['@', '?', '#']) {
                             add(&mut out, u);
                         }
                     }
@@ -280,7 +281,8 @@ impl Fetch {
 /// again would bring nothing new.
 pub fn already_there(f: &Fetch) -> bool {
     match f {
-        Fetch::Sdk { sdk, api } => sdk.join(format!("sources/android-{api}")).is_dir(),
+        // a sources folder with the android packages (an empty or cut-off one is fetched again)
+        Fetch::Sdk { sdk, api } => sdk.join(format!("sources/android-{api}/android")).is_dir(),
         Fetch::Maven { coords, .. } => cached_sources_jar(coords).is_some_and(|j| j.is_file()),
     }
 }
@@ -353,21 +355,35 @@ pub fn fetch(f: &Fetch) -> Result<(), String> {
                     continue;
                 }
                 tried += 1;
-                let status = std::process::Command::new("curl")
+                let mut child = std::process::Command::new("curl")
                     // -g: the URL is taken as written (no curl globbing)
-                    .args(["-fsSLg", "--max-time", "120", "--max-filesize", "209715200"])
+                    .args(["-fsSLg", "--max-time", "120", "--max-filesize"])
+                    .arg(MAX_DOWNLOAD.to_string())
                     .args(["--proto", if file { "=file" } else { "=https" }])
                     .args(["--proto-redir", if file { "=file" } else { "=https" }])
                     .arg("-o")
                     .arg(&part)
                     .arg(format!("{r}/{rel}"))
                     .stdin(std::process::Stdio::null())
-                    .status()
+                    .spawn()
                     .map_err(|e| format!("curl did not start: {e}"))?;
-                // a whole zip (a cut-off download has no central directory) of at most 200 MB
-                // (curl cannot cap a download whose size the server does not send)
-                let zip = whole_zip(&part, 209_715_200);
-                if status.success() && zip && std::fs::rename(&part, &dest).is_ok() {
+                // curl cannot cap a download whose size the server does not send: stopped here
+                let ok = loop {
+                    match child.try_wait() {
+                        Ok(Some(s)) => break s.success(),
+                        Ok(None) => {}
+                        Err(_) => break false,
+                    }
+                    if std::fs::metadata(&part).is_ok_and(|m| m.len() > MAX_DOWNLOAD) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                };
+                // a whole zip (a cut-off download has no central directory)
+                let zip = whole_zip(&part, MAX_DOWNLOAD);
+                if ok && zip && std::fs::rename(&part, &dest).is_ok() {
                     return Ok(());
                 }
             }
@@ -494,6 +510,8 @@ pub fn fun_entries(jar: &Path, package: &str, name: &str) -> Vec<String> {
         .file_names()
         .filter(|n| n.ends_with(".kt") && in_dir(n))
         .map(String::from)
+        // a package's files only, and not without end (each is read up to MAX_SCAN)
+        .take(MAX_PACKAGE_FILES)
         .collect();
     names
         .into_iter()
@@ -563,7 +581,12 @@ pub fn supertypes(text: &str, class: &str) -> Vec<Vec<String>> {
     let list: String = if let Some(i) = top_level_colon(head) {
         head[i + 1..].to_string()
     } else {
-        head.replace(" extends ", " , ")
+        // `extends` may start or end a line
+        let flat = format!(
+            " {} ",
+            head.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+        flat.replace(" extends ", " , ")
             .replace(" implements ", " , ")
     };
     let package = text
@@ -746,12 +769,18 @@ pub fn find_member(path: &Path, text: &str, class: &str, call: &LibCall) -> Memb
     let class_params = class_offset(text, simple)
         .map(|at| type_params(&text[at + simple.len()..]))
         .unwrap_or_default();
-    rank(&ds, args, |d| {
+    rank(&ds, args, call.java, |d| {
         let mut v = class_params.clone();
         v.extend(method_type_params(text, d.offset));
         v
     })
 }
+
+/// The most Kotlin files of one package read to find a function's file.
+const MAX_PACKAGE_FILES: usize = 500;
+
+/// The largest sources jar downloaded (200 MB).
+const MAX_DOWNLOAD: u64 = 200 << 20;
 
 /// `p` is a whole zip (a cut-off download has no central directory) of at most `max` bytes.
 fn whole_zip(p: &Path, max: u64) -> bool {
@@ -807,6 +836,7 @@ fn brace_body(text: &str, from: usize) -> Option<std::ops::Range<usize>> {
 fn rank(
     ds: &[&crate::kotlin::Decl],
     args: &[Vec<String>],
+    java: bool,
     tparams: impl Fn(&crate::kotlin::Decl) -> Vec<String>,
 ) -> Members {
     let count = |d: &&&crate::kotlin::Decl| {
@@ -832,7 +862,7 @@ fn rank(
                 } else {
                     p.ty.as_str()
                 };
-                score += match_score(ty, a, &tp)?;
+                score += match_score(ty, a, &tp, java)?;
             }
             Some((d.offset, score))
         })
@@ -966,7 +996,7 @@ pub fn find_extension(path: &Path, text: &str, receivers: &[String], call: &LibC
         })
         .collect();
     match &call.args {
-        Some(args) => rank(&ds, args, |d| method_type_params(text, d.offset)),
+        Some(args) => rank(&ds, args, call.java, |d| method_type_params(text, d.offset)),
         None => Members {
             exact: !ds.is_empty(),
             offsets: ds.iter().map(|d| d.offset).collect(),
@@ -1142,7 +1172,7 @@ const MAX_AAR_JAR: u64 = 64 * 1024 * 1024;
 /// step for a supertype, 50 a widening (a number literal), 40 a box (`Int` to `Integer`), 10 a
 /// parameter that takes anything (`Object`, a type parameter, a function type for a lambda),
 /// None when it does not take it.
-fn match_score(param: &str, arg: &[String], tparams: &[String]) -> Option<usize> {
+fn match_score(param: &str, arg: &[String], tparams: &[String], java: bool) -> Option<usize> {
     if param.contains("->") {
         return Some(10); // a function type: what a lambda is, whose type is not read
     }
@@ -1181,8 +1211,15 @@ fn match_score(param: &str, arg: &[String], tparams: &[String]) -> Option<usize>
     if widen.contains(&p.as_str()) {
         return Some(50);
     }
-    // a Java caller widens an int to a float or a double too (after a long, like javac)
-    if own == "Int" && matches!(p.as_str(), "float" | "double") {
+    // a Java caller widens further: int to float or double (after long, like javac), long to
+    // float or double, float to double; kotlinc does not
+    let java_widen: &[&str] = match own.as_str() {
+        "Int" => &["float", "double"],
+        "Long" => &["float", "double"],
+        "Float" => &["double"],
+        _ => &[],
+    };
+    if java && java_widen.contains(&p.as_str()) {
         return Some(45);
     }
     let boxed: &[&str] = match own.as_str() {
@@ -1374,6 +1411,7 @@ mod tests {
                     .collect(),
             ),
             builtin: false,
+            java: false,
             fallback: false,
         }
     }
@@ -1453,7 +1491,7 @@ mod tests {
     }
 
     fn accepts_(param: &str, arg: &[String]) -> bool {
-        match_score(param, arg, &[]).is_some()
+        match_score(param, arg, &[], false).is_some()
     }
 
     #[test]
@@ -1475,9 +1513,12 @@ mod tests {
         let f = fm(Path::new("H.java"), h, "H", &c);
         assert!(f.len() == 1 && h[f[0]..].starts_with("f(Mid m)"));
         // String and String[] are told apart; IntArray is int[]; a lambda fits a function type
-        assert!(match_score("String[]", &s(&["String"]), &[]).is_none());
-        assert_eq!(match_score("int[]", &s(&["IntArray"]), &[]), Some(100));
-        assert!(match_score("(Int) -> Unit", &s(&[]), &[]).is_some());
+        assert!(match_score("String[]", &s(&["String"]), &[], false).is_none());
+        assert_eq!(
+            match_score("int[]", &s(&["IntArray"]), &[], false),
+            Some(100)
+        );
+        assert!(match_score("(Int) -> Unit", &s(&[]), &[], false).is_some());
         // a real tie: two declarations that fit as well
         let t2 = "class T {\n    void g(Object a) {}\n    void g(Object b) {}\n}\n";
         let mut c = call("g", &[&["Thing"]]);
@@ -1551,11 +1592,11 @@ mod tests {
     #[test]
     fn a_kotlin_number_is_a_java_number() {
         let int = ["Int".to_string()];
-        assert_eq!(match_score("Number", &int, &[]), Some(80));
-        assert_eq!(match_score("Comparable", &int, &[]), Some(80));
-        assert_eq!(match_score("String", &int, &[]), None);
+        assert_eq!(match_score("Number", &int, &[], false), Some(80));
+        assert_eq!(match_score("Comparable", &int, &[], false), Some(80));
+        assert_eq!(match_score("String", &int, &[], false), None);
         assert!(
-            match_score("Integer", &int, &[]) > match_score("long", &int, &[]),
+            match_score("Integer", &int, &[], false) > match_score("long", &int, &[], false),
             "Int is an Integer"
         );
     }
@@ -1568,9 +1609,15 @@ mod tests {
             2,
             "the `->` of a function type is no bracket"
         );
+        let java = "package a;\n\npublic class A extends\n        B implements\n        C {\n}\n";
+        assert_eq!(
+            supertypes(java, "A").len(),
+            2,
+            "extends and implements on their own lines"
+        );
         let d = std::env::temp_dir().join(format!("dl-repos-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("settings.gradle.kts"), "val api = uri(\"https://api.example.com/v1\")\ndependencyResolutionManagement {\n    repositories {\n        google()\n        maven { url = uri(\"https://repo.example.com/maven\") }\n    }\n}\n").unwrap();
+        std::fs::write(d.join("settings.gradle.kts"), "val api = uri(\"https://api.example.com/v1\")\ndependencyResolutionManagement {\n    repositories {\n        google()\n        maven { url = uri(\"https://repo.example.com/maven\") }\n        maven { url = uri(\"https://private.example.com/m?token=secret\") }\n    }\n}\n").unwrap();
         // SAFETY: a unit test; the env var is put back
         let saved = std::env::var_os("DROID_LITE_MAVEN_REPOS");
         unsafe { std::env::remove_var("DROID_LITE_MAVEN_REPOS") };
@@ -1694,7 +1741,17 @@ mod tests {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         assert!(accepts_("long", &s(&["Int"])), "a number literal widens");
         // a Java caller widens an int to a float too, after a long (like javac)
-        assert!(match_score("float", &s(&["Int"]), &[]) < match_score("long", &s(&["Int"]), &[]));
+        let js = |p: &str, a: &str| match_score(p, &s(&[a]), &[], true);
+        assert!(
+            js("float", "Int") < js("long", "Int"),
+            "javac: int to long before float"
+        );
+        assert!(js("double", "Float").is_some() && js("double", "Long").is_some());
+        assert_eq!(
+            match_score("float", &s(&["Int"]), &[], false),
+            None,
+            "kotlinc does not widen"
+        );
         assert!(!accepts_("boolean", &s(&["Int"])));
         assert!(accepts_(
             "@NonNull final java.lang.CharSequence",

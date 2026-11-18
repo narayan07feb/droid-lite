@@ -1449,11 +1449,7 @@ impl App {
     /// The declarations of `word` by name (imported and nearby ones first): for a call through a
     /// project class's library supertype that the library does not declare (a project or standard
     /// library function).
-    pub(super) fn goto_named(&mut self, word: String) {
-        let Some(t) = self.tabs.get(self.active) else {
-            return;
-        };
-        let (path, at) = (t.path.clone(), t.cursor);
+    pub(super) fn goto_named(&mut self, word: String, path: PathBuf, at: usize) {
         let defs = self.index.read().definitions(&word, &path);
         self.goto_defs(word, path, at, defs);
     }
@@ -1647,17 +1643,8 @@ impl App {
             .map(|t| (t.path.clone(), std::sync::Arc::from(t.text.as_str())))
             .collect();
         let Some(base) = self.lookup_base() else { return };
-        let imports: Vec<String> = self
-            .tabs
-            .get(self.active)
-            .map(|t| {
-                t.text
-                    .lines()
-                    .filter_map(|l| l.trim().strip_prefix("import "))
-                    .map(|l| l.trim_end_matches(';').trim().to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
+        // the same imports as Go to declaration reads
+        let imports = self.active_imports();
         let (tx, rx) = channel();
         let (note_tx, note_rx) = channel();
         let c = ctx.clone();

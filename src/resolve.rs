@@ -57,6 +57,8 @@ pub struct LibCall {
     /// The receiver is a Kotlin built-in type (String, List, Int…): its member or standard
     /// library extension, whose sources are not read; never a project declaration.
     pub builtin: bool,
+    /// Called in a Java file: a Java caller widens numbers further (`int` to `float`).
+    pub java: bool,
     /// Reached through a project class's library supertype (`finish()` in an Activity, or
     /// `tracker.x` on a LocationManager subclass): when the library has no such member it may be
     /// a function of the project or the standard library, found by name as before.
@@ -2685,6 +2687,7 @@ impl<'a> Resolver<'a> {
             // a Kotlin type with a Java twin (ArrayList, StringBuilder, Exception…) has the Java
             // class's members: looked up there like any SDK class
             builtin,
+            java: f.java,
             fallback: false,
         }
     }
@@ -4337,7 +4340,6 @@ fn java_twin(t: &str) -> Option<&'static str> {
     })
 }
 
-/// The type of a number literal: `0f` Float, `0L` Long, `1.5` / `1e3` Double, else Int.
 /// A whole-number literal (decimal, `0x…` or `0b…`) too big for an `Int`: kotlinc types it
 /// `Long`.
 fn past_int(l: &str) -> bool {
@@ -4351,6 +4353,7 @@ fn past_int(l: &str) -> bool {
         || radix == 10 && !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) && digits.len() > 19
 }
 
+/// The type of a number literal: `0f` Float, `0L` Long, `1.5` / `1e3` Double, else Int.
 fn num_type(lit: &str) -> &'static str {
     let l = lit.to_ascii_lowercase();
     let hex = l.starts_with("0x") || l.starts_with("0b");

@@ -8895,6 +8895,7 @@ fn e2e_find_usages_reruns_when_the_download_ends_before_its_list() {
         member: "getSystemService".into(),
         args: Some(vec![vec!["String".into()]]),
         builtin: false,
+        java: false,
         fallback: false,
     };
     let (tx, rx) = std::sync::mpsc::channel();
@@ -8910,6 +8911,7 @@ fn e2e_find_usages_reruns_when_the_download_ends_before_its_list() {
         member: "getSystemService".into(),
         args: Some(vec![vec!["String".into()]]),
         builtin: false,
+        java: false,
         fallback: false,
     };
     h.state_mut().fetches.usages_again = Some((call, "mine".into()));
@@ -8990,4 +8992,75 @@ fn e2e_goto_a_star_imported_receiver_downloads_its_missing_sources() {
     steps(&mut h, 3);
     assert!(tab(&h).text[tab(&h).cursor..].contains("LocationListener listener)"));
     assert!(log.exists());
+}
+
+#[test]
+fn e2e_goto_on_a_class_no_library_has_falls_back_to_the_name_search() {
+    // a generated (or not yet indexed) class: no library declares it, so the project's `ping`
+    let Some((f, _sdk, _tracker)) = sdk_fixture("gotogenerated", true) else { return };
+    let file = f.path("app/src/main/java/com/demo/loc/Use.kt");
+    std::fs::write(&file, "package com.demo.loc\n\nimport com.demo.gen.Generated\n\nfun f(g: Generated) {\n    g.ping()\n}\n").unwrap();
+    let other = f.path("app/src/main/java/com/demo/loc/Ping.kt");
+    std::fs::write(&other, "package com.demo.loc\n\nfun ping() {}\n").unwrap();
+    let mut h = f.harness();
+    goto_at(&mut h, &file, "ping()", 1);
+    wait(&mut h, "Ping.kt", |a| a.tabs[a.active].path == other);
+    assert_eq!(h.state().fetches.started, 0);
+}
+
+#[test]
+fn e2e_goto_an_extension_downloads_one_library_per_jump_not_a_chain() {
+    // spin is declared in two libraries without sources, both for another receiver
+    let other = ("demo/geo/Other.java", "package demo.geo;\n\npublic class Other {}\n");
+    let base_ext = ("demo/geo/BaseExtKt.java", "package demo.geo;\n\npublic final class BaseExtKt {\n    public static void spin(Other o, int n) {}\n}\n");
+    let geo_ext = ("demo/geo2/ExtKt.java", "package demo.geo2;\n\nimport demo.geo.Other;\n\npublic final class ExtKt {\n    public static void spin(Other o, int n) {}\n}\n");
+    let java = [("demo/geo/Locator.java", GEO_JAVA), ("demo/geo/Base.java", GEO_BASE), other, base_ext, geo_ext];
+    let Some((f, file)) = two_lib_fixture(
+        "gotoextchain",
+        &java,
+        &["demo/geo/Locator", "demo/geo/Base", "demo/geo/Other", "demo/geo/BaseExtKt"],
+        "package com.demo.loc\n\nimport demo.geo.Locator\n\nfun find(l: Locator) {\n    l.spin(2)\n}\n",
+    ) else {
+        return;
+    };
+    let home = f.config.join("gradle-home/caches/modules-2/files-2.1/demo.lib");
+    let repo = f.config.join("repo/demo/lib");
+    let jar = |path: &Path, files: &[(&str, &str)]| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut z = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for (n, t) in files {
+            z.start_file(*n, zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut z, t.as_bytes()).unwrap();
+        }
+        z.finish().unwrap();
+    };
+    // base: Locator's sources stay in the Gradle cache, its extension file only in the repository
+    jar(&home.join("base/1.0/bbb/base-1.0-sources.jar"), &[("demo/geo/Locator.java", GEO_JAVA), ("demo/geo/Base.java", GEO_BASE), other]);
+    std::fs::remove_file(home.join("base/1.0/bbb/base-1.0-sources.jar")).unwrap();
+    jar(&repo.join("base/1.0/base-1.0-sources.jar"), &[("demo/geo/BaseExt.kt", "package demo.geo\n\nfun Other.spin(n: Int) {}\n")]);
+    jar(&repo.join("geo/1.0/geo-1.0-sources.jar"), &[("demo/geo2/Ext.kt", "package demo.geo2\n\nimport demo.geo.Other\n\nfun Other.spin(n: Int) {}\n")]);
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 2);
+    goto_at(&mut h, &file, "spin(", 1);
+    wait(&mut h, "settled", |a| !a.fetches.ended.is_empty() && !a.lib_reading());
+    steps(&mut h, 30);
+    assert_eq!(h.state().fetches.started, 1, "one download, then no more: {}", h.state().status);
+}
+
+#[test]
+fn e2e_a_source_in_a_jar_is_read_with_a_size_limit_and_kept_when_not_utf8() {
+    let d = std::env::temp_dir().join(format!("dl-entry-{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    let jar = d.join("x-sources.jar");
+    let mut z = zip::ZipWriter::new(std::fs::File::create(&jar).unwrap());
+    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    z.start_file("Big.java", opts).unwrap();
+    std::io::Write::write_all(&mut z, &vec![b'a'; (crate::libs::MAX_ENTRY + 10) as usize]).unwrap();
+    z.start_file("Latin.java", opts).unwrap();
+    std::io::Write::write_all(&mut z, b"class L { /* caf\xe9 */ }").unwrap();
+    z.finish().unwrap();
+    let at = |e: &str| PathBuf::from(format!("{}!/{e}", jar.display()));
+    assert!(crate::libs::read_entry(&at("Big.java")).is_none(), "over the limit");
+    assert!(crate::libs::read_entry(&at("Latin.java")).is_some_and(|t| t.starts_with("class L")));
+    let _ = std::fs::remove_dir_all(&d);
 }
