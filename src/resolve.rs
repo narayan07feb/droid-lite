@@ -2499,7 +2499,12 @@ impl<'a> Resolver<'a> {
                         || f.imports
                             .named
                             .get(&name)
-                            .is_some_and(|q| !q.join(".").starts_with("androidx.compose.")))
+                            // Compose functions (androidx.compose, navigation-compose,
+                            // accompanist): composables, not classes
+                            .is_some_and(|q| {
+                                let q = q.join(".");
+                                !q.contains(".compose.") && !q.starts_with("com.google.accompanist.")
+                            }))
                 {
                     return Some(Ty::Lib(name.clone(), Vec::new()));
                 }
@@ -2622,7 +2627,8 @@ impl<'a> Resolver<'a> {
                 match f.t(k) {
                     "<" => depth += 1,
                     ">" => depth -= 1,
-                    "(" | ")" | "{" | "}" | "=" | ";" => break,
+                    // a `<` that is a less-than ends at `&&`, `||` or `?` (`x.size < y && z > (1)`)
+                    "(" | ")" | "{" | "}" | "=" | ";" | "&&" | "||" | "?" => break,
                     _ => {}
                 }
                 k += 1;
@@ -4344,7 +4350,7 @@ fn java_twin(t: &str) -> Option<&'static str> {
 }
 
 /// A whole-number literal (decimal, `0x…` or `0b…`) too big for an `Int`: kotlinc types it
-/// `Long`.
+/// `Long`. (A Java `-2147483648` is an `int`; read here without its minus, it counts as `Long`.)
 fn past_int(l: &str) -> bool {
     let (digits, radix) = match l.get(..2) {
         Some("0x") => (&l[2..], 16),

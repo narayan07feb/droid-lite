@@ -1130,6 +1130,13 @@ impl App {
                         }
                     }
                     self.status = format!("Saved {}", d.path.display());
+                    // a build file may set another compileSdk: read again at the next lookup
+                    if d.path
+                        .extension()
+                        .is_some_and(|e| e == "gradle" || e == "kts" || e == "toml")
+                    {
+                        self.fetches.forget_compile_sdk();
+                    }
                 }
                 saver::Outcome::DiskChanged(s) => {
                     if let Some(tab) = tab {

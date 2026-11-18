@@ -66,14 +66,16 @@ pub fn compile_sdk(root: &Path, scripts: &[PathBuf], sdk: &Path) -> Option<u32> 
 
 /// The highest compile SDK a build script or catalog gives (see [`compile_sdk`]).
 fn compile_sdk_in(text: &str) -> Option<u32> {
-    let lines: Vec<String> = text
+    // `/* compileSdk = 99 */` is no setting
+    let lines: Vec<String> = without_block_comments(text)
         .lines()
         .map(|l| l.trim().to_ascii_lowercase())
         .map(|l| {
             if l.starts_with('#') || l.starts_with("//") {
                 String::new()
             } else {
-                l
+                // `x = 1 // compileSdk = 99`: the comment is no setting
+                l.split(" //").next().unwrap_or_default().to_string()
             }
         })
         .collect();
@@ -1341,14 +1343,13 @@ const MAX_CLASS: u64 = 4 * 1024 * 1024;
 /// An `.aar`'s `classes.jar` bigger than this is not read.
 const MAX_AAR_JAR: u64 = 64 * 1024 * 1024;
 
-/// How well a parameter of type `param` (as spelled in Java or Kotlin source) takes an argument
-/// whose type and supertypes are `arg` (simple names, Kotlin spelling, nearest first), like the
-/// compiler ranks overloads: 100 its own type (a Kotlin `Int` is Java `int`), 90 less one per
-/// step for a supertype, 50 a widening (a number literal), 40 a box (`Int` to `Integer`), 10 a
-/// parameter that takes anything (`Object`, a type parameter, a function type for a lambda),
-/// None when it does not take it.
-/// How well an argument of type `arg` (its type, then supertypes) fits parameter `param` of a
-/// declaration in a Java source (`java_src`; else Kotlin), called from Java (`java`) or Kotlin.
+/// How well a parameter of type `param` (as spelled in a Java source, `java_src`, or a Kotlin one)
+/// takes an argument whose type and supertypes are `arg` (simple names, Kotlin spelling, nearest
+/// first) from a Java caller (`java`) or a Kotlin one, like the compiler ranks overloads: 100 its
+/// own type (a Kotlin `Int` is Java `int`), 89 less one per step for a supertype, 60 a box for a
+/// Kotlin caller (30 for a Java one, after any widening), 50 a widening (a number literal), 45 and
+/// below a Java caller's further widenings, 40 a Number or Comparable, 10 a parameter that takes
+/// anything (`Object`, a type parameter, a function type for a lambda), None when it does not.
 fn match_score(
     param: &str,
     arg: &[String],
@@ -1381,7 +1382,6 @@ fn match_score(
     if let Some(d) = arg.iter().skip(1).position(|a| *a == p) {
         return Some(89 - d.min(39));
     }
-    // a Kotlin number is a Java Number and Comparable
     // a Kotlin number is a Java Number and Comparable: after a widening (javac takes `long`
     // for an `int` before `Number`), before `Object`
     if kotlin_supers(own).contains(&p.as_str()) {
@@ -1396,8 +1396,9 @@ fn match_score(
         "Char" => "Character",
         o => o,
     };
+    // a Java caller boxes only when no widening fits (javac's second phase): below them
     if p == twin && java_primitive(own).is_some() {
-        return Some(60);
+        return Some(if java { 30 } else { 60 });
     }
     // a Kotlin literal fits any whole-number type; javac never narrows an int (to short or byte)
     let widen: &[&str] = match own.as_str() {
@@ -1864,6 +1865,12 @@ mod tests {
 
     #[test]
     fn arrows_literals_and_repository_blocks() {
+        assert_eq!(
+            compile_sdk_in(
+                "val x = 1 // compileSdk = 99\n/* compileSdk = 98 */\ncompileSdk = 34\n"
+            ),
+            Some(34)
+        );
         let kt = "package a\n\nclass A(val f: () -> Unit) : B(), C {\n}\n";
         assert_eq!(
             supertypes(kt, "A").len(),
@@ -2004,6 +2011,16 @@ mod tests {
         assert!(accepts_("long", &s(&["Int"])), "a number literal widens");
         // a Java caller widens an int to a float too, after a long (like javac)
         let js = |p: &str, a: &str| match_score(p, &s(&[a]), &[], true, true);
+        assert!(
+            js("long", "Int") > js("Integer", "Int"),
+            "javac widens before it boxes"
+        );
+        assert!(js("double", "Int") > js("Integer", "Int"));
+        assert!(
+            match_score("Integer", &s(&["Int"]), &[], false, true)
+                > match_score("long", &s(&["Int"]), &[], false, true),
+            "kotlinc: an Int is an Integer before a long"
+        );
         assert!(
             js("float", "Int") < js("long", "Int"),
             "javac: int to long before float"

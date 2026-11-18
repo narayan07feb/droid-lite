@@ -62,6 +62,13 @@ pub(super) struct Fetches {
 
 impl Fetches {
     /// Drops a jump still waiting for a download or a lookup (the user went elsewhere).
+    /// The compile SDK is read from the build files again at the next lookup.
+    pub(super) fn forget_compile_sdk(&mut self) {
+        if let Ok(mut a) = self.api.lock() {
+            *a = None;
+        }
+    }
+
     pub(super) fn cancel(&mut self) {
         self.waiting = None;
         self.looking = None;
@@ -244,7 +251,6 @@ impl App {
         self.fetches.ended.clear();
     }
 
-    /// The imports of the open file (where a class known only by its simple name may be nested).
     /// The package of the open file.
     pub(super) fn active_package(&self) -> String {
         self.tabs
@@ -258,6 +264,7 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// The imports of the open file (where a class known only by its simple name may be nested).
     pub(super) fn active_imports(&self) -> Vec<String> {
         self.tabs
             .get(self.active)
@@ -341,9 +348,9 @@ impl App {
         jump.downloads += 1;
         let key = fetch.key();
         let label = fetch.label();
-        // it ended while the lookup ran (another jump started it): look again, which now sees how
-        // it ended (the source, or the stub), never a second download
-        // done, and its result still on disk (a deleted cache downloads again), or failed lately
+        // it ended (maybe while the lookup ran) and its result is still on disk, or it failed
+        // lately: look again, which now sees how it ended (the source, or the stub), never a
+        // second download (a deleted result downloads again)
         if let Some((r, at)) = self.fetches.ended.get(&key)
             && (r.is_ok() && libsrc::already_there(&fetch)
                 || r.is_err() && at.elapsed() < RETRY_AFTER)
@@ -835,9 +842,6 @@ impl Lookup {
             None => Vec::new(),
         };
         let exact_depth = best.map_or(usize::MAX, |(_, std::cmp::Reverse(d))| d);
-        // a class without source as near as the match (or nearer) may declare it, and a farther
-        // one may fit better when the match is not a perfect fit: fetch it first
-
         // its result is on disk already (an earlier session): running it again brings nothing;
         // its class is just not in it
         let state = |f: &Fetch| {
@@ -916,7 +920,7 @@ impl Lookup {
             // class): the name search, as before
             // an Android class with no SDK to read it from: say so, never a project declaration
             // that only shares the name (the bug this lookup fixes)
-            Looked::NotFound(_, c)
+            Looked::NotFound(..)
                 if seen.is_empty()
                     && self.may_be_platform()
                     && (self.base.sdk.is_none() || self.base.api.is_none()) =>
@@ -926,7 +930,6 @@ impl Lookup {
                     Some(_) => "The project's compileSdk was not found in its build files".to_string(),
                 };
                 // no call: the name search must not run (the library could not be asked)
-                let _ = c;
                 Looked::NotFound(format!("`{}.{}`: {why}", call.class, call.member), None)
             }
             // the libraries are still being read: it may be one of theirs, not the project's
