@@ -52,6 +52,8 @@ pub(super) struct GitState {
     panel_flash: Option<(std::ops::Range<usize>, Instant)>,
     /// A row to scroll to the middle of the panel next frame.
     panel_scroll: Option<usize>,
+    /// The panel's changes, counted for the layout (true: unified) they are in.
+    panel_ranges: Option<(bool, Vec<std::ops::Range<usize>>)>,
     commit_rx: Option<Receiver<(String, String)>>,
     /// Uncommitted files and the branch's changes (refreshed in the background).
     pub changes: Option<git::Changes>,
@@ -177,7 +179,7 @@ impl App {
         {
             g.commit = Some((title, text.lines().map(String::from).collect()));
             g.commit_rx = None;
-            (g.panel_cur, g.panel_flash, g.panel_scroll) = (None, None, None);
+            (g.panel_cur, g.panel_flash, g.panel_scroll, g.panel_ranges) = (None, None, None, None);
         }
     }
 
@@ -203,30 +205,30 @@ impl App {
             self.git.panel_cur,
             self.git.panel_flash,
             self.git.panel_scroll,
-        ) = (None, None, None);
+            self.git.panel_ranges,
+        ) = (None, None, None, None);
     }
 
-    /// The docked diff panel's changes in its current layout (unified lines or side-by-side rows).
-    fn panel_changes(&self) -> Vec<std::ops::Range<usize>> {
-        let Some((_, lines)) = &self.git.commit else {
-            return Vec::new();
-        };
-        if self.git.unified {
-            super::diff_view::changes(lines.iter().map(|l| {
-                (l.starts_with('+') && !l.starts_with("+++"))
-                    || (l.starts_with('-') && !l.starts_with("---"))
-            }))
-        } else {
-            super::diff_view::changes(
-                side_rows(lines)
-                    .iter()
-                    .map(|r| matches!(r, SideRow::Pair { changed: true, .. })),
-            )
+    /// The docked diff panel's changes in its current layout (unified lines or side-by-side rows),
+    /// counted once per diff and layout.
+    fn panel_changes(&mut self) -> Vec<std::ops::Range<usize>> {
+        let unified = self.git.unified;
+        if let Some((u, r)) = &self.git.panel_ranges
+            && *u == unified
+        {
+            return r.clone();
         }
+        let r = self
+            .git
+            .commit
+            .as_ref()
+            .map_or_else(Vec::new, |(_, l)| panel_ranges(l, unified));
+        self.git.panel_ranges = Some((unified, r.clone()));
+        r
     }
 
-    /// The next or previous change of the docked diff panel, file after file; it centres the change
-    /// and flashes it.
+    /// The next or previous change of the docked diff panel, through every file of its diff; it
+    /// centres the change and flashes it.
     pub(super) fn panel_jump(&mut self, forward: bool) {
         let ch = self.panel_changes();
         match super::diff_view::step(&ch, self.git.panel_cur, 0, forward) {
@@ -782,7 +784,6 @@ impl App {
         }
         let mut open = !ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let mut jump = None;
-        let n_changes = self.panel_changes().len();
         let keys = [
             crate::keymap::text(self.keymap, crate::keymap::Action::NextChange),
             crate::keymap::text(self.keymap, crate::keymap::Action::PrevChange),
@@ -806,6 +807,17 @@ impl App {
             }
             self.git.unified = !split;
             jump = super::diff_view::jump_buttons(ui, [&keys[0], &keys[1]]);
+            // counted in the layout just picked, so a flip shows the right count at once
+            if self
+                .git
+                .panel_ranges
+                .as_ref()
+                .is_none_or(|(u, _)| *u != self.git.unified)
+            {
+                self.git.panel_ranges =
+                    Some((self.git.unified, panel_ranges(lines, self.git.unified)));
+            }
+            let n_changes = self.git.panel_ranges.as_ref().map_or(0, |(_, r)| r.len());
             let at = super::diff_view::position(n_changes, self.git.panel_cur);
             if !at.is_empty() {
                 ui.label(RichText::new(at).small().color(DIM));
@@ -943,6 +955,28 @@ impl App {
             self.panel_jump(fwd);
         }
     }
+}
+
+/// The changes of a diff text: runs of removed and added lines (unified, counted in `lines`) or of
+/// changed side-by-side rows (counted in [`side_rows`]). Inside a hunk a line is a change by its
+/// first char, so a removed `-- comment` line is not taken for a `---` file header.
+fn panel_ranges(lines: &[String], unified: bool) -> Vec<std::ops::Range<usize>> {
+    if !unified {
+        return super::diff_view::changes(
+            side_rows(lines)
+                .iter()
+                .map(|r| matches!(r, SideRow::Pair { changed: true, .. })),
+        );
+    }
+    let mut in_hunk = false;
+    super::diff_view::changes(lines.iter().map(|l| {
+        if l.starts_with("diff --git") {
+            in_hunk = false;
+        } else if l.starts_with("@@") {
+            in_hunk = true;
+        }
+        in_hunk && (l.starts_with('+') || l.starts_with('-'))
+    }))
 }
 
 /// One row of the side-by-side diff: old line (number, text), new line, and what happened.
@@ -1313,7 +1347,34 @@ pub(super) fn paint_changes(
 
 #[cfg(test)]
 mod tests {
-    use super::{SideRow, side_rows};
+    use super::{SideRow, panel_ranges, side_rows};
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // ranges of lines, not a range to collect
+    fn a_removed_comment_line_inside_a_hunk_is_a_change_not_a_header() {
+        let lines: Vec<String> = [
+            "diff --git a/q.sql b/q.sql",
+            "--- a/q.sql",
+            "+++ b/q.sql",
+            "@@ -1,2 +1,1 @@",
+            " select 1;",
+            "--- old note",
+            "-- note",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            panel_ranges(&lines, true),
+            [5..7],
+            "unified: both removed lines"
+        );
+        assert_eq!(
+            panel_ranges(&lines, false).len(),
+            1,
+            "side by side: one change"
+        );
+    }
 
     fn pair(old: Option<(usize, &str)>, new: Option<(usize, &str)>, changed: bool) -> SideRow {
         let s = |x: Option<(usize, &str)>| x.map(|(n, t)| (n, t.to_string()));

@@ -572,8 +572,8 @@ pub struct App {
     selected_composable: Option<String>,
     textures: HashMap<PathBuf, (SystemTime, egui::TextureHandle)>,
     shift_down: bool,
-    /// A diff jump opened another file: go to its first (true) or last change once compared.
-    land_jump: Option<bool>,
+    /// A diff jump opened this file: go to its first (true) or last change once it is compared.
+    land_jump: Option<(PathBuf, bool)>,
     last_shift: Option<Instant>,
     status: String,
     /// Why actions that waited for a save did not run, each with how often in a row it came:

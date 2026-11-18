@@ -8,8 +8,9 @@
 //!
 //! Next / Previous change (F7, Shift+F7, Cmd+Shift+] and Cmd+Shift+[, like Android Studio) move
 //! from change to change, centre each one and flash it; past the last change of a file they open
-//! the next changed file at its first change (and back the other way). The docked diff panel moves
-//! the same way through its changes, file after file.
+//! the next changed file at its first change (and back the other way), passing over files without
+//! changes. The docked diff panel, while on screen, takes the keys first and moves the same way
+//! through the changes of its diff (every file in it).
 
 use super::{App, git_ui};
 use crate::git;
@@ -120,6 +121,8 @@ pub(super) struct Aligned {
     pub changed: usize,
     /// The older version's path when the file was renamed since (git's rename detection).
     pub renamed: Option<String>,
+    /// The changes: runs of rows that are not unchanged ([`changes`]).
+    pub change_rows: Vec<Range<usize>>,
 }
 
 impl Aligned {
@@ -265,6 +268,7 @@ pub(super) fn align(old: &str, new: &str, diff: &[String]) -> Aligned {
             Kind::Same => {}
         }
     }
+    a.change_rows = changes(rows.iter().map(|r| r.kind != Kind::Same));
     a.rows = rows;
     a.old_lines = old_lines;
     a
@@ -379,8 +383,6 @@ pub(super) struct TabDiff {
     pub cur: Option<usize>,
     /// Rows of the change that flashes, and since when.
     pub flash: Option<(Range<usize>, Instant)>,
-    /// Opened by a jump from another file: go to the first (true) or last change once compared.
-    pub land: Option<bool>,
 }
 
 type Key = (u64, Against, Option<String>, Option<String>);
@@ -507,8 +509,7 @@ pub(super) fn controls(
         if let Some(fwd) = jump_buttons(ui, keys) {
             ctl = Some(Ctl::Jump(fwd));
         }
-        let n = changes(v.rows.iter().map(|r| r.kind != Kind::Same)).len();
-        let at = position(n, d.cur);
+        let at = position(v.change_rows.len(), d.cur);
         if !at.is_empty() {
             ui.label(RichText::new(at).small().color(weak));
         }
@@ -614,11 +615,6 @@ impl App {
                 Ok(a) => (d.view, d.note) = (Some(Arc::new(a)), None),
                 Err(e) => (d.view, d.note) = (None, Some(e)),
             }
-            if let Some(first) = d.land.take()
-                && d.view.is_some()
-            {
-                self.land_jump = Some(first);
-            }
         }
         if t.rev != d.seen_rev {
             d.seen_rev = t.rev;
@@ -660,30 +656,50 @@ impl App {
         d.for_key = Some(key);
     }
 
-    /// F7 / Shift+F7 and the arrows: the next or previous change of the docked diff panel when it
-    /// is open, else of the active tab's diff.
+    /// F7 / Shift+F7 and the arrows: the next or previous change of the docked diff panel while it
+    /// is on screen, else of the active tab's diff.
     pub(super) fn jump_change(&mut self, forward: bool) {
-        if self.has_diff() {
+        if self.has_diff() && !self.focus {
             self.panel_jump(forward);
         } else {
             self.tab_jump(forward);
         }
     }
 
-    /// A file opened by a jump from another file was compared: go to its first or last change.
+    /// A file opened by a jump from another file: once compared, go to its first (forward) or last
+    /// change; a file with a note or without changes is passed over to the one after it. Another
+    /// tab made active meanwhile drops the jump.
     pub(super) fn finish_land(&mut self) {
-        if let Some(first) = self.land_jump.take()
-            && let Some(t) = self.tabs.get_mut(self.active)
-        {
-            let n = t.diff.view.as_ref().map_or(0, |v| {
-                changes(v.rows.iter().map(|r| r.kind != Kind::Same)).len()
-            });
-            if n == 0 {
-                return;
-            }
-            t.diff.cur = Some(if first { 0 } else { n - 1 });
-            self.go_to_change();
+        let Some((path, forward)) = self.land_jump.clone() else {
+            return;
+        };
+        let Some(t) = self
+            .tabs
+            .get_mut(self.active)
+            .filter(|t| t.path == path && t.diff.on)
+        else {
+            self.land_jump = None;
+            return;
+        };
+        if t.diff.rx.is_some() || (t.diff.view.is_none() && t.diff.note.is_none()) {
+            return; // still comparing
         }
+        self.land_jump = None;
+        let n = t.diff.view.as_ref().map_or(0, |v| v.change_rows.len());
+        if n == 0 {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let why = t.diff.note.clone().unwrap_or_else(|| "no changes".into());
+            self.other_changed_file(forward, true);
+            if !self.status.starts_with("That was") {
+                self.status = format!("Passed over {name}: {why}");
+            }
+            return;
+        }
+        t.diff.cur = Some(if forward { 0 } else { n - 1 });
+        self.go_to_change();
     }
 
     /// The next or previous change of the active tab's diff; past its last (first) change, the
@@ -693,23 +709,32 @@ impl App {
             self.status = "Open a file to move between its changes".into();
             return;
         };
-        let Some(v) = t.diff.view.clone().filter(|_| t.diff.on) else {
-            self.status = if t.diff.on {
-                "Comparing…".into()
+        if !t.diff.on {
+            self.status = "Turn Diff on to move between changes".into();
+            return;
+        }
+        let Some(v) = t.diff.view.clone() else {
+            if t.diff.note.is_some() && t.diff.rx.is_none() {
+                self.other_changed_file(forward, false); // nothing to step through here
             } else {
-                "Turn Diff on to move between changes".into()
-            };
+                self.status = "Comparing…".into();
+            }
             return;
         };
-        let ch = changes(v.rows.iter().map(|r| r.kind != Kind::Same));
         let line = t.text[..t.cursor.min(t.text.len())].matches('\n').count();
         let at_row = v.row_of_new.get(line).copied().unwrap_or(v.rows.len());
-        match step(&ch, t.diff.cur, at_row, forward) {
+        // the cursor moved away from the change the last jump went to: start from the cursor
+        let cur = t.diff.cur.filter(|&c| {
+            v.change_rows
+                .get(c)
+                .is_some_and(|r| (r.start..=r.end).contains(&at_row))
+        });
+        match step(&v.change_rows, cur, at_row, forward) {
             Step::At(i) => {
                 self.tabs[self.active].diff.cur = Some(i);
                 self.go_to_change();
             }
-            Step::OtherFile => self.other_changed_file(forward),
+            Step::OtherFile => self.other_changed_file(forward, false),
         }
     }
 
@@ -721,10 +746,7 @@ impl App {
         let Some((v, i)) = t.diff.view.clone().zip(t.diff.cur) else {
             return;
         };
-        let Some(rows) = changes(v.rows.iter().map(|r| r.kind != Kind::Same))
-            .get(i)
-            .cloned()
-        else {
+        let Some(rows) = v.change_rows.get(i).cloned() else {
             return;
         };
         let r = &v.rows[rows.start];
@@ -742,8 +764,10 @@ impl App {
     }
 
     /// Opens the next (or previous) file of the changes the diff compares with (uncommitted files
-    /// against the last commit, the branch's files against the PR base), with Diff on.
-    fn other_changed_file(&mut self, forward: bool) {
+    /// against the last commit, the branch's files against the PR base), with Diff on; it lands on
+    /// that file's first (last) change once compared ([`App::finish_land`]).
+    /// `passing`: a hop past a file without changes (Back keeps only the walk's start).
+    fn other_changed_file(&mut self, forward: bool, passing: bool) {
         let Some(t) = self.tabs.get(self.active) else {
             return;
         };
@@ -776,23 +800,17 @@ impl App {
             };
             return;
         };
-        self.open_file(&next, None);
+        // one Back entry for the walk: only the first hop records where it started
+        if passing {
+            self.show_file(&next, None);
+        } else {
+            self.open_file(&next, None);
+        }
         if let Some(t) = self.tabs.get_mut(self.active).filter(|t| t.path == next) {
             t.diff.set(true, against);
             t.diff.cur = None;
-            match t
-                .diff
-                .view
-                .as_ref()
-                .filter(|_| t.diff.for_key.is_some() && t.diff.rx.is_none())
-            {
-                // already compared (an open tab): go now
-                Some(_) => {
-                    self.land_jump = Some(forward);
-                    self.finish_land();
-                }
-                None => t.diff.land = Some(forward),
-            }
+            self.land_jump = Some((next, forward));
+            self.finish_land(); // an open tab compared already goes now
             self.save_session(true);
         }
     }

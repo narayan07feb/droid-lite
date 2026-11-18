@@ -7872,3 +7872,73 @@ fn e2e_diff_panel_jumps_through_its_changes_file_after_file() {
     key(&mut h, Modifiers::NONE, Key::F7);
     h.get_by_label("Change 1 of 3");
 }
+
+#[test]
+fn e2e_diff_jump_passes_over_a_file_without_changes_and_lands_in_an_open_tab() {
+    let f = Fixture::new("diffjumppass");
+    let gradle = f.path("app/build.gradle.kts");
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    // git order: app/build.gradle.kts (a change), User.kt (only line ends: no change), UserCard.kt
+    std::fs::write(&gradle, "plugins { id(\"com.android.application\") }\n").unwrap();
+    std::fs::write(&user, USER_KT.replace('\n', "\r\n")).unwrap();
+    std::fs::write(&card, CARD_KT.replace("mutableStateOf(0)", "mutableStateOf(1)")).unwrap();
+    let mut h = f.harness();
+    // UserCard.kt is open and compared already: the jump lands in that tab
+    open(&mut h, &card);
+    wait(&mut h, "git status", |a| {
+        a.git.changes.as_ref().is_some_and(|c| c.repo && c.working.len() == 3)
+    });
+    h.get_by_label("Diff").click();
+    wait(&mut h, "card compared", |a| diff_counts(a) == Some((0, 0, 1)));
+    open(&mut h, &gradle);
+    h.get_by_label("Diff").click();
+    wait(&mut h, "gradle compared", |a| {
+        a.tabs[a.active].path == gradle && diff_view(a).is_some_and(|v| !v.change_rows.is_empty())
+    });
+    key(&mut h, Modifiers::NONE, Key::F7);
+    assert_eq!(at_line(h.state()), (gradle.clone(), 0));
+    // Alt+F7 is Find references, not a jump
+    let cur = tab(&h).diff.cur;
+    key(&mut h, Modifiers::ALT, Key::F7);
+    assert_eq!(tab(&h).diff.cur, cur);
+    assert_eq!(at_line(h.state()).0, gradle);
+    // past the change: User.kt has no changes and is passed over; UserCard.kt is open already
+    key(&mut h, Modifiers::NONE, Key::F7);
+    wait(&mut h, "landed in UserCard.kt", |a| {
+        a.tabs[a.active].path == card && a.tabs[a.active].diff.cur == Some(0)
+    });
+    steps(&mut h, 3);
+    assert_eq!(at_line(h.state()), (card.clone(), 6));
+    assert!(h.state().land_jump.is_none());
+    // Back goes to where the walk started, not to the file passed over
+    key(&mut h, Modifiers::COMMAND, Key::OpenBracket);
+    assert_eq!(at_line(h.state()).0, gradle);
+}
+
+#[test]
+fn e2e_diff_jump_starts_from_the_cursor_after_it_moved_and_skips_a_hidden_panel() {
+    let f = Fixture::new("diffjumpcursor");
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    std::fs::write(&user, USER_KT.replace("var age", "val age").replace("emptyList()", "listOf()")).unwrap();
+    let mut h = f.harness();
+    open(&mut h, &user);
+    wait(&mut h, "git status", |a| a.git.changes.as_ref().is_some_and(|c| c.repo));
+    h.get_by_label("Diff").click();
+    wait(&mut h, "compared", |a| diff_counts(a) == Some((0, 0, 2)));
+    key(&mut h, Modifiers::NONE, Key::F7);
+    key(&mut h, Modifiers::NONE, Key::F7);
+    assert_eq!(at_line(h.state()), (user.clone(), 5));
+    // the cursor goes back to the top: Next goes to the first change again, not past the last
+    h.state_mut().open_file(&user, Some(0));
+    steps(&mut h, 3);
+    key(&mut h, Modifiers::NONE, Key::F7);
+    assert_eq!(at_line(h.state()), (user.clone(), 2));
+    // a commit diff hidden by focus mode does not take the keys
+    h.state_mut().show_diff_text("Diff: x".into(), "@@ -1 +1 @@\n-a\n+b\n".into());
+    h.state_mut().focus = true;
+    steps(&mut h, 2);
+    key(&mut h, Modifiers::NONE, Key::F7);
+    assert_eq!(at_line(h.state()), (user, 5), "the tab diff moved");
+    assert_eq!(h.state().git.panel_cur, None);
+}
