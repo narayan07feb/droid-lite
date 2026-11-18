@@ -2676,6 +2676,9 @@ impl<'a> Resolver<'a> {
                 .collect()
         });
         // an imported class that shares a Kotlin type's name (a library `Result`) is that class
+        // in Java, String, CharSequence, Number and Object are the java.lang classes
+        let java_lang = f.java && matches!(class.as_str(), "String" | "CharSequence" | "Number" | "Object");
+        let qualified = qualified.or_else(|| java_lang.then(|| format!("java.lang.{class}")));
         let builtin = qualified.is_none() && is_kotlin_type(&class) && java_twin(&class).is_none();
         let qualified = qualified.or_else(|| java_twin(&class).map(String::from));
         LibCall {

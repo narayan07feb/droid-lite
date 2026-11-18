@@ -319,7 +319,13 @@ pub fn fetch(f: &Fetch) -> Result<(), String> {
             let err = out.try_clone().map_err(|e| e.to_string())?;
             // its own process group: on a timeout the java it starts stops too
             use std::os::unix::process::CommandExt;
-            let mut child = std::process::Command::new(&tool)
+            let mut cmd = std::process::Command::new(&tool);
+            // started from Finder there is no JAVA_HOME: Android Studio's runtime, when there
+            let jbr = Path::new("/Applications/Android Studio.app/Contents/jbr/Contents/Home");
+            if std::env::var_os("JAVA_HOME").is_none() && jbr.is_dir() {
+                cmd.env("JAVA_HOME", jbr);
+            }
+            let mut child = cmd
                 .process_group(0)
                 .arg(format!("--sdk_root={}", sdk.display()))
                 .arg(format!("sources;android-{api}"))
@@ -380,16 +386,26 @@ pub fn fetch(f: &Fetch) -> Result<(), String> {
                     .arg("-o")
                     .arg(&part)
                     .arg(format!("{r}/{rel}"))
+                    .args(["-w", "%{http_code}"])
                     .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
                     .spawn()
                     .map_err(|e| format!("curl did not start: {e}"))?;
                 // curl cannot cap a download whose size the server does not send: stopped here
                 let ok = loop {
                     match child.try_wait() {
                         Ok(Some(s)) => {
-                            // 22: the server said it has no such file (37: no such local file)
-                            let gone = if file { 37 } else { 22 };
-                            not_there &= s.code() == Some(gone);
+                            // the server said it has no such file (404, 410; not a 429 or a 503
+                            // that may pass), or no such local file (37)
+                            let mut http = String::new();
+                            if let Some(mut o) = child.stdout.take() {
+                                let _ = std::io::Read::read_to_string(&mut o, &mut http);
+                            }
+                            not_there &= if file {
+                                s.code() == Some(37)
+                            } else {
+                                matches!(http.trim(), "404" | "410")
+                            };
                             break s.success();
                         }
                         Ok(None) => {}
@@ -774,6 +790,8 @@ pub fn find_member(path: &Path, text: &str, class: &str, call: &LibCall) -> Memb
             .iter()
             .filter(|d| d.name == name && !d.kind.is_type())
             .filter(|d| !called || d.kind == crate::kotlin::Kind::Fun)
+            // what a caller outside the library can call: not private or internal
+            .filter(|d| !d.has_modifier("private") && !d.has_modifier("internal"))
             .filter(in_class)
             .collect()
     };

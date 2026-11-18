@@ -669,6 +669,32 @@ impl Xref {
     }
 }
 
+impl Xref {
+    /// What the name at byte `at` of `path` means, for one Go to declaration or Find usages
+    /// asked before the file's whole pass is done (open texts as they are now).
+    pub fn resolve_one(
+        &mut self,
+        path: PathBuf,
+        open: HashMap<PathBuf, Arc<str>>,
+        at: usize,
+        reply: impl FnOnce(Res) + Send + 'static,
+    ) {
+        self.submit("resolve-one", move |s, stale| {
+            let texts = Texts::new(open);
+            let cache = Cache::default();
+            let res = s.resolve(&texts, &cache, |r| {
+                r.file(&path).map(|fi| r.resolve(&fi, at))
+            });
+            if !stale() {
+                reply(res.unwrap_or(Res::None));
+                if let Some(c) = &s.ctx {
+                    c.request_repaint();
+                }
+            }
+        });
+    }
+}
+
 /// Two library calls may mean the same declaration: the same member, as many arguments, and where
 /// both know an argument's type, types that can be the same parameter. Which class declares it is
 /// checked after, by looking each up ([`super::libsrc_ui::exact_usages`]). A Kotlin library
@@ -676,7 +702,20 @@ impl Xref {
 fn may_be_same(a: &crate::resolve::LibCall, b: &crate::resolve::LibCall) -> bool {
     let args = match (&a.args, &b.args) {
         (Some(x), Some(y)) => {
-            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| crate::libsrc::same_type(p, q))
+            // a Java caller widens numbers (`0` for a float): any two numbers may be one parameter
+            let java = a.java || b.java;
+            let number = |t: &[String]| {
+                t.first().is_some_and(|n| {
+                    matches!(
+                        n.as_str(),
+                        "Int" | "Long" | "Short" | "Byte" | "Float" | "Double"
+                    )
+                })
+            };
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y)
+                    .all(|(p, q)| crate::libsrc::same_type(p, q) || java && number(p) && number(q))
         }
         (None, None) => true,
         _ => false,
@@ -1102,6 +1141,29 @@ fn hilt_pass(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_java_caller_widening_a_number_may_be_the_same_call() {
+        let call = |args: &[&str], java: bool| crate::resolve::LibCall {
+            class: "LocationManager".into(),
+            qualified: None,
+            stars: Vec::new(),
+            member: "f".into(),
+            args: Some(args.iter().map(|a| vec![a.to_string()]).collect()),
+            builtin: false,
+            java,
+            fallback: false,
+        };
+        let kotlin = call(&["String", "Int", "Float"], false);
+        assert!(
+            super::may_be_same(&kotlin, &call(&["String", "Int", "Int"], true)),
+            "0 for a float, in Java"
+        );
+        assert!(
+            !super::may_be_same(&kotlin, &call(&["String", "Int", "Int"], false)),
+            "not in Kotlin"
+        );
+    }
+
     use super::*;
     use crate::index::Index;
 

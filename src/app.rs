@@ -614,9 +614,11 @@ pub struct App {
     libs_rx: Option<Receiver<crate::libs::Libraries>>,
     /// Downloads of library and SDK sources for Go to declaration.
     fetches: libsrc_ui::Fetches,
-    /// A Go to declaration (or a Find usages: true) waiting for the resolver's reading of this
-    /// version of the file: (file, version, the name's start, when asked, find usages).
-    goto_pending: Option<(PathBuf, u64, usize, Instant, bool)>,
+    /// A Go to declaration (or a Find usages: true) waiting for the resolver's answer for its one
+    /// name: (file, version, the name's start, find usages, the answer).
+    goto_pending: Option<(PathBuf, u64, usize, bool, Receiver<crate::resolve::Res>)>,
+    /// That answer, while the jump (or Find usages) it was asked for runs.
+    one_res: Option<(PathBuf, u64, usize, crate::resolve::Res)>,
     /// A library Find usages under way: its call, when it started, and how its list came out.
     lib_usages_note: Option<(crate::resolve::LibCall, Instant, Receiver<libsrc_ui::UsagesState>)>,
     compose_view: Option<ComposeView>,
@@ -772,6 +774,7 @@ impl App {
             fetches: Default::default(),
             lib_usages_note: None,
             goto_pending: None,
+            one_res: None,
             compose_view: None,
             previews: Previews::default(),
             show_structure: false,
@@ -1014,7 +1017,7 @@ impl App {
                 return;
             }
             let text = if crate::libs::is_archive_path(path) {
-                crate::libs::read_entry(path)
+                crate::libs::read_entry(path).or_else(|| self.fetches.stubs.get(path).cloned())
             } else {
                 std::fs::read_to_string(path).ok()
             };
@@ -1457,41 +1460,45 @@ impl App {
     /// A waiting Go to declaration: run when the resolver has read the file (or after 3 s, by
     /// name as before); dropped when the cursor, the file or its text changed.
     fn poll_goto_pending(&mut self, ctx: &egui::Context) {
-        let Some((path, rev, at, asked, refs)) = self.goto_pending.clone() else {
+        let Some((path, rev, at, refs, rx)) = self.goto_pending.take() else {
             return;
         };
         let here = self.tabs.get(self.active).is_some_and(|t| {
             t.path == path && t.rev == rev && word_bounds(&t.text, t.cursor).0 == at
         });
         if !here {
-            self.goto_pending = None;
-            return;
+            return; // the file, its text or the cursor changed: the answer is for something else
         }
-        if self.xref.for_file(&path, rev).is_some() {
-            // read: run it now (it does not wait again, the file is read)
-            self.goto_pending = None;
-            if refs {
-                self.find_references(ctx);
-            } else {
-                self.goto_definition();
+        match rx.try_recv() {
+            Ok(res) => {
+                // run it with this answer (it does not ask again)
+                self.one_res = Some((path, rev, at, res));
+                if refs {
+                    self.find_references(ctx);
+                } else {
+                    self.goto_definition();
+                }
+                self.one_res = None;
             }
-        } else if asked.elapsed() > std::time::Duration::from_secs(10) {
-            // never by name here: that could be another class's member (a project function)
-            self.goto_pending = None;
-            self.status = "The file is still being read: try again in a moment".into();
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.goto_pending = Some((path, rev, at, refs, rx));
+            }
+            // a newer question replaced it
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
         }
     }
 
     /// A member name (`x.name`) in a project source the resolver has not read in this version
-    /// yet: its answer comes in a moment, and the name alone could be any class's member (a
-    /// project function of the same name), so the jump (or Find usages) waits for it. True when
-    /// it waits. Only for a file the resolver reads (a project source, not a read-only one); a
-    /// read file goes on, whatever the resolver made of the name.
+    /// yet: the name alone could be any class's member (a project function of the same name), so
+    /// the resolver answers for this one name first (it does not wait for the file's whole pass).
+    /// True when the jump (or Find usages) waits for that answer. A read file, a read-only one
+    /// or a name without a `.` before it goes on at once.
     fn wait_for_resolver(&mut self, word: &str, at: usize, refs: bool) -> bool {
         let Some(t) = self.tabs.get(self.active) else {
             return false;
         };
-        let read = self.xref.for_file(&t.path, t.rev).is_some();
+        let read = self.xref.for_file(&t.path, t.rev).is_some()
+            || self.one_res.as_ref().is_some_and(|(p, r, a, _)| *p == t.path && *r == t.rev && *a == at);
         let resolved_here = !t.readonly
             && t.path
                 .extension()
@@ -1500,8 +1507,18 @@ impl App {
         if read || !resolved_here || at == 0 || !t.text[..at].trim_end().ends_with('.') {
             return false;
         }
-        self.goto_pending = Some((t.path.clone(), t.rev, at, Instant::now(), refs));
-        self.status = format!("Reading the file to find `{word}`…");
+        let (path, rev) = (t.path.clone(), t.rev);
+        let open: HashMap<PathBuf, std::sync::Arc<str>> = self
+            .tabs
+            .iter()
+            .map(|t| (t.path.clone(), std::sync::Arc::from(t.text.as_str())))
+            .collect();
+        let (tx, rx) = channel();
+        self.xref.resolve_one(path.clone(), open, at, move |res| {
+            let _ = tx.send(res);
+        });
+        self.goto_pending = Some((path, rev, at, refs, rx));
+        self.status = format!("Reading `{word}`…");
         true
     }
 
@@ -1621,6 +1638,13 @@ impl App {
     /// version of the file is done.
     fn resolved_at(&self, at: usize) -> Option<crate::resolve::Res> {
         let t = self.tabs.get(self.active)?;
+        if let Some((p, rev, a, res)) = &self.one_res
+            && *p == t.path
+            && *rev == t.rev
+            && *a == at
+        {
+            return Some(res.clone());
+        }
         self.xref.for_file(&t.path, t.rev)?.at(at).cloned()
     }
 

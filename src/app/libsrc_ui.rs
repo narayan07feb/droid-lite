@@ -48,6 +48,8 @@ pub(super) struct Fetches {
     /// The library call whose Find usages were approximate (a source was missing): searched
     /// again when a download ends.
     pub usages_again: Option<(LibCall, String, PathBuf)>,
+    /// The stubs shown (their paths name no file): Back, Recent files open them again.
+    pub stubs: HashMap<PathBuf, String>,
     /// Find usages' searches: a newer one makes an older one stop.
     pub usages_gen: Arc<AtomicU64>,
     /// The project's compile SDK, read once per project root (on a worker).
@@ -436,6 +438,7 @@ impl App {
         let i = match self.tabs.iter().position(|t| t.path == path) {
             Some(i) => i,
             None => {
+                self.fetches.stubs.insert(path.clone(), text.clone());
                 let mut tab = Tab::open(&path, text);
                 tab.readonly = true;
                 tab.reanalyse();
@@ -802,7 +805,8 @@ impl Lookup {
             };
             match state {
                 None => return Looked::Fetch(fetch, self.jump.clone()),
-                Some(_) if !exact.is_empty() => {}
+                // the match is as near as the class without source (or nearer): it stands
+                Some(_) if !exact.is_empty() && missing_depth >= exact_depth => {}
                 Some(_) if self.fetch_only => return Looked::Nothing,
                 // a loose fit no farther than the class that declares the member; a farther one
                 // is another overload, so that class's stub is nearer the truth
@@ -1180,16 +1184,16 @@ impl Lookup {
 /// A source file's text (a file, or `jar!/entry`), up to 16 MB.
 fn read_source(path: &Path) -> Option<String> {
     if crate::libs::is_archive_path(path) {
-        return crate::libs::read_entry(path).filter(|t| t.len() <= MAX_SOURCE);
+        return crate::libs::read_entry(path).filter(|t| t.len() as u64 <= MAX_SOURCE);
     }
-    if std::fs::metadata(path).ok()?.len() > MAX_SOURCE as u64 {
+    if std::fs::metadata(path).ok()?.len() > MAX_SOURCE {
         return None;
     }
     std::fs::read_to_string(path).ok()
 }
 
 /// A source bigger than this is not read.
-const MAX_SOURCE: usize = 16 * 1024 * 1024;
+const MAX_SOURCE: u64 = crate::libs::MAX_ENTRY;
 
 /// `a.b.Outer.Inner` and then `a.b.Outer`: the class and the classes it is nested in.
 fn outers(q: &str) -> Vec<String> {

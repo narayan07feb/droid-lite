@@ -9137,7 +9137,7 @@ fn e2e_goto_right_after_an_edit_waits_for_the_resolver_instead_of_guessing_by_na
     type_text(&mut h, " ");
     place_cursor(&mut h, "requestLocationUpdates(provider", 1);
     h.state_mut().goto_definition();
-    assert!(h.state().status.starts_with("Reading the file"), "{}", h.state().status);
+    assert!(h.state().status.starts_with("Reading `"), "{}", h.state().status);
     let lm = sdk.join("sources/android-34/android/location/LocationManager.java");
     wait(&mut h, "LocationManager.java", |a| a.tabs[a.active].path == lm);
 }
@@ -9156,7 +9156,7 @@ fn e2e_goto_on_a_name_the_resolver_left_unresolved_never_waits() {
     h.state_mut().goto_definition();
     assert!(h.state().goto_pending.is_none(), "{}", h.state().status);
     steps(&mut h, 30);
-    assert!(!h.state().status.starts_with("Reading the file"), "{}", h.state().status);
+    assert!(!h.state().status.starts_with("Reading `"), "{}", h.state().status);
     // a dotted name in a read-only SDK source: no resolver reads it, no wait either
     goto_at(&mut h, &tracker, "requestLocationUpdates(provider", 1);
     let lm = sdk.join("sources/android-34/android/location/LocationManager.java");
@@ -9201,6 +9201,41 @@ fn e2e_find_usages_right_after_an_edit_waits_for_the_resolver_too() {
     // asked before any frame runs: this version of the file cannot be read yet
     let ctx = h.state().ctx.clone().expect("a context");
     h.state_mut().find_references(&ctx);
-    assert!(h.state().status.starts_with("Reading the file"), "{}", h.state().status);
+    assert!(h.state().status.starts_with("Reading `"), "{}", h.state().status);
     wait(&mut h, "the library search", |a| a.found_title.contains("(library)"));
+}
+
+#[test]
+fn e2e_goto_never_opens_a_private_overload_the_caller_cannot_call() {
+    let c = ("demo/geo/C.java", "package demo.geo;\n\npublic class C {\n    public void f(Object o) {}\n    private void f(String s) {}\n}\n");
+    let kt = "package com.demo.loc\n\nimport demo.geo.C\n\nfun g(c: C) {\n    c.f(\"x\")\n}\n";
+    let Some((f, file)) = maven_fixture("gotoprivate", &[c], Some(&[c]), kt) else { return };
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    goto_at(&mut h, &file, "f(\"x\")", 0);
+    wait(&mut h, "C.java", |a| a.tabs[a.active].path.to_string_lossy().ends_with("!/demo/geo/C.java"));
+    wait(&mut h, "the lookup", |a| !a.lib_reading());
+    steps(&mut h, 3);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("f(Object o)"), "the public one");
+}
+
+#[test]
+fn e2e_a_stub_opens_again_from_back_or_recent_files() {
+    let kt = "package com.demo.loc\n\nimport demo.geo.Locator\n\nfun find(l: Locator) {\n    l.locate(\"home\", 5L)\n}\n";
+    let java = [("demo/geo/Locator.java", GEO_JAVA), ("demo/geo/Base.java", GEO_BASE)];
+    let Some((f, file)) = maven_fixture_with("stubagain", &java, None, kt, true, None) else { return };
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    goto_at(&mut h, &file, "locate(", 1);
+    wait(&mut h, "the stub", |a| a.tabs[a.active].path.to_string_lossy().ends_with("(no source)"));
+    let stub = tab(&h).path.clone();
+    // closed, then opened again by its path (Recent files, Back)
+    let i = h.state().active;
+    h.state_mut().tabs.remove(i);
+    h.state_mut().active = 0;
+    steps(&mut h, 3);
+    h.state_mut().open_file(&stub, None);
+    steps(&mut h, 3);
+    assert_eq!(tab(&h).path, stub, "{}", h.state().status);
+    assert!(tab(&h).text.contains("locate(String p0, long p1)"));
 }
