@@ -1457,8 +1457,8 @@ impl App {
         self.goto_defs(word, path, at, defs);
     }
 
-    /// A waiting Go to declaration: run when the resolver has read the file (or after 3 s, by
-    /// name as before); dropped when the cursor, the file or its text changed.
+    /// A waiting Go to declaration (or Find usages): run with the resolver's answer for its one
+    /// name; dropped when the cursor, the file or its text changed, or a newer question came.
     fn poll_goto_pending(&mut self, ctx: &egui::Context) {
         let Some((path, rev, at, refs, rx)) = self.goto_pending.take() else {
             return;
@@ -1467,7 +1467,11 @@ impl App {
             t.path == path && t.rev == rev && word_bounds(&t.text, t.cursor).0 == at
         });
         if !here {
-            return; // the file, its text or the cursor changed: the answer is for something else
+            // the file, its text or the cursor changed: the answer is for something else
+            if self.status.starts_with("Reading `") {
+                self.status.clear();
+            }
+            return;
         }
         match rx.try_recv() {
             Ok(res) => {
@@ -1483,8 +1487,12 @@ impl App {
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 self.goto_pending = Some((path, rev, at, refs, rx));
             }
-            // a newer question replaced it
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            // a newer question replaced it, or the project closed
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                if self.status.starts_with("Reading `") {
+                    self.status.clear();
+                }
+            }
         }
     }
 

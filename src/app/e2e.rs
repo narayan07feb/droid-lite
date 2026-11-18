@@ -9239,3 +9239,36 @@ fn e2e_a_stub_opens_again_from_back_or_recent_files() {
     assert_eq!(tab(&h).path, stub, "{}", h.state().status);
     assert!(tab(&h).text.contains("locate(String p0, long p1)"));
 }
+
+#[test]
+fn e2e_goto_fetches_a_farther_exact_overload_when_the_near_one_takes_an_object() {
+    // Child (source here) has f(String, Object); Parent (source only in the repository) has the
+    // exact f(String, int): a high sum must not hide the Object
+    let parent = ("demo/geo/Parent.java", "package demo.geo;\n\npublic class Parent {\n    public void f(String s, int n) {}\n}\n");
+    let child = ("demo/geo/Child.java", "package demo.geo;\n\npublic class Child extends Parent {\n    public void f(String s, Object o) {}\n}\n");
+    let full = [parent, child];
+    let kt = "package com.demo.loc\n\nimport demo.geo.Child\n\nfun g(c: Child) {\n    c.f(\"x\", 1)\n}\n";
+    // Child in `base` (its sources in the Gradle cache), Parent in `geo` (sources only in the repository)
+    let Some((f, file)) = two_lib_fixture("gotoworst", &full, &["demo/geo/Child"], kt) else { return };
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 2);
+    goto_at(&mut h, &file, "f(\"x\"", 0);
+    wait(&mut h, "Parent.java", |a| a.tabs[a.active].path.to_string_lossy().ends_with("!/demo/geo/Parent.java"));
+    wait(&mut h, "the lookup", |a| !a.lib_reading());
+    steps(&mut h, 3);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("f(String s, int n)"));
+}
+
+#[test]
+fn e2e_goto_never_opens_a_package_private_overload() {
+    let c = ("demo/geo/C.java", "package demo.geo;\n\npublic class C {\n    public void f(Object o) {}\n    void f(String s) {}\n}\n");
+    let kt = "package com.demo.loc\n\nimport demo.geo.C\n\nfun g(c: C) {\n    c.f(\"x\")\n}\n";
+    let Some((f, file)) = maven_fixture("gotopackage", &[c], Some(&[c]), kt) else { return };
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    goto_at(&mut h, &file, "f(\"x\")", 0);
+    wait(&mut h, "C.java", |a| a.tabs[a.active].path.to_string_lossy().ends_with("!/demo/geo/C.java"));
+    wait(&mut h, "the lookup", |a| !a.lib_reading());
+    steps(&mut h, 3);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("f(Object o)"));
+}

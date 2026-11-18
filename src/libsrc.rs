@@ -288,13 +288,14 @@ pub fn already_there(f: &Fetch) -> bool {
     match f {
         // a sources folder with the android packages (an empty or cut-off one is fetched again)
         Fetch::Sdk { sdk, api } => sdk.join(format!("sources/android-{api}/android")).is_dir(),
-        Fetch::Maven { coords, .. } => cached_sources_jar(coords).is_some_and(|j| {
+        Fetch::Maven { coords, repos } => cached_sources_jar(coords).is_some_and(|j| {
             j.is_file()
-                || std::fs::metadata(none_marker(&j))
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.elapsed().ok())
-                    .is_some_and(|age| age < std::time::Duration::from_secs(24 * 3600))
+                || std::fs::read_to_string(none_marker(&j)).is_ok_and(|r| r == repos.join("\n"))
+                    && std::fs::metadata(none_marker(&j))
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age < std::time::Duration::from_secs(24 * 3600))
         }),
     }
 }
@@ -427,8 +428,9 @@ pub fn fetch(f: &Fetch) -> Result<(), String> {
             }
             let _ = std::fs::remove_file(&part);
             if tried > 0 && not_there {
-                // remembered for a day, so the next session does not ask every repository again
-                let _ = std::fs::write(none_marker(&dest), "");
+                // remembered for a day with the repositories asked, so the next session does not
+                // ask them again (another set of repositories asks again)
+                let _ = std::fs::write(none_marker(&dest), repos.join("\n"));
             }
             Err(format!("no sources jar for {c} in {tried} repositories"))
         }
@@ -752,6 +754,9 @@ pub struct Members {
     pub offsets: Vec<usize>,
     pub exact: bool,
     pub score: usize,
+    /// The weakest known argument's score in the best fit (100 with none known): a high sum may
+    /// hide one argument taken only as an `Object`.
+    pub worst: usize,
 }
 
 /// The declarations of `call.member` in `class` of a library source (`text` of `path`): those
@@ -764,7 +769,7 @@ pub fn find_member(path: &Path, text: &str, class: &str, call: &LibCall) -> Memb
     let simple = class.rsplit('.').next().unwrap_or(class);
     // the class's body: for `Outer.Builder` the Builder inside Outer, not another file's or class's
     let outer = class.rsplit('.').nth(1);
-    let body = syms
+    let type_decl = syms
         .decls
         .iter()
         .filter(|d| d.kind.is_type() && d.name == simple)
@@ -774,8 +779,12 @@ pub fn find_member(path: &Path, text: &str, class: &str, call: &LibCall) -> Memb
                 .as_deref()
                 .is_some_and(|c| c.rsplit('.').next() == Some(o)),
             None => true,
-        })
-        .and_then(|d| d.body.clone().or_else(|| brace_body(text, d.offset)));
+        });
+    let body = type_decl.and_then(|d| d.body.clone().or_else(|| brace_body(text, d.offset)));
+    // in a Java class a member without `public` or `protected` is the package's own (an
+    // interface's members are public)
+    let java_class = path.extension().is_some_and(|e| e == "java")
+        && type_decl.is_some_and(|d| d.kind != crate::kotlin::Kind::Interface);
     let in_class = |d: &&crate::kotlin::Decl| {
         d.container
             .as_deref()
@@ -792,6 +801,7 @@ pub fn find_member(path: &Path, text: &str, class: &str, call: &LibCall) -> Memb
             .filter(|d| !called || d.kind == crate::kotlin::Kind::Fun)
             // what a caller outside the library can call: not private or internal
             .filter(|d| !d.has_modifier("private") && !d.has_modifier("internal"))
+            .filter(|d| !java_class || d.has_modifier("public") || d.has_modifier("protected"))
             .filter(in_class)
             .collect()
     };
@@ -816,6 +826,7 @@ pub fn find_member(path: &Path, text: &str, class: &str, call: &LibCall) -> Memb
             offsets: ds.iter().map(|d| d.offset).collect(),
             exact,
             score: 0,
+            worst: 100,
         };
     };
     let class_params = class_offset(text, simple)
@@ -972,11 +983,12 @@ fn rank(
     let by_count: Vec<&&crate::kotlin::Decl> = ds.iter().filter(count).collect();
     // like the compiler, the most specific overload: an exact parameter type beats one that takes
     // anything (`Object`, a type parameter); several equally specific ones are all returned
-    let scored: Vec<(usize, usize)> = by_count
+    let scored: Vec<(usize, usize, usize)> = by_count
         .iter()
         .filter_map(|d| {
             let tp = tparams(d);
             let mut score = 0;
+            let mut worst = 100;
             for (a, p) in args.iter().zip(&d.params) {
                 if a.is_empty() {
                     continue;
@@ -987,20 +999,29 @@ fn rank(
                 } else {
                     p.ty.as_str()
                 };
-                score += match_score(ty, a, &tp, java)?;
+                let s = match_score(ty, a, &tp, java)?;
+                score += s;
+                worst = worst.min(s);
             }
-            Some((d.offset, score))
+            Some((d.offset, score, worst))
         })
         .collect();
-    if let Some(best) = scored.iter().map(|(_, s)| *s).max() {
+    if let Some(best) = scored.iter().map(|(_, s, _)| *s).max() {
+        let worst = scored
+            .iter()
+            .filter(|(_, s, _)| *s == best)
+            .map(|(_, _, w)| *w)
+            .min()
+            .unwrap_or(100);
         return Members {
             offsets: scored
                 .into_iter()
-                .filter(|(_, s)| *s == best)
-                .map(|(o, _)| o)
+                .filter(|(_, s, _)| *s == best)
+                .map(|(o, _, _)| o)
                 .collect(),
             exact: true,
             score: best,
+            worst,
         };
     }
     let offsets = if by_count.is_empty() {
@@ -1012,6 +1033,7 @@ fn rank(
         offsets,
         exact: false,
         score: 0,
+        worst: 0,
     }
 }
 
@@ -1126,6 +1148,7 @@ pub fn find_extension(path: &Path, text: &str, receivers: &[String], call: &LibC
             exact: !ds.is_empty(),
             offsets: ds.iter().map(|d| d.offset).collect(),
             score: 0,
+            worst: 100,
         },
     }
 }
@@ -1303,6 +1326,16 @@ fn match_score(param: &str, arg: &[String], tparams: &[String], java: bool) -> O
     }
     let p = simple_type(param);
     let own = arg.first()?;
+    // a Kotlin `Long` is Java's `long` first (javac's first phase); `java.lang.Long` after
+    if *own == p
+        && java_primitive(own).is_some()
+        && matches!(
+            p.as_str(),
+            "Long" | "Float" | "Double" | "Boolean" | "Short" | "Byte"
+        )
+    {
+        return Some(60);
+    }
     if *own == p || java_primitive(own) == Some(p.as_str()) || array_of(own) == Some(p.as_str()) {
         return Some(100);
     }
@@ -1632,7 +1665,7 @@ mod tests {
             "{f:?}"
         );
         // the nearest supertype wins: Leaf goes to f(Mid), not f(Base)
-        let h = "class H {\n    void f(Base b) {}\n    void f(Mid m) {}\n}\n";
+        let h = "class H {\n    public void f(Base b) {}\n    public void f(Mid m) {}\n}\n";
         let mut c = call("f", &[&["Leaf", "Mid", "Base"]]);
         c.class = "H".into();
         let f = fm(Path::new("H.java"), h, "H", &c);
@@ -1645,7 +1678,7 @@ mod tests {
         );
         assert!(match_score("(Int) -> Unit", &s(&[]), &[], false).is_some());
         // a real tie: two declarations that fit as well
-        let t2 = "class T {\n    void g(Object a) {}\n    void g(Object b) {}\n}\n";
+        let t2 = "class T {\n    public void g(Object a) {}\n    public void g(Object b) {}\n}\n";
         let mut c = call("g", &[&["Thing"]]);
         c.class = "T".into();
         assert_eq!(fm(Path::new("T.java"), t2, "T", &c).len(), 2);
@@ -1677,7 +1710,7 @@ mod tests {
         let m = find_member(Path::new("Task.java"), task, "Task", &c);
         assert!(m.exact && m.offsets.len() == 1, "{m:?}");
         // two nested Builders in one file: Outer.Builder is Outer's
-        let two = "class Outer {\n    static class Builder {\n        void build(int a) {}\n    }\n}\nclass Other {\n    static class Builder {\n        void build(int b) {}\n    }\n}\n";
+        let two = "class Outer {\n    static class Builder {\n        public void build(int a) {}\n    }\n}\nclass Other {\n    static class Builder {\n        public void build(int b) {}\n    }\n}\n";
         let mut c = call("build", &[&["Int"]]);
         c.class = "Builder".into();
         let m = find_member(Path::new("X.java"), two, "Outer.Builder", &c);
@@ -1720,6 +1753,11 @@ mod tests {
         assert_eq!(match_score("Number", &int, &[], false), Some(80));
         assert_eq!(match_score("Comparable", &int, &[], false), Some(80));
         assert_eq!(match_score("String", &int, &[], false), None);
+        let long = ["Long".to_string()];
+        assert!(
+            match_score("Long", &long, &[], false) < match_score("long", &long, &[], false),
+            "javac's first phase: the primitive before its box"
+        );
         assert!(
             match_score("Integer", &int, &[], false) > match_score("long", &int, &[], false),
             "Int is an Integer"

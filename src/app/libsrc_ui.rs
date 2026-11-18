@@ -149,6 +149,8 @@ pub(super) struct LookupBase {
     /// The project's repositories, read once per lookup (on its worker).
     repos: std::sync::OnceLock<Vec<String>>,
     libs: Arc<Libraries>,
+    /// The project's libraries are still being read: a class not found may be one of them.
+    libs_loading: bool,
     /// Downloads that may not run (again): done but the class was not in them (None), or failed
     /// lately (the error), for the stub's note.
     blocked: HashMap<String, Option<String>>,
@@ -274,6 +276,7 @@ impl App {
             scripts,
             repos: std::sync::OnceLock::new(),
             libs: self.libs.clone(),
+            libs_loading: self.libs_rx.is_some(),
             blocked,
         })
     }
@@ -438,6 +441,9 @@ impl App {
         let i = match self.tabs.iter().position(|t| t.path == path) {
             Some(i) => i,
             None => {
+                if self.fetches.stubs.len() >= 50 {
+                    self.fetches.stubs.clear(); // a few kept is enough for Back and Recent files
+                }
                 self.fetches.stubs.insert(path.clone(), text.clone());
                 let mut tab = Tab::open(&path, text);
                 tab.readonly = true;
@@ -620,6 +626,8 @@ fn class_path(q: &str) -> String {
 struct Level {
     depth: usize,
     score: usize,
+    /// Its weakest argument's score.
+    worst: usize,
     hits: Vec<(PathBuf, usize, String)>,
 }
 
@@ -731,13 +739,19 @@ impl Lookup {
                 offsets,
                 exact: sure,
                 score,
+                worst,
             } = libsrc::find_member(&path, &text, &class, &c);
             let hits: Vec<(PathBuf, usize, String)> = offsets
                 .into_iter()
                 .map(|o| (path.clone(), o, line_at(&text, o)))
                 .collect();
             if sure && !hits.is_empty() {
-                levels.push(Level { depth, score, hits });
+                levels.push(Level {
+                    depth,
+                    score,
+                    worst,
+                    hits,
+                });
             } else if loose.is_empty() {
                 loose = hits; // used only when no level fits exactly
                 loose_depth = depth;
@@ -761,6 +775,14 @@ impl Lookup {
             .iter()
             .map(|l| (l.score, std::cmp::Reverse(l.depth)))
             .max();
+        // every known argument of the best fit its own type or a literal's widening (`0` to
+        // `long`): no farther overload can fit better (one taken as an `Object` can)
+        let perfect = best.is_some_and(|(s, std::cmp::Reverse(d))| {
+            levels
+                .iter()
+                .filter(|l| l.score == s && l.depth == d)
+                .all(|l| l.worst >= 50)
+        });
         let exact: Vec<(PathBuf, usize, String)> = match best {
             Some((s, std::cmp::Reverse(d))) => levels
                 .into_iter()
@@ -772,13 +794,7 @@ impl Lookup {
         let exact_depth = best.map_or(usize::MAX, |(_, std::cmp::Reverse(d))| d);
         // a class without source as near as the match (or nearer) may declare it, and a farther
         // one may fit better when the match is not a perfect fit: fetch it first
-        let known_args = call
-            .args
-            .as_ref()
-            .map_or(0, |a| a.iter().filter(|x| !x.is_empty()).count());
-        // every known argument its own type or a literal's widening (`0` to `long`): no farther
-        // overload can fit better
-        let perfect = best.is_some_and(|(s, _)| s >= 50 * known_args);
+
         // its result is on disk already (an earlier session): running it again brings nothing;
         // its class is just not in it
         let state = |f: &Fetch| {
@@ -867,6 +883,16 @@ impl Lookup {
                 // no call: the name search must not run (the library could not be asked)
                 let _ = c;
                 Looked::NotFound(format!("`{}.{}`: {why}", call.class, call.member), None)
+            }
+            // the libraries are still being read: it may be one of theirs, not the project's
+            Looked::NotFound(_, Some(_)) if seen.is_empty() && self.base.libs_loading => {
+                Looked::NotFound(
+                    format!(
+                        "`{}.{}`: the project's libraries are still being read; try again in a moment",
+                        call.class, call.member
+                    ),
+                    None,
+                )
             }
             Looked::NotFound(w, Some((mut c, from))) if seen.is_empty() && !c.builtin => {
                 c.fallback = true;
