@@ -76,6 +76,30 @@ struct Jump {
     from: Option<(PathBuf, usize)>,
 }
 
+/// `java.lang` classes common in Android code (a receiver of these needs the SDK's sources).
+const JAVA_LANG: &[&str] = &[
+    "Thread",
+    "Runnable",
+    "System",
+    "Math",
+    "Object",
+    "Integer",
+    "Long",
+    "Double",
+    "Float",
+    "Boolean",
+    "Character",
+    "Runtime",
+    "Process",
+    "Class",
+    "ClassLoader",
+    "Iterable",
+    "Comparable",
+    "Enum",
+    "ThreadLocal",
+    "StringBuffer",
+];
+
 /// The downloads one jump may run (a class's SDK sources, then a library's): no chain.
 const MAX_JUMP_DOWNLOADS: u8 = 2;
 
@@ -443,6 +467,8 @@ pub(super) enum UsagesState {
     Downloading(String),
     /// The declaration has no source (a stub, not found, or several fit): calls on the same class.
     NoSource,
+    /// No library class of that name (a generated or unindexed project class): searched by name.
+    NotLibrary,
 }
 
 /// Find usages of a library call, exactly: the candidate calls (same member, as many arguments,
@@ -486,6 +512,7 @@ pub(super) fn exact_usages(
     let (want, state) = match target_look {
         Looked::Found(h) if h.len() == 1 => (Some((h[0].0.clone(), h[0].1)), UsagesState::Exact),
         Looked::Fetch(f, _) => (None, UsagesState::Downloading(f.key())),
+        Looked::NotFound(_, Some((c, _))) if c.fallback => (None, UsagesState::NotLibrary),
         _ => (None, UsagesState::NoSource),
     };
     let mut known: HashMap<CallKey, Option<Decl>> = HashMap::new();
@@ -628,6 +655,7 @@ impl Lookup {
         let mut seen_names: Vec<String> = Vec::new();
         let mut levels: Vec<Level> = Vec::new();
         let mut loose: Vec<(PathBuf, usize, String)> = Vec::new();
+        let mut loose_depth = usize::MAX;
         // classes without source that declare the member, in walk order (nearest first)
         let mut missing: Vec<(Fetch, Option<ClassFile>, String, usize)> = Vec::new();
         while let Some((cands, depth)) = queue.pop_front() {
@@ -693,6 +721,7 @@ impl Lookup {
                 levels.push(Level { depth, score, hits });
             } else if loose.is_empty() {
                 loose = hits; // used only when no level fits exactly
+                loose_depth = depth;
             }
             // supertypes may declare a better overload (javac weighs them all): walk on
             if depth < MAX_DEPTH {
@@ -728,7 +757,9 @@ impl Lookup {
             .args
             .as_ref()
             .map_or(0, |a| a.iter().filter(|x| !x.is_empty()).count());
-        let perfect = best.is_some_and(|(s, _)| s >= 100 * known_args);
+        // every known argument its own type or a literal's widening (`0` to `long`): no farther
+        // overload can fit better
+        let perfect = best.is_some_and(|(s, _)| s >= 50 * known_args);
         // its result is on disk already (an earlier session): running it again brings nothing;
         // its class is just not in it
         let state = |f: &Fetch| {
@@ -746,7 +777,7 @@ impl Lookup {
         // the nearest: it declares the member (its class file says so), so it is the exact
         // declaration (an override); a farther one's source would be what it overrides, so when
         // it cannot be fetched its stub is shown, not a farther source
-        if let Some((fetch, stub, class, _)) = wanted.into_iter().next() {
+        if let Some((fetch, stub, class, missing_depth)) = wanted.into_iter().next() {
             let state = if can_fetch {
                 state(&fetch)
             } else {
@@ -757,7 +788,11 @@ impl Lookup {
                 None => return Looked::Fetch(fetch, self.jump.clone()),
                 Some(_) if !exact.is_empty() => {}
                 Some(_) if self.fetch_only => return Looked::Nothing,
-                Some(_) if !loose.is_empty() => return Looked::Found(loose),
+                // a loose fit no farther than the class that declares the member; a farther one
+                // is another overload, so that class's stub is nearer the truth
+                Some(_) if !loose.is_empty() && loose_depth <= missing_depth => {
+                    return Looked::Found(loose);
+                }
                 Some(None) => {
                     let why = format!("{} has no source of {class}", fetch.label());
                     return self.stub(stub, &why, &class);
@@ -802,7 +837,7 @@ impl Lookup {
             // that only shares the name (the bug this lookup fixes)
             Looked::NotFound(_, c)
                 if seen.is_empty()
-                    && call.qualified.as_deref().is_some_and(libsrc::is_platform)
+                    && self.may_be_platform()
                     && (self.base.sdk.is_none() || self.base.api.is_none()) =>
             {
                 let why = match &self.base.sdk {
@@ -940,7 +975,7 @@ impl Lookup {
                 if depth > 4 || seen.len() > 12 {
                     break;
                 }
-                let Some((q, Source::Text(path))) = cands
+                let Some((q, source)) = cands
                     .iter()
                     .find_map(|q| Some((q.clone(), self.locate(q, false)?)))
                 else {
@@ -950,10 +985,19 @@ impl Lookup {
                     continue;
                 }
                 let class = q.rsplit('.').next().unwrap_or(&q).to_string();
-                let Some(text) = read_source(&path) else {
-                    continue;
+                // the supertypes from its source, else from its class file
+                let sups: Vec<Vec<String>> = match source {
+                    Source::Text(path) => match read_source(&path) {
+                        Some(text) => libsrc::supertypes(&text, &class),
+                        None => Vec::new(),
+                    },
+                    Source::Missing(_, stub) => stub
+                        .and_then(|s| libsrc::class_bytes(&s.archive, &s.entry))
+                        .and_then(|b| crate::classfile::parse(&b))
+                        .map(|i| i.supers.into_iter().map(|s| vec![s]).collect())
+                        .unwrap_or_default(),
                 };
-                for sup in libsrc::supertypes(&text, &class) {
+                for sup in sups {
                     if let Some(n) = sup.first().and_then(|s| s.rsplit('.').next())
                         && !names.iter().any(|x| x == n)
                     {
@@ -965,6 +1009,21 @@ impl Lookup {
             out.push(names);
         }
         self.jump.call.args = Some(out);
+    }
+
+    /// The receiver may be an Android or Java platform class: imported from one by name or by a
+    /// star (`android.location.*`), or a common `java.lang` class.
+    fn may_be_platform(&self) -> bool {
+        let call = &self.jump.call;
+        match &call.qualified {
+            Some(q) => libsrc::is_platform(q),
+            None => {
+                call.stars
+                    .iter()
+                    .any(|s| libsrc::is_platform(&format!("{s}.X")))
+                    || JAVA_LANG.contains(&call.class.as_str())
+            }
+        }
     }
 
     /// The classes a receiver known only by its simple name may be, with whether each is a guess

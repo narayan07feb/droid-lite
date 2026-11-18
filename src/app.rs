@@ -614,6 +614,9 @@ pub struct App {
     libs_rx: Option<Receiver<crate::libs::Libraries>>,
     /// Downloads of library and SDK sources for Go to declaration.
     fetches: libsrc_ui::Fetches,
+    /// A Go to declaration waiting for the resolver's reading of this version of the file:
+    /// (file, version, the name's start, when asked).
+    goto_pending: Option<(PathBuf, u64, usize, Instant)>,
     /// A library Find usages under way: its call, when it started, and how its list came out.
     lib_usages_note: Option<(crate::resolve::LibCall, Instant, Receiver<libsrc_ui::UsagesState>)>,
     compose_view: Option<ComposeView>,
@@ -768,6 +771,7 @@ impl App {
             libs_rx: None,
             fetches: Default::default(),
             lib_usages_note: None,
+            goto_pending: None,
             compose_view: None,
             previews: Previews::default(),
             show_structure: false,
@@ -1420,11 +1424,29 @@ impl App {
     fn goto_definition(&mut self) {
         self.settle(true);
         self.cancel_lib_jump(); // a jump still waiting for a download is replaced by this one
+        self.goto_pending = None;
         let Some((word, at)) = self.word_at_cursor() else {
             return;
         };
         let path = self.tabs[self.active].path.clone();
         if self.goto_android_reference(&word, at) {
+            return;
+        }
+        // a member call (`x.name`) in a file the resolver has not read in this version yet: its
+        // answer comes in a moment; the name alone could be any class's member (a project function
+        // of the same name), so the jump waits for it
+        let t = &self.tabs[self.active];
+        let code = path
+            .extension()
+            .is_some_and(|e| e == "kt" || e == "java" || e == "kts");
+        if code
+            && at > 0
+            && t.text[..at].trim_end().ends_with('.')
+            && self.resolved_at(at).is_none()
+            && self.project.is_some()
+        {
+            self.goto_pending = Some((path, t.rev, at, Instant::now()));
+            self.status = format!("Reading the file to find `{word}`…");
             return;
         }
         // what the name means here, from the worker's reading of the file; until that is ready,
@@ -1444,6 +1466,32 @@ impl App {
             _ => self.index.read().definitions(&word, &path),
         };
         self.goto_defs(word, path, at, defs);
+    }
+
+    /// A waiting Go to declaration: run when the resolver has read the file (or after 3 s, by
+    /// name as before); dropped when the cursor, the file or its text changed.
+    fn poll_goto_pending(&mut self) {
+        let Some((path, rev, at, asked)) = self.goto_pending.clone() else {
+            return;
+        };
+        let here = self.tabs.get(self.active).is_some_and(|t| {
+            t.path == path && t.rev == rev && word_bounds(&t.text, t.cursor).0 == at
+        });
+        if !here {
+            self.goto_pending = None;
+            return;
+        }
+        let ready = self.xref.for_file(&path, rev).is_some();
+        if ready {
+            self.goto_definition();
+        } else if asked.elapsed() > std::time::Duration::from_secs(3) {
+            // the resolver is slow on this file: by name, as before it was there
+            self.goto_pending = None;
+            if let Some((word, _)) = self.word_at_cursor() {
+                let defs = self.index.read().definitions(&word, &path);
+                self.goto_defs(word, path, at, defs);
+            }
+        }
     }
 
     /// The declarations of `word` by name (imported and nearby ones first): for a call through a
@@ -1904,6 +1952,7 @@ impl App {
 
     fn poll(&mut self, ctx: &egui::Context) {
         self.poll_previews(ctx);
+        self.poll_goto_pending();
         if let Some(rx) = &self.indexing
             && let Ok((project, index, branch, tree, res)) = rx.try_recv()
         {
@@ -4897,6 +4946,13 @@ impl eframe::App for App {
                             "References to `{}.{}` are approximate until its source is downloaded",
                             call.class, call.member
                         );
+                    }
+                }
+                libsrc_ui::UsagesState::NotLibrary => {
+                    // not a library class after all: the project's declarations of the name
+                    if let Some(ctx) = self.ctx.clone() {
+                        self.found_title = format!("References to `{}`", call.member);
+                        self.search_project(call.member.clone(), true, None, &ctx);
                     }
                 }
                 libsrc_ui::UsagesState::NoSource => {

@@ -283,7 +283,14 @@ pub fn already_there(f: &Fetch) -> bool {
     match f {
         // a sources folder with the android packages (an empty or cut-off one is fetched again)
         Fetch::Sdk { sdk, api } => sdk.join(format!("sources/android-{api}/android")).is_dir(),
-        Fetch::Maven { coords, .. } => cached_sources_jar(coords).is_some_and(|j| j.is_file()),
+        Fetch::Maven { coords, .. } => cached_sources_jar(coords).is_some_and(|j| {
+            j.is_file()
+                || std::fs::metadata(none_marker(&j))
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age < std::time::Duration::from_secs(24 * 3600))
+        }),
     }
 }
 
@@ -351,6 +358,8 @@ pub fn fetch(f: &Fetch) -> Result<(), String> {
             // only web repositories, unless the tests name a local one
             let local = std::env::var_os("DROID_LITE_MAVEN_REPOS").is_some();
             let mut tried = 0;
+            // every repository answered that it has no such jar (not: offline, too big, broken)
+            let mut not_there = true;
             for r in repos {
                 let file = r.starts_with("file://");
                 if file && !local || !file && !r.starts_with("https://") {
@@ -372,11 +381,17 @@ pub fn fetch(f: &Fetch) -> Result<(), String> {
                 // curl cannot cap a download whose size the server does not send: stopped here
                 let ok = loop {
                     match child.try_wait() {
-                        Ok(Some(s)) => break s.success(),
+                        Ok(Some(s)) => {
+                            // 22: the server said it has no such file (37: no such local file)
+                            let gone = if file { 37 } else { 22 };
+                            not_there &= s.code() == Some(gone);
+                            break s.success();
+                        }
                         Ok(None) => {}
                         Err(_) => break false,
                     }
                     if std::fs::metadata(&part).is_ok_and(|m| m.len() > MAX_DOWNLOAD) {
+                        not_there = false;
                         let _ = child.kill();
                         let _ = child.wait();
                         break false;
@@ -390,6 +405,10 @@ pub fn fetch(f: &Fetch) -> Result<(), String> {
                 }
             }
             let _ = std::fs::remove_file(&part);
+            if tried > 0 && not_there {
+                // remembered for a day, so the next session does not ask every repository again
+                let _ = std::fs::write(none_marker(&dest), "");
+            }
             Err(format!("no sources jar for {c} in {tried} repositories"))
         }
     }
@@ -574,7 +593,11 @@ pub fn supertypes(text: &str, class: &str) -> Vec<Vec<String>> {
         return Vec::new();
     };
     let head = &text[at + class.len()..];
-    let mut end = head.find('{').unwrap_or(head.len()).min(600);
+    let mut end = head
+        .find('{')
+        .unwrap_or(head.len())
+        .min(head_end(head))
+        .min(600);
     while !head.is_char_boundary(end) {
         end -= 1; // never inside a multibyte character
     }
@@ -783,7 +806,13 @@ pub fn find_member(path: &Path, text: &str, class: &str, call: &LibCall) -> Memb
 }
 
 /// The most Kotlin files of one package read to find a function's file.
-const MAX_PACKAGE_FILES: usize = 500;
+const MAX_PACKAGE_FILES: usize = 200;
+
+/// The file that says no repository had the sources jar `jar` (younger than a day: not asked
+/// again).
+fn none_marker(jar: &Path) -> PathBuf {
+    jar.with_extension("jar.none")
+}
 
 /// Part files a stopped Droid Lite left behind (older than an hour: no download runs so long).
 fn sweep_parts(dir: &Path) {
@@ -821,6 +850,39 @@ fn without_block_comments(t: &str) -> String {
 
 /// The largest sources jar downloaded (200 MB).
 const MAX_DOWNLOAD: u64 = 200 << 20;
+
+/// Where a class header without a body ends (`class Foo` then `val x: T` on the next line): the
+/// first line break outside brackets that does not carry the supertype list on (`,` or `:` around
+/// it, or `extends` / `implements` / `where` / `{` after it).
+fn head_end(head: &str) -> usize {
+    let mut depth = 0i32;
+    let mut prev = ' ';
+    for (i, c) in head.char_indices() {
+        match c {
+            '(' | '<' => depth += 1,
+            ')' => depth -= 1,
+            '>' if prev != '-' => depth -= 1,
+            '\n' if depth <= 0 => {
+                let before = head[..i].trim_end();
+                let after = head[i..].trim_start();
+                let words = ["extends", "implements", "where"];
+                let goes_on = before.ends_with([',', ':'])
+                    || after.starts_with([',', ':', '{'])
+                    || words
+                        .iter()
+                        .any(|w| after.starts_with(w) || before.ends_with(w));
+                if !goes_on {
+                    return i;
+                }
+            }
+            _ => {}
+        }
+        if !c.is_whitespace() {
+            prev = c;
+        }
+    }
+    head.len()
+}
 
 /// `p` is a whole zip (a cut-off download has no central directory) of at most `max` bytes.
 fn whole_zip(p: &Path, max: u64) -> bool {
@@ -1655,6 +1717,13 @@ mod tests {
             2,
             "extends and implements on their own lines"
         );
+        let bodiless = "package a\n\nclass Foo\n\nval x: Bar = Bar()\n";
+        assert!(
+            supertypes(bodiless, "Foo").is_empty(),
+            "no body: nothing after its line"
+        );
+        let multi = "package a\n\nclass Foo(\n    val a: Int,\n) : Bar(),\n    Baz\n";
+        assert_eq!(supertypes(multi, "Foo").len(), 2);
         let d = std::env::temp_dir().join(format!("dl-repos-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("settings.gradle.kts"), "val api = uri(\"https://api.example.com/v1\")\ndependencyResolutionManagement {\n    repositories {\n        google()\n        maven { url = uri(\"https://repo.example.com/maven\") }\n        maven { url = uri(\"https://private.example.com/m?token=secret\") }\n        /* maven { url = uri(\"https://old.example.com/maven\") } */\n    }\n}\n").unwrap();

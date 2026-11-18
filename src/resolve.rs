@@ -4350,6 +4350,7 @@ fn past_int(l: &str) -> bool {
     };
     let digits = digits.replace('_', "");
     u64::from_str_radix(&digits, radix).is_ok_and(|n| n > i32::MAX as u64)
+        // past even u64 (which kotlinc rejects): not an Int either
         || radix == 10 && !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) && digits.len() > 19
 }
 

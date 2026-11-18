@@ -671,7 +671,8 @@ impl Xref {
 
 /// Two library calls may mean the same declaration: the same member, as many arguments, and where
 /// both know an argument's type, types that can be the same parameter. Which class declares it is
-/// checked after, by looking each up ([`super::libsrc_ui::exact_usages`]).
+/// checked after, by looking each up ([`super::libsrc_ui::exact_usages`]). A Kotlin library
+/// function with default parameters called with fewer arguments is not matched (a known limit).
 fn may_be_same(a: &crate::resolve::LibCall, b: &crate::resolve::LibCall) -> bool {
     let args = match (&a.args, &b.args) {
         (Some(x), Some(y)) => {

@@ -8360,8 +8360,7 @@ fn e2e_goto_downloads_a_librarys_sources_jar_once_then_uses_the_cache() {
     let home = f.config.join("gradle-home");
     let java = "package demo.geo;\n\npublic class Locator {\n    public void locate(String name, long timeout) {}\n    public void locate(String name, Object tag) {}\n}\n";
     let Some(classes) = crate::classfile::tests::javac(&f.config.join("javac"), &[("demo/geo/Locator.java", java)]) else {
-        eprintln!("no javac: skipped");
-        return;
+        panic!("javac is needed for the library tests (install a JDK)");
     };
     let zip = |path: &Path, files: &[(String, Vec<u8>)]| {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -8541,6 +8540,13 @@ fn e2e_goto_never_downloads_twice_when_the_jar_lacks_the_class_or_the_download_f
     assert!(h.state().status.contains("could not be downloaded"), "{}", h.state().status);
     assert_eq!(h.state().fetches.started, 1);
     assert!(tab(&h).text.contains("protected void secret()"), "protected members are in the stub");
+    // the repository said it has no such jar: the next session does not ask it again
+    drop(h);
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    goto_at(&mut h, &file, "locate(", 1);
+    wait(&mut h, "the stub", |a| a.tabs[a.active].path.to_string_lossy().ends_with("(no source)"));
+    assert_eq!(h.state().fetches.started, 0, "remembered across sessions");
 }
 
 #[test]
@@ -9007,6 +9013,11 @@ fn e2e_goto_on_a_class_no_library_has_falls_back_to_the_name_search() {
     goto_at(&mut h, &file, "ping()", 1);
     wait(&mut h, "Ping.kt", |a| a.tabs[a.active].path == other);
     assert_eq!(h.state().fetches.started, 0);
+    // Find usages on it: the project's, like the jump
+    open(&mut h, &file);
+    place_cursor(&mut h, "ping()", 1);
+    key(&mut h, Modifiers::ALT, Key::F7);
+    wait(&mut h, "by name", |a| a.found_title == "References to `ping`");
 }
 
 #[test]
@@ -9092,4 +9103,41 @@ fn e2e_goto_on_an_sdk_call_without_an_sdk_says_so_and_never_opens_the_project_fu
     let t = tab(&h);
     assert_eq!(t.path, tracker);
     assert!(!t.text[t.cursor..].starts_with("requestLocationUpdates()"), "not the project's override");
+}
+
+#[test]
+fn e2e_goto_on_a_star_imported_sdk_call_without_an_sdk_says_so() {
+    let Some((f, _sdk, tracker)) = sdk_fixture("gotostarnosdk", true) else { return };
+    // SAFETY: the fixture holds the SERIAL lock.
+    unsafe { std::env::set_var("DROID_LITE_ANDROID_SDK", "/nonexistent/droid-lite-no-sdk") };
+    let file = f.path("app/src/main/java/com/demo/loc/Star.kt");
+    std::fs::write(
+        &file,
+        "package com.demo.loc\n\nimport android.location.*\n\nfun g(m: LocationManager, l: LocationListener) {\n    m.requestLocationUpdates(\"gps\", 0, 0f, l)\n}\n",
+    )
+    .unwrap();
+    let mut h = f.harness();
+    goto_at(&mut h, &file, "requestLocationUpdates(", 1);
+    wait(&mut h, "the message", |a| a.status.contains("No Android SDK found"));
+    steps(&mut h, 10);
+    assert_ne!(tab(&h).path, tracker, "not the project's requestLocationUpdates()");
+}
+
+#[test]
+fn e2e_goto_right_after_an_edit_waits_for_the_resolver_instead_of_guessing_by_name() {
+    let Some((f, sdk, tracker)) = sdk_fixture("gotoafteredit", true) else { return };
+    let mut h = f.harness();
+    open(&mut h, &tracker);
+    wait(&mut h, "resolved", |a| {
+        let t = &a.tabs[a.active];
+        a.xref.for_file(&t.path, t.rev).is_some()
+    });
+    // an edit: this version of the file is not read yet when the jump is asked
+    place_cursor(&mut h, "fun trim() {}", 13);
+    type_text(&mut h, " ");
+    place_cursor(&mut h, "requestLocationUpdates(provider", 1);
+    h.state_mut().goto_definition();
+    assert!(h.state().status.starts_with("Reading the file"), "{}", h.state().status);
+    let lm = sdk.join("sources/android-34/android/location/LocationManager.java");
+    wait(&mut h, "LocationManager.java", |a| a.tabs[a.active].path == lm);
 }
