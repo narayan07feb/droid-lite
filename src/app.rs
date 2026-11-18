@@ -1601,7 +1601,8 @@ impl App {
         self.bottom = Bottom::Find;
     }
 
-    /// Find references of a library member, on the worker ([`xref::Xref::find_lib_usages`]).
+    /// Find references of a library member: the calls the worker reads as the same member, kept
+    /// when they lead to the same declaration ([`libsrc_ui::exact_usages`]).
     fn search_lib_usages(&mut self, call: crate::resolve::LibCall, ctx: &egui::Context) {
         let Some(p) = &self.project else { return };
         let root = p.root.clone();
@@ -1610,12 +1611,28 @@ impl App {
             .iter()
             .map(|t| (t.path.clone(), std::sync::Arc::from(t.text.as_str())))
             .collect();
+        let Some(base) = self.lookup_base() else { return };
+        let imports: Vec<String> = self
+            .tabs
+            .get(self.active)
+            .map(|t| {
+                t.text
+                    .lines()
+                    .filter_map(|l| l.trim().strip_prefix("import "))
+                    .map(|l| l.trim_end_matches(';').trim().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
         let (tx, rx) = channel();
         let c = ctx.clone();
         self.status = format!("Searching for `{}.{}`…", call.class, call.member);
-        self.xref.find_lib_usages("find", call, open, root, move |found| {
-            let _ = tx.send(found);
-            c.request_repaint();
+        let target = call.clone();
+        self.xref.find_lib_usages("find", call, open, root, move |cands| {
+            // the lookups read sources: on their own thread, not the code insight worker
+            std::thread::spawn(move || {
+                let _ = tx.send(libsrc_ui::exact_usages(base, target, imports, cands));
+                c.request_repaint();
+            });
         });
         self.find_rx = Some(rx);
         self.bottom = Bottom::Find;
@@ -3220,6 +3237,7 @@ impl App {
                         if clicked {
                             self.active = i;
                             self.completion = None;
+                            self.fetches.cancel(); // a library jump still waiting stays put
                         }
                         if closed {
                             close = Some(i);

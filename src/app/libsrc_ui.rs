@@ -1,19 +1,20 @@
 //! Go to declaration on a library or Android SDK call, like Android Studio: the exact declaration
 //! (the overload whose parameter types take the arguments, looked for in the class and then, breadth
-//! first, in all its supertypes) in the class's source, opened read-only. A missing source is
-//! downloaded first, on a worker thread with a status line, and cached; when there is no source at
-//! all, a stub made from the class file is shown instead. The whole lookup (jars, sources, the
-//! supertype walk, the stub) runs on a worker: the editor never waits for it.
+//! first, in all its supertypes; an extension function by its receiver) in the source, opened
+//! read-only. A missing source is downloaded first, on a worker thread with a status line, and
+//! cached; when there is no source at all, a stub made from the class file is shown instead. The
+//! whole lookup (jars, sources, the supertype walk, the stub) runs on a worker: the editor never
+//! waits for it.
 
 use super::{App, Tab};
 use crate::index::Hit;
 use crate::libs::Libraries;
-use crate::libsrc::{self, Fetch};
+use crate::libsrc::{self, Fetch, Members};
 use crate::resolve::LibCall;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 /// A failed download is tried again after this long (a network blip is not for the session).
@@ -21,6 +22,8 @@ const RETRY_AFTER: Duration = Duration::from_secs(600);
 /// How many supertypes up, and how many classes in all, a member is looked for.
 const MAX_DEPTH: usize = 8;
 const MAX_CLASSES: usize = 40;
+/// How many library functions of the name are read to match an extension's receiver.
+const MAX_EXTENSION_FILES: usize = 30;
 
 /// Downloads of sources, and lookups on a worker.
 #[derive(Default)]
@@ -30,12 +33,22 @@ pub(super) struct Fetches {
     pub ended: HashMap<String, (Result<(), String>, Instant)>,
     /// The download key and the jump to make once it ends.
     waiting: Option<(String, Jump)>,
-    /// A lookup on a worker, and whether it opens what it finds.
-    looking: Option<(Receiver<Looked>, bool)>,
+    /// A jump's lookup on a worker.
+    looking: Option<Receiver<Looked>>,
+    /// Find usages' lookup: only fetches a missing source.
+    prefetch: Option<Receiver<Looked>>,
     /// The project's compile SDK, read once per project root.
     api: Option<(PathBuf, Option<u32>)>,
     /// How many downloads ran (tests check a cached source is not downloaded again).
     pub started: usize,
+}
+
+impl Fetches {
+    /// Drops a jump still waiting for a download or a lookup (the user went elsewhere).
+    pub(super) fn cancel(&mut self) {
+        self.waiting = None;
+        self.looking = None;
+    }
 }
 
 /// What a jump needs to look again after a download: the call and the file's imports.
@@ -45,10 +58,10 @@ struct Jump {
     imports: Vec<String>,
 }
 
-/// A class file inside a jar: for a stub when no source can be had.
+/// A class file inside a jar or `.aar`: for a stub when no source can be had.
 #[derive(Clone, Debug)]
 struct ClassFile {
-    jar: PathBuf,
+    archive: PathBuf,
     entry: String,
     qualified: String,
 }
@@ -61,8 +74,10 @@ enum Looked {
     Fetch(Fetch, Jump),
     /// No source can be had: a stub (its path, text and the member's offset) and why.
     Stub(PathBuf, String, Option<usize>, String),
-    /// The member is not in the class or its supertypes, or the class is not found.
-    NotFound(String, Jump),
+    /// Not found: why.
+    NotFound(String),
+    /// Find usages: nothing to fetch.
+    Nothing,
 }
 
 /// Where a class's source is.
@@ -71,9 +86,9 @@ enum Source {
     Missing(Fetch, Option<ClassFile>),
 }
 
-/// Everything a lookup reads, sent to the worker.
-struct Lookup {
-    jump: Jump,
+/// What every lookup reads besides the call (shared by Find usages' checks).
+#[derive(Clone)]
+pub(super) struct LookupBase {
     root: PathBuf,
     sdk: Option<PathBuf>,
     api: Option<u32>,
@@ -83,6 +98,14 @@ struct Lookup {
     blocked: HashMap<String, Option<String>>,
 }
 
+/// One lookup, sent to the worker.
+struct Lookup {
+    jump: Jump,
+    /// Find usages: only find what to fetch, read nothing.
+    fetch_only: bool,
+    base: LookupBase,
+}
+
 impl App {
     /// Go to declaration on a library member call ([`crate::resolve::Res::Lib`]).
     pub(super) fn goto_lib_call(&mut self, call: LibCall) {
@@ -90,7 +113,7 @@ impl App {
             call,
             imports: self.active_imports(),
         };
-        self.look(jump, true);
+        self.look(jump, false);
     }
 
     /// The source of a library member call fetched when it is missing, without opening it (Find
@@ -100,27 +123,25 @@ impl App {
             call,
             imports: self.active_imports(),
         };
-        self.look(jump, false);
+        self.look(jump, true);
     }
 
-    /// A lookup is running (tests wait for it).
+    /// A jump's lookup is running (tests wait for it).
     #[cfg(test)]
     pub(super) fn lib_reading(&self) -> bool {
         self.fetches.looking.is_some()
     }
 
-    /// A new jump or file: a jump still waiting for a download or a lookup is dropped.
+    /// The user went elsewhere (a new jump, a file, a tab): a jump still waiting for a download or
+    /// a lookup is dropped.
     pub(super) fn cancel_lib_jump(&mut self) {
-        self.fetches.waiting = None;
-        if self.fetches.looking.as_ref().is_some_and(|(_, open)| *open) {
-            self.fetches.looking = None;
-        }
+        self.fetches.cancel();
     }
 
     /// A project opened: nothing of the last one's lookups is kept but the downloads' results.
     pub(super) fn reset_lib_lookups(&mut self) {
-        self.fetches.waiting = None;
-        self.fetches.looking = None;
+        self.cancel_lib_jump();
+        self.fetches.prefetch = None;
         self.fetches.api = None;
     }
 
@@ -128,20 +149,13 @@ impl App {
     fn active_imports(&self) -> Vec<String> {
         self.tabs
             .get(self.active)
-            .map(|t| {
-                t.text
-                    .lines()
-                    .filter_map(|l| l.trim().strip_prefix("import "))
-                    .map(|l| l.trim_end_matches(';').trim().to_string())
-                    .filter(|l| !l.ends_with('*') && !l.contains(" as "))
-                    .collect()
-            })
+            .map(|t| imports_of(&t.text))
             .unwrap_or_default()
     }
 
-    /// Starts a lookup on a worker ([`App::poll_fetches`] takes its result).
-    fn look(&mut self, jump: Jump, open: bool) {
-        let Some(p) = &self.project else { return };
+    /// What a lookup reads besides the call; None without a project.
+    pub(super) fn lookup_base(&mut self) -> Option<LookupBase> {
+        let p = self.project.as_ref()?;
         let root = p.root.clone();
         let sdk = libsrc::sdk_dir();
         let api = match &self.fetches.api {
@@ -171,13 +185,27 @@ impl App {
                 Err(_) => None,
             })
             .collect();
-        let lookup = Lookup {
-            jump,
+        Some(LookupBase {
             root,
             sdk,
             api,
             libs: self.libs.clone(),
             blocked,
+        })
+    }
+
+    /// Starts a lookup on a worker ([`App::poll_fetches`] takes its result).
+    fn look(&mut self, jump: Jump, fetch_only: bool) {
+        let Some(base) = self.lookup_base() else {
+            if !fetch_only {
+                self.status = "Open a project to go to library declarations".into();
+            }
+            return;
+        };
+        let lookup = Lookup {
+            jump,
+            fetch_only,
+            base,
         };
         let (tx, rx) = channel();
         let ctx = self.ctx.clone();
@@ -187,7 +215,11 @@ impl App {
                 c.request_repaint();
             }
         });
-        self.fetches.looking = Some((rx, open));
+        if fetch_only {
+            self.fetches.prefetch = Some(rx);
+        } else {
+            self.fetches.looking = Some(rx);
+        }
     }
 
     /// Downloads a missing source on a worker (once per key at a time); the jump goes on when it
@@ -201,7 +233,7 @@ impl App {
             && (r.is_ok() || at.elapsed() < RETRY_AFTER)
         {
             if open {
-                self.look(jump, true);
+                self.look(jump, false);
             }
             return;
         }
@@ -237,8 +269,8 @@ impl App {
                 done.push((k.clone(), r));
                 false
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => true,
-            Err(_) => {
+            Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Disconnected) => {
                 done.push((k.clone(), Err("the download stopped".into())));
                 false
             }
@@ -249,24 +281,21 @@ impl App {
             }
             self.fetches.ended.insert(key.clone(), (r, Instant::now()));
             match self.fetches.waiting.take() {
-                Some((wk, jump)) if wk == key => self.look(jump, true),
+                Some((wk, jump)) if wk == key => self.look(jump, false),
                 other => self.fetches.waiting = other,
             }
         }
-        let Some((rx, open)) = &self.fetches.looking else {
-            return;
-        };
-        let open = *open;
-        let Ok(looked) = rx.try_recv() else {
-            return;
-        };
-        self.fetches.looking = None;
-        match looked {
-            Looked::Fetch(fetch, jump) => self.start_fetch(fetch, jump, open),
-            _ if !open => {}
-            Looked::Found(hits) => self.open_found(hits),
-            Looked::Stub(path, text, at, why) => self.open_stub(path, text, at, why),
-            Looked::NotFound(why, jump) => self.library_functions(why, &jump.call),
+        if let Some(looked) = take(&mut self.fetches.prefetch, &mut self.status)
+            && let Looked::Fetch(fetch, jump) = looked
+        {
+            self.start_fetch(fetch, jump, false);
+        }
+        match take(&mut self.fetches.looking, &mut self.status) {
+            Some(Looked::Fetch(fetch, jump)) => self.start_fetch(fetch, jump, true),
+            Some(Looked::Found(hits)) => self.open_found(hits),
+            Some(Looked::Stub(path, text, at, why)) => self.open_stub(path, text, at, why),
+            Some(Looked::NotFound(why)) => self.status = why,
+            Some(Looked::Nothing) | None => {}
         }
     }
 
@@ -276,12 +305,14 @@ impl App {
             self.open_file(&path.clone(), Some(*at));
             return;
         }
-        let name = hits.first().map(|(_, _, l)| l.clone()).unwrap_or_default();
         let n = hits.len();
         let hits = hits
             .into_iter()
             .map(|(path, offset, detail)| Hit {
-                name: name.clone(),
+                name: path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
                 detail,
                 path,
                 offset,
@@ -291,28 +322,13 @@ impl App {
         self.pick(format!("{n} declarations fit"), hits);
     }
 
-    /// Not a member of the class or its supertypes: a library's top-level function of that name
-    /// (an extension such as `Modifier.padding`), never a project declaration that only shares
-    /// the name.
-    fn library_functions(&mut self, why: String, call: &LibCall) {
-        let found: Vec<Hit> = self
-            .libs
-            .named(&call.member)
-            .filter(|s| !s.kind.is_type())
-            .map(|s| super::libs_ui::lib_hit(s, 0))
-            .collect();
-        match found.len() {
-            0 => self.status = why,
-            1 if super::libs_ui::is_binary_archive(&found[0].path) => {
-                self.status = format!("{why}; `{}`: {} (no sources)", call.member, found[0].detail)
-            }
-            1 => self.open_file(&found[0].path.clone(), None),
-            n => self.pick(format!("`{}` in {n} libraries", call.member), found),
-        }
-    }
-
     /// The stub of a class without source, read-only, at the member when it can tell.
     fn open_stub(&mut self, path: PathBuf, text: String, at: Option<usize>, why: String) {
+        if let Some(t) = self.tabs.get(self.active) {
+            // Back returns to the call, as after any jump
+            super::push_capped(&mut self.history, (t.path.clone(), t.cursor));
+            self.forward.clear();
+        }
         let i = match self.tabs.iter().position(|t| t.path == path) {
             Some(i) => i,
             None => {
@@ -329,11 +345,114 @@ impl App {
     }
 }
 
+/// A call as Find usages tells calls apart: its file, receiver class (simple, qualified) and
+/// argument types.
+type CallKey = (PathBuf, String, Option<String>, String);
+/// A declaration: its file and offset.
+type Decl = (PathBuf, usize);
+
+/// Find usages of a library call, exactly: the candidate calls (same member, as many arguments,
+/// argument types that can match) that lead to the same declaration as `target`. When the target's
+/// declaration cannot be read (no source), the candidates on the same class are kept.
+pub(super) fn exact_usages(
+    base: LookupBase,
+    target: LibCall,
+    target_imports: Vec<String>,
+    cands: Vec<(super::FoundLine, LibCall)>,
+) -> Vec<super::FoundLine> {
+    let decl = |call: LibCall, imports: Vec<String>| -> Option<Decl> {
+        let l = Lookup {
+            jump: Jump { call, imports },
+            fetch_only: false,
+            base: base.clone(),
+        };
+        match l.run() {
+            Looked::Found(h) if h.len() == 1 => Some((h[0].0.clone(), h[0].1)),
+            _ => None,
+        }
+    };
+    let want = decl(target.clone(), target_imports);
+    let mut known: HashMap<CallKey, Option<Decl>> = HashMap::new();
+    let mut imports: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    cands
+        .into_iter()
+        .filter(|(line, c)| {
+            let Some(w) = &want else {
+                return super::xref::same_lib_call(c, &target); // nothing to compare with
+            };
+            let im = imports
+                .entry(line.path.clone())
+                .or_insert_with(|| {
+                    std::fs::read_to_string(&line.path)
+                        .map(|t| imports_of(&t))
+                        .unwrap_or_default()
+                })
+                .clone();
+            let key = (
+                line.path.clone(),
+                c.class.clone(),
+                c.qualified.clone(),
+                format!("{:?}", c.args),
+            );
+            let got = known
+                .entry(key)
+                .or_insert_with(|| decl(c.clone(), im))
+                .clone();
+            match got {
+                Some(g) => g == *w,
+                None => super::xref::same_lib_call(c, &target),
+            }
+        })
+        .map(|(line, _)| line)
+        .collect()
+}
+
+/// A finished lookup from `slot`; a lookup that died (a bug in it) clears the slot and says so.
+fn take(slot: &mut Option<Receiver<Looked>>, status: &mut String) -> Option<Looked> {
+    let rx = slot.as_ref()?;
+    match rx.try_recv() {
+        Ok(l) => {
+            *slot = None;
+            Some(l)
+        }
+        Err(TryRecvError::Empty) => None,
+        Err(TryRecvError::Disconnected) => {
+            *slot = None;
+            *status = "The library lookup stopped unexpectedly".into();
+            None
+        }
+    }
+}
+
+/// `import a.b.C` lines of a file (not `*` or aliases).
+fn imports_of(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix("import "))
+        .map(|l| l.trim_end_matches(';').trim().to_string())
+        .filter(|l| !l.ends_with('*') && !l.contains(" as "))
+        .collect()
+}
+
 impl Lookup {
     /// On a worker: the declarations the call means, breadth first through the class and its
-    /// supertypes; else the download that would bring a missing source, or the stub.
-    fn run(self) -> Looked {
-        let call = &self.jump.call;
+    /// supertypes, else its extension functions; else the download that would bring a missing
+    /// source, or the stub.
+    fn run(mut self) -> Looked {
+        if self.jump.call.builtin {
+            // a Kotlin type: a standard library extension (its members have no source to read)
+            let mut receivers: Vec<String> = vec![self.jump.call.class.clone()];
+            receivers.extend(
+                libsrc::kotlin_supers(&self.jump.call.class)
+                    .iter()
+                    .map(|s| s.to_string()),
+            );
+            if self.fetch_only {
+                return Looked::Nothing;
+            }
+            return self.extensions(&receivers, None);
+        }
+        self.widen_args();
+        let call = self.jump.call.clone();
         // the receiver's class: an import names it for sure; else each candidate is a class to
         // look in (with whether it is a nested-class guess, kept only when its class file is there)
         let starts: Vec<Vec<(String, bool)>> = match &call.qualified {
@@ -343,12 +462,14 @@ impl Lookup {
         let mut queue: VecDeque<(Vec<(String, bool)>, usize)> =
             starts.into_iter().map(|c| (c, 0)).collect();
         let mut seen: HashSet<String> = HashSet::new();
-        let mut found: Vec<(PathBuf, usize, String)> = Vec::new();
-        let mut found_depth = usize::MAX;
-        let mut missing: Option<(Fetch, Option<ClassFile>, String)> = None;
+        let mut seen_names: Vec<String> = Vec::new();
+        let mut exact: Vec<(PathBuf, usize, String)> = Vec::new();
+        let mut exact_depth = usize::MAX;
+        let mut loose: Vec<(PathBuf, usize, String)> = Vec::new();
+        let mut missing: Option<(Fetch, Option<ClassFile>, String, usize)> = None;
         while let Some((cands, depth)) = queue.pop_front() {
-            if depth > found_depth || seen.len() >= MAX_CLASSES {
-                break; // the nearest class that declares it wins
+            if depth > exact_depth || seen.len() >= MAX_CLASSES {
+                break; // the nearest level that declares it exactly wins
             }
             let Some((q, source)) = cands
                 .iter()
@@ -360,31 +481,38 @@ impl Lookup {
                 continue; // a cycle, or a class reached twice
             }
             let class = q.rsplit('.').next().unwrap_or(&q).to_string();
+            seen_names.push(class.clone());
             let path = match source {
                 Source::Text(p) => p,
                 Source::Missing(fetch, stub) => {
                     if missing.is_none() {
-                        missing = Some((fetch, stub, class));
+                        missing = Some((fetch, stub, class, depth));
                     }
                     continue; // its supertypes cannot be read either
                 }
             };
-            let text = if crate::libs::is_archive_path(&path) {
-                crate::libs::read_entry(&path)
-            } else {
-                std::fs::read_to_string(&path).ok()
+            if self.fetch_only {
+                continue; // the receiver's source is there: nothing to fetch for it
+            }
+            let Some(text) = read_source(&path) else {
+                continue;
             };
-            let Some(text) = text else { continue };
             let mut c = call.clone();
             c.class = class.clone();
-            let here = libsrc::find_member(&path, &text, &class, &c);
-            if !here.is_empty() {
-                found_depth = depth;
-                found.extend(
-                    here.into_iter()
-                        .map(|o| (path.clone(), o, line_at(&text, o))),
-                );
+            let Members {
+                offsets,
+                exact: sure,
+            } = libsrc::find_member(&path, &text, &class, &c);
+            let hits = offsets
+                .into_iter()
+                .map(|o| (path.clone(), o, line_at(&text, o)));
+            if sure {
+                exact_depth = depth;
+                exact.extend(hits);
                 continue;
+            }
+            if loose.is_empty() {
+                loose.extend(hits); // used only when no level fits exactly
             }
             if depth < MAX_DEPTH {
                 for sup in libsrc::supertypes(&text, &class) {
@@ -399,22 +527,32 @@ impl Lookup {
                 }
             }
         }
-        if !found.is_empty() {
-            return Looked::Found(found);
-        }
-        if let Some((fetch, stub, class)) = missing {
-            return match self.blocked.get(&fetch.key()) {
+        // a class without source as near as the match (or nearer) may declare it: fetch it first
+        if let Some((fetch, stub, class, depth)) = missing
+            && (exact.is_empty() || depth <= exact_depth)
+        {
+            match self.base.blocked.get(&fetch.key()) {
+                None => return Looked::Fetch(fetch, self.jump.clone()),
+                Some(_) if !exact.is_empty() => {}
                 Some(None) => {
                     let why = format!("{} has no source of {class}", fetch.label());
-                    self.stub(stub, &why, &class)
+                    return self.stub(stub, &why, &class);
                 }
                 Some(Some(e)) => {
                     let why = format!("{} could not be downloaded ({e})", fetch.label());
-                    self.stub(stub, &why, &class)
+                    return self.stub(stub, &why, &class);
                 }
-                None => Looked::Fetch(fetch, self.jump.clone()),
-            };
+            }
         }
+        if self.fetch_only {
+            return Looked::Nothing;
+        }
+        if !exact.is_empty() {
+            return Looked::Found(exact);
+        }
+        // not a member: an extension function of the class or a supertype
+        let mut receivers = vec![call.class.clone()];
+        receivers.extend(seen_names.iter().cloned());
         let why = if seen.is_empty() {
             format!(
                 "`{}.{}`: no source of {} in the Android SDK or the project's libraries",
@@ -422,11 +560,140 @@ impl Lookup {
             )
         } else {
             format!(
-                "`{}` is not a member of {} or its supertypes (an extension function?)",
+                "`{}` is not a member of {} or its supertypes, nor a library extension of them",
                 call.member, call.class
             )
         };
-        Looked::NotFound(why, self.jump.clone())
+        match self.extensions(&receivers, Some(&why)) {
+            Looked::NotFound(_) if !loose.is_empty() => Looked::Found(loose),
+            other => other,
+        }
+    }
+
+    /// The library's extension functions `fun Receiver.member` for one of `receivers`, read from
+    /// the sources of the library functions of that name; ranked by the arguments.
+    fn extensions(&self, receivers: &[String], why: Option<&str>) -> Looked {
+        let call = &self.jump.call;
+        let mut found = Vec::new();
+        let mut binary: Vec<String> = Vec::new();
+        for s in self
+            .base
+            .libs
+            .named(&call.member)
+            .filter(|s| !s.kind.is_type())
+            .take(MAX_EXTENSION_FILES)
+        {
+            // its source: in the Gradle cache's sources jar, else in a downloaded one (a
+            // function's file is found by what it declares: `Ext.kt` holds `ExtKt`'s functions)
+            let paths: Vec<PathBuf> = match s.source_path() {
+                Some(p) => vec![p],
+                None => libsrc::cached_sources_jar(&s.artifact)
+                    .filter(|j| j.is_file())
+                    .map(|jar| {
+                        libsrc::fun_entries(&jar, &s.package, &call.member)
+                            .into_iter()
+                            .map(|e| PathBuf::from(format!("{}!/{e}", jar.display())))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            };
+            if paths.is_empty() {
+                binary.push(format!("{} ({})", s.qualified(), s.artifact));
+                continue;
+            }
+            for path in paths {
+                if found.iter().any(|(p, _, _)| *p == path) {
+                    continue; // one file holds several functions of the name
+                }
+                let Some(text) = read_source(&path) else {
+                    continue;
+                };
+                let m = libsrc::find_extension(&path, &text, receivers, call);
+                found.extend(
+                    m.offsets
+                        .into_iter()
+                        .map(|o| (path.clone(), o, line_at(&text, o))),
+                );
+            }
+        }
+        if !found.is_empty() {
+            return Looked::Found(found);
+        }
+        let mut msg = why.map(String::from).unwrap_or_else(|| {
+            format!(
+                "`{}` on Kotlin's {}: a standard library function whose source is not here",
+                call.member, call.class
+            )
+        });
+        if !binary.is_empty() {
+            msg.push_str(&format!(
+                "; library functions of that name without source: {}",
+                binary.join(", ")
+            ));
+        }
+        Looked::NotFound(msg)
+    }
+
+    /// A library argument (known by its name only) gets its supertypes from its source, so a
+    /// `MainActivity`-like library class passed for a `Context` parameter is taken by it.
+    fn widen_args(&mut self) {
+        let Some(args) = self.jump.call.args.clone() else {
+            return;
+        };
+        let mut out = Vec::with_capacity(args.len());
+        for a in args {
+            let simple_lib = a.len() == 1
+                && a[0].starts_with(char::is_uppercase)
+                && libsrc::kotlin_supers(&a[0]).is_empty()
+                && !matches!(
+                    a[0].as_str(),
+                    "String" | "Boolean" | "Char" | "Unit" | "Any"
+                );
+            if !simple_lib {
+                out.push(a);
+                continue;
+            }
+            let mut names = a.clone();
+            let mut queue: VecDeque<(Vec<String>, usize)> = VecDeque::new();
+            let first: Vec<String> = self
+                .jump
+                .imports
+                .iter()
+                .filter(|i| i.rsplit('.').next() == Some(a[0].as_str()))
+                .cloned()
+                .chain([format!("java.lang.{}", a[0])])
+                .collect();
+            queue.push_back((first, 0));
+            let mut seen = HashSet::new();
+            while let Some((cands, depth)) = queue.pop_front() {
+                if depth > 4 || seen.len() > 12 {
+                    break;
+                }
+                let Some((q, Source::Text(path))) = cands
+                    .iter()
+                    .find_map(|q| Some((q.clone(), self.locate(q, false)?)))
+                else {
+                    continue;
+                };
+                if !seen.insert(q.clone()) {
+                    continue;
+                }
+                let class = q.rsplit('.').next().unwrap_or(&q).to_string();
+                let Some(text) = read_source(&path) else {
+                    continue;
+                };
+                for sup in libsrc::supertypes(&text, &class) {
+                    if let Some(n) = sup.first().and_then(|s| s.rsplit('.').next())
+                        && !names.iter().any(|x| x == n)
+                    {
+                        names.push(n.to_string());
+                    }
+                    queue.push_back((sup, depth + 1));
+                }
+            }
+            out.push(names);
+        }
+        self.jump.call.args = Some(out);
     }
 
     /// The classes a receiver known only by its simple name may be, with whether each is a guess
@@ -452,7 +719,8 @@ impl Lookup {
         );
         out.push((format!("java.lang.{}", call.class), false));
         out.extend(
-            self.libs
+            self.base
+                .libs
                 .named(&call.class)
                 .filter(|s| s.kind.is_type())
                 .map(|s| (s.qualified(), false)),
@@ -462,41 +730,43 @@ impl Lookup {
         out
     }
 
-    /// Where the source of class `q` is, or the download it needs; None when `q` is no such
-    /// class (a guess whose class file is not there, a name no SDK or library has).
+    /// Where the source of class `q` is, or the download it needs; None when `q` is no such class
+    /// (a guess whose class file is not there, a name no SDK or library has).
     fn locate(&self, q: &str, guess: bool) -> Option<Source> {
-        if libsrc::is_platform(q) {
-            let (sdk, api) = (self.sdk.clone()?, self.api?);
+        if libsrc::is_platform(q)
+            && let (Some(sdk), Some(api)) = (self.base.sdk.clone(), self.base.api)
+        {
             let jar = sdk.join(format!("platforms/android-{api}/android.jar"));
             let entry = libsrc::class_entry(q);
-            let in_jar = || zip_has(&jar, &entry);
-            if guess && !in_jar() {
-                return None;
+            // without the platform installed, the package says it is an SDK class
+            let in_jar = || !jar.is_file() || libsrc::has_class(&jar, &entry);
+            if !(guess && !in_jar()) {
+                if let Some(path) = libsrc::sdk_source(&sdk, api, q) {
+                    return Some(Source::Text(path));
+                }
+                if in_jar() {
+                    let stub = jar.is_file().then(|| ClassFile {
+                        archive: jar,
+                        entry,
+                        qualified: q.to_string(),
+                    });
+                    return Some(Source::Missing(Fetch::Sdk { sdk, api }, stub));
+                }
             }
-            if let Some(path) = libsrc::sdk_source(&sdk, api, q) {
-                return Some(Source::Text(path));
-            }
-            if !in_jar() {
-                return None; // not an SDK class: maybe a library one of the same name
-            }
-            let stub = ClassFile {
-                jar,
-                entry,
-                qualified: q.to_string(),
-            };
-            return Some(Source::Missing(Fetch::Sdk { sdk, api }, Some(stub)));
+            // not an SDK class (javax.inject, android.support…): maybe a library one
         }
         // the class, or for a nested class its outer class (whose file holds it)
         let (s, outer) = outers(q).into_iter().find_map(|o| {
             let simple = o.rsplit('.').next().unwrap_or(&o).to_string();
-            self.libs
+            self.base
+                .libs
                 .named(&simple)
                 .find(|s| s.kind.is_type() && s.qualified() == o)
                 .cloned()
                 .map(|s| (s, o))
         })?;
-        let jar = s.archive.extension().is_some_and(|e| e == "jar");
-        if guess && jar && !zip_has(&s.archive, &libsrc::class_entry(q)) {
+        let entry = libsrc::class_entry(q);
+        if guess && !libsrc::has_class(&s.archive, &entry) {
             return None;
         }
         if let Some(src) = s.source_path() {
@@ -510,45 +780,57 @@ impl Lookup {
                 cached.display()
             ))));
         }
-        let stub = jar.then(|| ClassFile {
-            jar: s.archive.to_path_buf(),
-            entry: libsrc::class_entry(q),
+        let stub = ClassFile {
+            archive: s.archive.to_path_buf(),
+            entry,
             qualified: q.to_string(),
-        });
+        };
         let fetch = Fetch::Maven {
             coords: s.artifact.to_string(),
-            repos: libsrc::repos(&self.root),
+            repos: libsrc::repos(&self.base.root),
         };
-        Some(Source::Missing(fetch, stub))
+        Some(Source::Missing(fetch, Some(stub)))
     }
 
     /// The class without source as a stub of its public and protected members, from its class
-    /// file, at the member the call means when it can tell.
+    /// file (in a jar or an `.aar`), at the member the call means when it can tell.
     fn stub(&self, stub: Option<ClassFile>, why: &str, class: &str) -> Looked {
         let made = stub.as_ref().and_then(|s| {
-            let bytes = zip_read(&s.jar, &s.entry)?;
+            let bytes = libsrc::class_bytes(&s.archive, &s.entry)?;
             let note = format!("{why}: signatures from the class file, no source");
             Some((s, libsrc::stub(&bytes, &note)?))
         });
         let Some((s, text)) = made else {
-            return Looked::NotFound(
-                format!("{why}; no class file to show either"),
-                self.jump.clone(),
-            );
+            return Looked::NotFound(format!("{why}; no class file to show either"));
         };
         let path = PathBuf::from(format!(
             "{}!/{}.java (no source)",
-            s.jar.display(),
+            s.archive.display(),
             s.qualified.replace('.', "/")
         ));
         let mut c = self.jump.call.clone();
         c.class = class.to_string();
         let at = libsrc::find_member(Path::new("Stub.java"), &text, class, &c)
+            .offsets
             .first()
             .copied();
         Looked::Stub(path, text, at, why.to_string())
     }
 }
+
+/// A source file's text (a file, or `jar!/entry`), up to 16 MB.
+fn read_source(path: &Path) -> Option<String> {
+    if crate::libs::is_archive_path(path) {
+        return crate::libs::read_entry(path).filter(|t| t.len() <= MAX_SOURCE);
+    }
+    if std::fs::metadata(path).ok()?.len() > MAX_SOURCE as u64 {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+/// A source bigger than this is not read.
+const MAX_SOURCE: usize = 16 * 1024 * 1024;
 
 /// `a.b.Outer.Inner` and then `a.b.Outer`: the class and the classes it is nested in.
 fn outers(q: &str) -> Vec<String> {
@@ -562,21 +844,6 @@ fn outers(q: &str) -> Vec<String> {
                 .is_some_and(|x| x.starts_with(char::is_uppercase))
         })
         .collect()
-}
-
-fn zip_read(jar: &Path, entry: &str) -> Option<Vec<u8>> {
-    let mut z = zip::ZipArchive::new(std::fs::File::open(jar).ok()?).ok()?;
-    let mut e = z.by_name(entry).ok()?;
-    let mut v = Vec::new();
-    std::io::Read::read_to_end(&mut e, &mut v).ok()?;
-    Some(v)
-}
-
-fn zip_has(jar: &Path, entry: &str) -> bool {
-    std::fs::File::open(jar)
-        .ok()
-        .and_then(|f| zip::ZipArchive::new(f).ok())
-        .is_some_and(|mut z| z.by_name(entry).is_ok())
 }
 
 fn line_at(text: &str, at: usize) -> String {

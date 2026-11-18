@@ -33,7 +33,8 @@ pub enum Res {
     /// A local variable, parameter or lambda parameter declared at this offset of the same file.
     Local(usize),
     /// A member of a library type called on a value of that type (`manager.requestLocationUpdates(…)`
-    /// with `manager: LocationManager`): never a project declaration of the same name.
+    /// with `manager: LocationManager`, or `name.trim()` on a Kotlin `String`): never a project
+    /// declaration of the same name.
     Lib(LibCall),
     /// Not a project declaration (a library), or not found.
     None,
@@ -52,6 +53,9 @@ pub struct LibCall {
     /// The arguments of a call (None: not called, e.g. a property): each argument's type and
     /// supertypes by simple name, or an empty list when its type is not known.
     pub args: Option<Vec<Vec<String>>>,
+    /// The receiver is a Kotlin built-in type (String, List, Int…): its member or standard
+    /// library extension, whose sources are not read; never a project declaration.
+    pub builtin: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2587,7 +2591,23 @@ impl<'a> Resolver<'a> {
                 (class.contains('.') && class.starts_with(char::is_lowercase))
                     .then(|| class.clone())
             });
-        let open = i + 1;
+        // `getSystemService<T>(…)`: the arguments follow the type arguments
+        let mut open = i + 1;
+        if f.t(open) == "<" && !f.java {
+            let mut depth = 0;
+            while open < f.toks.len() {
+                match f.t(open) {
+                    "<" => depth += 1,
+                    ">" => depth -= 1,
+                    "(" | ")" | "{" | "}" | "=" | ";" => break,
+                    _ => {}
+                }
+                open += 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+        }
         // a trailing lambda after the parentheses (or instead of them) is one more argument
         let after = if f.t(open) == "(" {
             f.pair(open).map_or(open, |c| c + 1)
@@ -2632,6 +2652,7 @@ impl<'a> Resolver<'a> {
             stars: f.imports.stars.clone(),
             member: name.to_string(),
             args,
+            builtin: is_kotlin_type(&class),
         }
     }
 
@@ -3170,9 +3191,7 @@ impl<'a> Resolver<'a> {
                     return Res::Decls(found);
                 }
             }
-            // a Kotlin type (String, List, Int…): its members and the standard library's
-            // extensions are not read from sources here, so it stays "not a project declaration"
-            if let Some(class) = t.lib().filter(|l| !is_kotlin_type(l)) {
+            if let Some(class) = t.lib().filter(|l| *l != "Any") {
                 return Res::Lib(self.lib_call(f, i, class, name));
             }
             if matches!(t, Ty::Decl(_)) || t.lib().is_some_and(|l| l != "Any") {
@@ -4222,8 +4241,8 @@ fn is_comparison(f: &FileInfo, s: usize, e: usize) -> bool {
     false
 }
 
-/// Types of the Kotlin standard library (and their Java twins Kotlin maps them to): calls on them
-/// are not followed into library sources ([`Res::Lib`]), as their extensions live elsewhere.
+/// Types of the Kotlin standard library (and their Java twins Kotlin maps them to): a call on
+/// them is a [`LibCall::builtin`], answered by the standard library, not a project declaration.
 fn is_kotlin_type(t: &str) -> bool {
     matches!(
         t.split('<').next().unwrap_or(t),

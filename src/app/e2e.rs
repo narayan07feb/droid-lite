@@ -8100,7 +8100,7 @@ fn e2e_diff_panel_counts_rows_of_the_layout_it_shows_and_a_new_diff() {
 
 const LM_JAVA: &str = "package android.location;\n\nimport android.app.PendingIntent;\n\npublic class LocationManager {\n    public void requestLocationUpdates(String provider, long minTimeMs, float minDistanceM, PendingIntent pendingIntent) {}\n    public void requestLocationUpdates(String provider, long minTimeMs, float minDistanceM, LocationListener listener) {}\n    public java.util.List<String> getAllProviders() { return null; }\n}\n";
 
-const TRACKER_KT: &str = "package com.demo.loc\n\nimport android.app.PendingIntent\nimport android.location.LocationListener\nimport android.location.LocationManager\n\ninterface Updates {\n    fun requestLocationUpdates()\n}\n\nclass Tracker(private val listener: LocationListener) : Updates {\n    private var locationManager: LocationManager? = null\n\n    override fun requestLocationUpdates() {\n        val manager = locationManager\n        val provider = \"gps\"\n        if (manager != null) {\n            manager.requestLocationUpdates(provider, 0, 0f, listener)\n        }\n    }\n\n    fun later(manager: LocationManager, pending: PendingIntent) {\n        manager.requestLocationUpdates(\"gps\", 0L, 1f, pending)\n    }\n\n    fun show(a: Int) {}\n    fun show(a: String) {}\n\n    fun start() {\n        show(\"x\")\n        requestLocationUpdates()\n    }\n}\n";
+const TRACKER_KT: &str = "package com.demo.loc\n\nimport android.app.PendingIntent\nimport android.location.LocationListener\nimport android.location.LocationManager\nimport android.content.Context\nimport android.app.Activity\n\ninterface Updates {\n    fun requestLocationUpdates()\n}\n\nclass Tracker(private val listener: LocationListener) : Updates {\n    private var locationManager: LocationManager? = null\n\n    override fun requestLocationUpdates() {\n        val manager = locationManager\n        val provider = \"gps\"\n        if (manager != null) {\n            manager.requestLocationUpdates(provider, 0, 0f, listener)\n        }\n    }\n\n    fun later(manager: LocationManager, pending: PendingIntent) {\n        manager.requestLocationUpdates(\"gps\", 0L, 1f, pending)\n    }\n\n    fun svc(ctx: Context, act: Activity) {\n        ctx.getSystemService(\"a\")\n        act.getSystemService(\"b\")\n    }\n\n    fun trim() {}\n\n    fun show(a: Int) {}\n    fun show(a: String) {}\n\n    fun start() {\n        show(\"x\")\n        requestLocationUpdates()\n    }\n}\n";
 
 /// A fake Android SDK in `dir` for API 34: `android.jar` with LocationManager (compiled), and its
 /// source when `sources`. False when this Mac has no javac.
@@ -8114,6 +8114,8 @@ fn fake_sdk(dir: &Path, sources: bool) -> bool {
                 "package android.location; public interface LocationListener { void onLocationChanged(Object l); }",
             ),
             ("android/app/PendingIntent.java", "package android.app; public class PendingIntent {}"),
+            ("android/content/Context.java", CONTEXT_JAVA),
+            ("android/app/Activity.java", ACTIVITY_JAVA),
         ],
     ) else {
         return false;
@@ -8127,12 +8129,21 @@ fn fake_sdk(dir: &Path, sources: bool) -> bool {
     }
     z.finish().unwrap();
     if sources {
-        let s = dir.join("sources/android-34/android/location/LocationManager.java");
-        std::fs::create_dir_all(s.parent().unwrap()).unwrap();
-        std::fs::write(s, LM_JAVA).unwrap();
+        for (rel, text) in [
+            ("android/location/LocationManager.java", LM_JAVA),
+            ("android/content/Context.java", CONTEXT_JAVA),
+            ("android/app/Activity.java", ACTIVITY_JAVA),
+        ] {
+            let s = dir.join("sources/android-34").join(rel);
+            std::fs::create_dir_all(s.parent().unwrap()).unwrap();
+            std::fs::write(s, text).unwrap();
+        }
     }
     true
 }
+
+const CONTEXT_JAVA: &str = "package android.content;\n\npublic abstract class Context {\n    public Object getSystemService(String name) { return null; }\n}\n";
+const ACTIVITY_JAVA: &str = "package android.app;\n\nimport android.content.Context;\n\npublic class Activity extends Context {}\n";
 
 /// A fixture with Tracker.kt, compileSdk 34 and the fake SDK; None without javac.
 fn sdk_fixture(name: &str, sources: bool) -> Option<(Fixture, PathBuf, PathBuf)> {
@@ -8194,20 +8205,29 @@ fn e2e_goto_on_an_sdk_call_opens_its_exact_overload_not_a_project_function_of_th
     key(&mut h, Modifiers::ALT, Key::F7);
     wait(&mut h, "usages", |a| a.find_rx.is_none() && !a.found.is_empty());
     let lines: Vec<usize> = h.state().found.iter().map(|l| l.line).collect();
-    assert_eq!(lines, [18], "only this overload: not the PendingIntent call, not the project's function");
+    assert_eq!(lines, [20], "only this overload: not the PendingIntent call, not the project's function");
     // and the PendingIntent call lists only itself
     open(&mut h, &tracker);
     place_cursor(&mut h, "requestLocationUpdates(\"gps\"", 1);
     key(&mut h, Modifiers::ALT, Key::F7);
-    wait(&mut h, "usages 2", |a| a.find_rx.is_none() && a.found.iter().any(|l| l.line == 23));
+    wait(&mut h, "usages 2", |a| a.find_rx.is_none() && a.found.iter().any(|l| l.line == 25));
     let lines: Vec<usize> = h.state().found.iter().map(|l| l.line).collect();
-    assert_eq!(lines, [23]);
-    // a Kotlin standard type (String.trim): not followed into library sources, nothing downloaded
+    assert_eq!(lines, [25]);
+    // Find usages on Context.getSystemService also finds the call through Activity (a subclass)
+    open(&mut h, &tracker);
+    place_cursor(&mut h, "getSystemService(\"a\")", 1);
+    key(&mut h, Modifiers::ALT, Key::F7);
+    wait(&mut h, "usages 3", |a| a.find_rx.is_none() && a.found.iter().any(|l| l.line == 29));
+    let lines: Vec<usize> = h.state().found.iter().map(|l| l.line).collect();
+    assert_eq!(lines, [29, 30], "the declaring class decides, not the receiver's type");
+    // a Kotlin standard type (String.trim): the standard library's, never the project's trim()
     std::fs::write(&tracker, TRACKER_KT.replace("val provider = \"gps\"", "val provider = \"gps\".trim()")).unwrap();
     h.state_mut().tabs.retain(|t| t.path != tracker);
-    goto_at(&mut h, &tracker, "trim()", 1);
+    goto_at(&mut h, &tracker, "trim()\n        if", 1);
     assert_eq!(h.state().fetches.started, 0);
-    assert!(h.state().found_title.contains("LocationManager.requestLocationUpdates"));
+    let project_trim = tab(&h).text.find("fun trim()").unwrap() + 4;
+    assert!(tab(&h).path != tracker || tab(&h).cursor != project_trim, "not the project's trim()");
+    assert!(h.state().status.contains("standard library"), "{}", h.state().status);
 }
 
 #[test]
@@ -8369,6 +8389,18 @@ fn e2e_goto_downloads_a_librarys_sources_jar_once_then_uses_the_cache() {
 /// cache (no sources), and a repository folder holding `sources` as its sources jar (None: no
 /// sources jar there). Returns the fixture and the Kotlin file `kt` written at Find.kt.
 fn maven_fixture(name: &str, java: &[(&str, &str)], sources: Option<&[(&str, &str)]>, kt: &str) -> Option<(Fixture, PathBuf)> {
+    maven_fixture_with(name, java, sources, kt, false, None)
+}
+
+/// [`maven_fixture`], the classes in an `.aar` (`aar`), and `cached` already in the sources cache.
+fn maven_fixture_with(
+    name: &str,
+    java: &[(&str, &str)],
+    sources: Option<&[(&str, &str)]>,
+    kt: &str,
+    aar: bool,
+    cached: Option<&[(&str, &str)]>,
+) -> Option<(Fixture, PathBuf)> {
     let f = Fixture::new(name);
     let home = f.config.join("gradle-home");
     let Some(classes) = crate::classfile::tests::javac(&f.config.join("javac"), java) else {
@@ -8384,7 +8416,25 @@ fn maven_fixture(name: &str, java: &[(&str, &str)], sources: Option<&[(&str, &st
         }
         z.finish().unwrap();
     };
-    zip(&home.join("caches/modules-2/files-2.1/demo.lib/geo/1.0/aaa/geo-1.0.jar"), &classes);
+    let art = home.join("caches/modules-2/files-2.1/demo.lib/geo/1.0/aaa");
+    if aar {
+        let mut inner = Vec::new();
+        {
+            let mut z = zip::ZipWriter::new(std::io::Cursor::new(&mut inner));
+            for (n, b) in &classes {
+                z.start_file(n.as_str(), zip::write::SimpleFileOptions::default()).unwrap();
+                std::io::Write::write_all(&mut z, b).unwrap();
+            }
+            z.finish().unwrap();
+        }
+        zip(&art.join("geo-1.0.aar"), &[("classes.jar".into(), inner), ("AndroidManifest.xml".into(), b"<manifest/>".to_vec())]);
+    } else {
+        zip(&art.join("geo-1.0.jar"), &classes);
+    }
+    if let Some(c) = cached {
+        let files: Vec<(String, Vec<u8>)> = c.iter().map(|(n, t)| (n.to_string(), t.as_bytes().to_vec())).collect();
+        zip(&f.config.join("sources/demo.lib/geo/1.0/geo-1.0-sources.jar"), &files);
+    }
     let repo = f.config.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     if let Some(src) = sources {
@@ -8491,4 +8541,109 @@ fn e2e_goto_walks_every_supertype_breadth_first_and_falls_back_to_library_functi
     assert!(tab(&h).path != file || tab(&h).cursor != project_spin, "not the project's same-named function");
     // GeoKt ships without sources here: the status names the library function
     assert!(h.state().status.contains("`spin`") && h.state().status.contains("demo.geo"), "{}", h.state().status);
+}
+
+const THING: (&str, &str) = ("demo/geo/Thing.java", "package demo.geo;\n\npublic class Thing {}\n");
+const PARENT: (&str, &str) = ("demo/geo/Parent.java", "package demo.geo;\n\npublic class Parent {\n    public void foo(Thing t, String s) {}\n}\n");
+
+#[test]
+fn e2e_goto_a_loose_overload_nearby_does_not_hide_the_exact_one_further_up() {
+    // Child declares foo(Integer, String); the call foo(thing, "x") is Parent's foo(Thing, String)
+    let child = ("demo/geo/Child.java", "package demo.geo;\n\npublic class Child extends Parent {\n    public void foo(Integer a, String s) {}\n}\n");
+    let src = [THING, PARENT, child];
+    let kt = "package com.demo.loc\n\nimport demo.geo.Child\nimport demo.geo.Thing\n\nfun f(c: Child, t: Thing) {\n    c.foo(t, \"x\")\n}\n";
+    let Some((f, file)) = maven_fixture("gotoloose", &src, Some(&src), kt) else { return };
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    goto_at(&mut h, &file, "foo(", 1);
+    wait(&mut h, "Parent.java", |a| a.tabs[a.active].path.to_string_lossy().ends_with("!/demo/geo/Parent.java"));
+    wait(&mut h, "the lookup", |a| !a.lib_reading());
+    steps(&mut h, 3);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("foo(Thing t, String s)"));
+}
+
+#[test]
+fn e2e_goto_fetches_a_nearer_class_without_source_before_taking_a_farther_match() {
+    // the cache's jar has Parent but not Child; Child overrides foo: it must be fetched and opened
+    let child = ("demo/geo/Child.java", "package demo.geo;\n\npublic class Child extends Parent {\n    @Override public void foo(Thing t, String s) {}\n}\n");
+    let full = [THING, PARENT, child];
+    let kt = "package com.demo.loc\n\nimport demo.geo.Child\nimport demo.geo.Thing\n\nfun f(c: Child, t: Thing) {\n    c.foo(t, \"x\")\n}\n";
+    let Some((f, file)) = maven_fixture_with("gotonearer", &full, Some(&full), kt, false, Some(&[THING, PARENT])) else { return };
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    goto_at(&mut h, &file, "foo(", 1);
+    wait(&mut h, "Child.java", |a| a.tabs[a.active].path.to_string_lossy().ends_with("!/demo/geo/Child.java"));
+    wait(&mut h, "the lookup", |a| !a.lib_reading());
+    steps(&mut h, 3);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("foo(Thing t, String s)"));
+    assert_eq!(h.state().fetches.started, 1);
+}
+
+#[test]
+fn e2e_goto_an_extension_by_its_receiver_and_a_stub_from_an_aar() {
+    let other = ("demo/geo/Other.java", "package demo.geo;\n\npublic class Other {}\n");
+    let ext_kt = ("demo/geo/Ext.kt", "package demo.geo\n\nfun Other.spin(n: Int) {}\nfun Locator.spin(n: Int) {}\n");
+    let ext_java = ("demo/geo/ExtKt.java", "package demo.geo;\n\npublic final class ExtKt {\n    public static void spin(Other o, int n) {}\n    public static void spin(Locator l, int n) {}\n}\n");
+    let java = [("demo/geo/Locator.java", GEO_JAVA), ("demo/geo/Base.java", GEO_BASE), other, ext_java];
+    let src = [("demo/geo/Locator.java", GEO_JAVA), ("demo/geo/Base.java", GEO_BASE), other, ext_kt];
+    let kt = "package com.demo.loc\n\nimport demo.geo.Locator\n\nfun find(l: Locator) {\n    l.spin(2)\n}\n";
+    let Some((f, file)) = maven_fixture("gotoext", &java, Some(&src), kt) else { return };
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    goto_at(&mut h, &file, "spin(", 1);
+    wait(&mut h, "Ext.kt", |a| a.tabs[a.active].path.to_string_lossy().ends_with("!/demo/geo/Ext.kt"));
+    wait(&mut h, "the lookup", |a| !a.lib_reading());
+    steps(&mut h, 3);
+    assert!(tab(&h).text[..tab(&h).cursor].ends_with("fun Locator."), "Locator's spin, not Other's");
+    drop(h);
+    drop(f);
+    // an .aar library without sources anywhere: the stub from its classes.jar
+    let kt = "package com.demo.loc\n\nimport demo.geo.Locator\n\nfun find(l: Locator) {\n    l.locate(\"home\", 5L)\n}\n";
+    let java = [("demo/geo/Locator.java", GEO_JAVA), ("demo/geo/Base.java", GEO_BASE)];
+    let Some((f, file)) = maven_fixture_with("gotoaar", &java, None, kt, true, None) else { return };
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    goto_at(&mut h, &file, "locate(", 1);
+    wait(&mut h, "the stub", |a| a.tabs[a.active].path.to_string_lossy().ends_with("(no source)"));
+    steps(&mut h, 3);
+    assert!(tab(&h).path.to_string_lossy().contains("geo-1.0.aar!/"));
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("locate(String p0, long p1)"));
+}
+
+#[test]
+fn e2e_goto_a_javax_library_class_is_looked_up_in_the_libraries_not_only_the_sdk() {
+    let scope = ("javax/geo/Scope.java", "package javax.geo;\n\npublic class Scope {\n    public void enter(int level) {}\n}\n");
+    let kt = "package com.demo.loc\n\nimport javax.geo.Scope\n\nfun f(s: Scope) {\n    s.enter(1)\n}\n";
+    let Some((f, file)) = maven_fixture("gotojavax", &[scope], Some(&[scope]), kt) else { return };
+    let sdk = f.config.join("sdk");
+    if !fake_sdk(&sdk, true) {
+        return;
+    }
+    // SAFETY: the fixture holds the SERIAL lock.
+    unsafe { std::env::set_var("DROID_LITE_ANDROID_SDK", &sdk) };
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    goto_at(&mut h, &file, "enter(", 1);
+    wait(&mut h, "Scope.java", |a| a.tabs[a.active].path.to_string_lossy().ends_with("!/javax/geo/Scope.java"));
+    wait(&mut h, "the lookup", |a| !a.lib_reading());
+    steps(&mut h, 3);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("enter(int level)"));
+}
+
+#[test]
+fn e2e_goto_fetches_a_supertype_without_source_at_the_level_of_the_match() {
+    // Child extends Parent implements Iface; Parent and Iface are one level up; the cache's jar
+    // has Child and Parent but not Iface: Iface must be fetched before Parent's foo is taken
+    let iface = ("demo/geo/Iface.java", "package demo.geo;\n\npublic interface Iface {\n    default void foo(Thing t, String s) {}\n}\n");
+    let child = ("demo/geo/Child.java", "package demo.geo;\n\npublic class Child extends Parent implements Iface {}\n");
+    let full = [THING, PARENT, iface, child];
+    let kt = "package com.demo.loc\n\nimport demo.geo.Child\nimport demo.geo.Thing\n\nfun f(c: Child, t: Thing) {\n    c.foo(t, \"x\")\n}\n";
+    let Some((f, file)) = maven_fixture_with("gotolevel", &full, Some(&full), kt, false, Some(&[THING, PARENT, child])) else { return };
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    goto_at(&mut h, &file, "foo(", 1);
+    wait(&mut h, "fetched", |a| a.fetches.started == 1 && a.fetches.ended.len() == 1);
+    wait(&mut h, "the lookup", |a| !a.lib_reading());
+    steps(&mut h, 3);
+    assert_eq!(h.state().fetches.started, 1, "Iface's source was fetched before deciding");
 }

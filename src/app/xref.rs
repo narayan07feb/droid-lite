@@ -626,13 +626,13 @@ impl Xref {
         call: crate::resolve::LibCall,
         open: HashMap<PathBuf, Arc<str>>,
         root: PathBuf,
-        reply: impl FnOnce(Vec<FoundLine>) + Send + 'static,
+        reply: impl FnOnce(Vec<(FoundLine, crate::resolve::LibCall)>) + Send + 'static,
     ) {
         self.submit(kind, move |s, stale| {
             let files = s.code_files(&root);
             let texts = Texts::new(open);
             let cache = Cache::default();
-            let same = |c: &crate::resolve::LibCall| same_lib_call(c, &call);
+            let same = |c: &crate::resolve::LibCall| may_be_same(c, &call);
             let mut found = Vec::new();
             for f in files.iter() {
                 if stale() {
@@ -642,17 +642,22 @@ impl Xref {
                 if !text.contains(call.member.as_str()) {
                     continue;
                 }
-                let at: Vec<usize> = s.resolve(&texts, &cache, |r| {
+                let at: Vec<(usize, crate::resolve::LibCall)> = s.resolve(&texts, &cache, |r| {
                     let Some(fi) = r.file(f) else {
                         return Vec::new();
                     };
                     crate::refactor::occurrences(&text, &call.member)
                         .iter()
-                        .map(|o| o.start)
-                        .filter(|&o| matches!(r.resolve(&fi, o), Res::Lib(c) if same(&c)))
+                        .filter_map(|o| match r.resolve(&fi, o.start) {
+                            Res::Lib(c) if same(&c) => Some((o.start, c)),
+                            _ => None,
+                        })
                         .collect()
                 });
-                found.extend(at.into_iter().map(|o| super::found_line(f, &text, o)));
+                found.extend(
+                    at.into_iter()
+                        .map(|(o, c)| (super::found_line(f, &text, o), c)),
+                );
             }
             if !stale() {
                 reply(found);
@@ -664,28 +669,28 @@ impl Xref {
     }
 }
 
-/// Two library calls mean the same declaration: the same member of the same class (by its
-/// qualified name when both know it), as many arguments, and where both know an argument's type,
-/// types that can be the same parameter (one is the other or among its supertypes).
-fn same_lib_call(a: &crate::resolve::LibCall, b: &crate::resolve::LibCall) -> bool {
-    let class = match (&a.qualified, &b.qualified) {
-        (Some(x), Some(y)) => x == y,
-        _ => a.class == b.class,
-    };
+/// Two library calls may mean the same declaration: the same member, as many arguments, and where
+/// both know an argument's type, types that can be the same parameter. Which class declares it is
+/// checked after, by looking each up ([`super::libsrc_ui::exact_usages`]).
+fn may_be_same(a: &crate::resolve::LibCall, b: &crate::resolve::LibCall) -> bool {
     let args = match (&a.args, &b.args) {
         (Some(x), Some(y)) => {
-            x.len() == y.len()
-                && x.iter().zip(y).all(|(p, q)| {
-                    p.is_empty()
-                        || q.is_empty()
-                        || p.first().is_some_and(|t| q.contains(t))
-                        || q.first().is_some_and(|t| p.contains(t))
-                })
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| crate::libsrc::same_type(p, q))
         }
         (None, None) => true,
         _ => false,
     };
-    class && a.member == b.member && args
+    a.member == b.member && args
+}
+
+/// [`may_be_same`] and on the same class (by its qualified name when both know it): the check
+/// when the declaration cannot be read.
+pub(super) fn same_lib_call(a: &crate::resolve::LibCall, b: &crate::resolve::LibCall) -> bool {
+    let class = match (&a.qualified, &b.qualified) {
+        (Some(x), Some(y)) => x == y,
+        _ => a.class == b.class,
+    };
+    class && may_be_same(a, b)
 }
 
 /// Runs one task; a panic is logged and the task dropped (its reply channel closes, so whoever

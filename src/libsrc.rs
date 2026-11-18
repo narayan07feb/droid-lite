@@ -224,8 +224,13 @@ pub fn repos(root: &Path) -> Vec<String> {
         add(&mut out, "https://dl.google.com/dl/android/maven2");
         add(&mut out, "https://repo.maven.apache.org/maven2");
     }
+    // at most a few, each tried in turn for up to 2 minutes
+    out.truncate(MAX_REPOS);
     out
 }
+
+/// How many repositories a sources jar is looked for in.
+const MAX_REPOS: usize = 5;
 
 /// A download that brings a missing source.
 #[derive(Clone, Debug, PartialEq)]
@@ -260,7 +265,7 @@ pub fn fetch(f: &Fetch) -> Result<(), String> {
         Fetch::Sdk { sdk, api } => {
             let tool = std::env::var_os("DROID_LITE_SDKMANAGER")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| sdk.join("cmdline-tools/latest/bin/sdkmanager"));
+                .unwrap_or_else(|| sdkmanager_in(sdk));
             if !tool.exists() {
                 return Err(format!(
                     "sdkmanager not found ({}): install the Android SDK Command-line Tools",
@@ -272,7 +277,10 @@ pub fn fetch(f: &Fetch) -> Result<(), String> {
             std::fs::create_dir_all(sources_cache()).map_err(|e| e.to_string())?;
             let out = std::fs::File::create(&log).map_err(|e| e.to_string())?;
             let err = out.try_clone().map_err(|e| e.to_string())?;
+            // its own process group: on a timeout the java it starts stops too
+            use std::os::unix::process::CommandExt;
             let mut child = std::process::Command::new(&tool)
+                .process_group(0)
                 .arg(format!("--sdk_root={}", sdk.display()))
                 .arg(format!("sources;android-{api}"))
                 .stdin(std::process::Stdio::null())
@@ -284,13 +292,22 @@ pub fn fetch(f: &Fetch) -> Result<(), String> {
             if sdk.join(format!("sources/android-{api}")).is_dir() {
                 Ok(())
             } else {
+                // the last lines say why (a licence not accepted shows its question there)
                 let text = std::fs::read_to_string(&log).unwrap_or_default();
-                let line = text
+                let mut last: Vec<&str> = text
                     .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
                     .rev()
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or("no sources were installed");
-                Err(format!("sdkmanager: {}", line.trim()))
+                    .take(3)
+                    .collect();
+                last.reverse();
+                let why = if last.is_empty() {
+                    "no sources were installed".to_string()
+                } else {
+                    last.join(" / ")
+                };
+                Err(format!("sdkmanager: {why}"))
             }
         }
         Fetch::Maven { coords: c, repos } => {
@@ -313,6 +330,7 @@ pub fn fetch(f: &Fetch) -> Result<(), String> {
                 let status = std::process::Command::new("curl")
                     .args(["-fsSL", "--max-time", "120", "--max-filesize", "209715200"])
                     .args(["--proto", if file { "=file" } else { "=https" }])
+                    .args(["--proto-redir", if file { "=file" } else { "=https" }])
                     .arg("-o")
                     .arg(&part)
                     .arg(format!("{r}/{rel}"))
@@ -328,6 +346,26 @@ pub fn fetch(f: &Fetch) -> Result<(), String> {
             Err(format!("no sources jar for {c} in {tried} repositories"))
         }
     }
+}
+
+/// The SDK's sdkmanager: `cmdline-tools/latest`, else any installed `cmdline-tools/<version>`,
+/// else the old `tools/bin`.
+fn sdkmanager_in(sdk: &Path) -> PathBuf {
+    let latest = sdk.join("cmdline-tools/latest/bin/sdkmanager");
+    if latest.exists() {
+        return latest;
+    }
+    let mut versions: Vec<PathBuf> = std::fs::read_dir(sdk.join("cmdline-tools"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path().join("bin/sdkmanager"))
+        .filter(|p| p.exists())
+        .collect();
+    versions.sort();
+    versions
+        .pop()
+        .unwrap_or_else(|| sdk.join("tools/bin/sdkmanager"))
 }
 
 /// How long sdkmanager may run.
@@ -347,6 +385,8 @@ fn wait_at_most(
                 std::thread::sleep(std::time::Duration::from_millis(200))
             }
             Ok(None) => {
+                // the whole group (the script and the java it started)
+                unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) };
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(format!("{what} took over {} minutes", limit.as_secs() / 60));
@@ -368,7 +408,13 @@ pub fn jar_entry(jar: &Path, qualified: &str) -> Option<String> {
         format!("{}/", pkg.replace('.', "/"))
     };
     let names: Vec<String> = z.file_names().map(String::from).collect();
-    let at = |n: &str, want: &str| n == want || n.ends_with(&format!("/{want}"));
+    // the file itself, or under one source set folder (`commonMain/a/b/C.kt`), not another package
+    let at = |n: &str, want: &str| {
+        n == want
+            || n.strip_suffix(want)
+                .and_then(|p| p.strip_suffix('/'))
+                .is_some_and(|p| !p.is_empty() && !p.contains('/'))
+    };
     for ext in ["kt", "java"] {
         let want = format!("{dir}{class}.{ext}");
         if let Some(n) = names.iter().find(|n| at(n, &want)) {
@@ -394,6 +440,49 @@ pub fn jar_entry(jar: &Path, qualified: &str) -> Option<String> {
                 && declares(&s, class)
         })
         .cloned()
+}
+
+/// The entries of a sources jar in `package` (also under a source set folder) that declare a
+/// top-level function `name` (`fun name(` or `fun Receiver.name(`): where a library function
+/// known only by its package and name lives.
+pub fn fun_entries(jar: &Path, package: &str, name: &str) -> Vec<String> {
+    let Some(mut z) = std::fs::File::open(jar)
+        .ok()
+        .and_then(|f| zip::ZipArchive::new(f).ok())
+    else {
+        return Vec::new();
+    };
+    let dir = package.replace('.', "/");
+    let in_dir = |n: &str| {
+        let parent = n.rsplit_once('/').map_or("", |(d, _)| d);
+        parent == dir
+            || parent
+                .strip_suffix(dir.as_str())
+                .and_then(|p| p.strip_suffix('/'))
+                .is_some_and(|p| !p.is_empty() && !p.contains('/'))
+    };
+    let names: Vec<String> = z
+        .file_names()
+        .filter(|n| n.ends_with(".kt") && in_dir(n))
+        .map(String::from)
+        .collect();
+    names
+        .into_iter()
+        .filter(|n| {
+            let Ok(e) = z.by_name(n) else {
+                return false;
+            };
+            if e.size() > MAX_SCAN {
+                return false;
+            }
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut std::io::Read::take(e, MAX_SCAN), &mut s).is_ok()
+                && s.lines().any(|l| {
+                    l.contains("fun ")
+                        && (l.contains(&format!(".{name}(")) || l.contains(&format!(" {name}(")))
+                })
+        })
+        .collect()
 }
 
 /// Files bigger than this are not read to look for a class.
@@ -436,7 +525,11 @@ pub fn supertypes(text: &str, class: &str) -> Vec<Vec<String>> {
         return Vec::new();
     };
     let head = &text[at + class.len()..];
-    let head = &head[..head.find('{').unwrap_or(head.len()).min(600)];
+    let mut end = head.find('{').unwrap_or(head.len()).min(600);
+    while !head.is_char_boundary(end) {
+        end -= 1; // never inside a multibyte character
+    }
+    let head = &head[..end];
     // Kotlin: after the `:` that follows the constructor; Java: after extends / implements
     let list: String = if let Some(i) = top_level_colon(head) {
         head[i + 1..].to_string()
@@ -547,16 +640,26 @@ pub fn class_entry(qualified: &str) -> String {
         .to_string()
 }
 
-/// The declarations of `call.member` in `class` of a library source (`text` of `path`) that the
-/// call means, best first: those whose parameters take the arguments' types; else those that
-/// take as many arguments; else every one of that name. A Kotlin property read as a Java getter
-/// (`manager.allProviders` for `getAllProviders()`) finds the getter.
-pub fn find_member(path: &Path, text: &str, class: &str, call: &LibCall) -> Vec<usize> {
+/// The declarations a call means in a library source, best first, and whether they are a sure
+/// match: `exact` when the parameter types were weighed (the most specific overload, or every one
+/// when no argument's type is known), not when only the count or the name fit.
+#[derive(Debug, Default, PartialEq)]
+pub struct Members {
+    pub offsets: Vec<usize>,
+    pub exact: bool,
+}
+
+/// The declarations of `call.member` in `class` of a library source (`text` of `path`): those
+/// whose parameters take the arguments' types (exact); else those that take as many arguments;
+/// else every one of that name. A Kotlin property read as a Java getter (`manager.allProviders`
+/// for `getAllProviders()`) finds the getter.
+pub fn find_member(path: &Path, text: &str, class: &str, call: &LibCall) -> Members {
     let syms = crate::kotlin::scan_file(path, text);
+    // a member of the class itself, not a top-level function of the file
     let in_class = |d: &&crate::kotlin::Decl| {
         d.container
             .as_deref()
-            .is_none_or(|c| c.rsplit('.').next() == Some(class))
+            .is_some_and(|c| c.rsplit('.').next() == Some(class))
     };
     let named = |name: &str| -> Vec<&crate::kotlin::Decl> {
         syms.decls
@@ -580,8 +683,18 @@ pub fn find_member(path: &Path, text: &str, class: &str, call: &LibCall) -> Vec<
         }
     }
     let Some(args) = &call.args else {
-        return ds.iter().map(|d| d.offset).collect();
+        // a property (or its getter): the name says it
+        let exact = !ds.is_empty();
+        return Members {
+            offsets: ds.iter().map(|d| d.offset).collect(),
+            exact,
+        };
     };
+    rank(&ds, args)
+}
+
+/// The overloads `ds` that `args` fit best (see [`Members`]).
+fn rank(ds: &[&crate::kotlin::Decl], args: &[Vec<String>]) -> Members {
     let count = |d: &&&crate::kotlin::Decl| {
         let ps = &d.params;
         let required = ps.iter().filter(|p| !p.has_default && !p.vararg).count();
@@ -610,17 +723,175 @@ pub fn find_member(path: &Path, text: &str, class: &str, call: &LibCall) -> Vec<
         })
         .collect();
     if let Some(best) = scored.iter().map(|(_, s)| *s).max() {
-        return scored
-            .into_iter()
-            .filter(|(_, s)| *s == best)
-            .map(|(o, _)| o)
-            .collect();
+        return Members {
+            offsets: scored
+                .into_iter()
+                .filter(|(_, s)| *s == best)
+                .map(|(o, _)| o)
+                .collect(),
+            exact: true,
+        };
     }
-    if !by_count.is_empty() {
-        return by_count.iter().map(|d| d.offset).collect();
+    let offsets = if by_count.is_empty() {
+        ds.iter().map(|d| d.offset).collect()
+    } else {
+        by_count.iter().map(|d| d.offset).collect()
+    };
+    Members {
+        offsets,
+        exact: false,
     }
-    ds.iter().map(|d| d.offset).collect()
 }
+
+/// Top-level extension functions `fun Receiver.member(…)` in a library source whose receiver is
+/// one of `receivers` (simple names; a type parameter or `Any` takes every receiver), ranked by
+/// the arguments like members.
+pub fn find_extension(path: &Path, text: &str, receivers: &[String], call: &LibCall) -> Members {
+    let syms = crate::kotlin::scan_file(path, text);
+    let ds: Vec<&crate::kotlin::Decl> = syms
+        .decls
+        .iter()
+        .filter(|d| d.name == call.member && d.container.is_none() && !d.kind.is_type())
+        .filter(|d| {
+            receiver_of(text, d.offset).is_some_and(|r| {
+                r == "Any"
+                    || (r.len() == 1 && r.starts_with(char::is_uppercase))
+                    || receivers.contains(&r)
+            })
+        })
+        .collect();
+    match &call.args {
+        Some(args) => rank(&ds, args),
+        None => Members {
+            exact: !ds.is_empty(),
+            offsets: ds.iter().map(|d| d.offset).collect(),
+        },
+    }
+}
+
+/// The receiver of a Kotlin extension declared with its name at `offset` (`fun <T> List<T>.name`
+/// gives `List`), or None when it is not an extension.
+pub fn receiver_of(text: &str, offset: usize) -> Option<String> {
+    let before = text[..offset].trim_end();
+    let before = before.strip_suffix('.')?;
+    let line = &before[before.rfind('\n').map_or(0, |i| i + 1)..];
+    let at = line
+        .find("fun ")
+        .or_else(|| line.find("val "))
+        .or_else(|| line.find("var "))?;
+    let mut recv = line[at + 4..].trim_start();
+    if recv.starts_with('<') {
+        // `fun <T> T.name`: past the type parameters
+        let mut depth = 0;
+        let end = recv.char_indices().find_map(|(i, c)| {
+            match c {
+                '<' => depth += 1,
+                '>' => depth -= 1,
+                _ => {}
+            }
+            (depth == 0).then_some(i + 1)
+        })?;
+        recv = recv[end..].trim_start();
+    }
+    let ty = simple_type(recv);
+    (!ty.is_empty()).then_some(ty)
+}
+
+/// Supertypes of Kotlin's built-in types, for their extensions (`String` takes a `CharSequence`
+/// extension, `MutableList` an `Iterable` one).
+pub fn kotlin_supers(t: &str) -> &'static [&'static str] {
+    match t {
+        "String" => &["String", "CharSequence", "Comparable"],
+        "StringBuilder" => &["StringBuilder", "CharSequence", "Appendable"],
+        "MutableList" | "ArrayList" => &[
+            "MutableList",
+            "List",
+            "MutableCollection",
+            "Collection",
+            "MutableIterable",
+            "Iterable",
+        ],
+        "List" => &["List", "Collection", "Iterable"],
+        "MutableSet" | "HashSet" | "LinkedHashSet" => &[
+            "MutableSet",
+            "Set",
+            "MutableCollection",
+            "Collection",
+            "MutableIterable",
+            "Iterable",
+        ],
+        "Set" => &["Set", "Collection", "Iterable"],
+        "MutableMap" | "HashMap" | "LinkedHashMap" => &["MutableMap", "Map"],
+        "Collection" => &["Collection", "Iterable"],
+        "MutableCollection" => &[
+            "MutableCollection",
+            "Collection",
+            "MutableIterable",
+            "Iterable",
+        ],
+        "Int" | "Long" | "Short" | "Byte" | "Double" | "Float" => &["Number", "Comparable"],
+        _ => &[],
+    }
+}
+
+/// Two arguments' types (each its type and supertypes) can be the same parameter: one is the other
+/// or among its supertypes, or both are whole numbers (a literal `0` and `0L` call one `long`).
+pub fn same_type(a: &[String], b: &[String]) -> bool {
+    let whole = |x: &[String]| {
+        x.first()
+            .is_some_and(|t| matches!(t.as_str(), "Int" | "Long" | "Short" | "Byte"))
+    };
+    a.is_empty()
+        || b.is_empty()
+        || a.first().is_some_and(|t| b.contains(t))
+        || b.first().is_some_and(|t| a.contains(t))
+        || whole(a) && whole(b)
+}
+
+/// The class file `entry` from a jar, or from the `classes.jar` inside an `.aar`; None when it
+/// is not there or is bigger than [`MAX_CLASS`].
+pub fn class_bytes(archive: &Path, entry: &str) -> Option<Vec<u8>> {
+    fn read<R: std::io::Read + std::io::Seek>(
+        z: &mut zip::ZipArchive<R>,
+        entry: &str,
+    ) -> Option<Vec<u8>> {
+        let e = z.by_name(entry).ok()?;
+        if e.size() > MAX_CLASS {
+            return None;
+        }
+        let mut v = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(e, MAX_CLASS), &mut v).ok()?;
+        Some(v)
+    }
+    let mut z = zip::ZipArchive::new(std::fs::File::open(archive).ok()?).ok()?;
+    if archive.extension().is_some_and(|e| e == "aar") {
+        let jar = {
+            let e = z.by_name("classes.jar").ok()?;
+            let mut v = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::Read::take(e, MAX_AAR_JAR), &mut v).ok()?;
+            v
+        };
+        let mut inner = zip::ZipArchive::new(std::io::Cursor::new(jar)).ok()?;
+        return read(&mut inner, entry);
+    }
+    read(&mut z, entry)
+}
+
+/// The class file `entry` is in the jar (or the `.aar`'s `classes.jar`).
+pub fn has_class(archive: &Path, entry: &str) -> bool {
+    if archive.extension().is_some_and(|e| e == "aar") {
+        return class_bytes(archive, entry).is_some();
+    }
+    std::fs::File::open(archive)
+        .ok()
+        .and_then(|f| zip::ZipArchive::new(f).ok())
+        .is_some_and(|mut z| z.by_name(entry).is_ok())
+}
+
+/// A class file bigger than this is not read for a stub.
+const MAX_CLASS: u64 = 4 * 1024 * 1024;
+/// An `.aar`'s `classes.jar` bigger than this is not read.
+const MAX_AAR_JAR: u64 = 64 * 1024 * 1024;
 
 /// How well a parameter of type `param` (as spelled in Java or Kotlin source) takes an argument
 /// whose type and supertypes are `arg` (simple names, Kotlin spelling, nearest first), like the
@@ -831,6 +1102,10 @@ fn java_signature(name: &str, desc: &str) -> String {
 mod tests {
     use super::*;
 
+    fn fm(path: &Path, text: &str, class: &str, call: &LibCall) -> Vec<usize> {
+        find_member(path, text, class, call).offsets
+    }
+
     fn call(member: &str, args: &[&[&str]]) -> LibCall {
         LibCall {
             class: "LocationManager".into(),
@@ -842,6 +1117,7 @@ mod tests {
                     .map(|a| a.iter().map(|s| s.to_string()).collect())
                     .collect(),
             ),
+            builtin: false,
         }
     }
 
@@ -850,7 +1126,7 @@ mod tests {
     #[test]
     fn the_overload_whose_parameter_types_take_the_arguments_is_the_one() {
         let p = Path::new("LocationManager.java");
-        let listener = find_member(
+        let listener = fm(
             p,
             LM,
             "LocationManager",
@@ -862,7 +1138,7 @@ mod tests {
         assert_eq!(listener.len(), 1);
         assert!(LM[listener[0]..].starts_with("requestLocationUpdates(@NonNull String provider, long minTimeMs, float minDistanceM, @NonNull LocationListener listener)"));
         // the same count, another type: the PendingIntent one
-        let pending = find_member(
+        let pending = fm(
             p,
             LM,
             "LocationManager",
@@ -880,7 +1156,7 @@ mod tests {
         assert!(LM[pending[0]..].contains("PendingIntent pendingIntent) {}"));
         assert_ne!(listener, pending);
         // a project class that implements the listener is taken by its supertype
-        let mine = find_member(
+        let mine = fm(
             p,
             LM,
             "LocationManager",
@@ -899,11 +1175,11 @@ mod tests {
         let src = "class Locator {\n    public void locate(String name, Object tag) {}\n    public void locate(String name, long timeout) {}\n}\n";
         let mut l = call("locate", &[&["String"], &["Long"]]);
         l.class = "Locator".into();
-        let best = find_member(Path::new("Locator.java"), src, "Locator", &l);
+        let best = fm(Path::new("Locator.java"), src, "Locator", &l);
         assert!(best.len() == 1 && src[best[0]..].starts_with("locate(String name, long timeout)"));
         // types not known: every 4-argument one
         assert_eq!(
-            find_member(
+            fm(
                 p,
                 LM,
                 "LocationManager",
@@ -915,7 +1191,7 @@ mod tests {
         // a Kotlin property read is the Java getter
         let mut prop = call("allProviders", &[]);
         prop.args = None;
-        let g = find_member(p, LM, "LocationManager", &prop);
+        let g = fm(p, LM, "LocationManager", &prop);
         assert!(g.len() == 1 && LM[g[0]..].starts_with("getAllProviders"));
     }
 
@@ -930,7 +1206,7 @@ mod tests {
         let sb = "class StringBuilder {\n    public StringBuilder append(long l) { return this; }\n    public StringBuilder append(int i) { return this; }\n    public StringBuilder append(Integer i) { return this; }\n    public StringBuilder append(Object o) { return this; }\n}\n";
         let mut c = call("append", &[&["Int"]]);
         c.class = "StringBuilder".into();
-        let f = find_member(Path::new("SB.java"), sb, "StringBuilder", &c);
+        let f = fm(Path::new("SB.java"), sb, "StringBuilder", &c);
         assert!(
             f.len() == 1 && sb[f[0]..].starts_with("append(int i)"),
             "{f:?}"
@@ -939,7 +1215,7 @@ mod tests {
         let h = "class H {\n    void f(Base b) {}\n    void f(Mid m) {}\n}\n";
         let mut c = call("f", &[&["Leaf", "Mid", "Base"]]);
         c.class = "H".into();
-        let f = find_member(Path::new("H.java"), h, "H", &c);
+        let f = fm(Path::new("H.java"), h, "H", &c);
         assert!(f.len() == 1 && h[f[0]..].starts_with("f(Mid m)"));
         // String and String[] are told apart; IntArray is int[]; a lambda fits a function type
         assert!(match_score("String[]", &s(&["String"])).is_none());
@@ -949,7 +1225,24 @@ mod tests {
         let t2 = "class T {\n    void g(Object a) {}\n    void g(Object b) {}\n}\n";
         let mut c = call("g", &[&["Thing"]]);
         c.class = "T".into();
-        assert_eq!(find_member(Path::new("T.java"), t2, "T", &c).len(), 2);
+        assert_eq!(fm(Path::new("T.java"), t2, "T", &c).len(), 2);
+    }
+
+    #[test]
+    fn long_headers_with_non_ascii_text_and_whole_number_arguments() {
+        // a class header over 600 bytes with no `{` and multibyte text: no panic
+        let text = format!("class X : Base(\"{}\")", "é".repeat(400));
+        let _ = supertypes(&text, "X");
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(
+            same_type(&s(&["Int"]), &s(&["Long"])),
+            "0 and 0L call one long"
+        );
+        assert!(!same_type(
+            &s(&["LocationListener"]),
+            &s(&["PendingIntent", "Parcelable"])
+        ));
+        assert!(same_type(&s(&["Leaf", "Base"]), &s(&["Base"])));
     }
 
     #[test]
