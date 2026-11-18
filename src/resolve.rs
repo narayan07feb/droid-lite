@@ -2574,15 +2574,34 @@ impl<'a> Resolver<'a> {
     /// `x.name(…)` on a value of library type `class`: the call as [`LibCall`].
     fn lib_call(&self, f: &FileInfo, i: usize, class: &str, name: &str) -> LibCall {
         let class = class.split('<').next().unwrap_or(class).trim().to_string();
+        // `NotificationCompat.Builder`: the import of `NotificationCompat`, then `.Builder`; a
+        // name that starts with a package is qualified already
+        let first = class.split('.').next().unwrap_or(&class);
         let qualified = f
             .imports
             .named
-            .get(&class)
+            .get(first)
             .and_then(|v| v.first().cloned())
-            .or_else(|| class.contains('.').then(|| class.clone()));
+            .map(|q| format!("{q}{}", &class[first.len()..]))
+            .or_else(|| {
+                (class.contains('.') && class.starts_with(char::is_lowercase))
+                    .then(|| class.clone())
+            });
         let open = i + 1;
-        let args = (f.t(open) == "(").then(|| {
-            split_args_tokens(f, open)
+        // a trailing lambda after the parentheses (or instead of them) is one more argument
+        let after = if f.t(open) == "(" {
+            f.pair(open).map_or(open, |c| c + 1)
+        } else {
+            open
+        };
+        let lambda = f.t(after) == "{";
+        let args = (f.t(open) == "(" || lambda).then(|| {
+            let parens = if f.t(open) == "(" {
+                split_args_tokens(f, open)
+            } else {
+                Vec::new()
+            };
+            parens
                 .into_iter()
                 .map(|(s, e)| {
                     if f.t(s + 1) == "=" {
@@ -2604,6 +2623,7 @@ impl<'a> Resolver<'a> {
                     }
                     names
                 })
+                .chain(lambda.then(Vec::new))
                 .collect()
         });
         LibCall {
@@ -3150,10 +3170,12 @@ impl<'a> Resolver<'a> {
                     return Res::Decls(found);
                 }
             }
-            if let Some(class) = t.lib().filter(|l| *l != "Any") {
+            // a Kotlin type (String, List, Int…): its members and the standard library's
+            // extensions are not read from sources here, so it stays "not a project declaration"
+            if let Some(class) = t.lib().filter(|l| !is_kotlin_type(l)) {
                 return Res::Lib(self.lib_call(f, i, class, name));
             }
-            if matches!(t, Ty::Decl(_)) {
+            if matches!(t, Ty::Decl(_)) || t.lib().is_some_and(|l| l != "Any") {
                 return Res::None;
             }
         }
@@ -4200,7 +4222,24 @@ fn is_comparison(f: &FileInfo, s: usize, e: usize) -> bool {
     false
 }
 
-/// Token ranges of the arguments of the call whose `(` is token `open`.
+/// Types of the Kotlin standard library (and their Java twins Kotlin maps them to): calls on them
+/// are not followed into library sources ([`Res::Lib`]), as their extensions live elsewhere.
+fn is_kotlin_type(t: &str) -> bool {
+    matches!(
+        t.split('<').next().unwrap_or(t),
+        "Any" | "Unit" | "Nothing" | "String" | "CharSequence" | "Int" | "Long" | "Short"
+            | "Byte" | "Double" | "Float" | "Boolean" | "Char" | "Number" | "Comparable"
+            | "List" | "MutableList" | "ArrayList" | "Map" | "MutableMap" | "HashMap"
+            | "LinkedHashMap" | "Set" | "MutableSet" | "HashSet" | "LinkedHashSet" | "Collection"
+            | "MutableCollection" | "Iterable" | "MutableIterable" | "Iterator"
+            | "MutableIterator" | "ListIterator" | "Sequence" | "Array" | "IntArray"
+            | "LongArray" | "ByteArray" | "CharArray" | "ShortArray" | "FloatArray"
+            | "DoubleArray" | "BooleanArray" | "Pair" | "Triple" | "Result" | "Lazy" | "Regex"
+            | "IntRange" | "LongRange" | "CharRange" | "Enum" | "Throwable" | "Exception"
+            | "Error" | "Function" | "KClass" | "StringBuilder"
+    )
+}
+
 /// The type of a number literal: `0f` Float, `0L` Long, `1.5` / `1e3` Double, else Int.
 fn num_type(lit: &str) -> &'static str {
     let l = lit.to_ascii_lowercase();
@@ -4216,6 +4255,7 @@ fn num_type(lit: &str) -> &'static str {
     }
 }
 
+/// Token ranges of the arguments of the call whose `(` is token `open`.
 fn split_args_tokens(f: &FileInfo, open: usize) -> Vec<(usize, usize)> {
     let Some(close) = f.pair(open) else {
         return Vec::new();

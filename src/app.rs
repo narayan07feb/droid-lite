@@ -1412,6 +1412,7 @@ impl App {
 
     fn goto_definition(&mut self) {
         self.settle(true);
+        self.cancel_lib_jump(); // a jump still waiting for a download is replaced by this one
         let Some((word, at)) = self.word_at_cursor() else {
             return;
         };
@@ -1503,7 +1504,7 @@ impl App {
         if let Some(crate::resolve::Res::Lib(call)) = self.resolved_at(at) {
             self.found_title = format!("References to `{}.{}` (library)", call.class, call.member);
             self.search_lib_usages(call.clone(), ctx);
-            self.lib_source(call, false);
+            self.lib_source(call, false, 0);
             return;
         }
         match self.ref_target(at) {

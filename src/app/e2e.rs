@@ -8100,7 +8100,7 @@ fn e2e_diff_panel_counts_rows_of_the_layout_it_shows_and_a_new_diff() {
 
 const LM_JAVA: &str = "package android.location;\n\nimport android.app.PendingIntent;\n\npublic class LocationManager {\n    public void requestLocationUpdates(String provider, long minTimeMs, float minDistanceM, PendingIntent pendingIntent) {}\n    public void requestLocationUpdates(String provider, long minTimeMs, float minDistanceM, LocationListener listener) {}\n    public java.util.List<String> getAllProviders() { return null; }\n}\n";
 
-const TRACKER_KT: &str = "package com.demo.loc\n\nimport android.location.LocationListener\nimport android.location.LocationManager\n\ninterface Updates {\n    fun requestLocationUpdates()\n}\n\nclass Tracker(private val listener: LocationListener) : Updates {\n    private var locationManager: LocationManager? = null\n\n    override fun requestLocationUpdates() {\n        val manager = locationManager\n        val provider = \"gps\"\n        if (manager != null) {\n            manager.requestLocationUpdates(provider, 0, 0f, listener)\n        }\n    }\n\n    fun show(a: Int) {}\n    fun show(a: String) {}\n\n    fun start() {\n        show(\"x\")\n        requestLocationUpdates()\n    }\n}\n";
+const TRACKER_KT: &str = "package com.demo.loc\n\nimport android.app.PendingIntent\nimport android.location.LocationListener\nimport android.location.LocationManager\n\ninterface Updates {\n    fun requestLocationUpdates()\n}\n\nclass Tracker(private val listener: LocationListener) : Updates {\n    private var locationManager: LocationManager? = null\n\n    override fun requestLocationUpdates() {\n        val manager = locationManager\n        val provider = \"gps\"\n        if (manager != null) {\n            manager.requestLocationUpdates(provider, 0, 0f, listener)\n        }\n    }\n\n    fun later(manager: LocationManager, pending: PendingIntent) {\n        manager.requestLocationUpdates(\"gps\", 0L, 1f, pending)\n    }\n\n    fun show(a: Int) {}\n    fun show(a: String) {}\n\n    fun start() {\n        show(\"x\")\n        requestLocationUpdates()\n    }\n}\n";
 
 /// A fake Android SDK in `dir` for API 34: `android.jar` with LocationManager (compiled), and its
 /// source when `sources`. False when this Mac has no javac.
@@ -8160,6 +8160,8 @@ fn goto_at(h: &mut Harness<'static, App>, file: &Path, needle: &str, extra: usiz
     });
     place_cursor(h, needle, extra);
     key(h, Modifiers::NONE, Key::F3);
+    wait(h, "the source read", |a| !a.lib_reading());
+    steps(h, 3);
 }
 
 #[test]
@@ -8192,7 +8194,19 @@ fn e2e_goto_on_an_sdk_call_opens_its_exact_overload_not_a_project_function_of_th
     key(&mut h, Modifiers::ALT, Key::F7);
     wait(&mut h, "usages", |a| a.find_rx.is_none() && !a.found.is_empty());
     let lines: Vec<usize> = h.state().found.iter().map(|l| l.line).collect();
-    assert_eq!(lines, [17], "only manager.requestLocationUpdates(provider, 0, 0f, listener)");
+    assert_eq!(lines, [18], "only this overload: not the PendingIntent call, not the project's function");
+    // and the PendingIntent call lists only itself
+    open(&mut h, &tracker);
+    place_cursor(&mut h, "requestLocationUpdates(\"gps\"", 1);
+    key(&mut h, Modifiers::ALT, Key::F7);
+    wait(&mut h, "usages 2", |a| a.find_rx.is_none() && a.found.iter().any(|l| l.line == 23));
+    let lines: Vec<usize> = h.state().found.iter().map(|l| l.line).collect();
+    assert_eq!(lines, [23]);
+    // a Kotlin standard type (String.trim): not followed into library sources, nothing downloaded
+    std::fs::write(&tracker, TRACKER_KT.replace("val provider = \"gps\"", "val provider = \"gps\".trim()")).unwrap();
+    h.state_mut().tabs.retain(|t| t.path != tracker);
+    goto_at(&mut h, &tracker, "trim()", 1);
+    assert_eq!(h.state().fetches.started, 0);
     assert!(h.state().found_title.contains("LocationManager.requestLocationUpdates"));
 }
 
@@ -8318,5 +8332,102 @@ fn e2e_goto_downloads_a_librarys_sources_jar_once_then_uses_the_cache() {
     std::fs::remove_dir_all(&repo).unwrap();
     goto_at(&mut h, &file, "locate(", 1);
     assert!(tab(&h).path.to_string_lossy().ends_with("geo-1.0-sources.jar!/demo/geo/Locator.java"));
+    assert_eq!(h.state().fetches.started, 1);
+}
+
+/// A fixture whose library `demo.lib:geo:1.0` has the classes compiled from `java` in the Gradle
+/// cache (no sources), and a repository folder holding `sources` as its sources jar (None: no
+/// sources jar there). Returns the fixture and the Kotlin file `kt` written at Find.kt.
+fn maven_fixture(name: &str, java: &[(&str, &str)], sources: Option<&[(&str, &str)]>, kt: &str) -> Option<(Fixture, PathBuf)> {
+    let f = Fixture::new(name);
+    let home = f.config.join("gradle-home");
+    let Some(classes) = crate::classfile::tests::javac(&f.config.join("javac"), java) else {
+        eprintln!("no javac: skipped");
+        return None;
+    };
+    let zip = |path: &Path, files: &[(String, Vec<u8>)]| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut z = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for (n, b) in files {
+            z.start_file(n.as_str(), zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut z, b).unwrap();
+        }
+        z.finish().unwrap();
+    };
+    zip(&home.join("caches/modules-2/files-2.1/demo.lib/geo/1.0/aaa/geo-1.0.jar"), &classes);
+    let repo = f.config.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    if let Some(src) = sources {
+        let files: Vec<(String, Vec<u8>)> = src.iter().map(|(n, t)| (n.to_string(), t.as_bytes().to_vec())).collect();
+        zip(&repo.join("demo/lib/geo/1.0/geo-1.0-sources.jar"), &files);
+    }
+    // SAFETY: the fixture holds the SERIAL lock.
+    unsafe {
+        std::env::set_var("DROID_LITE_GRADLE_HOME", &home);
+        std::env::set_var("DROID_LITE_MAVEN_REPOS", format!("file://{}", repo.display()));
+    }
+    std::fs::create_dir_all(f.path("gradle")).unwrap();
+    std::fs::write(f.path("gradle/libs.versions.toml"), "[libraries]\ndemo-geo = { module = \"demo.lib:geo\", version = \"1.0\" }\n").unwrap();
+    let file = f.path("app/src/main/java/com/demo/loc/Find.kt");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, kt).unwrap();
+    Some((f, file))
+}
+
+const GEO_JAVA: &str = "package demo.geo;\n\npublic class Locator extends Base {\n    public void locate(String name, long timeout) {}\n    public static class Spot {\n        public void pin(int level) {}\n    }\n}\n";
+const GEO_BASE: &str = "package demo.geo;\n\npublic class Base {\n    public void reset(boolean hard) {}\n}\n";
+
+#[test]
+fn e2e_goto_follows_nested_classes_and_supertypes_into_a_downloaded_sources_jar() {
+    let kt = "package com.demo.loc\n\nimport demo.geo.Locator\n\nfun find(l: Locator, s: Locator.Spot) {\n    s.pin(2)\n    l.reset(true)\n}\n";
+    let java = [("demo/geo/Locator.java", GEO_JAVA), ("demo/geo/Base.java", GEO_BASE)];
+    let Some((f, file)) = maven_fixture("gotonested", &java, Some(&java), kt) else { return };
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    // Locator.Spot: the nested class in Locator.java, after one download
+    goto_at(&mut h, &file, "pin(", 1);
+    wait(&mut h, "opened", |a| a.tabs[a.active].path.to_string_lossy().ends_with("!/demo/geo/Locator.java"));
+    wait(&mut h, "the source read", |a| !a.lib_reading());
+    steps(&mut h, 3);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("pin(int level)"), "{}", h.state().status);
+    // reset is declared in Base, Locator's superclass: found there
+    goto_at(&mut h, &file, "reset(", 1);
+    wait(&mut h, "Base.java", |a| a.tabs[a.active].path.to_string_lossy().ends_with("!/demo/geo/Base.java"));
+    wait(&mut h, "the source read", |a| !a.lib_reading());
+    steps(&mut h, 3);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("reset(boolean hard)"));
+    assert_eq!(h.state().fetches.started, 1, "one jar for both");
+}
+
+#[test]
+fn e2e_goto_never_downloads_twice_when_the_jar_lacks_the_class_or_the_download_failed() {
+    let kt = "package com.demo.loc\n\nimport demo.geo.Locator\n\nfun find(l: Locator) {\n    l.locate(\"home\", 5L)\n}\n";
+    let java = [("demo/geo/Locator.java", GEO_JAVA), ("demo/geo/Base.java", GEO_BASE)];
+    // the repository's sources jar holds only Base: Locator is not in it
+    let Some((f, file)) = maven_fixture("gotonoclass", &java, Some(&[("demo/geo/Base.java", GEO_BASE)]), kt) else { return };
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    // two jumps while the download runs: one download
+    goto_at(&mut h, &file, "locate(", 1);
+    h.state_mut().goto_definition();
+    wait(&mut h, "the stub", |a| a.tabs[a.active].path.to_string_lossy().ends_with("(no source)"));
+    steps(&mut h, 3);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("locate(String p0, long p1)"));
+    assert!(h.state().status.contains("has no source of Locator"), "{}", h.state().status);
+    // again: the stub at once, no second download
+    goto_at(&mut h, &file, "locate(", 1);
+    assert!(tab(&h).path.to_string_lossy().ends_with("(no source)"));
+    assert_eq!(h.state().fetches.started, 1);
+    drop(h);
+    drop(f); // its test lock, which the next fixture takes
+    // a repository without the jar: the download fails once and is not tried again at once
+    let Some((f, file)) = maven_fixture("gotofailed", &java, None, kt) else { return };
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    goto_at(&mut h, &file, "locate(", 1);
+    wait(&mut h, "the stub", |a| a.tabs[a.active].path.to_string_lossy().ends_with("(no source)"));
+    goto_at(&mut h, &file, "locate(", 1);
+    assert!(tab(&h).path.to_string_lossy().ends_with("(no source)"));
+    assert!(h.state().status.contains("could not be downloaded"), "{}", h.state().status);
     assert_eq!(h.state().fetches.started, 1);
 }

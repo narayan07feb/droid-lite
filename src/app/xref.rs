@@ -632,7 +632,7 @@ impl Xref {
             let files = s.code_files(&root);
             let texts = Texts::new(open);
             let cache = Cache::default();
-            let arity = |c: &crate::resolve::LibCall| c.args.as_ref().map(Vec::len);
+            let same = |c: &crate::resolve::LibCall| same_lib_call(c, &call);
             let mut found = Vec::new();
             for f in files.iter() {
                 if stale() {
@@ -649,10 +649,7 @@ impl Xref {
                     crate::refactor::occurrences(&text, &call.member)
                         .iter()
                         .map(|o| o.start)
-                        .filter(|&o| {
-                            matches!(r.resolve(&fi, o), Res::Lib(c)
-                                if c.class == call.class && c.member == call.member && arity(&c) == arity(&call))
-                        })
+                        .filter(|&o| matches!(r.resolve(&fi, o), Res::Lib(c) if same(&c)))
                         .collect()
                 });
                 found.extend(at.into_iter().map(|o| super::found_line(f, &text, o)));
@@ -665,6 +662,30 @@ impl Xref {
             }
         });
     }
+}
+
+/// Two library calls mean the same declaration: the same member of the same class (by its
+/// qualified name when both know it), as many arguments, and where both know an argument's type,
+/// types that can be the same parameter (one is the other or among its supertypes).
+fn same_lib_call(a: &crate::resolve::LibCall, b: &crate::resolve::LibCall) -> bool {
+    let class = match (&a.qualified, &b.qualified) {
+        (Some(x), Some(y)) => x == y,
+        _ => a.class == b.class,
+    };
+    let args = match (&a.args, &b.args) {
+        (Some(x), Some(y)) => {
+            x.len() == y.len()
+                && x.iter().zip(y).all(|(p, q)| {
+                    p.is_empty()
+                        || q.is_empty()
+                        || p.first().is_some_and(|t| q.contains(t))
+                        || q.first().is_some_and(|t| p.contains(t))
+                })
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    class && a.member == b.member && args
 }
 
 /// Runs one task; a panic is logged and the task dropped (its reply channel closes, so whoever

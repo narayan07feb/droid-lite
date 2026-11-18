@@ -39,20 +39,16 @@ pub fn sdk_dir() -> Option<PathBuf> {
         .find(|p| p.is_dir())
 }
 
-/// The project's compile SDK: the highest number written after `compileSdk` (any case, also a
-/// version catalog key like `branchCompileSdk = "36"`) in its build scripts and catalog; else the
-/// newest platform the SDK has.
+/// The project's compile SDK: the highest number given to `compileSdk` (any case, also a version
+/// catalog key like `branchCompileSdk = "36"`, or `compileSdk { version = release(36) }`) in its
+/// build scripts and catalog, comments left out; else the newest platform the SDK has.
 pub fn compile_sdk(root: &Path, scripts: &[PathBuf], sdk: &Path) -> Option<u32> {
     let catalog = root.join("gradle/libs.versions.toml");
     let found = scripts
         .iter()
         .chain(std::iter::once(&catalog))
         .filter_map(|p| std::fs::read_to_string(p).ok())
-        .flat_map(|t| {
-            t.lines()
-                .filter_map(number_after_compile_sdk)
-                .collect::<Vec<_>>()
-        })
+        .filter_map(|t| compile_sdk_in(&t))
         .max();
     found.or_else(|| {
         std::fs::read_dir(sdk.join("platforms"))
@@ -66,15 +62,48 @@ pub fn compile_sdk(root: &Path, scripts: &[PathBuf], sdk: &Path) -> Option<u32> 
     })
 }
 
-/// `compileSdk = 35`, `compileSdkVersion(34)`, `branchCompileSdk = "36"`: the number.
-fn number_after_compile_sdk(line: &str) -> Option<u32> {
-    let l = line.to_ascii_lowercase();
-    let at = l.find("compilesdk")? + "compilesdk".len();
-    let rest = &l[at..];
-    let rest = rest.trim_start_matches(|c: char| c.is_alphabetic());
-    let rest = rest.trim_start_matches(|c: char| " =(\"'".contains(c));
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
+/// The highest compile SDK a build script or catalog gives (see [`compile_sdk`]).
+fn compile_sdk_in(text: &str) -> Option<u32> {
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| l.trim().to_ascii_lowercase())
+        .map(|l| {
+            if l.starts_with('#') || l.starts_with("//") {
+                String::new()
+            } else {
+                l
+            }
+        })
+        .collect();
+    let digits = |s: &str| -> Option<u32> {
+        s.chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .ok()
+    };
+    let mut best = None;
+    for (i, l) in lines.iter().enumerate() {
+        let Some(at) = l.find("compilesdk") else {
+            continue;
+        };
+        let rest = &l[at + "compilesdk".len()..];
+        // `compileSdkExtension = 12`, `compileSdkMinor`, `compileSdkPreview`: not the SDK
+        let word: String = rest.chars().take_while(|c| c.is_alphabetic()).collect();
+        if !word.is_empty() && word != "version" {
+            continue;
+        }
+        let after = rest[word.len()..].trim_start_matches(|c: char| " =(\"'".contains(c));
+        let n = digits(after).or_else(|| {
+            // `compileSdk { version = release(36) }`, on this line or the next few
+            lines[i..lines.len().min(i + 4)].iter().find_map(|x| {
+                let r = x.find("release(")?;
+                digits(&x[r + "release(".len()..])
+            })
+        });
+        best = best.max(n);
+    }
+    best
 }
 
 /// The source file of `qualified` in the SDK's sources for `api`, when it is there. A nested
@@ -115,10 +144,25 @@ pub fn sources_cache() -> PathBuf {
         })
 }
 
-/// The cached `-sources.jar` of `group:name:version`.
-pub fn cached_sources_jar(coords: &str) -> Option<PathBuf> {
-    let mut it = coords.split(':');
+/// `group:name:version`, each part a plain Maven name (letters, digits, `.`, `_`, `-`; not `.`
+/// or `..`): parts that could leave the cache folder or the repository's path are refused.
+fn coords(c: &str) -> Option<(&str, &str, &str)> {
+    let mut it = c.split(':');
     let (g, n, v) = (it.next()?, it.next()?, it.next()?);
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && !s.contains("..")
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+    };
+    (it.next().is_none() && plain(g) && plain(n) && plain(v)).then_some((g, n, v))
+}
+
+/// The cached `-sources.jar` of `group:name:version`.
+pub fn cached_sources_jar(c: &str) -> Option<PathBuf> {
+    let (g, n, v) = coords(c)?;
     Some(
         sources_cache()
             .join(g)
@@ -222,59 +266,96 @@ pub fn fetch(f: &Fetch) -> Result<(), String> {
                     tool.display()
                 ));
             }
-            let out = std::process::Command::new(&tool)
+            // its output goes to a log (stdout and stderr: the license text is on stdout)
+            let log = sources_cache().join(format!("sdkmanager-{api}.log"));
+            std::fs::create_dir_all(sources_cache()).map_err(|e| e.to_string())?;
+            let out = std::fs::File::create(&log).map_err(|e| e.to_string())?;
+            let err = out.try_clone().map_err(|e| e.to_string())?;
+            let mut child = std::process::Command::new(&tool)
                 .arg(format!("--sdk_root={}", sdk.display()))
                 .arg(format!("sources;android-{api}"))
                 .stdin(std::process::Stdio::null())
-                .output()
+                .stdout(out)
+                .stderr(err)
+                .spawn()
                 .map_err(|e| format!("sdkmanager did not start: {e}"))?;
+            wait_at_most(&mut child, SDK_TIMEOUT, "sdkmanager")?;
             if sdk.join(format!("sources/android-{api}")).is_dir() {
                 Ok(())
             } else {
-                let err = String::from_utf8_lossy(&out.stderr);
-                let line = err
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                let line = text
                     .lines()
                     .rev()
                     .find(|l| !l.trim().is_empty())
-                    .unwrap_or("no sources");
+                    .unwrap_or("no sources were installed");
                 Err(format!("sdkmanager: {}", line.trim()))
             }
         }
-        Fetch::Maven { coords, repos } => {
-            let dest = cached_sources_jar(coords).ok_or("not group:name:version")?;
-            let mut it = coords.split(':');
-            let (g, n, v) = (
-                it.next().unwrap_or(""),
-                it.next().unwrap_or(""),
-                it.next().unwrap_or(""),
-            );
+        Fetch::Maven { coords: c, repos } => {
+            let dest = cached_sources_jar(c).ok_or("not a plain group:name:version")?;
+            let (g, n, v) = coords(c).ok_or("not a plain group:name:version")?;
             let rel = format!("{}/{n}/{v}/{n}-{v}-sources.jar", g.replace('.', "/"));
             std::fs::create_dir_all(dest.parent().unwrap_or(Path::new(".")))
                 .map_err(|e| e.to_string())?;
             let part = dest.with_extension("jar.part");
+            // only web repositories, unless the tests name a local one
+            let local = std::env::var_os("DROID_LITE_MAVEN_REPOS").is_some();
+            let mut tried = 0;
             for r in repos {
-                let ok = std::process::Command::new("curl")
-                    .args(["-fsSL", "--max-time", "120", "-o"])
+                let file = r.starts_with("file://");
+                if file && !local || !file && !r.starts_with("http") {
+                    continue;
+                }
+                tried += 1;
+                let status = std::process::Command::new("curl")
+                    .args(["-fsSL", "--max-time", "120", "--max-filesize", "209715200"])
+                    .args(["--proto", if file { "=file" } else { "=http,https" }])
+                    .arg("-o")
                     .arg(&part)
                     .arg(format!("{r}/{rel}"))
                     .stdin(std::process::Stdio::null())
                     .status()
-                    .is_ok_and(|s| s.success());
-                if ok && std::fs::rename(&part, &dest).is_ok() {
+                    .map_err(|e| format!("curl did not start: {e}"))?;
+                let zip = std::fs::read(&part).is_ok_and(|b| b.starts_with(b"PK\x03\x04"));
+                if status.success() && zip && std::fs::rename(&part, &dest).is_ok() {
                     return Ok(());
                 }
             }
             let _ = std::fs::remove_file(&part);
-            Err(format!(
-                "no sources jar for {coords} in {} repositories",
-                repos.len()
-            ))
+            Err(format!("no sources jar for {c} in {tried} repositories"))
         }
     }
 }
 
-/// The entry of `qualified`'s source in a sources jar: `a/b/C.kt` or `a/b/C.java`, else a file of
-/// that package that declares the class.
+/// How long sdkmanager may run.
+const SDK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Waits for `child`, stopping it when it runs longer than `limit`.
+fn wait_at_most(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+    what: &str,
+) -> Result<(), String> {
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if start.elapsed() < limit => {
+                std::thread::sleep(std::time::Duration::from_millis(200))
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{what} took over {} minutes", limit.as_secs() / 60));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// The entry of `qualified`'s source in a sources jar: `a/b/C.kt` or `a/b/C.java` (also under a
+/// source set folder such as `commonMain/`), else a file of that package that declares the class.
 pub fn jar_entry(jar: &Path, qualified: &str) -> Option<String> {
     let f = std::fs::File::open(jar).ok()?;
     let mut z = zip::ZipArchive::new(f).ok()?;
@@ -285,29 +366,155 @@ pub fn jar_entry(jar: &Path, qualified: &str) -> Option<String> {
         format!("{}/", pkg.replace('.', "/"))
     };
     let names: Vec<String> = z.file_names().map(String::from).collect();
+    let at = |n: &str, want: &str| n == want || n.ends_with(&format!("/{want}"));
     for ext in ["kt", "java"] {
         let want = format!("{dir}{class}.{ext}");
-        if names.contains(&want) {
-            return Some(want);
+        if let Some(n) = names.iter().find(|n| at(n, &want)) {
+            return Some(n.clone());
         }
     }
-    let decl = [
-        format!("class {class}"),
-        format!("interface {class}"),
-        format!("object {class}"),
-    ];
+    let in_dir = |n: &str| {
+        let parent = n.rsplit_once('/').map_or("", |(d, _)| d);
+        format!("{parent}/") == dir || parent.ends_with(&format!("/{}", dir.trim_end_matches('/')))
+    };
     names
         .iter()
-        .filter(|n| n.starts_with(&dir) && !n[dir.len()..].contains('/'))
-        .filter(|n| n.ends_with(".kt") || n.ends_with(".java"))
+        .filter(|n| (n.ends_with(".kt") || n.ends_with(".java")) && in_dir(n))
         .find(|n| {
+            let Ok(e) = z.by_name(n) else {
+                return false;
+            };
+            if e.size() > MAX_SCAN {
+                return false; // a huge file is not read on a hunch
+            }
             let mut s = String::new();
-            z.by_name(n)
-                .ok()
-                .and_then(|mut e| std::io::Read::read_to_string(&mut e, &mut s).ok())
-                .is_some_and(|_| decl.iter().any(|d| s.contains(d.as_str())))
+            std::io::Read::read_to_string(&mut std::io::Read::take(e, MAX_SCAN), &mut s).is_ok()
+                && declares(&s, class)
         })
         .cloned()
+}
+
+/// Files bigger than this are not read to look for a class.
+const MAX_SCAN: u64 = 2 * 1024 * 1024;
+
+/// `text` declares `class Name`, `interface Name` or `object Name` (the whole word).
+pub fn declares(text: &str, class: &str) -> bool {
+    class_offset(text, class).is_some()
+}
+
+/// Where `class Name` / `interface Name` / `object Name` / `enum Name` is spelled (the name).
+pub fn class_offset(text: &str, class: &str) -> Option<usize> {
+    ["class ", "interface ", "object ", "enum "]
+        .iter()
+        .find_map(|k| {
+            text.match_indices(&format!("{k}{class}"))
+                .map(|(i, _)| i + k.len())
+                .find(|&e| {
+                    !text[e + class.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                })
+        })
+}
+
+/// The supertypes `class` names in its source, qualified through the file's imports (else its
+/// own package): `class A extends B implements C` (Java), `class A(…) : B(), C` (Kotlin).
+pub fn supertypes(text: &str, class: &str) -> Vec<String> {
+    let Some(at) = class_offset(text, class) else {
+        return Vec::new();
+    };
+    let head = &text[at + class.len()..];
+    let head = &head[..head.find('{').unwrap_or(head.len()).min(600)];
+    // Kotlin: after the `:` that follows the constructor; Java: after extends / implements
+    let list: String = if let Some(i) = top_level_colon(head) {
+        head[i + 1..].to_string()
+    } else {
+        head.replace(" extends ", " , ")
+            .replace(" implements ", " , ")
+    };
+    let package = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("package "))
+        .map(|p| p.trim_end_matches(';').trim().to_string())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for part in split_top(&list) {
+        let name: String = part
+            .trim()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+            .collect();
+        if name.is_empty()
+            || !name
+                .rsplit('.')
+                .next()
+                .is_some_and(|s| s.starts_with(char::is_uppercase))
+        {
+            continue;
+        }
+        let first = name.split('.').next().unwrap_or(&name);
+        let imported = text.lines().find_map(|l| {
+            let l = l
+                .trim()
+                .strip_prefix("import ")?
+                .trim_end_matches(';')
+                .trim();
+            (l.rsplit('.').next() == Some(first)).then(|| l.to_string())
+        });
+        let q = match imported {
+            Some(i) => format!("{i}{}", &name[first.len()..]),
+            None if name.contains('.') && name.starts_with(char::is_lowercase) => name.clone(),
+            None if package.is_empty() => name.clone(),
+            None => format!("{package}.{name}"),
+        };
+        if !out.contains(&q) {
+            out.push(q);
+        }
+    }
+    out
+}
+
+/// The `:` of a Kotlin supertype list (outside brackets).
+fn top_level_colon(head: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, c) in head.char_indices() {
+        match c {
+            '(' | '<' => depth += 1,
+            ')' | '>' => depth -= 1,
+            ':' if depth == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Splits at commas outside brackets.
+fn split_top(s: &str) -> Vec<&str> {
+    let (mut out, mut depth, mut from) = (Vec::new(), 0i32, 0);
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '<' => depth += 1,
+            ')' | '>' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(&s[from..i]);
+                from = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[from..]);
+    out
+}
+
+/// The class file of `qualified` in a jar: the package as folders, nested classes joined by `$`
+/// (`android/app/Notification$Builder.class`).
+pub fn class_entry(qualified: &str) -> String {
+    let parts: Vec<&str> = qualified.split('.').collect();
+    let k = parts
+        .iter()
+        .position(|s| s.starts_with(char::is_uppercase))
+        .unwrap_or(parts.len().saturating_sub(1));
+    format!("{}/{}.class", parts[..k].join("/"), parts[k..].join("$"))
+        .trim_start_matches('/')
+        .to_string()
 }
 
 /// The declarations of `call.member` in `class` of a library source (`text` of `path`) that the
@@ -380,69 +587,137 @@ pub fn find_member(path: &Path, text: &str, class: &str, call: &LibCall) -> Vec<
 }
 
 /// How well a parameter of type `param` (as spelled in Java or Kotlin source) takes an argument
-/// whose type and supertypes are `arg` (simple names, Kotlin spelling): 3 its own type, 2 a
-/// supertype or a widening, 1 a parameter that takes anything, None when it does not take it.
+/// whose type and supertypes are `arg` (simple names, Kotlin spelling, nearest first), like the
+/// compiler ranks overloads: 100 its own type (a Kotlin `Int` is Java `int`), 90 less one per
+/// step for a supertype, 50 a widening (a number literal), 40 a box (`Int` to `Integer`), 10 a
+/// parameter that takes anything (`Object`, a type parameter, a function type for a lambda),
+/// None when it does not take it.
 fn match_score(param: &str, arg: &[String]) -> Option<usize> {
+    if param.contains("->") {
+        return Some(10); // a function type: what a lambda is, whose type is not read
+    }
     let p = simple_type(param);
-    if arg.first() == Some(&p) {
-        return Some(3);
+    let own = arg.first()?;
+    if *own == p || java_primitive(own) == Some(p.as_str()) || array_of(own) == Some(p.as_str()) {
+        return Some(100);
+    }
+    if p.ends_with("[]") && own == "Array" {
+        return Some(90); // Array<T>: the element type is not read
+    }
+    if let Some(d) = arg.iter().skip(1).position(|a| *a == p) {
+        return Some(89 - d.min(39));
+    }
+    // Kotlin converts only a number literal, and only between whole numbers
+    let widen: &[&str] = match own.as_str() {
+        "Int" => &["long", "short", "byte"],
+        "String" => &["CharSequence"],
+        _ => &[],
+    };
+    if widen.contains(&p.as_str()) {
+        return Some(50);
+    }
+    let boxed: &[&str] = match own.as_str() {
+        "Int" => &["Integer", "Long", "Short", "Byte"],
+        "Long" => &["Long"],
+        "Float" => &["Float"],
+        "Double" => &["Double"],
+        "Boolean" => &["Boolean"],
+        "Char" => &["Character"],
+        _ => &[],
+    };
+    if boxed.contains(&p.as_str()) {
+        return Some(40);
     }
     if p.is_empty()
         || p == "Object"
         || p == "Any"
         || (p.len() == 1 && p.starts_with(char::is_uppercase))
     {
-        return Some(1); // anything, or a type parameter
+        return Some(10);
     }
-    arg.iter()
-        .any(|a| {
-            a == &p
-                || match a.as_str() {
-                    // a number literal widens to a bigger Java type; a Kotlin Int to its boxes
-                    "Int" => [
-                        "int", "Integer", "long", "Long", "short", "Short", "byte", "Byte",
-                    ]
-                    .contains(&p.as_str()),
-                    "Long" => ["long", "Long"].contains(&p.as_str()),
-                    "Float" => ["float", "Float"].contains(&p.as_str()),
-                    "Double" => ["double", "Double"].contains(&p.as_str()),
-                    "Boolean" => ["boolean", "Boolean"].contains(&p.as_str()),
-                    "Char" => ["char", "Character"].contains(&p.as_str()),
-                    "String" => ["String", "CharSequence"].contains(&p.as_str()),
-                    _ => false,
-                }
-        })
-        .then_some(2)
+    None
 }
 
-/// `@NonNull final java.util.List<String>...` gives `List`; `String?` gives `String`.
+/// The Java primitive a Kotlin number, boolean or char type is.
+fn java_primitive(k: &str) -> Option<&'static str> {
+    Some(match k {
+        "Int" => "int",
+        "Long" => "long",
+        "Short" => "short",
+        "Byte" => "byte",
+        "Float" => "float",
+        "Double" => "double",
+        "Boolean" => "boolean",
+        "Char" => "char",
+        _ => return None,
+    })
+}
+
+/// The Java array a Kotlin primitive array is (`IntArray` is `int[]`).
+fn array_of(k: &str) -> Option<&'static str> {
+    Some(match k {
+        "IntArray" => "int[]",
+        "LongArray" => "long[]",
+        "ByteArray" => "byte[]",
+        "CharArray" => "char[]",
+        "FloatArray" => "float[]",
+        "DoubleArray" => "double[]",
+        "BooleanArray" => "boolean[]",
+        "ShortArray" => "short[]",
+        _ => return None,
+    })
+}
+
+/// `@NonNull final java.util.List<String>` gives `List`; `String?` gives `String`; `String[]`
+/// stays `String[]`; a vararg `String...` gives `String` (it takes single values).
 fn simple_type(ty: &str) -> String {
     let words: Vec<&str> = ty
         .split_whitespace()
         .filter(|w| !w.starts_with('@') && !matches!(*w, "final" | "vararg" | "out" | "in"))
         .collect();
     let t = words.last().copied().unwrap_or("");
+    let array = t.ends_with("[]");
     let t = t.split('<').next().unwrap_or(t);
     let t = t
         .trim_end_matches("...")
         .trim_end_matches("[]")
         .trim_end_matches('?');
-    t.rsplit('.').next().unwrap_or(t).to_string()
+    let base = t.rsplit('.').next().unwrap_or(t);
+    if array {
+        format!("{base}[]")
+    } else {
+        base.to_string()
+    }
 }
 
-/// A stub for a class without source, from its class file: its public methods as Java
-/// declarations, one per line, so Go to declaration has a line to show.
+/// A stub for a class without source, from its class file: its public constructors and methods as
+/// Java declarations, one per line, so Go to declaration has a line to show.
 pub fn stub(class_bytes: &[u8], note: &str) -> Option<String> {
     let c = crate::classfile::parse(class_bytes)?;
     let name = c.name.replace('/', ".");
     let (pkg, simple) = name.rsplit_once('.').unwrap_or(("", &name));
+    let simple = simple.rsplit('$').next().unwrap_or(simple);
     let mut out = format!("// {note}\n");
     if !pkg.is_empty() {
         out.push_str(&format!("package {pkg};\n\n"));
     }
-    out.push_str(&format!("public class {simple} {{\n"));
-    for (m, desc) in &c.methods {
-        out.push_str(&format!("    public {};\n", java_signature(m, desc)));
+    let kind = match c.kind {
+        crate::classfile::ClassKind::Interface => "interface",
+        crate::classfile::ClassKind::Enum => "enum",
+        crate::classfile::ClassKind::Annotation => "@interface",
+        crate::classfile::ClassKind::Class => "class",
+    };
+    out.push_str(&format!("public {kind} {simple} {{\n"));
+    for (m, desc, access) in &c.methods {
+        let stat = if access & 0x0008 != 0 { "static " } else { "" };
+        let sig = if m == "<init>" {
+            java_signature(simple, desc)
+                .split_once(' ')
+                .map_or(String::new(), |(_, s)| s.to_string())
+        } else {
+            java_signature(m, desc)
+        };
+        out.push_str(&format!("    public {stat}{sig};\n"));
     }
     out.push_str("}\n");
     Some(out)
@@ -595,6 +870,101 @@ mod tests {
     }
 
     #[test]
+    fn overloads_rank_like_the_compiler() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // a Kotlin Int is Java int: append(int) beats append(long) and append(Integer)
+        let sb = "class StringBuilder {\n    public StringBuilder append(long l) { return this; }\n    public StringBuilder append(int i) { return this; }\n    public StringBuilder append(Integer i) { return this; }\n    public StringBuilder append(Object o) { return this; }\n}\n";
+        let mut c = call("append", &[&["Int"]]);
+        c.class = "StringBuilder".into();
+        let f = find_member(Path::new("SB.java"), sb, "StringBuilder", &c);
+        assert!(
+            f.len() == 1 && sb[f[0]..].starts_with("append(int i)"),
+            "{f:?}"
+        );
+        // the nearest supertype wins: Leaf goes to f(Mid), not f(Base)
+        let h = "class H {\n    void f(Base b) {}\n    void f(Mid m) {}\n}\n";
+        let mut c = call("f", &[&["Leaf", "Mid", "Base"]]);
+        c.class = "H".into();
+        let f = find_member(Path::new("H.java"), h, "H", &c);
+        assert!(f.len() == 1 && h[f[0]..].starts_with("f(Mid m)"));
+        // String and String[] are told apart; IntArray is int[]; a lambda fits a function type
+        assert!(match_score("String[]", &s(&["String"])).is_none());
+        assert_eq!(match_score("int[]", &s(&["IntArray"])), Some(100));
+        assert!(match_score("(Int) -> Unit", &s(&[])).is_some());
+        // a real tie: two declarations that fit as well
+        let t2 = "class T {\n    void g(Object a) {}\n    void g(Object b) {}\n}\n";
+        let mut c = call("g", &[&["Thing"]]);
+        c.class = "T".into();
+        assert_eq!(find_member(Path::new("T.java"), t2, "T", &c).len(), 2);
+    }
+
+    #[test]
+    fn coordinates_that_could_leave_the_cache_are_refused() {
+        assert!(cached_sources_jar("androidx.core:core:1.13.1").is_some());
+        for bad in [
+            "..:x:1",
+            "a:..:1",
+            "a:b:../../x",
+            "a/b:c:1",
+            "a:b:1:extra",
+            "a:b",
+            "a:b:1 2",
+        ] {
+            assert!(cached_sources_jar(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn supertypes_nested_classes_and_jar_entries() {
+        let java = "package android.app;\n\nimport android.os.Parcelable;\n\npublic class Notification implements Parcelable {\n    public static class Builder extends BaseBuilder<Builder> implements Cloneable {}\n}\n";
+        assert_eq!(
+            supertypes(java, "Builder"),
+            ["android.app.BaseBuilder", "android.app.Cloneable"]
+        );
+        assert_eq!(supertypes(java, "Notification"), ["android.os.Parcelable"]);
+        let kt = "package a.b\n\nimport c.d.Base\n\nclass Leaf(x: Int) : Base(x), Comparable<Leaf> {\n}\n";
+        assert_eq!(supertypes(kt, "Leaf"), ["c.d.Base", "a.b.Comparable"]);
+        assert_eq!(
+            class_entry("android.app.Notification.Builder"),
+            "android/app/Notification$Builder.class"
+        );
+        assert_eq!(
+            class_entry("android.location.LocationManager"),
+            "android/location/LocationManager.class"
+        );
+        assert!(declares("class Inner {}", "Inner") && !declares("class InnerFoo {}", "Inner"));
+        // a Kotlin Multiplatform sources jar keeps files under a source set folder
+        let d = std::env::temp_dir().join(format!("dl-kmp-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let jar = d.join("x-sources.jar");
+        let mut z = zip::ZipWriter::new(std::fs::File::create(&jar).unwrap());
+        for (n, b) in [
+            (
+                "commonMain/demo/geo/Locator.kt",
+                "package demo.geo\nclass Locator\n",
+            ),
+            (
+                "commonMain/demo/geo/Other.kt",
+                "package demo.geo\nclass Spot\n",
+            ),
+        ] {
+            z.start_file(n, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut z, b.as_bytes()).unwrap();
+        }
+        z.finish().unwrap();
+        assert_eq!(
+            jar_entry(&jar, "demo.geo.Locator").as_deref(),
+            Some("commonMain/demo/geo/Locator.kt")
+        );
+        assert_eq!(
+            jar_entry(&jar, "demo.geo.Spot").as_deref(),
+            Some("commonMain/demo/geo/Other.kt")
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn types_and_literals() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         assert!(accepts_("long", &s(&["Int"])), "a number literal widens");
@@ -606,15 +976,22 @@ mod tests {
         assert!(accepts_("T", &s(&["Anything"])));
         assert!(accepts_("List<String>?", &s(&["List"])));
         assert!(!accepts_("PendingIntent", &s(&["LocationListener"])));
+        assert_eq!(compile_sdk_in("branchCompileSdk = \"36\""), Some(36));
+        assert_eq!(compile_sdk_in("    compileSdk = 35"), Some(35));
+        assert_eq!(compile_sdk_in("compileSdkVersion(34)"), Some(34));
         assert_eq!(
-            number_after_compile_sdk("branchCompileSdk = \"36\""),
-            Some(36)
-        );
-        assert_eq!(number_after_compile_sdk("    compileSdk = 35"), Some(35));
-        assert_eq!(number_after_compile_sdk("compileSdkVersion(34)"), Some(34));
-        assert_eq!(
-            number_after_compile_sdk("compileSdk = libs.versions.x.get().toInt()"),
+            compile_sdk_in("compileSdk = libs.versions.x.get().toInt()"),
             None
+        );
+        assert_eq!(
+            compile_sdk_in("android {\n    compileSdk {\n        version = release(36)\n    }\n}"),
+            Some(36),
+            "the new DSL"
+        );
+        assert_eq!(
+            compile_sdk_in("// compileSdk = 99\ncompileSdkExtension = 12\ncompileSdk = 35\n"),
+            Some(35),
+            "comments and the extension level are not the SDK"
         );
         assert_eq!(
             java_signature(
