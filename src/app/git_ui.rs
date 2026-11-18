@@ -49,7 +49,7 @@ pub(super) struct GitState {
     /// The panel's change the last jump went to (an index into its changes in the current layout).
     pub(super) panel_cur: Option<usize>,
     /// Rows of the panel's change that flashes, and since when.
-    panel_flash: Option<(std::ops::Range<usize>, Instant)>,
+    pub(super) panel_flash: Option<(std::ops::Range<usize>, Instant)>,
     /// A row to scroll to the middle of the panel next frame.
     panel_scroll: Option<usize>,
     /// The panel's changes, counted for the layout (true: unified) they are in.
@@ -972,8 +972,8 @@ fn panel_ranges(lines: &[String], unified: bool) -> Vec<std::ops::Range<usize>> 
     }
     let mut in_hunk = false;
     super::diff_view::changes(lines.iter().map(|l| {
-        if l.starts_with("diff --git") {
-            in_hunk = false;
+        if l.starts_with("diff --") {
+            in_hunk = false; // `diff --git`, or `diff --cc` of a merge
         } else if l.starts_with("@@") {
             in_hunk = true;
         }

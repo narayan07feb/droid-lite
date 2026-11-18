@@ -1973,6 +1973,16 @@ impl App {
 
     // ---------- keyboard ----------
 
+    /// The docked diff panel is open and drawn (focus mode and the start screen hide it).
+    pub(super) fn panel_on_screen(&self) -> bool {
+        self.has_diff() && !self.panels_hidden()
+    }
+
+    /// Focus mode, or no project yet: the side panels are not drawn.
+    fn panels_hidden(&self) -> bool {
+        self.focus || (self.project.is_none() && self.indexing.is_none())
+    }
+
     /// The Next / Previous change shortcuts as text (made once per keymap, not every frame).
     pub(super) fn change_keys(&mut self) -> [String; 2] {
         if self.jump_keys.as_ref().is_none_or(|(k, _)| *k != self.keymap) {
@@ -2057,7 +2067,7 @@ impl App {
     /// navigation bar: `app › src › … › UserCard.kt › UserCard`. Click a declaration to jump to it.
     fn breadcrumb(&mut self, ui: &mut Ui) -> egui::Id {
         // while the docked diff panel is on screen the keys move through it, not this tab
-        let jump_keys = if self.has_diff() && !self.focus {
+        let jump_keys = if self.panel_on_screen() {
             [String::new(), String::new()]
         } else {
             self.change_keys()
@@ -4792,7 +4802,7 @@ impl eframe::App for App {
                 .show(ui, |ui| self.top_bar(ui))
         });
         // focus mode, and the welcome screen before a project opens, show no side panels
-        let hidden = self.focus || (self.project.is_none() && self.indexing.is_none());
+        let hidden = self.panels_hidden();
         watch.stage("status bar", || {
             egui::Panel::bottom("status")
                 .frame(

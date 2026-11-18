@@ -7980,7 +7980,20 @@ fn e2e_diff_walk_passes_over_a_file_it_cannot_open_and_comes_back_when_nothing_i
     });
     let s = &h.state().status;
     assert!(s.contains("UserCard.kt (no changes)") && s.contains("Blob.dat (cannot open)"), "{s}");
-    assert_eq!(at_line(h.state()), (user, 2), "where the walk started");
+    assert_eq!(at_line(h.state()), (user.clone(), 2), "where the walk started");
+    // the tab it opened only to pass over is closed again, and neither file is in Recent
+    assert!(!h.state().tabs.iter().any(|t| t.path == card));
+    assert!(!h.state().recent.contains(&card) && !h.state().recent.contains(&bin));
+    // Previous before User.kt's first change walks back into build.gradle.kts at its last change
+    key(&mut h, Modifiers::SHIFT, Key::F7);
+    wait(&mut h, "back in build.gradle.kts", |a| {
+        a.tabs[a.active].path == gradle && a.tabs[a.active].diff.cur == Some(0)
+    });
+    steps(&mut h, 3);
+    assert_eq!(at_line(h.state()), (gradle.clone(), 0));
+    // Back returns to where that walk started (the walk that found nothing added no entry)
+    key(&mut h, Modifiers::COMMAND, Key::OpenBracket);
+    assert_eq!(at_line(h.state()).0, user);
 }
 
 #[test]
@@ -8007,6 +8020,7 @@ fn e2e_diff_jump_details_alias_keys_dropped_walk_and_panel_previous() {
         forward: true,
         origin: (user.clone(), 0),
         passed: Vec::new(),
+        opened: Vec::new(),
     });
     steps(&mut h, 2);
     assert!(h.state().land_jump.is_none());
@@ -8024,4 +8038,55 @@ fn e2e_diff_jump_details_alias_keys_dropped_walk_and_panel_previous() {
     steps(&mut h, 3);
     key(&mut h, Modifiers::SHIFT, Key::F7);
     h.get_by_label("Change 3 of 3");
+}
+
+#[test]
+fn e2e_diff_jump_over_a_removal_at_the_end_and_two_jumps_in_one_frame() {
+    let f = Fixture::new("diffjumpend");
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    // line 3 changed, the last two lines removed, and no newline at the end
+    std::fs::write(
+        &user,
+        "package com.demo.data\n\ndata class User(val name: String, val age: Int)\n\nclass UserRepository {",
+    )
+    .unwrap();
+    let mut h = f.harness();
+    open(&mut h, &user);
+    wait(&mut h, "git status", |a| a.git.changes.as_ref().is_some_and(|c| c.repo));
+    h.get_by_label("Diff").click();
+    wait(&mut h, "compared", |a| diff_view(a).is_some_and(|v| v.change_rows.len() == 2));
+    // two jumps before the editor paints (an arrow click and F7 in one frame): the second
+    // change, not the first one twice
+    h.state_mut().jump_change(true);
+    h.state_mut().jump_change(true);
+    steps(&mut h, 3);
+    assert_eq!(tab(&h).diff.cur, Some(1), "the removal at the end");
+    // past it: no other file, so it stays and says so (it does not stick on the removal)
+    key(&mut h, Modifiers::NONE, Key::F7);
+    assert!(h.state().status.starts_with("That was the last change"), "{}", h.state().status);
+    key(&mut h, Modifiers::SHIFT, Key::F7);
+    assert_eq!(tab(&h).diff.cur, Some(0));
+    assert_eq!(at_line(h.state()), (user, 2));
+}
+
+#[test]
+fn e2e_diff_panel_counts_rows_of_the_layout_it_shows_and_a_new_diff() {
+    let f = Fixture::new("diffpanelrows");
+    let mut h = f.harness();
+    steps(&mut h, 2);
+    // two replace hunks: unified lines 1-2 and 4-5, side-by-side rows 1 and 3
+    h.state_mut().show_diff_text("Diff: rows".into(), "@@ -1,3 +1,3 @@\n-a\n+A\n x\n-b\n+B\n".into());
+    steps(&mut h, 3);
+    key(&mut h, Modifiers::NONE, Key::F7);
+    key(&mut h, Modifiers::NONE, Key::F7);
+    assert_eq!(h.state().git.panel_flash.as_ref().map(|(r, _)| r.clone()), Some(3..4), "side by side");
+    h.get_by_label("Side by side").click();
+    steps(&mut h, 3);
+    key(&mut h, Modifiers::NONE, Key::F7);
+    key(&mut h, Modifiers::NONE, Key::F7);
+    assert_eq!(h.state().git.panel_flash.as_ref().map(|(r, _)| r.clone()), Some(4..6), "unified");
+    // another diff: counted afresh
+    h.state_mut().show_diff_text("Diff: one".into(), "@@ -1 +1 @@\n-a\n+A\n".into());
+    steps(&mut h, 3);
+    h.get_by_label("1 change");
 }
