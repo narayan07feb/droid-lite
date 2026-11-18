@@ -35,6 +35,8 @@ type ApiCache = Arc<std::sync::Mutex<Option<(PathBuf, Option<u32>)>>>;
 #[derive(Default)]
 pub(super) struct Fetches {
     running: Vec<(String, Receiver<Result<(), String>>)>,
+    /// What each download is, for the status line ("Android 36 SDK sources").
+    labels: HashMap<String, String>,
     /// How each download ended, and when.
     pub ended: HashMap<String, (Result<(), String>, Instant)>,
     /// The download key and the jump to make once it ends.
@@ -317,8 +319,10 @@ impl App {
         let label = fetch.label();
         // it ended while the lookup ran (another jump started it): look again, which now sees how
         // it ended (the source, or the stub), never a second download
+        // done, and its result still on disk (a deleted cache downloads again), or failed lately
         if let Some((r, at)) = self.fetches.ended.get(&key)
-            && (r.is_ok() || at.elapsed() < RETRY_AFTER)
+            && (r.is_ok() && libsrc::already_there(&fetch)
+                || r.is_err() && at.elapsed() < RETRY_AFTER)
         {
             if open {
                 self.look(jump, false);
@@ -344,6 +348,7 @@ impl App {
                 c.request_repaint();
             }
         });
+        self.fetches.labels.insert(key.clone(), label.clone());
         self.fetches.running.push((key, rx));
         self.fetches.started += 1;
     }
@@ -370,7 +375,10 @@ impl App {
         });
         for (key, r) in done {
             self.status = match &r {
-                Ok(()) => format!("Downloaded {key} sources"),
+                Ok(()) => format!(
+                    "Downloaded {}",
+                    self.fetches.labels.get(&key).unwrap_or(&key)
+                ),
                 Err(e) => format!("Download failed: {e}"),
             };
             self.fetches.ended.insert(key.clone(), (r, Instant::now()));
@@ -775,13 +783,14 @@ impl Lookup {
             .iter()
             .map(|l| (l.score, std::cmp::Reverse(l.depth)))
             .max();
-        // every known argument of the best fit its own type or a literal's widening (`0` to
-        // `long`): no farther overload can fit better (one taken as an `Object` can)
+        // every known argument of the best fit its own type or nearly (a box): no farther
+        // overload can fit better (one taken by a widening, `1` to `long`, or as an `Object`
+        // can: a farther `set(int)` beats `set(long)`)
         let perfect = best.is_some_and(|(s, std::cmp::Reverse(d))| {
             levels
                 .iter()
                 .filter(|l| l.score == s && l.depth == d)
-                .all(|l| l.worst >= 50)
+                .all(|l| l.worst > 50)
         });
         let exact: Vec<(PathBuf, usize, String)> = match best {
             Some((s, std::cmp::Reverse(d))) => levels
@@ -894,6 +903,11 @@ impl Lookup {
                     None,
                 )
             }
+            // a platform class (android.x.Y) absent from the SDK (newer than the compile SDK):
+            // never a project function of the name
+            Looked::NotFound(w, Some(_)) if seen.is_empty() && self.may_be_platform() => {
+                Looked::NotFound(w, None)
+            }
             Looked::NotFound(w, Some((mut c, from))) if seen.is_empty() && !c.builtin => {
                 c.fallback = true;
                 Looked::NotFound(w, Some((c, from)))
@@ -919,7 +933,16 @@ impl Lookup {
             .named(&call.member)
             .filter(|s| !s.kind.is_type())
             .collect();
-        syms.sort_by_key(|s| !self.jump.imports.contains(&s.qualified()));
+        // only those in scope when any is (imported by name or by a star): an unrelated
+        // library's function of the same name is not a second answer, nor in the way of the
+        // imported one's download
+        let in_scope = |s: &crate::libs::LibSym| {
+            self.jump.imports.contains(&s.qualified())
+                || call.stars.iter().any(|p| **p == *s.package)
+        };
+        if syms.iter().any(|s| in_scope(s)) {
+            syms.retain(|s| in_scope(s));
+        }
         for s in syms.into_iter().take(MAX_EXTENSION_FILES) {
             // its source: in the Gradle cache's sources jar, else in a downloaded one (a
             // function's file is found by what it declares: `Ext.kt` holds `ExtKt`'s functions)

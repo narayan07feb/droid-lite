@@ -517,6 +517,7 @@ pub fn jar_entry(jar: &Path, qualified: &str) -> Option<String> {
     names
         .iter()
         .filter(|n| (n.ends_with(".kt") || n.ends_with(".java")) && in_dir(n))
+        .take(MAX_PACKAGE_FILES)
         .find(|n| {
             let Ok(e) = z.by_name(n) else {
                 return false;
@@ -832,11 +833,17 @@ pub fn find_member(path: &Path, text: &str, class: &str, call: &LibCall) -> Memb
     let class_params = class_offset(text, simple)
         .map(|at| type_params(&text[at + simple.len()..]))
         .unwrap_or_default();
-    rank(&ds, args, call.java, |d| {
-        let mut v = class_params.clone();
-        v.extend(method_type_params(text, d.offset));
-        v
-    })
+    rank(
+        &ds,
+        args,
+        call.java,
+        path.extension().is_some_and(|e| e == "java"),
+        |d| {
+            let mut v = class_params.clone();
+            v.extend(method_type_params(text, d.offset));
+            v
+        },
+    )
 }
 
 /// The most Kotlin files of one package read to find a function's file.
@@ -973,6 +980,7 @@ fn rank(
     ds: &[&crate::kotlin::Decl],
     args: &[Vec<String>],
     java: bool,
+    java_src: bool,
     tparams: impl Fn(&crate::kotlin::Decl) -> Vec<String>,
 ) -> Members {
     let count = |d: &&&crate::kotlin::Decl| {
@@ -999,7 +1007,7 @@ fn rank(
                 } else {
                     p.ty.as_str()
                 };
-                let s = match_score(ty, a, &tp, java)?;
+                let s = match_score(ty, a, &tp, java, java_src)?;
                 score += s;
                 worst = worst.min(s);
             }
@@ -1143,7 +1151,9 @@ pub fn find_extension(path: &Path, text: &str, receivers: &[String], call: &LibC
         })
         .collect();
     match &call.args {
-        Some(args) => rank(&ds, args, call.java, |d| method_type_params(text, d.offset)),
+        Some(args) => rank(&ds, args, call.java, false, |d| {
+            method_type_params(text, d.offset)
+        }),
         None => Members {
             exact: !ds.is_empty(),
             offsets: ds.iter().map(|d| d.offset).collect(),
@@ -1320,14 +1330,23 @@ const MAX_AAR_JAR: u64 = 64 * 1024 * 1024;
 /// step for a supertype, 50 a widening (a number literal), 40 a box (`Int` to `Integer`), 10 a
 /// parameter that takes anything (`Object`, a type parameter, a function type for a lambda),
 /// None when it does not take it.
-fn match_score(param: &str, arg: &[String], tparams: &[String], java: bool) -> Option<usize> {
+/// How well an argument of type `arg` (its type, then supertypes) fits parameter `param` of a
+/// declaration in a Java source (`java_src`; else Kotlin), called from Java (`java`) or Kotlin.
+fn match_score(
+    param: &str,
+    arg: &[String],
+    tparams: &[String],
+    java: bool,
+    java_src: bool,
+) -> Option<usize> {
     if param.contains("->") {
         return Some(10); // a function type: what a lambda is, whose type is not read
     }
     let p = simple_type(param);
     let own = arg.first()?;
     // a Kotlin `Long` is Java's `long` first (javac's first phase); `java.lang.Long` after
-    if *own == p
+    if java_src
+        && *own == p
         && java_primitive(own).is_some()
         && matches!(
             p.as_str(),
@@ -1346,8 +1365,10 @@ fn match_score(param: &str, arg: &[String], tparams: &[String], java: bool) -> O
         return Some(89 - d.min(39));
     }
     // a Kotlin number is a Java Number and Comparable
+    // a Kotlin number is a Java Number and Comparable: after a widening (javac takes `long`
+    // for an `int` before `Number`), before `Object`
     if kotlin_supers(own).contains(&p.as_str()) {
-        return Some(80);
+        return Some(40);
     }
     // Kotlin converts only a number literal, and only between whole numbers; the argument's type
     // does not say it was a literal, so any Int may (a variable that does not fit would not
@@ -1375,10 +1396,12 @@ fn match_score(param: &str, arg: &[String], tparams: &[String], java: bool) -> O
         "Int" => &["float", "double"],
         "Long" => &["float", "double"],
         "Float" => &["double"],
+        // a char, short or byte widens to int first, then long, float, double
+        "Char" | "Short" | "Byte" => &["int", "long", "float", "double"],
         _ => &[],
     };
-    if java && java_widen.contains(&p.as_str()) {
-        return Some(45);
+    if java && let Some(k) = java_widen.iter().position(|w| *w == p) {
+        return Some(if own != "Int" && k == 0 { 50 } else { 45 });
     }
     let boxed: &[&str] = match own.as_str() {
         "Int" => &["Long", "Short", "Byte"],
@@ -1649,7 +1672,7 @@ mod tests {
     }
 
     fn accepts_(param: &str, arg: &[String]) -> bool {
-        match_score(param, arg, &[], false).is_some()
+        match_score(param, arg, &[], false, true).is_some()
     }
 
     #[test]
@@ -1671,12 +1694,12 @@ mod tests {
         let f = fm(Path::new("H.java"), h, "H", &c);
         assert!(f.len() == 1 && h[f[0]..].starts_with("f(Mid m)"));
         // String and String[] are told apart; IntArray is int[]; a lambda fits a function type
-        assert!(match_score("String[]", &s(&["String"]), &[], false).is_none());
+        assert!(match_score("String[]", &s(&["String"]), &[], false, true).is_none());
         assert_eq!(
-            match_score("int[]", &s(&["IntArray"]), &[], false),
+            match_score("int[]", &s(&["IntArray"]), &[], false, true),
             Some(100)
         );
-        assert!(match_score("(Int) -> Unit", &s(&[]), &[], false).is_some());
+        assert!(match_score("(Int) -> Unit", &s(&[]), &[], false, true).is_some());
         // a real tie: two declarations that fit as well
         let t2 = "class T {\n    public void g(Object a) {}\n    public void g(Object b) {}\n}\n";
         let mut c = call("g", &[&["Thing"]]);
@@ -1750,16 +1773,44 @@ mod tests {
     #[test]
     fn a_kotlin_number_is_a_java_number() {
         let int = ["Int".to_string()];
-        assert_eq!(match_score("Number", &int, &[], false), Some(80));
-        assert_eq!(match_score("Comparable", &int, &[], false), Some(80));
-        assert_eq!(match_score("String", &int, &[], false), None);
+        assert_eq!(match_score("Number", &int, &[], false, true), Some(40));
+        let ch = ["Char".to_string()];
+        assert_eq!(
+            match_score("int", &ch, &[], true, true),
+            Some(50),
+            "a Java char widens to int"
+        );
+        assert_eq!(
+            match_score("int", &ch, &[], false, true),
+            None,
+            "not in Kotlin"
+        );
+        let d = ["Double".to_string()];
+        assert_eq!(
+            match_score("Double", &d, &[], false, false),
+            Some(100),
+            "in a Kotlin source Double is Double"
+        );
+        assert_eq!(
+            match_score("Double", &d, &[], false, true),
+            Some(60),
+            "in Java, java.lang.Double"
+        );
+        assert!(
+            match_score("long", &int, &[], true, true)
+                > match_score("Number", &int, &[], true, true)
+        );
+        assert_eq!(match_score("Comparable", &int, &[], false, true), Some(40));
+        assert_eq!(match_score("String", &int, &[], false, true), None);
         let long = ["Long".to_string()];
         assert!(
-            match_score("Long", &long, &[], false) < match_score("long", &long, &[], false),
+            match_score("Long", &long, &[], false, true)
+                < match_score("long", &long, &[], false, true),
             "javac's first phase: the primitive before its box"
         );
         assert!(
-            match_score("Integer", &int, &[], false) > match_score("long", &int, &[], false),
+            match_score("Integer", &int, &[], false, true)
+                > match_score("long", &int, &[], false, true),
             "Int is an Integer"
         );
     }
@@ -1911,14 +1962,14 @@ mod tests {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         assert!(accepts_("long", &s(&["Int"])), "a number literal widens");
         // a Java caller widens an int to a float too, after a long (like javac)
-        let js = |p: &str, a: &str| match_score(p, &s(&[a]), &[], true);
+        let js = |p: &str, a: &str| match_score(p, &s(&[a]), &[], true, true);
         assert!(
             js("float", "Int") < js("long", "Int"),
             "javac: int to long before float"
         );
         assert!(js("double", "Float").is_some() && js("double", "Long").is_some());
         assert_eq!(
-            match_score("float", &s(&["Int"]), &[], false),
+            match_score("float", &s(&["Int"]), &[], false, true),
             None,
             "kotlinc does not widen"
         );

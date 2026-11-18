@@ -3368,7 +3368,7 @@ impl App {
                         if clicked {
                             self.active = i;
                             self.completion = None;
-                            self.fetches.cancel(); // a library jump still waiting stays put
+                            self.fetches.cancel(); // a library jump still waiting is dropped
                         }
                         if closed {
                             close = Some(i);

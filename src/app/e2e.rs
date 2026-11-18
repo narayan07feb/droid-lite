@@ -9272,3 +9272,54 @@ fn e2e_goto_never_opens_a_package_private_overload() {
     steps(&mut h, 3);
     assert!(tab(&h).text[tab(&h).cursor..].starts_with("f(Object o)"));
 }
+
+#[test]
+fn e2e_goto_an_extension_takes_the_imported_library_s_one_even_when_it_must_be_downloaded() {
+    // spin on Locator in two libraries: base (sources here) and geo2 (sources only in the
+    // repository); the file imports geo2's
+    let base_ext = ("demo/geo/BaseExtKt.java", "package demo.geo;\n\npublic final class BaseExtKt {\n    public static void spin(Locator l, int n) {}\n}\n");
+    let geo_ext = ("demo/geo2/ExtKt.java", "package demo.geo2;\n\nimport demo.geo.Locator;\n\npublic final class ExtKt {\n    public static void spin(Locator l, int n) {}\n}\n");
+    let java = [("demo/geo/Locator.java", GEO_JAVA), ("demo/geo/Base.java", GEO_BASE), base_ext, geo_ext];
+    let Some((f, file)) = two_lib_fixture(
+        "gotoextscope",
+        &java,
+        &["demo/geo/Locator", "demo/geo/Base", "demo/geo/BaseExtKt"],
+        "package com.demo.loc\n\nimport demo.geo.Locator\nimport demo.geo2.spin\n\nfun find(l: Locator) {\n    l.spin(2)\n}\n",
+    ) else {
+        return;
+    };
+    let home = f.config.join("gradle-home/caches/modules-2/files-2.1/demo.lib");
+    let repo = f.config.join("repo/demo/lib");
+    let jar = |path: &Path, files: &[(&str, &str)]| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut z = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for (n, t) in files {
+            z.start_file(*n, zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut z, t.as_bytes()).unwrap();
+        }
+        z.finish().unwrap();
+    };
+    jar(&home.join("base/1.0/bbb/base-1.0-sources.jar"), &[("demo/geo/Locator.java", GEO_JAVA), ("demo/geo/Base.java", GEO_BASE), ("demo/geo/BaseExt.kt", "package demo.geo\n\nfun Locator.spin(n: Int) {}\n")]);
+    jar(&repo.join("geo/1.0/geo-1.0-sources.jar"), &[("demo/geo2/Ext.kt", "package demo.geo2\n\nimport demo.geo.Locator\n\nfun Locator.spin(n: Int) {}\n")]);
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 2);
+    goto_at(&mut h, &file, "spin(", 1);
+    wait(&mut h, "geo2's Ext.kt", |a| a.tabs[a.active].path.to_string_lossy().ends_with("!/demo/geo2/Ext.kt"));
+    assert_eq!(h.state().fetches.started, 1);
+}
+
+#[test]
+fn e2e_goto_on_an_android_class_the_sdk_lacks_never_opens_a_project_function() {
+    let Some((f, _sdk, _tracker)) = sdk_fixture("gotonewer", true) else { return };
+    let file = f.path("app/src/main/java/com/demo/loc/Newer.kt");
+    std::fs::write(
+        &file,
+        "package com.demo.loc\n\nimport android.location.GnssFuture\n\nfun g(x: GnssFuture) {\n    x.measure()\n}\n\nclass Mine {\n    fun measure() {}\n}\n",
+    )
+    .unwrap();
+    let mut h = f.harness();
+    goto_at(&mut h, &file, "measure()\n}", 0);
+    steps(&mut h, 20);
+    let t = tab(&h);
+    assert!(!t.text[t.cursor..].starts_with("measure() {}"), "not Mine.measure: {}", h.state().status);
+}
