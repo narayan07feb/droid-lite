@@ -73,6 +73,8 @@ pub enum Action {
     Translations,
     DeepLink,
     ToggleDiff,
+    NextChange,
+    PrevChange,
 }
 
 /// Every action, in the order the action palette lists them with an empty query.
@@ -120,6 +122,8 @@ pub const ALL: &[Action] = {
         ToggleBottom,
         FocusMode,
         ToggleDiff,
+        NextChange,
+        PrevChange,
         Save,
         CloseTab,
         NewWindow,
@@ -177,6 +181,8 @@ impl Action {
             Action::Translations => "Translations (strings in every language)",
             Action::DeepLink => "Open a deep link on the device",
             Action::ToggleDiff => "Toggle diff (the older version beside this file)",
+            Action::NextChange => "Next change (diff)",
+            Action::PrevChange => "Previous change (diff)",
         }
     }
 }
@@ -238,6 +244,10 @@ pub fn bindings(km: Keymap) -> Vec<(Action, KeyboardShortcut)> {
             (QuickFix, sc(ALT, Key::Enter)),
             (NewFile, sc(CMD, Key::N)),
             (ToggleDiff, sc(CTRL | SHIFT, Key::D)),
+            (NextChange, sc(Modifiers::NONE, Key::F7)),
+            (PrevChange, sc(SHIFT, Key::F7)),
+            (NextChange, sc(CMD | SHIFT, Key::CloseBracket)),
+            (PrevChange, sc(CMD | SHIFT, Key::OpenBracket)),
         ],
         Keymap::AndroidStudio => vec![
             (GotoClass, sc(CMD, Key::O)),
@@ -282,6 +292,10 @@ pub fn bindings(km: Keymap) -> Vec<(Action, KeyboardShortcut)> {
             (QuickFix, sc(ALT, Key::Enter)),
             (NewFile, sc(CMD, Key::N)),
             (ToggleDiff, sc(CTRL | SHIFT, Key::D)),
+            (NextChange, sc(Modifiers::NONE, Key::F7)),
+            (PrevChange, sc(SHIFT, Key::F7)),
+            (NextChange, sc(CMD | SHIFT, Key::CloseBracket)),
+            (PrevChange, sc(CMD | SHIFT, Key::OpenBracket)),
         ],
     };
     v.sort_by_key(|(_, s)| std::cmp::Reverse(count(s.modifiers)));

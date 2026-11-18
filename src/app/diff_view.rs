@@ -5,6 +5,11 @@
 //! The lines are paired by `git diff` and the side-by-side pairing of the docked diff panel
 //! ([`git_ui::side_rows`]), off the UI thread, after a short typing pause. A frame only paints
 //! the rows on screen.
+//!
+//! Next / Previous change (F7, Shift+F7, Cmd+Shift+] and Cmd+Shift+[, like Android Studio) move
+//! from change to change, centre each one and flash it; past the last change of a file they open
+//! the next changed file at its first change (and back the other way). The docked diff panel moves
+//! the same way through its changes, file after file.
 
 use super::{App, git_ui};
 use crate::git;
@@ -15,6 +20,9 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// How long a change flashes after a jump to it.
+pub(super) const FLASH: Duration = Duration::from_millis(900);
 
 /// Wait this long after the last keystroke before comparing again.
 const DEBOUNCE: Duration = Duration::from_millis(150);
@@ -367,6 +375,12 @@ pub(super) struct TabDiff {
     pub scroll: egui::Vec2,
     /// Where the left column was drawn last frame.
     pub left: Option<Rect>,
+    /// The change the last jump went to (an index into [`changes`] of the view).
+    pub cur: Option<usize>,
+    /// Rows of the change that flashes, and since when.
+    pub flash: Option<(Range<usize>, Instant)>,
+    /// Opened by a jump from another file: go to the first (true) or last change once compared.
+    pub land: Option<bool>,
 }
 
 type Key = (u64, Against, Option<String>, Option<String>);
@@ -381,7 +395,67 @@ impl TabDiff {
             self.rx = None;
             self.for_key = None;
             self.left = None;
+            self.cur = None;
         }
+    }
+
+    /// The flashing rows and how strong the flash is now (1 at the jump, fading to 0).
+    pub fn flash_now(&self) -> Option<(Range<usize>, f32)> {
+        let (rows, at) = self.flash.as_ref()?;
+        let left = 1.0 - at.elapsed().as_secs_f32() / FLASH.as_secs_f32();
+        (left > 0.0).then(|| (rows.clone(), left))
+    }
+}
+
+/// The changes of a diff: each run of rows that are not unchanged, as a range of row indexes.
+pub(super) fn changes(kinds: impl IntoIterator<Item = bool>) -> Vec<Range<usize>> {
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for (i, changed) in kinds.into_iter().enumerate() {
+        if !changed {
+            continue;
+        }
+        match out.last_mut() {
+            Some(r) if r.end == i => r.end = i + 1,
+            _ => out.push(i..i + 1),
+        }
+    }
+    out
+}
+
+/// Where a Next (`forward`) or Previous change goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Step {
+    /// To this change of the same file.
+    At(usize),
+    /// Past the last change: the next changed file (or, backwards, the previous one).
+    OtherFile,
+}
+
+/// The step from change `cur` (or, when none was picked yet, from row `at_row`, e.g. the cursor)
+/// over `changes`.
+pub(super) fn step(
+    changes: &[Range<usize>],
+    cur: Option<usize>,
+    at_row: usize,
+    forward: bool,
+) -> Step {
+    let n = changes.len();
+    let i = match (cur.filter(|&c| c < n), forward) {
+        (Some(c), true) => (c + 1 < n).then_some(c + 1),
+        (Some(c), false) => c.checked_sub(1),
+        (None, true) => changes.iter().position(|r| r.start >= at_row),
+        (None, false) => changes.iter().rposition(|r| r.start < at_row),
+    };
+    i.map_or(Step::OtherFile, Step::At)
+}
+
+/// "Change 2 of 5" for the toolbar ("5 changes" before a jump; empty without changes).
+pub(super) fn position(n: usize, cur: Option<usize>) -> String {
+    match cur.filter(|&c| c < n) {
+        _ if n == 0 => String::new(),
+        Some(c) => format!("Change {} of {n}", c + 1),
+        None if n == 1 => "1 change".into(),
+        None => format!("{n} changes"),
     }
 }
 
@@ -389,6 +463,8 @@ impl TabDiff {
 pub(super) enum Ctl {
     Toggle,
     Against(Against),
+    /// Next (true) or previous change.
+    Jump(bool),
 }
 
 /// The Diff checkbox and, while it is on, the Compare with choice and a summary. Laid out right
@@ -398,6 +474,7 @@ pub(super) fn controls(
     d: &TabDiff,
     blocked: Option<&str>,
     shortcut: &str,
+    keys: [&str; 2],
 ) -> Option<Ctl> {
     let mut ctl = None;
     let mut on = d.on;
@@ -426,6 +503,16 @@ pub(super) fn controls(
     let weak = crate::theme::t().weak;
     ui.label(RichText::new("Compare with").small().color(weak));
     ui.add_space(12.0);
+    if let Some(v) = &d.view {
+        if let Some(fwd) = jump_buttons(ui, keys) {
+            ctl = Some(Ctl::Jump(fwd));
+        }
+        let n = changes(v.rows.iter().map(|r| r.kind != Kind::Same)).len();
+        let at = position(n, d.cur);
+        if !at.is_empty() {
+            ui.label(RichText::new(at).small().color(weak));
+        }
+    }
     let summary = match (&d.note, &d.view) {
         (Some(n), _) => RichText::new(n).small().color(ERROR),
         (None, Some(v)) => RichText::new(v.summary()).small().color(weak),
@@ -433,6 +520,25 @@ pub(super) fn controls(
     };
     ui.label(summary);
     ctl
+}
+
+/// The Previous / Next change arrows (laid out right to left: Next first). `keys`: their shortcuts.
+pub(super) fn jump_buttons(ui: &mut Ui, keys: [&str; 2]) -> Option<bool> {
+    let mut out = None;
+    for (fwd, icon, tip) in [
+        (true, crate::icons::ARROW_DOWN, "Next change"),
+        (false, crate::icons::ARROW_UP, "Previous change"),
+    ] {
+        let key = keys[usize::from(!fwd)];
+        if ui
+            .add(egui::Button::new(RichText::new(icon).small()).frame(false))
+            .on_hover_text(format!("{tip}  {key}"))
+            .clicked()
+        {
+            out = Some(fwd);
+        }
+    }
+    out
 }
 
 impl App {
@@ -472,6 +578,10 @@ impl App {
                     self.save_session(true);
                 }
             }
+            Ctl::Jump(fwd) => {
+                self.tab_jump(fwd);
+                return; // the jump placed the cursor
+            }
         }
         if let Some(t) = self.tabs.get_mut(self.active) {
             t.caret = Some(t.cursor);
@@ -499,9 +609,15 @@ impl App {
             && let Ok(r) = rx.try_recv()
         {
             d.rx = None;
+            d.cur = None; // the changes may have moved
             match r {
                 Ok(a) => (d.view, d.note) = (Some(Arc::new(a)), None),
                 Err(e) => (d.view, d.note) = (None, Some(e)),
+            }
+            if let Some(first) = d.land.take()
+                && d.view.is_some()
+            {
+                self.land_jump = Some(first);
             }
         }
         if t.rev != d.seen_rev {
@@ -542,6 +658,143 @@ impl App {
         });
         d.rx = Some(rx);
         d.for_key = Some(key);
+    }
+
+    /// F7 / Shift+F7 and the arrows: the next or previous change of the docked diff panel when it
+    /// is open, else of the active tab's diff.
+    pub(super) fn jump_change(&mut self, forward: bool) {
+        if self.has_diff() {
+            self.panel_jump(forward);
+        } else {
+            self.tab_jump(forward);
+        }
+    }
+
+    /// A file opened by a jump from another file was compared: go to its first or last change.
+    pub(super) fn finish_land(&mut self) {
+        if let Some(first) = self.land_jump.take()
+            && let Some(t) = self.tabs.get_mut(self.active)
+        {
+            let n = t.diff.view.as_ref().map_or(0, |v| {
+                changes(v.rows.iter().map(|r| r.kind != Kind::Same)).len()
+            });
+            if n == 0 {
+                return;
+            }
+            t.diff.cur = Some(if first { 0 } else { n - 1 });
+            self.go_to_change();
+        }
+    }
+
+    /// The next or previous change of the active tab's diff; past its last (first) change, the
+    /// next (previous) changed file.
+    pub(super) fn tab_jump(&mut self, forward: bool) {
+        let Some(t) = self.tabs.get(self.active) else {
+            self.status = "Open a file to move between its changes".into();
+            return;
+        };
+        let Some(v) = t.diff.view.clone().filter(|_| t.diff.on) else {
+            self.status = if t.diff.on {
+                "Comparing…".into()
+            } else {
+                "Turn Diff on to move between changes".into()
+            };
+            return;
+        };
+        let ch = changes(v.rows.iter().map(|r| r.kind != Kind::Same));
+        let line = t.text[..t.cursor.min(t.text.len())].matches('\n').count();
+        let at_row = v.row_of_new.get(line).copied().unwrap_or(v.rows.len());
+        match step(&ch, t.diff.cur, at_row, forward) {
+            Step::At(i) => {
+                self.tabs[self.active].diff.cur = Some(i);
+                self.go_to_change();
+            }
+            Step::OtherFile => self.other_changed_file(forward),
+        }
+    }
+
+    /// Moves the cursor to the active tab's current change, centres it and flashes it.
+    fn go_to_change(&mut self) {
+        let Some(t) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let Some((v, i)) = t.diff.view.clone().zip(t.diff.cur) else {
+            return;
+        };
+        let Some(rows) = changes(v.rows.iter().map(|r| r.kind != Kind::Same))
+            .get(i)
+            .cloned()
+        else {
+            return;
+        };
+        let r = &v.rows[rows.start];
+        let line = r.new.unwrap_or(r.anchor);
+        let at = t
+            .text
+            .match_indices('\n')
+            .nth(line.wrapping_sub(1))
+            .map_or(if line == 0 { 0 } else { t.text.len() }, |(i, _)| i + 1);
+        t.goto = Some(at);
+        t.diff.flash = Some((rows, Instant::now()));
+        if let Some(ctx) = &self.ctx {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Opens the next (or previous) file of the changes the diff compares with (uncommitted files
+    /// against the last commit, the branch's files against the PR base), with Diff on.
+    fn other_changed_file(&mut self, forward: bool) {
+        let Some(t) = self.tabs.get(self.active) else {
+            return;
+        };
+        let (path, against) = (t.path.clone(), t.diff.against);
+        let files: Vec<PathBuf> = self
+            .git
+            .changes
+            .as_ref()
+            .map(|c| match against {
+                Against::Head => &c.working,
+                Against::Base => &c.branch,
+            })
+            .into_iter()
+            .flatten()
+            .filter(|c| c.code != 'D')
+            .map(|c| c.path.clone())
+            .collect();
+        let here = files.iter().position(|p| *p == path);
+        let next = match (here, forward) {
+            (Some(i), true) => files.get(i + 1),
+            (Some(i), false) => i.checked_sub(1).and_then(|i| files.get(i)),
+            (None, true) => files.first(),
+            (None, false) => files.last(),
+        };
+        let Some(next) = next.cloned() else {
+            self.status = if forward {
+                "That was the last change of the last changed file".into()
+            } else {
+                "That was the first change of the first changed file".into()
+            };
+            return;
+        };
+        self.open_file(&next, None);
+        if let Some(t) = self.tabs.get_mut(self.active).filter(|t| t.path == next) {
+            t.diff.set(true, against);
+            t.diff.cur = None;
+            match t
+                .diff
+                .view
+                .as_ref()
+                .filter(|_| t.diff.for_key.is_some() && t.diff.rx.is_none())
+            {
+                // already compared (an open tab): go now
+                Some(_) => {
+                    self.land_jump = Some(forward);
+                    self.finish_land();
+                }
+                None => t.diff.land = Some(forward),
+            }
+            self.save_session(true);
+        }
     }
 }
 
@@ -709,8 +962,15 @@ fn word_rects(
 
 /// The editor side's highlights for the rows on screen (painted under the text): tinted lines,
 /// changed words and grey spacer rows. `x` is the left edge of the tint.
-pub(super) fn new_side(v: &Aligned, at: &Placed, x: f32, clip: Rect) -> Vec<Shape> {
+pub(super) fn new_side(
+    v: &Aligned,
+    at: &Placed,
+    x: f32,
+    clip: Rect,
+    flash: Option<&(Range<usize>, f32)>,
+) -> Vec<Shape> {
     let mut out = Vec::new();
+    flash_rects(&mut out, v, at, x, clip, flash);
     let first = at.line_at(clip.top());
     for (n, row) in at.galley.rows.iter().enumerate().skip(first) {
         let y = at.pos.y + row.pos.y;
@@ -739,6 +999,41 @@ pub(super) fn new_side(v: &Aligned, at: &Placed, x: f32, clip: Rect) -> Vec<Shap
     out
 }
 
+/// The flash over the rows of a change just jumped to (both columns), fading out.
+fn flash_rects(
+    out: &mut Vec<Shape>,
+    v: &Aligned,
+    at: &Placed,
+    x: f32,
+    clip: Rect,
+    flash: Option<&(Range<usize>, f32)>,
+) {
+    let Some((rows, strength)) = flash else {
+        return;
+    };
+    let ys: Vec<f32> = v
+        .rows
+        .get(rows.clone())
+        .into_iter()
+        .flatten()
+        .map(|r| at.row_y(v, r))
+        .collect();
+    if let (Some(top), Some(bottom)) = (
+        ys.iter().copied().reduce(f32::min),
+        ys.iter().copied().reduce(f32::max),
+    ) {
+        let rect = Rect::from_min_max(
+            Pos2::new(x, top),
+            Pos2::new(clip.right(), bottom + at.row_h),
+        );
+        out.push(Shape::rect_filled(
+            rect,
+            0.0,
+            CHANGED.gamma_multiply(0.35 * strength),
+        ));
+    }
+}
+
 /// The older version in `rect`, row by row beside the editor rows: line numbers, syntax colours,
 /// the same highlights, scrolled `scroll_x` to the right like the editor.
 pub(super) fn paint_old(
@@ -748,10 +1043,14 @@ pub(super) fn paint_old(
     at: &Placed,
     scroll_x: f32,
     font: &FontId,
+    flash: Option<&(Range<usize>, f32)>,
 ) {
     let theme = crate::theme::t();
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme.editor_bg);
+    let mut lit = Vec::new();
+    flash_rects(&mut lit, v, at, rect.left(), rect, flash);
+    painter.extend(lit);
     let char_w = ui.fonts_mut(|f| f.glyph_width(font, '0'));
     let num_w = char_w * v.old_lines.len().to_string().len().max(3) as f32 + 18.0;
     let text_x = rect.left() + num_w - scroll_x;
@@ -798,6 +1097,72 @@ pub(super) fn paint_old(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // ranges of rows, not a range to collect
+    fn changes_are_runs_of_changed_rows() {
+        let k = |s: &str| s.chars().map(|c| c == 'x').collect::<Vec<_>>();
+        assert_eq!(changes(k("..xx.x..xxx")), [2..4, 5..6, 8..11]);
+        assert_eq!(changes(k("xx")), [0..2]);
+        assert!(changes(k("....")).is_empty(), "no changes");
+    }
+
+    #[test]
+    fn jumps_go_in_order_and_past_the_edges_to_the_other_file() {
+        let ch = [2..4, 5..6, 8..11];
+        // from the top, change by change, then the next file
+        assert_eq!(step(&ch, None, 0, true), Step::At(0));
+        assert_eq!(step(&ch, Some(0), 0, true), Step::At(1));
+        assert_eq!(step(&ch, Some(1), 0, true), Step::At(2));
+        assert_eq!(
+            step(&ch, Some(2), 0, true),
+            Step::OtherFile,
+            "past the last change"
+        );
+        // and back
+        assert_eq!(step(&ch, Some(2), 0, false), Step::At(1));
+        assert_eq!(
+            step(&ch, Some(0), 0, false),
+            Step::OtherFile,
+            "before the first change"
+        );
+        // nothing picked yet: from the cursor's row
+        assert_eq!(
+            step(&ch, None, 5, true),
+            Step::At(1),
+            "a change at the cursor row"
+        );
+        assert_eq!(step(&ch, None, 7, true), Step::At(2));
+        assert_eq!(step(&ch, None, 7, false), Step::At(1));
+        assert_eq!(
+            step(&ch, None, 2, false),
+            Step::OtherFile,
+            "nothing above the cursor"
+        );
+        assert_eq!(
+            step(&ch, None, 12, true),
+            Step::OtherFile,
+            "nothing below the cursor"
+        );
+        // a stale index (the file changed) counts as none
+        assert_eq!(step(&ch, Some(9), 0, true), Step::At(0));
+    }
+
+    #[test]
+    fn a_file_without_changes_goes_straight_to_the_other_file() {
+        assert_eq!(step(&[], None, 0, true), Step::OtherFile);
+        assert_eq!(step(&[], None, 0, false), Step::OtherFile);
+        assert_eq!(step(&[], Some(0), 0, true), Step::OtherFile);
+        assert_eq!(position(0, None), "");
+    }
+
+    #[test]
+    fn the_toolbar_says_which_change() {
+        assert_eq!(position(5, Some(1)), "Change 2 of 5");
+        assert_eq!(position(5, None), "5 changes");
+        assert_eq!(position(1, None), "1 change");
+        assert_eq!(position(3, Some(7)), "3 changes", "a stale index");
+    }
 
     #[test]
     fn a_git_that_fails_shows_a_note_not_unchanged_lines() {

@@ -572,6 +572,8 @@ pub struct App {
     selected_composable: Option<String>,
     textures: HashMap<PathBuf, (SystemTime, egui::TextureHandle)>,
     shift_down: bool,
+    /// A diff jump opened another file: go to its first (true) or last change once compared.
+    land_jump: Option<bool>,
     last_shift: Option<Instant>,
     status: String,
     /// Why actions that waited for a save did not run, each with how often in a row it came:
@@ -733,6 +735,7 @@ impl App {
             selected_composable: None,
             textures: HashMap::new(),
             shift_down: false,
+            land_jump: None,
             last_shift: None,
             status: String::new(),
             notices: Vec::new(),
@@ -1973,6 +1976,12 @@ impl App {
                 self.run(action, ctx);
             }
         }
+        // Cmd+Shift+[ / ] may arrive as { / } (the shifted key): the same jumps
+        for (fwd, k) in [(true, egui::Key::CloseCurlyBracket), (false, egui::Key::OpenCurlyBracket)] {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, k)) {
+                self.jump_change(fwd);
+            }
+        }
         let open = |kind| {
             Some(Search {
                 kind,
@@ -2067,6 +2076,10 @@ impl App {
         let mut diff_ctl = None;
         let blocked = self.diff_blocked();
         let shortcut = keymap::text(self.keymap, Action::ToggleDiff);
+        let jump_keys = [
+            keymap::text(self.keymap, Action::NextChange),
+            keymap::text(self.keymap, Action::PrevChange),
+        ];
         let r = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             for d in inside.iter().filter_map(|d| d.container.as_ref()).take(1) {
@@ -2082,7 +2095,13 @@ impl App {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                diff_ctl = diff_view::controls(ui, &t.diff, blocked, &shortcut);
+                diff_ctl = diff_view::controls(
+                    ui,
+                    &t.diff,
+                    blocked,
+                    &shortcut,
+                    [&jump_keys[0], &jump_keys[1]],
+                );
             });
             label.id
         });
@@ -2211,6 +2230,8 @@ impl App {
             }
             Action::NewFile => self.new_file(None),
             Action::ToggleDiff => self.toggle_diff(),
+            Action::NextChange => self.jump_change(true),
+            Action::PrevChange => self.jump_change(false),
         }
     }
 
@@ -3311,6 +3332,10 @@ impl App {
         // Diff on: the older version beside the editor, its removed lines as room in the editor
         let diff = tab.diff.on.then(|| tab.diff.view.clone()).flatten();
         let diff_scroll = tab.diff.scroll;
+        let flash = tab.diff.flash_now();
+        if flash.is_some() {
+            ui.ctx().request_repaint();
+        }
         let mut room: Vec<(usize, f32)> = lens_lines.iter().map(|&l| (l, lens_h)).collect();
         if let Some(v) = &diff {
             room.extend(v.room.iter().map(|&(l, n)| (l, n as f32 * row_h)));
@@ -3521,7 +3546,13 @@ impl App {
                             lens: &lens_lines,
                             lens_h,
                         };
-                        let shapes = diff_view::new_side(v, &at, gutter.right(), ui.clip_rect());
+                        let shapes = diff_view::new_side(
+                            v,
+                            &at,
+                            gutter.right(),
+                            ui.clip_rect(),
+                            flash.as_ref(),
+                        );
                         ui.painter().set(diff_bg, egui::Shape::Vec(shapes));
                         placed = Some((out.galley.clone(), out.galley_pos));
                     }
@@ -3681,7 +3712,15 @@ impl App {
                     lens: &lens_lines,
                     lens_h,
                 };
-                diff_view::paint_old(ui, left, v, &at, scrolled.state.clamped_offset().x, &font);
+                diff_view::paint_old(
+                    ui,
+                    left,
+                    v,
+                    &at,
+                    scrolled.state.clamped_offset().x,
+                    &font,
+                    flash.as_ref(),
+                );
             }
             let line = egui::Stroke::new(1.0, crate::theme::t().border);
             ui.painter().vline(left.right() + 0.5, full.y_range(), line);
@@ -4694,6 +4733,7 @@ impl eframe::App for App {
         watch.stage("analysis", || self.settle(false));
         watch.stage("git blame", || self.poll_git(&ctx));
         self.poll_diff(&ctx);
+        self.finish_land();
         // index changes an edit queued while the worker was reading go in now
         if !self.index.flush() {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(10));

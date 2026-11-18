@@ -7755,3 +7755,120 @@ fn a_found_line_offset_from_another_version_of_the_file_never_panics() {
     let l = found_line(Path::new("/p/A.kt"), "ab", 9);
     assert_eq!((l.offset, l.line), (2, 1));
 }
+
+/// The active tab's file and the 0-based line of its cursor.
+fn at_line(a: &App) -> (PathBuf, usize) {
+    let t = &a.tabs[a.active];
+    (t.path.clone(), t.text[..t.cursor.min(t.text.len())].matches('\n').count())
+}
+
+#[test]
+fn e2e_diff_jumps_change_by_change_and_on_to_the_next_changed_file() {
+    let f = Fixture::new("diffjump");
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    // two changes in User.kt (lines 3 and 6), one in UserCard.kt (line 7)
+    std::fs::write(&user, USER_KT.replace("var age", "val age").replace("emptyList()", "listOf()")).unwrap();
+    std::fs::write(&card, CARD_KT.replace("mutableStateOf(0)", "mutableStateOf(1)")).unwrap();
+    let mut h = f.harness();
+    open(&mut h, &user);
+    wait(&mut h, "git status", |a| {
+        a.git.changes.as_ref().is_some_and(|c| c.repo && c.working.len() == 2)
+    });
+    h.get_by_label("Diff").click();
+    wait(&mut h, "compared", |a| diff_counts(a) == Some((0, 0, 2)));
+    steps(&mut h, 2);
+    h.get_by_label("2 changes");
+    // F7: the first change, then the second, each at the cursor and flashing
+    key(&mut h, Modifiers::NONE, Key::F7);
+    assert_eq!(at_line(h.state()), (user.clone(), 2));
+    h.get_by_label("Change 1 of 2");
+    assert!(tab(&h).diff.flash_now().is_some(), "the change flashes");
+    key(&mut h, Modifiers::NONE, Key::F7);
+    assert_eq!(at_line(h.state()), (user.clone(), 5));
+    h.get_by_label("Change 2 of 2");
+    // past the last change: the next changed file opens with Diff on, at its first change
+    key(&mut h, Modifiers::NONE, Key::F7);
+    wait(&mut h, "landed in UserCard.kt", |a| {
+        a.tabs[a.active].path == card && a.tabs[a.active].diff.cur == Some(0)
+    });
+    steps(&mut h, 3);
+    assert!(tab(&h).diff.on);
+    assert_eq!(at_line(h.state()), (card.clone(), 6));
+    h.get_by_label("Change 1 of 1");
+    // Shift+F7 before its first change: back to User.kt at its LAST change
+    key(&mut h, Modifiers::SHIFT, Key::F7);
+    wait(&mut h, "back in User.kt", |a| {
+        a.tabs[a.active].path == user && a.tabs[a.active].diff.cur == Some(1)
+    });
+    steps(&mut h, 3);
+    assert_eq!(at_line(h.state()), (user.clone(), 5));
+    // Cmd+Shift+[ is Previous change too; before the first change of the first file it stays
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::OpenBracket);
+    assert_eq!(at_line(h.state()), (user.clone(), 2));
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::OpenBracket);
+    assert_eq!(at_line(h.state()), (user.clone(), 2), "nowhere before the first change");
+    assert!(h.state().status.starts_with("That was the first change"), "{}", h.state().status);
+    // Cmd+Shift+] and the toolbar arrow are Next change
+    key(&mut h, Modifiers::COMMAND | Modifiers::SHIFT, Key::CloseBracket);
+    assert_eq!(at_line(h.state()), (user.clone(), 5));
+    h.get_by_label(crate::icons::ARROW_UP).click();
+    steps(&mut h, 3);
+    assert_eq!(at_line(h.state()), (user, 2), "the Previous change arrow");
+}
+
+#[test]
+fn e2e_diff_jump_from_a_file_without_changes_goes_to_the_first_changed_file() {
+    let f = Fixture::new("diffjumpnone");
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    let card = f.path("app/src/main/java/com/demo/ui/UserCard.kt");
+    std::fs::write(&card, CARD_KT.replace("mutableStateOf(0)", "mutableStateOf(1)")).unwrap();
+    let mut h = f.harness();
+    open(&mut h, &user);
+    wait(&mut h, "git status", |a| {
+        a.git.changes.as_ref().is_some_and(|c| c.repo && c.working.len() == 1)
+    });
+    // Diff off: F7 says what to do and goes nowhere
+    key(&mut h, Modifiers::NONE, Key::F7);
+    assert_eq!(at_line(h.state()).0, user);
+    assert!(h.state().status.starts_with("Turn Diff on"), "{}", h.state().status);
+    h.get_by_label("Diff").click();
+    wait(&mut h, "compared", |a| diff_counts(a) == Some((0, 0, 0)));
+    key(&mut h, Modifiers::NONE, Key::F7);
+    wait(&mut h, "landed in UserCard.kt", |a| {
+        a.tabs[a.active].path == card && a.tabs[a.active].diff.cur == Some(0)
+    });
+    steps(&mut h, 3);
+    assert_eq!(at_line(h.state()), (card, 6));
+    // the last change of the last changed file: it stays and says so
+    key(&mut h, Modifiers::NONE, Key::F7);
+    assert!(h.state().status.starts_with("That was the last change"), "{}", h.state().status);
+}
+
+#[test]
+fn e2e_diff_panel_jumps_through_its_changes_file_after_file() {
+    let f = Fixture::new("diffpaneljump");
+    let mut h = f.harness();
+    steps(&mut h, 2);
+    let text = "diff --git a/A.kt b/A.kt\n--- a/A.kt\n+++ b/A.kt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n@@ -9,2 +9,2 @@\n x\n-y\n+Y\ndiff --git a/B.kt b/B.kt\n--- a/B.kt\n+++ b/B.kt\n@@ -1 +1,2 @@\n p\n+q\n";
+    h.state_mut().show_diff_text("Diff: two files".into(), text.into());
+    steps(&mut h, 3);
+    h.get_by_label("3 changes");
+    key(&mut h, Modifiers::NONE, Key::F7);
+    h.get_by_label("Change 1 of 3");
+    key(&mut h, Modifiers::NONE, Key::F7);
+    key(&mut h, Modifiers::NONE, Key::F7);
+    h.get_by_label("Change 3 of 3");
+    assert_eq!(h.state().git.panel_cur, Some(2), "the change in the second file");
+    key(&mut h, Modifiers::NONE, Key::F7);
+    assert_eq!(h.state().git.panel_cur, Some(2), "it stays at the last change");
+    assert!(h.state().status.starts_with("That was the last change"), "{}", h.state().status);
+    key(&mut h, Modifiers::SHIFT, Key::F7);
+    h.get_by_label("Change 2 of 3");
+    // the unified layout counts its own lines: the place starts over
+    h.get_by_label("Side by side").click();
+    steps(&mut h, 3);
+    h.get_by_label("3 changes");
+    key(&mut h, Modifiers::NONE, Key::F7);
+    h.get_by_label("Change 1 of 3");
+}

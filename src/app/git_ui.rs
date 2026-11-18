@@ -46,6 +46,12 @@ pub(super) struct GitState {
     pub(super) commit: Option<(String, Vec<String>)>,
     /// The diff panel shows one column (unified) instead of old | new side by side.
     unified: bool,
+    /// The panel's change the last jump went to (an index into its changes in the current layout).
+    pub(super) panel_cur: Option<usize>,
+    /// Rows of the panel's change that flashes, and since when.
+    panel_flash: Option<(std::ops::Range<usize>, Instant)>,
+    /// A row to scroll to the middle of the panel next frame.
+    panel_scroll: Option<usize>,
     commit_rx: Option<Receiver<(String, String)>>,
     /// Uncommitted files and the branch's changes (refreshed in the background).
     pub changes: Option<git::Changes>,
@@ -171,6 +177,7 @@ impl App {
         {
             g.commit = Some((title, text.lines().map(String::from).collect()));
             g.commit_rx = None;
+            (g.panel_cur, g.panel_flash, g.panel_scroll) = (None, None, None);
         }
     }
 
@@ -192,6 +199,50 @@ impl App {
     /// Shows a diff (of a commit or a file) in the diff window.
     pub(super) fn show_diff_text(&mut self, title: String, text: String) {
         self.git.commit = Some((title, text.lines().map(String::from).collect()));
+        (
+            self.git.panel_cur,
+            self.git.panel_flash,
+            self.git.panel_scroll,
+        ) = (None, None, None);
+    }
+
+    /// The docked diff panel's changes in its current layout (unified lines or side-by-side rows).
+    fn panel_changes(&self) -> Vec<std::ops::Range<usize>> {
+        let Some((_, lines)) = &self.git.commit else {
+            return Vec::new();
+        };
+        if self.git.unified {
+            super::diff_view::changes(lines.iter().map(|l| {
+                (l.starts_with('+') && !l.starts_with("+++"))
+                    || (l.starts_with('-') && !l.starts_with("---"))
+            }))
+        } else {
+            super::diff_view::changes(
+                side_rows(lines)
+                    .iter()
+                    .map(|r| matches!(r, SideRow::Pair { changed: true, .. })),
+            )
+        }
+    }
+
+    /// The next or previous change of the docked diff panel, file after file; it centres the change
+    /// and flashes it.
+    pub(super) fn panel_jump(&mut self, forward: bool) {
+        let ch = self.panel_changes();
+        match super::diff_view::step(&ch, self.git.panel_cur, 0, forward) {
+            super::diff_view::Step::At(i) => {
+                self.git.panel_cur = Some(i);
+                self.git.panel_flash = Some((ch[i].clone(), Instant::now()));
+                self.git.panel_scroll = Some(ch[i].start);
+            }
+            super::diff_view::Step::OtherFile => {
+                self.status = match (ch.is_empty(), forward) {
+                    (true, _) => "This diff has no changes".into(),
+                    (false, true) => "That was the last change of this diff".into(),
+                    (false, false) => "That was the first change of this diff".into(),
+                };
+            }
+        }
     }
 
     /// Settings key of the base choice for the current branch.
@@ -726,10 +777,19 @@ impl App {
     /// The diff of a commit or a file, docked beside the editor like Android Studio's diff:
     /// side by side (old | new, with line numbers) or unified. Esc or × closes it.
     pub(super) fn diff_panel(&mut self, ui: &mut Ui) {
+        if self.git.commit.is_none() {
+            return;
+        }
+        let mut open = !ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let mut jump = None;
+        let n_changes = self.panel_changes().len();
+        let keys = [
+            crate::keymap::text(self.keymap, crate::keymap::Action::NextChange),
+            crate::keymap::text(self.keymap, crate::keymap::Action::PrevChange),
+        ];
         let Some((title, lines)) = &self.git.commit else {
             return;
         };
-        let mut open = !ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         right_row(ui, |ui| {
             if ui
                 .add(egui::Button::new(crate::icons::X).frame(false))
@@ -740,7 +800,16 @@ impl App {
             }
             let mut split = !self.git.unified;
             ui.checkbox(&mut split, "Side by side");
+            if self.git.unified == split {
+                // the changes are counted in the new layout's rows
+                (self.git.panel_cur, self.git.panel_flash) = (None, None);
+            }
             self.git.unified = !split;
+            jump = super::diff_view::jump_buttons(ui, [&keys[0], &keys[1]]);
+            let at = super::diff_view::position(n_changes, self.git.panel_cur);
+            if !at.is_empty() {
+                ui.label(RichText::new(at).small().color(DIM));
+            }
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                 ui.add(egui::Label::new(RichText::new(title).strong()).truncate());
             });
@@ -751,12 +820,38 @@ impl App {
         let row_h = ui.fonts_mut(|f| f.row_height(&font));
         let code = crate::theme::t().code;
         let added = Color32::from_rgb(0x6A, 0xB0, 0x6A);
+        // a jump: centre its first row (show_rows spaces rows by row_h plus the item spacing)
+        let step_h = row_h + ui.spacing().item_spacing.y;
+        let centre = self
+            .git
+            .panel_scroll
+            .take()
+            .map(|r| (r as f32 * step_h - (ui.available_height() - row_h) / 2.0).max(0.0));
+        let flash = self.git.panel_flash.as_ref().and_then(|(rows, at)| {
+            let left = 1.0 - at.elapsed().as_secs_f32() / super::diff_view::FLASH.as_secs_f32();
+            (left > 0.0).then(|| (rows.clone(), left))
+        });
+        if flash.is_some() {
+            ui.ctx().request_repaint();
+        }
+        let lit = |ui: &Ui, i: usize, rect: egui::Rect| {
+            if let Some((rows, s)) = &flash
+                && rows.contains(&i)
+            {
+                ui.painter()
+                    .rect_filled(rect, 0.0, INFO.gamma_multiply(0.30 * s));
+            }
+        };
+        let scroll = |s: egui::ScrollArea| match centre {
+            Some(y) => s.vertical_scroll_offset(y),
+            None => s,
+        };
         if self.git.unified {
-            egui::ScrollArea::both()
+            scroll(egui::ScrollArea::both())
                 .id_salt("diff-unified")
                 .auto_shrink([false, false])
                 .show_rows(ui, row_h, lines.len(), |ui, range| {
-                    for l in &lines[range] {
+                    for (i, l) in lines[range.clone()].iter().enumerate() {
                         let color = if l.starts_with("+++") || l.starts_with("---") {
                             code
                         } else if l.starts_with('+') {
@@ -768,7 +863,9 @@ impl App {
                         } else {
                             code
                         };
-                        ui.label(RichText::new(l).monospace().size(size).color(color));
+                        let r = ui.label(RichText::new(l).monospace().size(size).color(color));
+                        let full = r.rect.with_max_x(ui.max_rect().right());
+                        lit(ui, range.start + i, full);
                     }
                 });
         } else {
@@ -778,15 +875,16 @@ impl App {
                     .size()
                     .x
             });
-            egui::ScrollArea::vertical()
+            scroll(egui::ScrollArea::vertical())
                 .id_salt("diff-split")
                 .auto_shrink([false, false])
                 .show_rows(ui, row_h, rows.len(), |ui, range| {
-                    for row in &rows[range] {
+                    for (i, row) in rows[range.clone()].iter().enumerate() {
                         let (rect, _) = ui.allocate_exact_size(
                             egui::vec2(ui.available_width(), row_h),
                             Sense::hover(),
                         );
+                        lit(ui, range.start + i, rect);
                         let p = ui.painter_at(rect);
                         let text = |p: &egui::Painter, x: f32, s: &str, c: Color32| {
                             p.text(
@@ -840,6 +938,9 @@ impl App {
         }
         if !open {
             self.git.commit = None;
+        }
+        if let Some(fwd) = jump {
+            self.panel_jump(fwd);
         }
     }
 }
