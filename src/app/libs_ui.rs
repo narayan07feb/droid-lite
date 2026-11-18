@@ -36,7 +36,7 @@ impl App {
                 l.syms.len(),
                 l.artifacts
             );
-            self.libs = l;
+            self.libs = std::sync::Arc::new(l);
             self.libs_rx = None;
             self.index.change(|i| i.generation += 1); // UI-call detection and annotations may change
         }

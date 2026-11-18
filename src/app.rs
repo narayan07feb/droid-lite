@@ -609,7 +609,8 @@ pub struct App {
     /// A file under `res/` changed: rescan resources.
     res_stale: bool,
     /// Library symbols from the Gradle cache.
-    libs: crate::libs::Libraries,
+    /// Shared with the worker that looks up library declarations.
+    libs: std::sync::Arc<crate::libs::Libraries>,
     libs_rx: Option<Receiver<crate::libs::Libraries>>,
     /// Downloads of library and SDK sources for Go to declaration.
     fetches: libsrc_ui::Fetches,
@@ -939,6 +940,7 @@ impl App {
             self.res.len()
         );
         self.project = Some(project);
+        self.reset_lib_lookups();
         self.load_variants();
         self.load_avds(ctx);
         self.load_plugins(ctx);
@@ -982,6 +984,8 @@ impl App {
     }
 
     fn open_file(&mut self, path: &Path, offset: Option<usize>) {
+        // the user went elsewhere: a library jump still waiting does not pull them back
+        self.cancel_lib_jump();
         if let Some(t) = self.tabs.get(self.active) {
             push_capped(&mut self.history, (t.path.clone(), t.cursor));
             self.forward.clear();
@@ -1504,7 +1508,7 @@ impl App {
         if let Some(crate::resolve::Res::Lib(call)) = self.resolved_at(at) {
             self.found_title = format!("References to `{}.{}` (library)", call.class, call.member);
             self.search_lib_usages(call.clone(), ctx);
-            self.lib_source(call, false, 0);
+            self.fetch_lib_source(call);
             return;
         }
         match self.ref_target(at) {

@@ -9,8 +9,8 @@ pub struct ClassInfo {
     pub kind: ClassKind,
     /// Public static methods: (name, is @Composable).
     pub statics: Vec<(String, bool)>,
-    /// Every public constructor (`<init>`) and method that is not synthetic: (name, descriptor,
-    /// access flags), for a stub without source.
+    /// Every public or protected constructor (`<init>`) and method that is not synthetic: (name,
+    /// descriptor, access flags), for a stub without source.
     pub methods: Vec<(String, String, u16)>,
 }
 
@@ -118,7 +118,12 @@ pub fn parse(bytes: &[u8]) -> Option<ClassInfo> {
             r.at = end;
         }
         // public (0x1) static (0x8), not synthetic (0x1000)
-        if m_access & 0x1001 == 0x0001 && m_name != "<clinit>" && !m_name.contains('$') {
+        // public (0x1) or protected (0x4), not synthetic (0x1000)
+        if m_access & 0x1000 == 0
+            && m_access & 0x0005 != 0
+            && m_name != "<clinit>"
+            && !m_name.contains('$')
+        {
             methods.push((m_name.clone(), m_desc, m_access));
         }
         if m_access & 0x1009 == 0x0009 && !m_name.starts_with('<') && !m_name.contains('$') {

@@ -211,7 +211,8 @@ pub fn repos(root: &Path) -> Vec<String> {
                     let rest = &line[i + key.len()..];
                     if let Some(end) = rest.find(['"', '\'']) {
                         let u = &rest[..end];
-                        if u.starts_with("http") {
+                        // https only: a plain-http repository is not trusted for code
+                        if u.starts_with("https://") {
                             add(&mut out, u);
                         }
                     }
@@ -298,19 +299,20 @@ pub fn fetch(f: &Fetch) -> Result<(), String> {
             let rel = format!("{}/{n}/{v}/{n}-{v}-sources.jar", g.replace('.', "/"));
             std::fs::create_dir_all(dest.parent().unwrap_or(Path::new(".")))
                 .map_err(|e| e.to_string())?;
-            let part = dest.with_extension("jar.part");
+            // this process's part file: another Droid Lite downloading the same jar has its own
+            let part = dest.with_extension(format!("jar.{}.part", std::process::id()));
             // only web repositories, unless the tests name a local one
             let local = std::env::var_os("DROID_LITE_MAVEN_REPOS").is_some();
             let mut tried = 0;
             for r in repos {
                 let file = r.starts_with("file://");
-                if file && !local || !file && !r.starts_with("http") {
+                if file && !local || !file && !r.starts_with("https://") {
                     continue;
                 }
                 tried += 1;
                 let status = std::process::Command::new("curl")
                     .args(["-fsSL", "--max-time", "120", "--max-filesize", "209715200"])
-                    .args(["--proto", if file { "=file" } else { "=http,https" }])
+                    .args(["--proto", if file { "=file" } else { "=https" }])
                     .arg("-o")
                     .arg(&part)
                     .arg(format!("{r}/{rel}"))
@@ -402,12 +404,23 @@ pub fn declares(text: &str, class: &str) -> bool {
     class_offset(text, class).is_some()
 }
 
-/// Where `class Name` / `interface Name` / `object Name` / `enum Name` is spelled (the name).
+/// Where `class Name` / `interface Name` / `object Name` / `enum Name` is declared (the name): the
+/// keyword starts a word and its line is not a comment.
 pub fn class_offset(text: &str, class: &str) -> Option<usize> {
+    let code = |i: usize| {
+        let line = text[..i].rfind('\n').map_or(0, |n| n + 1);
+        let head = text[line..i].trim_start();
+        let before = text[..i].chars().next_back();
+        before.is_none_or(|c| c.is_whitespace() || c == '(')
+            && !head.starts_with('*')
+            && !head.starts_with("//")
+            && !head.starts_with("/*")
+    };
     ["class ", "interface ", "object ", "enum "]
         .iter()
         .find_map(|k| {
             text.match_indices(&format!("{k}{class}"))
+                .filter(|(i, _)| code(*i))
                 .map(|(i, _)| i + k.len())
                 .find(|&e| {
                     !text[e + class.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
@@ -415,9 +428,10 @@ pub fn class_offset(text: &str, class: &str) -> Option<usize> {
         })
 }
 
-/// The supertypes `class` names in its source, qualified through the file's imports (else its
-/// own package): `class A extends B implements C` (Java), `class A(…) : B(), C` (Kotlin).
-pub fn supertypes(text: &str, class: &str) -> Vec<String> {
+/// The supertypes `class` names in its source, each as the qualified names it may have, surest
+/// first: the file's import of it; else its own package, `java.lang`, the `*` imports and the
+/// name as written. `class A extends B implements C` (Java), `class A(…) : B(), C` (Kotlin).
+pub fn supertypes(text: &str, class: &str) -> Vec<Vec<String>> {
     let Some(at) = class_offset(text, class) else {
         return Vec::new();
     };
@@ -435,7 +449,12 @@ pub fn supertypes(text: &str, class: &str) -> Vec<String> {
         .find_map(|l| l.trim().strip_prefix("package "))
         .map(|p| p.trim_end_matches(';').trim().to_string())
         .unwrap_or_default();
-    let mut out = Vec::new();
+    let imports: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("import "))
+        .map(|l| l.trim_end_matches(';').trim())
+        .collect();
+    let mut out: Vec<Vec<String>> = Vec::new();
     for part in split_top(&list) {
         let name: String = part
             .trim()
@@ -451,22 +470,33 @@ pub fn supertypes(text: &str, class: &str) -> Vec<String> {
             continue;
         }
         let first = name.split('.').next().unwrap_or(&name);
-        let imported = text.lines().find_map(|l| {
-            let l = l
-                .trim()
-                .strip_prefix("import ")?
-                .trim_end_matches(';')
-                .trim();
-            (l.rsplit('.').next() == Some(first)).then(|| l.to_string())
-        });
-        let q = match imported {
-            Some(i) => format!("{i}{}", &name[first.len()..]),
-            None if name.contains('.') && name.starts_with(char::is_lowercase) => name.clone(),
-            None if package.is_empty() => name.clone(),
-            None => format!("{package}.{name}"),
+        let imported = imports
+            .iter()
+            .find(|l| l.rsplit('.').next() == Some(first))
+            .map(|i| format!("{i}{}", &name[first.len()..]));
+        let qs: Vec<String> = match imported {
+            Some(q) => vec![q],
+            None if name.contains('.') && name.starts_with(char::is_lowercase) => {
+                vec![name.clone()]
+            }
+            None => {
+                let mut v = Vec::new();
+                if !package.is_empty() {
+                    v.push(format!("{package}.{name}"));
+                }
+                v.push(format!("java.lang.{name}"));
+                v.extend(
+                    imports
+                        .iter()
+                        .filter_map(|l| l.strip_suffix(".*"))
+                        .map(|p| format!("{p}.{name}")),
+                );
+                v.push(name.clone());
+                v
+            }
         };
-        if !out.contains(&q) {
-            out.push(q);
+        if !out.contains(&qs) {
+            out.push(qs);
         }
     }
     out
@@ -568,7 +598,13 @@ pub fn find_member(path: &Path, text: &str, class: &str, call: &LibCall) -> Vec<
                 if a.is_empty() {
                     continue;
                 }
-                score += match_score(&p.ty, a)?;
+                // a Java vararg `String...` reads as `String[]`: it takes single values
+                let ty = if p.vararg {
+                    p.ty.trim_end_matches("[]")
+                } else {
+                    p.ty.as_str()
+                };
+                score += match_score(ty, a)?;
             }
             Some((d.offset, score))
         })
@@ -607,7 +643,9 @@ fn match_score(param: &str, arg: &[String]) -> Option<usize> {
     if let Some(d) = arg.iter().skip(1).position(|a| *a == p) {
         return Some(89 - d.min(39));
     }
-    // Kotlin converts only a number literal, and only between whole numbers
+    // Kotlin converts only a number literal, and only between whole numbers; the argument's type
+    // does not say it was a literal, so any Int may (a variable that does not fit would not
+    // compile, so it is not in the code)
     let widen: &[&str] = match own.as_str() {
         "Int" => &["long", "short", "byte"],
         "String" => &["CharSequence"],
@@ -668,21 +706,32 @@ fn array_of(k: &str) -> Option<&'static str> {
     })
 }
 
-/// `@NonNull final java.util.List<String>` gives `List`; `String?` gives `String`; `String[]`
-/// stays `String[]`; a vararg `String...` gives `String` (it takes single values).
+/// `@NonNull final java.util.Map<String, Integer>` gives `Map`; `String?` gives `String`;
+/// `String[]` stays `String[]`; a vararg `String...` gives `String` (it takes single values).
 fn simple_type(ty: &str) -> String {
-    let words: Vec<&str> = ty
-        .split_whitespace()
-        .filter(|w| !w.starts_with('@') && !matches!(*w, "final" | "vararg" | "out" | "in"))
-        .collect();
-    let t = words.last().copied().unwrap_or("");
-    let array = t.ends_with("[]");
-    let t = t.split('<').next().unwrap_or(t);
-    let t = t
-        .trim_end_matches("...")
-        .trim_end_matches("[]")
-        .trim_end_matches('?');
-    let base = t.rsplit('.').next().unwrap_or(t);
+    let mut s = ty.trim();
+    loop {
+        if let Some(r) = s.strip_prefix('@') {
+            // an annotation: its name and its (arguments)
+            let end = r
+                .find(|c: char| !(c.is_alphanumeric() || c == '.' || c == '_'))
+                .unwrap_or(r.len());
+            let mut rest = &r[end..];
+            if rest.starts_with('(') {
+                rest = rest.find(')').map_or("", |c| &rest[c + 1..]);
+            }
+            s = rest.trim_start();
+        } else if let Some(r) = ["final ", "vararg "].iter().find_map(|k| s.strip_prefix(k)) {
+            s = r.trim_start();
+        } else {
+            break;
+        }
+    }
+    let s = s.trim_end_matches('?');
+    let array = s.ends_with("[]");
+    let base = s.split(['<', '[', ' ']).next().unwrap_or("");
+    let base = base.trim_end_matches("...").trim_end_matches('?');
+    let base = base.rsplit('.').next().unwrap_or(base);
     if array {
         format!("{base}[]")
     } else {
@@ -690,8 +739,8 @@ fn simple_type(ty: &str) -> String {
     }
 }
 
-/// A stub for a class without source, from its class file: its public constructors and methods as
-/// Java declarations, one per line, so Go to declaration has a line to show.
+/// A stub for a class without source, from its class file: its public and protected constructors
+/// and methods as Java declarations, one per line, so Go to declaration has a line to show.
 pub fn stub(class_bytes: &[u8], note: &str) -> Option<String> {
     let c = crate::classfile::parse(class_bytes)?;
     let name = c.name.replace('/', ".");
@@ -709,6 +758,11 @@ pub fn stub(class_bytes: &[u8], note: &str) -> Option<String> {
     };
     out.push_str(&format!("public {kind} {simple} {{\n"));
     for (m, desc, access) in &c.methods {
+        let vis = if access & 0x0001 != 0 {
+            "public"
+        } else {
+            "protected"
+        };
         let stat = if access & 0x0008 != 0 { "static " } else { "" };
         let sig = if m == "<init>" {
             java_signature(simple, desc)
@@ -717,7 +771,7 @@ pub fn stub(class_bytes: &[u8], note: &str) -> Option<String> {
         } else {
             java_signature(m, desc)
         };
-        out.push_str(&format!("    public {stat}{sig};\n"));
+        out.push_str(&format!("    {vis} {stat}{sig};\n"));
     }
     out.push_str("}\n");
     Some(out)
@@ -917,13 +971,36 @@ mod tests {
     #[test]
     fn supertypes_nested_classes_and_jar_entries() {
         let java = "package android.app;\n\nimport android.os.Parcelable;\n\npublic class Notification implements Parcelable {\n    public static class Builder extends BaseBuilder<Builder> implements Cloneable {}\n}\n";
+        let sup = supertypes(java, "Builder");
         assert_eq!(
-            supertypes(java, "Builder"),
-            ["android.app.BaseBuilder", "android.app.Cloneable"]
+            sup[0][..2],
+            ["android.app.BaseBuilder", "java.lang.BaseBuilder"]
         );
-        assert_eq!(supertypes(java, "Notification"), ["android.os.Parcelable"]);
+        assert_eq!(
+            sup[1][..2],
+            ["android.app.Cloneable", "java.lang.Cloneable"],
+            "java.lang too"
+        );
+        assert_eq!(
+            supertypes(java, "Notification"),
+            [["android.os.Parcelable"]]
+        );
         let kt = "package a.b\n\nimport c.d.Base\n\nclass Leaf(x: Int) : Base(x), Comparable<Leaf> {\n}\n";
-        assert_eq!(supertypes(kt, "Leaf"), ["c.d.Base", "a.b.Comparable"]);
+        let sup = supertypes(kt, "Leaf");
+        assert_eq!(sup[0], ["c.d.Base"]);
+        assert_eq!(sup[1][0], "a.b.Comparable");
+        // a class named in a comment is not its declaration
+        let doc = "/**\n * the class Spot is old\n */\npublic class Spot extends Base {}\n";
+        assert_eq!(class_offset(doc, "Spot"), doc.find("Spot extends"));
+        // generic parameter types with spaces, and annotations with arguments
+        assert_eq!(simple_type("Map<String, Integer>"), "Map");
+        assert_eq!(simple_type("@IntRange(from = 0) long"), "long");
+        assert_eq!(
+            simple_type("java.util.function.BiConsumer<A, B>"),
+            "BiConsumer"
+        );
+        assert_eq!(simple_type("String[]"), "String[]");
+        assert_eq!(simple_type("String?"), "String");
         assert_eq!(
             class_entry("android.app.Notification.Builder"),
             "android/app/Notification$Builder.class"

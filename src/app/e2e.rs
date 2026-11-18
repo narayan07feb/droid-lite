@@ -8251,6 +8251,36 @@ fn e2e_goto_downloads_missing_sdk_sources_once_then_uses_them() {
 }
 
 #[test]
+fn e2e_goto_a_jump_left_while_downloading_does_not_pull_back_and_find_usages_fetches() {
+    let Some((f, sdk, tracker)) = sdk_fixture("gotosdkleave", false) else { return };
+    // a slow stand-in sdkmanager (1 s) that installs the sources
+    let tool = f.config.join("sdkmanager");
+    let src = f.config.join("LocationManager.java");
+    std::fs::write(&src, LM_JAVA).unwrap();
+    let dest = sdk.join("sources/android-34/android/location");
+    std::fs::write(&tool, format!("#!/bin/sh\nsleep 1\nmkdir -p '{}' && cp '{}' '{}/'\n", dest.display(), src.display(), dest.display())).unwrap();
+    std::process::Command::new("chmod").arg("+x").arg(&tool).status().unwrap();
+    // SAFETY: the fixture holds the SERIAL lock.
+    unsafe { std::env::set_var("DROID_LITE_SDKMANAGER", &tool) };
+    let mut h = f.harness();
+    goto_at(&mut h, &tracker, "requestLocationUpdates(provider", 1);
+    assert!(h.state().status.starts_with("Downloading"), "{}", h.state().status);
+    // the user opens another file before it ends: the download ends, nothing pulls them back
+    let user = f.path("app/src/main/java/com/demo/data/User.kt");
+    open(&mut h, &user);
+    wait(&mut h, "downloaded", |a| !a.fetches.ended.is_empty());
+    steps(&mut h, 10);
+    assert_eq!(tab(&h).path, user);
+    // Find usages on a library call fetches its source without opening it (already here now)
+    open(&mut h, &tracker);
+    place_cursor(&mut h, "requestLocationUpdates(provider", 1);
+    key(&mut h, Modifiers::ALT, Key::F7);
+    wait(&mut h, "usages", |a| a.find_rx.is_none() && !a.found.is_empty());
+    assert_eq!(tab(&h).path, tracker, "Find usages does not open the declaration");
+    assert_eq!(h.state().fetches.started, 1);
+}
+
+#[test]
 fn e2e_goto_without_any_source_shows_the_class_file_stub_at_the_overload() {
     let Some((f, _sdk, tracker)) = sdk_fixture("gotostub", false) else { return };
     let tool = f.config.join("sdkmanager");
@@ -8374,7 +8404,7 @@ fn maven_fixture(name: &str, java: &[(&str, &str)], sources: Option<&[(&str, &st
     Some((f, file))
 }
 
-const GEO_JAVA: &str = "package demo.geo;\n\npublic class Locator extends Base {\n    public void locate(String name, long timeout) {}\n    public static class Spot {\n        public void pin(int level) {}\n    }\n}\n";
+const GEO_JAVA: &str = "package demo.geo;\n\npublic class Locator extends Base {\n    public void locate(String name, long timeout) {}\n    protected void secret() {}\n    public static class Spot {\n        public void pin(int level) {}\n    }\n}\n";
 const GEO_BASE: &str = "package demo.geo;\n\npublic class Base {\n    public void reset(boolean hard) {}\n}\n";
 
 #[test]
@@ -8430,4 +8460,35 @@ fn e2e_goto_never_downloads_twice_when_the_jar_lacks_the_class_or_the_download_f
     assert!(tab(&h).path.to_string_lossy().ends_with("(no source)"));
     assert!(h.state().status.contains("could not be downloaded"), "{}", h.state().status);
     assert_eq!(h.state().fetches.started, 1);
+    assert!(tab(&h).text.contains("protected void secret()"), "protected members are in the stub");
+}
+
+#[test]
+fn e2e_goto_walks_every_supertype_breadth_first_and_falls_back_to_library_functions() {
+    // A -> B -> C -> D -> E, and E implements J (its second supertype), which declares ping
+    let src = [
+        ("demo/geo/A.java", "package demo.geo;\n\npublic class A extends B {}\n"),
+        ("demo/geo/B.java", "package demo.geo;\n\npublic class B extends C {}\n"),
+        ("demo/geo/C.java", "package demo.geo;\n\npublic class C extends D {}\n"),
+        ("demo/geo/D.java", "package demo.geo;\n\npublic class D extends E {}\n"),
+        ("demo/geo/E.java", "package demo.geo;\n\npublic class E implements I, J {}\n"),
+        ("demo/geo/I.java", "package demo.geo;\n\npublic interface I {}\n"),
+        ("demo/geo/J.java", "package demo.geo;\n\npublic interface J {\n    default void ping(int times) {}\n}\n"),
+        ("demo/geo/GeoKt.java", "package demo.geo;\n\npublic final class GeoKt {\n    public static void spin(A a) {}\n}\n"),
+    ];
+    let kt = "package com.demo.loc\n\nimport demo.geo.A\n\nfun spin() {}\n\nfun find(a: A) {\n    a.ping(3)\n    a.spin()\n}\n";
+    let Some((f, file)) = maven_fixture("gotosupers", &src, Some(&src), kt) else { return };
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    goto_at(&mut h, &file, "ping(", 1);
+    wait(&mut h, "J.java", |a| a.tabs[a.active].path.to_string_lossy().ends_with("!/demo/geo/J.java"));
+    wait(&mut h, "the lookup", |a| !a.lib_reading());
+    steps(&mut h, 3);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("ping(int times)"), "5 classes up, the second supertype");
+    // not a member anywhere: the library's top-level spin (GeoKt), never the project's spin()
+    goto_at(&mut h, &file, "spin()\n}", 1);
+    let project_spin = tab(&h).text.find("fun spin()").unwrap() + 4;
+    assert!(tab(&h).path != file || tab(&h).cursor != project_spin, "not the project's same-named function");
+    // GeoKt ships without sources here: the status names the library function
+    assert!(h.state().status.contains("`spin`") && h.state().status.contains("demo.geo"), "{}", h.state().status);
 }
