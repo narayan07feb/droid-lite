@@ -1438,7 +1438,7 @@ impl App {
             // a member of a library or SDK type: its exact declaration there, never a project
             // declaration that only shares the name
             Some(crate::resolve::Res::Lib(call)) => {
-                self.goto_lib_call(call);
+                self.goto_lib_call(call, at);
                 return;
             }
             _ => self.index.read().definitions(&word, &path),
@@ -4890,7 +4890,9 @@ impl eframe::App for App {
                     {
                         self.search_lib_usages(call, &ctx);
                     } else {
-                        self.fetches.usages_again = Some((call.clone(), key));
+                        if let Some(t) = self.tabs.get(self.active) {
+                            self.fetches.usages_again = Some((call.clone(), key, t.path.clone()));
+                        }
                         self.status = format!(
                             "References to `{}.{}` are approximate until its source is downloaded",
                             call.class, call.member

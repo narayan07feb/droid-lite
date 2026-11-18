@@ -199,6 +199,7 @@ pub fn repos(root: &Path) -> Vec<String> {
         let Ok(t) = std::fs::read_to_string(root.join(f)) else {
             continue;
         };
+        let t = without_block_comments(&t);
         // only inside `repositories { … }` (a URL elsewhere is an API base or a doc link)
         let mut depth = 0i32;
         let mut inside: Option<i32> = None;
@@ -228,8 +229,7 @@ pub fn repos(root: &Path) -> Vec<String> {
                     if let Some(end) = rest.find(['"', '\'']) {
                         let u = &rest[..end];
                         // https only (a plain-http repository is not trusted for code), and no
-                        // URL with a password in it (it would show in the command line)
-                        // no credentials, tokens or fragments (the URL shows in `ps`)
+                        // credentials, tokens or fragments (the URL shows in `ps`)
                         if u.starts_with("https://") && !u.contains(['@', '?', '#']) {
                             add(&mut out, u);
                         }
@@ -317,7 +317,8 @@ pub fn fetch(f: &Fetch) -> Result<(), String> {
                 .spawn()
                 .map_err(|e| format!("sdkmanager did not start: {e}"))?;
             wait_at_most(&mut child, SDK_TIMEOUT, "sdkmanager")?;
-            if sdk.join(format!("sources/android-{api}")).is_dir() {
+            // the same test as `already_there`: the android packages are in it
+            if already_there(f) {
                 Ok(())
             } else {
                 // the last lines say why (a licence not accepted shows its question there)
@@ -346,6 +347,7 @@ pub fn fetch(f: &Fetch) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
             // this process's part file: another Droid Lite downloading the same jar has its own
             let part = dest.with_extension(format!("jar.{}.part", std::process::id()));
+            sweep_parts(dest.parent().unwrap_or(Path::new(".")));
             // only web repositories, unless the tests name a local one
             let local = std::env::var_os("DROID_LITE_MAVEN_REPOS").is_some();
             let mut tried = 0;
@@ -736,10 +738,14 @@ pub fn find_member(path: &Path, text: &str, class: &str, call: &LibCall) -> Memb
             .is_some_and(|c| c.rsplit('.').next() == Some(simple))
             && body.as_ref().is_none_or(|b| b.contains(&d.offset))
     };
+    // a call `x.foo()` is a function, never a field `foo` of the same name (`body` and
+    // `body()`); a property access may be either
+    let called = call.args.is_some();
     let named = |name: &str| -> Vec<&crate::kotlin::Decl> {
         syms.decls
             .iter()
             .filter(|d| d.name == name && !d.kind.is_type())
+            .filter(|d| !called || d.kind == crate::kotlin::Kind::Fun)
             .filter(in_class)
             .collect()
     };
@@ -778,6 +784,40 @@ pub fn find_member(path: &Path, text: &str, class: &str, call: &LibCall) -> Memb
 
 /// The most Kotlin files of one package read to find a function's file.
 const MAX_PACKAGE_FILES: usize = 500;
+
+/// Part files a stopped Droid Lite left behind (older than an hour: no download runs so long).
+fn sweep_parts(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > std::time::Duration::from_secs(3600));
+        if old && p.extension().is_some_and(|x| x == "part") {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// `t` without its `/* … */` comments (a commented-out repository is not one).
+fn without_block_comments(t: &str) -> String {
+    let mut out = String::with_capacity(t.len());
+    let mut rest = t;
+    while let Some(i) = rest.find("/*") {
+        out.push_str(&rest[..i]);
+        match rest[i + 2..].find("*/") {
+            Some(j) => rest = &rest[i + 2 + j + 2..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
 
 /// The largest sources jar downloaded (200 MB).
 const MAX_DOWNLOAD: u64 = 200 << 20;
@@ -1617,7 +1657,7 @@ mod tests {
         );
         let d = std::env::temp_dir().join(format!("dl-repos-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("settings.gradle.kts"), "val api = uri(\"https://api.example.com/v1\")\ndependencyResolutionManagement {\n    repositories {\n        google()\n        maven { url = uri(\"https://repo.example.com/maven\") }\n        maven { url = uri(\"https://private.example.com/m?token=secret\") }\n    }\n}\n").unwrap();
+        std::fs::write(d.join("settings.gradle.kts"), "val api = uri(\"https://api.example.com/v1\")\ndependencyResolutionManagement {\n    repositories {\n        google()\n        maven { url = uri(\"https://repo.example.com/maven\") }\n        maven { url = uri(\"https://private.example.com/m?token=secret\") }\n        /* maven { url = uri(\"https://old.example.com/maven\") } */\n    }\n}\n").unwrap();
         // SAFETY: a unit test; the env var is put back
         let saved = std::env::var_os("DROID_LITE_MAVEN_REPOS");
         unsafe { std::env::remove_var("DROID_LITE_MAVEN_REPOS") };

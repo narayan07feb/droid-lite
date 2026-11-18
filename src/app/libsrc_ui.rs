@@ -47,7 +47,7 @@ pub(super) struct Fetches {
     prefetch: Option<Receiver<Looked>>,
     /// The library call whose Find usages were approximate (a source was missing): searched
     /// again when a download ends.
-    pub usages_again: Option<(LibCall, String)>,
+    pub usages_again: Option<(LibCall, String, PathBuf)>,
     /// Find usages' searches: a newer one makes an older one stop.
     pub usages_gen: Arc<AtomicU64>,
     /// The project's compile SDK, read once per project root (on a worker).
@@ -133,15 +133,13 @@ struct Lookup {
 
 impl App {
     /// Go to declaration on a library member call ([`crate::resolve::Res::Lib`]).
-    pub(super) fn goto_lib_call(&mut self, call: LibCall) {
+    pub(super) fn goto_lib_call(&mut self, call: LibCall, at: usize) {
         let jump = Jump {
             call,
             imports: self.active_imports(),
             downloads: 0,
-            from: self
-                .tabs
-                .get(self.active)
-                .map(|t| (t.path.clone(), t.cursor)),
+            // the name's start, for the name search if the libraries have nothing
+            from: self.tabs.get(self.active).map(|t| (t.path.clone(), at)),
         };
         self.fetches.from = self.tabs.get(self.active).map(|t| t.path.clone());
         self.look(jump, false);
@@ -174,8 +172,11 @@ impl App {
     /// The download a Find usages waits for ended (`key`): it is searched again, now exactly.
     pub(super) fn usages_after_download(&mut self, key: &str) {
         match self.fetches.usages_again.take() {
-            Some((call, k)) if k == key => {
-                if let Some(ctx) = self.ctx.clone() {
+            // only from the file it was asked in (its imports name the class)
+            Some((call, k, path)) if k == key => {
+                if self.tabs.get(self.active).is_some_and(|t| t.path == path)
+                    && let Some(ctx) = self.ctx.clone()
+                {
                     self.search_lib_usages(call, &ctx);
                 }
             }
@@ -797,6 +798,19 @@ impl Lookup {
             Looked::NotFound(..) if !loose.is_empty() && !self.fetch_only => Looked::Found(loose),
             // no library class of that name at all (a typealias, a generated or unindexed project
             // class): the name search, as before
+            // an Android class with no SDK to read it from: say so, never a project declaration
+            // that only shares the name (the bug this lookup fixes)
+            Looked::NotFound(_, c)
+                if seen.is_empty()
+                    && call.qualified.as_deref().is_some_and(libsrc::is_platform)
+                    && (self.base.sdk.is_none() || self.base.api.is_none()) =>
+            {
+                let why = match &self.base.sdk {
+                    None => "No Android SDK found (set ANDROID_HOME or open the SDK in Android Studio once)".to_string(),
+                    Some(_) => "The project's compileSdk was not found in its build files".to_string(),
+                };
+                Looked::NotFound(format!("`{}.{}`: {why}", call.class, call.member), c)
+            }
             Looked::NotFound(w, Some((mut c, from))) if seen.is_empty() && !c.builtin => {
                 c.fallback = true;
                 Looked::NotFound(w, Some((c, from)))

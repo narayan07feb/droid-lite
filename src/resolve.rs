@@ -2307,7 +2307,7 @@ impl<'a> Resolver<'a> {
         }
         match f.kind(last) {
             Some(Tok::Str) => return Some(Ty::Lib("String".into(), vec![])),
-            Some(Tok::Num) => return Some(Ty::Lib(num_type(f.t(last)).into(), vec![])),
+            Some(Tok::Num) => return Some(Ty::Lib(num_type(f.t(last), f.java).into(), vec![])),
             _ => {}
         }
         match f.t(last) {
@@ -4354,12 +4354,14 @@ fn past_int(l: &str) -> bool {
 }
 
 /// The type of a number literal: `0f` Float, `0L` Long, `1.5` / `1e3` Double, else Int.
-fn num_type(lit: &str) -> &'static str {
+fn num_type(lit: &str, java: bool) -> &'static str {
     let l = lit.to_ascii_lowercase();
     let hex = l.starts_with("0x") || l.starts_with("0b");
     if !hex && l.ends_with('f') {
         "Float"
-    } else if l.ends_with('l') || past_int(&l) {
+    // Java types a hex, octal or binary literal of 32 bits as `int` (0xFF000000 is a color);
+    // only a decimal one past Int needs the `L`
+    } else if l.ends_with('l') || past_int(&l) && !(java && (hex || l.starts_with('0'))) {
         "Long"
     } else if !hex && (l.contains('.') || l.contains('e') || l.ends_with('d')) {
         "Double"
@@ -5022,12 +5024,14 @@ mod tests {
 
     #[test]
     fn a_literal_past_int_is_long() {
-        assert_eq!(num_type("3000000000"), "Long");
-        assert_eq!(num_type("3_000_000_000"), "Long");
-        assert_eq!(num_type("2147483647"), "Int");
-        assert_eq!(num_type("0xFFFFFFFF"), "Long", "past Int in hex too");
-        assert_eq!(num_type("0x7FFFFFFF"), "Int");
-        assert_eq!(num_type("0b101"), "Int");
+        assert_eq!(num_type("3000000000", false), "Long");
+        assert_eq!(num_type("3_000_000_000", false), "Long");
+        assert_eq!(num_type("2147483647", false), "Int");
+        assert_eq!(num_type("0xFFFFFFFF", false), "Long", "past Int in hex too");
+        assert_eq!(num_type("0x7FFFFFFF", false), "Int");
+        assert_eq!(num_type("0b101", false), "Int");
+        assert_eq!(num_type("0xFF000000", true), "Int", "a Java color is an int");
+        assert_eq!(num_type("0xFF000000L", true), "Long");
     }
 
     #[test]

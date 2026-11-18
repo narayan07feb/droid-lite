@@ -8914,7 +8914,8 @@ fn e2e_find_usages_reruns_when_the_download_ends_before_its_list() {
         java: false,
         fallback: false,
     };
-    h.state_mut().fetches.usages_again = Some((call, "mine".into()));
+    let here = h.state().tabs[h.state().active].path.clone();
+    h.state_mut().fetches.usages_again = Some((call, "mine".into(), here));
     h.state_mut().usages_after_download("another");
     assert!(h.state().fetches.usages_again.is_some(), "not that download");
     h.state_mut().usages_after_download("mine");
@@ -9063,4 +9064,32 @@ fn e2e_a_source_in_a_jar_is_read_with_a_size_limit_and_kept_when_not_utf8() {
     assert!(crate::libs::read_entry(&at("Big.java")).is_none(), "over the limit");
     assert!(crate::libs::read_entry(&at("Latin.java")).is_some_and(|t| t.starts_with("class L")));
     let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn e2e_goto_a_call_opens_the_method_not_a_field_of_the_same_name() {
+    let resp = ("demo/geo/Resp.java", "package demo.geo;\n\npublic class Resp {\n    private final String body = \"\";\n    public String body() { return body; }\n}\n");
+    let kt = "package com.demo.loc\n\nimport demo.geo.Resp\n\nfun f(r: Resp) {\n    r.body()\n}\n";
+    let Some((f, file)) = maven_fixture("gotofield", &[resp], Some(&[resp]), kt) else { return };
+    let mut h = f.harness();
+    wait(&mut h, "libraries", |a| a.libs.artifacts == 1);
+    goto_at(&mut h, &file, "body()", 1);
+    wait(&mut h, "Resp.java", |a| a.tabs[a.active].path.to_string_lossy().ends_with("!/demo/geo/Resp.java"));
+    wait(&mut h, "the lookup", |a| !a.lib_reading());
+    steps(&mut h, 3);
+    assert!(tab(&h).text[tab(&h).cursor..].starts_with("body() {"), "the method, no picker");
+}
+
+#[test]
+fn e2e_goto_on_an_sdk_call_without_an_sdk_says_so_and_never_opens_the_project_function() {
+    let Some((f, _sdk, tracker)) = sdk_fixture("gotonosdk", true) else { return };
+    // SAFETY: the fixture holds the SERIAL lock.
+    unsafe { std::env::set_var("DROID_LITE_ANDROID_SDK", "/nonexistent/droid-lite-no-sdk") };
+    let mut h = f.harness();
+    goto_at(&mut h, &tracker, "requestLocationUpdates(provider", 1);
+    wait(&mut h, "the message", |a| a.status.contains("No Android SDK found"));
+    steps(&mut h, 10);
+    let t = tab(&h);
+    assert_eq!(t.path, tracker);
+    assert!(!t.text[t.cursor..].starts_with("requestLocationUpdates()"), "not the project's override");
 }
