@@ -26,9 +26,9 @@ const MAX_CLASSES: usize = 40;
 /// How many library functions of the name are read to match an extension's receiver.
 const MAX_EXTENSION_FILES: usize = 30;
 
+/// A walk step: candidate classes (name, nested guess) and the depth.
+type Step = (Vec<(String, bool)>, usize);
 /// The project's compile SDK by project root, shared with the lookup workers.
-/// A walk step: candidate classes (name, nested guess), depth, which start it came from.
-type Step = (Vec<(String, bool)>, usize, usize);
 type ApiCache = Arc<std::sync::Mutex<Option<(PathBuf, Option<u32>)>>>;
 
 /// Downloads of sources, and lookups on a worker.
@@ -47,7 +47,7 @@ pub(super) struct Fetches {
     prefetch: Option<Receiver<Looked>>,
     /// The library call whose Find usages were approximate (a source was missing): searched
     /// again when a download ends.
-    pub usages_again: Option<LibCall>,
+    pub usages_again: Option<(LibCall, String)>,
     /// Find usages' searches: a newer one makes an older one stop.
     pub usages_gen: Arc<AtomicU64>,
     /// The project's compile SDK, read once per project root (on a worker).
@@ -157,11 +157,25 @@ impl App {
     }
 
     /// A project opened: nothing of the last one's lookups is kept but the downloads' results.
+    /// The download a Find usages waits for ended (`key`): it is searched again, now exactly.
+    pub(super) fn usages_after_download(&mut self, key: &str) {
+        match self.fetches.usages_again.take() {
+            Some((call, k)) if k == key => {
+                if let Some(ctx) = self.ctx.clone() {
+                    self.search_lib_usages(call, &ctx);
+                }
+            }
+            other => self.fetches.usages_again = other,
+        }
+    }
+
     pub(super) fn reset_lib_lookups(&mut self) {
         self.cancel_lib_jump();
         self.fetches.prefetch = None;
         self.fetches.usages_again = None;
         self.fetches.api = Default::default();
+        // another project: its sources folders may differ, so each download may run again
+        self.fetches.ended.clear();
     }
 
     /// The imports of the open file (where a class known only by its simple name may be nested).
@@ -308,11 +322,7 @@ impl App {
                 Some((wk, jump)) if wk == key => self.look(jump, false),
                 other => self.fetches.waiting = other,
             }
-            if let Some(call) = self.fetches.usages_again.take()
-                && let Some(ctx) = self.ctx.clone()
-            {
-                self.search_lib_usages(call, &ctx);
-            }
+            self.usages_after_download(&key);
         }
         if let Some(looked) = take(&mut self.fetches.prefetch, &mut self.status)
             && let Looked::Fetch(fetch, jump) = looked
@@ -389,12 +399,31 @@ type CallKey = (Option<PathBuf>, String, Option<String>, String);
 /// A declaration: its file and offset.
 type Decl = (PathBuf, usize);
 
+/// The class file declares `member`: a method of that name, its getter or setter (a Kotlin
+/// property), or a field.
+fn declares(info: &crate::classfile::ClassInfo, member: &str) -> bool {
+    let cap: String = member
+        .chars()
+        .take(1)
+        .flat_map(char::to_uppercase)
+        .chain(member.chars().skip(1))
+        .collect();
+    let names = [
+        member.to_string(),
+        format!("get{cap}"),
+        format!("is{cap}"),
+        format!("set{cap}"),
+    ];
+    info.methods.iter().any(|(n, _, _)| names.contains(n))
+        || info.fields.iter().any(|f| f == member)
+}
+
 /// How a library Find usages came out.
 pub(super) enum UsagesState {
     /// Each call checked against the declaration.
     Exact,
-    /// The declaration's source is downloading: calls on the same class for now.
-    Downloading,
+    /// The declaration's source is downloading (this key): calls on the same class for now.
+    Downloading(String),
     /// The declaration has no source (a stub, not found, or several fit): calls on the same class.
     NoSource,
 }
@@ -432,7 +461,7 @@ pub(super) fn exact_usages(
     .run();
     let (want, state) = match target_look {
         Looked::Found(h) if h.len() == 1 => (Some((h[0].0.clone(), h[0].1)), UsagesState::Exact),
-        Looked::Fetch(..) => (None, UsagesState::Downloading),
+        Looked::Fetch(f, _) => (None, UsagesState::Downloading(f.key())),
         _ => (None, UsagesState::NoSource),
     };
     let mut known: HashMap<CallKey, Option<Decl>> = HashMap::new();
@@ -570,18 +599,13 @@ impl Lookup {
             Some(q) => vec![vec![(q.clone(), false)]],
             None => self.candidates().into_iter().map(|c| vec![c]).collect(),
         };
-        // (classes, depth, which start it came from)
-        let mut queue: VecDeque<Step> = starts
-            .into_iter()
-            .enumerate()
-            .map(|(k, c)| (c, 0, k))
-            .collect();
+        let mut queue: VecDeque<Step> = starts.into_iter().map(|c| (c, 0)).collect();
         let mut seen: HashSet<String> = HashSet::new();
         let mut seen_names: Vec<String> = Vec::new();
         let mut levels: Vec<Level> = Vec::new();
         let mut loose: Vec<(PathBuf, usize, String)> = Vec::new();
         let mut missing: Option<(Fetch, Option<ClassFile>, String, usize)> = None;
-        while let Some((cands, depth, origin)) = queue.pop_front() {
+        while let Some((cands, depth)) = queue.pop_front() {
             if seen.len() >= MAX_CLASSES {
                 break;
             }
@@ -600,11 +624,30 @@ impl Lookup {
             let path = match source {
                 Source::Text(p) => p,
                 Source::Missing(fetch, stub) => {
-                    // a guessed receiver class other than the surest one: not worth a download
-                    if missing.is_none() && origin == 0 {
+                    // its class file says whether it declares the member and what its
+                    // supertypes are: only a class that declares it is worth a download (a
+                    // guessed class is here only when its class file is)
+                    let info = stub
+                        .as_ref()
+                        .and_then(|s| libsrc::class_bytes(&s.archive, &s.entry))
+                        .and_then(|b| crate::classfile::parse(&b));
+                    let declares = match &info {
+                        Some(i) => declares(i, &call.member),
+                        // no class file to tell: a sure receiver may still declare it; a name
+                        // that may be the project's or the standard library's is not fetched
+                        None => !call.fallback,
+                    };
+                    if missing.is_none() && declares {
                         missing = Some((fetch, stub, simple, depth));
                     }
-                    continue; // its supertypes cannot be read either
+                    if let Some(i) = info
+                        && depth < MAX_DEPTH
+                    {
+                        for s in i.supers {
+                            queue.push_back((vec![(s, false)], depth + 1));
+                        }
+                    }
+                    continue;
                 }
             };
             let Some(text) = read_source(&path) else {
@@ -635,7 +678,7 @@ impl Lookup {
                         .map(|s| (s, false))
                         .collect();
                     if !sup.is_empty() {
-                        queue.push_back((sup, depth + 1, origin));
+                        queue.push_back((sup, depth + 1));
                     }
                 }
             }

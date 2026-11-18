@@ -12,6 +12,11 @@ pub struct ClassInfo {
     /// Every public or protected constructor (`<init>`) and method that is not synthetic: (name,
     /// descriptor, access flags), for a stub without source.
     pub methods: Vec<(String, String, u16)>,
+    /// Public or protected fields by name.
+    pub fields: Vec<String>,
+    /// The superclass and interfaces, dotted (`android.content.ContextWrapper`; a nested class
+    /// `Outer.Inner`); no `java.lang.Object`.
+    pub supers: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,13 +91,26 @@ pub fn parse(bytes: &[u8]) -> Option<ClassInfo> {
     let access = r.u2()?;
     let this = r.u2()?;
     let name = text(*class_name_idx.get(this as usize)?)?;
-    r.skip(2)?; // super class
-    let n = r.u2()? as usize;
-    r.skip(2 * n)?; // interfaces
-    let fields = r.u2()?;
-    for _ in 0..fields {
-        r.skip(6)?;
+    let dotted = |idx: u16| {
+        class_name_idx
+            .get(idx as usize)
+            .and_then(|&n| text(n))
+            .map(|s| s.replace(['/', '$'], "."))
+            .filter(|s| s != "java.lang.Object")
+    };
+    let mut supers: Vec<String> = dotted(r.u2()?).into_iter().collect();
+    for _ in 0..r.u2()? {
+        supers.extend(dotted(r.u2()?));
+    }
+    let mut field_names = Vec::new();
+    for _ in 0..r.u2()? {
+        let f_access = r.u2()?;
+        let f_name = text(r.u2()?).unwrap_or_default();
+        r.skip(2)?;
         skip_attributes(&mut r)?;
+        if f_access & 0x1000 == 0 && f_access & 0x0005 != 0 {
+            field_names.push(f_name);
+        }
     }
     let mut statics = Vec::new();
     let mut methods = Vec::new();
@@ -145,6 +163,8 @@ pub fn parse(bytes: &[u8]) -> Option<ClassInfo> {
         kind,
         statics,
         methods,
+        fields: field_names,
+        supers,
     })
 }
 

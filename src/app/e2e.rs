@@ -8145,7 +8145,8 @@ fn fake_sdk(dir: &Path, sources: bool) -> bool {
 const CONTEXT_JAVA: &str = "package android.content;\n\npublic abstract class Context {\n    public Object getSystemService(String name) { return null; }\n}\n";
 const ACTIVITY_JAVA: &str = "package android.app;\n\nimport android.content.Context;\n\npublic class Activity extends Context {}\n";
 
-/// A fixture with Tracker.kt, compileSdk 34 and the fake SDK; None without javac.
+/// A fixture with Tracker.kt, compileSdk 34 and the fake SDK (javac is needed: it panics
+/// without one).
 fn sdk_fixture(name: &str, sources: bool) -> Option<(Fixture, PathBuf, PathBuf)> {
     let f = Fixture::new(name);
     let sdk = f.config.join("sdk");
@@ -8897,9 +8898,96 @@ fn e2e_find_usages_reruns_when_the_download_ends_before_its_list() {
         fallback: false,
     };
     let (tx, rx) = std::sync::mpsc::channel();
-    tx.send(super::libsrc_ui::UsagesState::Downloading).unwrap();
+    tx.send(super::libsrc_ui::UsagesState::Downloading("race".into())).unwrap();
     h.state_mut().lib_usages_note = Some((call, started, rx));
     h.step();
     assert!(h.state().fetches.usages_again.is_none(), "searched again, not waiting");
+    // a rerun waits for its own download, not any
+    let call = crate::resolve::LibCall {
+        class: "Context".into(),
+        qualified: Some("android.content.Context".into()),
+        stars: Vec::new(),
+        member: "getSystemService".into(),
+        args: Some(vec![vec!["String".into()]]),
+        builtin: false,
+        fallback: false,
+    };
+    h.state_mut().fetches.usages_again = Some((call, "mine".into()));
+    h.state_mut().usages_after_download("another");
+    assert!(h.state().fetches.usages_again.is_some(), "not that download");
+    h.state_mut().usages_after_download("mine");
+    assert!(h.state().fetches.usages_again.is_none());
     assert!(!h.state().status.contains("approximate"), "{}", h.state().status);
+}
+
+/// A stand-in sdkmanager that logs its calls to `log` and installs LocationManager.java.
+fn logging_sdkmanager(f: &Fixture, sdk: &Path, log: &Path) {
+    let tool = f.config.join("sdkmanager");
+    let src = f.config.join("LocationManager.java");
+    std::fs::write(&src, LM_JAVA).unwrap();
+    let dest = sdk.join("sources/android-34/android/location");
+    std::fs::write(
+        &tool,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\nmkdir -p '{}' && cp '{}' '{}/'\n",
+            log.display(),
+            dest.display(),
+            src.display(),
+            dest.display()
+        ),
+    )
+    .unwrap();
+    std::process::Command::new("chmod").arg("+x").arg(&tool).status().unwrap();
+    // SAFETY: the fixture holds the SERIAL lock.
+    unsafe { std::env::set_var("DROID_LITE_SDKMANAGER", &tool) };
+}
+
+#[test]
+fn e2e_a_name_the_library_supertype_does_not_declare_downloads_nothing() {
+    let Some((f, sdk, _tracker)) = sdk_fixture("gotonofetch", false) else { return };
+    let log = f.config.join("sdkmanager.log");
+    logging_sdkmanager(&f, &sdk, &log);
+    let file = f.path("app/src/main/java/com/demo/loc/MyAct.kt");
+    std::fs::write(
+        &file,
+        "package com.demo.loc\n\nimport android.app.Activity\n\nclass MyAct : Activity() {\n    fun go() {\n        val x = listOf(1)\n    }\n}\n\nfun h(a: Activity) {\n    a.getSystemService(\"x\")\n}\n",
+    )
+    .unwrap();
+    let mut h = f.harness();
+    // Activity's class file has no listOf: no SDK download, the name search as before
+    goto_at(&mut h, &file, "listOf(", 1);
+    steps(&mut h, 20);
+    assert_eq!(h.state().fetches.started, 0, "{}", h.state().status);
+    assert!(!log.exists(), "sdkmanager ran");
+    // Find usages on it: the project search, not a library one, and still no download
+    place_cursor(&mut h, "listOf(", 1);
+    key(&mut h, Modifiers::ALT, Key::F7);
+    steps(&mut h, 20);
+    assert!(!h.state().found_title.contains("(library)"), "{}", h.state().found_title);
+    assert_eq!(h.state().fetches.started, 0);
+    assert!(!log.exists());
+    // a member Activity inherits from Context: Activity's class file names its supertype, whose
+    // class file declares it, so the sources are fetched
+    goto_at(&mut h, &file, "getSystemService(", 1);
+    wait(&mut h, "the download", |a| a.fetches.started == 1);
+}
+
+#[test]
+fn e2e_goto_a_star_imported_receiver_downloads_its_missing_sources() {
+    let Some((f, sdk, _tracker)) = sdk_fixture("gotostar", false) else { return };
+    let log = f.config.join("sdkmanager.log");
+    logging_sdkmanager(&f, &sdk, &log);
+    let file = f.path("app/src/main/java/com/demo/loc/Star.kt");
+    std::fs::write(
+        &file,
+        "package com.demo.loc\n\nimport android.app.Activity\nimport android.location.*\n\nfun g(a: Activity, m: LocationManager, l: LocationListener) {\n    m.requestLocationUpdates(\"gps\", 0, 0f, l)\n}\n",
+    )
+    .unwrap();
+    let mut h = f.harness();
+    goto_at(&mut h, &file, "requestLocationUpdates(", 1);
+    let lm = sdk.join("sources/android-34/android/location/LocationManager.java");
+    wait(&mut h, "downloaded and opened", |a| a.tabs[a.active].path == lm);
+    steps(&mut h, 3);
+    assert!(tab(&h).text[tab(&h).cursor..].contains("LocationListener listener)"));
+    assert!(log.exists());
 }

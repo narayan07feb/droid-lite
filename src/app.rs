@@ -1524,23 +1524,30 @@ impl App {
         self.lsp_found = None;
         // The project search always runs: kotlin-lsp answers empty or with one file while it
         // still imports a big Gradle project. Its answer is merged in when it comes.
-        // a newer search: an older library search no longer runs again after a download
+        // a newer search: an older library search stops and no longer runs again after a
+        // download
         self.fetches.usages_again = None;
         self.lib_usages_note = None;
-        // a library member: the same library call elsewhere, and its source fetched for the
-        // declaration (as Go to declaration does)
-        if let Some(crate::resolve::Res::Lib(call)) = self.resolved_at(at) {
-            self.found_title = format!("References to `{}.{}` (library)", call.class, call.member);
-            self.search_lib_usages(call.clone(), ctx);
-            self.fetch_lib_source(call);
-            return;
-        }
-        match self.ref_target(at) {
-            Some(t) => self.search_usages(word, t, ctx),
-            None => {
-                let target = self.usage_target(at);
-                self.search_project(word, true, target, ctx);
+        self.fetches
+            .usages_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.resolved_at(at) {
+            // a library member: the same library call elsewhere, and its source fetched for the
+            // declaration (as Go to declaration does); a name only taken for an inherited one
+            // (it may be the project's) is searched by name like before
+            Some(crate::resolve::Res::Lib(call)) if !call.fallback => {
+                self.found_title =
+                    format!("References to `{}.{}` (library)", call.class, call.member);
+                self.search_lib_usages(call.clone(), ctx);
+                self.fetch_lib_source(call);
             }
+            _ => match self.ref_target(at) {
+                Some(t) => self.search_usages(word, t, ctx),
+                None => {
+                    let target = self.usage_target(at);
+                    self.search_project(word, true, target, ctx);
+                }
+            },
         }
         if let Some(l) = self.lsp.as_mut().filter(|l| l.ready) {
             let t = &self.tabs[self.active];
@@ -4885,14 +4892,18 @@ impl eframe::App for App {
             self.lib_usages_note = None;
             match state {
                 libsrc_ui::UsagesState::Exact => {}
-                libsrc_ui::UsagesState::Downloading => {
-                    // the download may have ended already, before this list: search again now
-                    if self.fetches.ended.values().any(|(_, at)| *at >= started)
+                libsrc_ui::UsagesState::Downloading(key) => {
+                    // its download may have ended already, before this list: search again now
+                    if self
+                        .fetches
+                        .ended
+                        .get(&key)
+                        .is_some_and(|(_, at)| *at >= started)
                         && let Some(ctx) = self.ctx.clone()
                     {
                         self.search_lib_usages(call, &ctx);
                     } else {
-                        self.fetches.usages_again = Some(call.clone());
+                        self.fetches.usages_again = Some((call.clone(), key));
                         self.status = format!(
                             "References to `{}.{}` are approximate until its source is downloaded",
                             call.class, call.member

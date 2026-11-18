@@ -720,11 +720,15 @@ pub fn read_entry(path: &Path) -> Option<String> {
     let s = path.to_string_lossy();
     let (archive, entry) = s.split_once("!/")?;
     let mut z = zip::ZipArchive::new(std::fs::File::open(archive).ok()?).ok()?;
-    let mut e = z.by_name(entry).ok()?;
-    let mut text = String::new();
-    e.read_to_string(&mut text).ok()?;
-    Some(text)
+    let e = z.by_name(entry).ok()?;
+    // bounded: a jar may come from any repository the build names
+    let mut v = Vec::new();
+    e.take(MAX_ENTRY + 1).read_to_end(&mut v).ok()?;
+    (v.len() as u64 <= MAX_ENTRY).then(|| String::from_utf8_lossy(&v).into_owned())
 }
+
+/// The largest source file read out of a jar (16 MB).
+pub const MAX_ENTRY: u64 = 16 << 20;
 
 pub fn is_archive_path(path: &Path) -> bool {
     path.to_string_lossy().contains("!/")

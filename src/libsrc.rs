@@ -203,12 +203,14 @@ pub fn repos(root: &Path) -> Vec<String> {
         let mut depth = 0i32;
         let mut inside: Option<i32> = None;
         for line in t.lines().map(str::trim).filter(|l| !l.starts_with("//")) {
-            if inside.is_none() && line.starts_with("repositories") {
+            let opening = inside.is_none() && line.starts_with("repositories");
+            if opening {
                 inside = Some(depth);
             }
             depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
             let here = inside.is_some();
-            if inside.is_some_and(|d| depth <= d) && !line.starts_with("repositories") {
+            // closed on this line (a one-line block too); `repositories` alone waits for its `{`
+            if inside.is_some_and(|d| depth <= d) && (!opening || line.contains('{')) {
                 inside = None;
             }
             if !here {
@@ -362,13 +364,9 @@ pub fn fetch(f: &Fetch) -> Result<(), String> {
                     .stdin(std::process::Stdio::null())
                     .status()
                     .map_err(|e| format!("curl did not start: {e}"))?;
-                let zip = {
-                    let mut magic = [0u8; 4];
-                    std::fs::File::open(&part)
-                        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic))
-                        .is_ok()
-                        && magic == *b"PK\x03\x04"
-                };
+                // a whole zip (a cut-off download has no central directory) of at most 200 MB
+                // (curl cannot cap a download whose size the server does not send)
+                let zip = whole_zip(&part, 209_715_200);
                 if status.success() && zip && std::fs::rename(&part, &dest).is_ok() {
                     return Ok(());
                 }
@@ -755,6 +753,13 @@ pub fn find_member(path: &Path, text: &str, class: &str, call: &LibCall) -> Memb
     })
 }
 
+/// `p` is a whole zip (a cut-off download has no central directory) of at most `max` bytes.
+fn whole_zip(p: &Path, max: u64) -> bool {
+    std::fs::File::open(p).is_ok_and(|f| {
+        f.metadata().is_ok_and(|m| m.len() <= max) && zip::ZipArchive::new(f).is_ok()
+    })
+}
+
 /// The `{ … }` that follows `from` (a class's body when the scanner kept none): its range, by
 /// counting braces outside strings, chars and comments.
 fn brace_body(text: &str, from: usize) -> Option<std::ops::Range<usize>> {
@@ -897,11 +902,50 @@ fn type_params(s: &str) -> Vec<String> {
 /// The type parameters a method declares: the `<…>` before its name on its line
 /// (`public <TResult> Task<TResult> continueWith(` gives TResult).
 fn method_type_params(text: &str, offset: usize) -> Vec<String> {
-    let line = text[..offset].rfind('\n').map_or(0, |i| i + 1);
-    let head = &text[line..offset];
-    head.find('<')
-        .map(|i| type_params(&head[i..]))
-        .unwrap_or_default()
+    // the declaration's head, from the end of the statement or comment before it (it may span
+    // lines): `public static <T> T get(` or `fun <T> List<T>.get(`
+    let from = ["*/", ";", "{", "}"]
+        .iter()
+        .filter_map(|p| text[..offset].rfind(p).map(|i| i + p.len()))
+        .max()
+        .unwrap_or(0);
+    let head = &text[from..offset];
+    let Some(i) = head.find('<') else {
+        return Vec::new();
+    };
+    // `<` right after a modifier or `fun` opens type parameters; after a type (`List<String>
+    // foo(`) it is that type's argument
+    let word = head[..i].split_whitespace().last().unwrap_or("");
+    let opens = word.is_empty()
+        || word.starts_with('@')
+        || matches!(
+            word,
+            "public"
+                | "private"
+                | "protected"
+                | "static"
+                | "final"
+                | "abstract"
+                | "synchronized"
+                | "native"
+                | "default"
+                | "strictfp"
+                | "fun"
+                | "inline"
+                | "suspend"
+                | "override"
+                | "open"
+                | "internal"
+                | "operator"
+                | "infix"
+                | "tailrec"
+                | "external"
+        );
+    if opens {
+        type_params(&head[i..])
+    } else {
+        Vec::new()
+    }
 }
 
 /// Top-level extension functions `fun Receiver.member(…)` in a library source whose receiver is
@@ -1046,9 +1090,20 @@ pub fn class_bytes(archive: &Path, entry: &str) -> Option<Vec<u8>> {
 /// An `.aar`'s `classes.jar`, read once and kept for the last few aars (a lookup asks the same
 /// aar many times).
 fn aar_classes(aar: &Path) -> Option<std::sync::Arc<Vec<u8>>> {
-    static KEPT: std::sync::Mutex<Vec<(PathBuf, std::sync::Arc<Vec<u8>>)>> =
-        std::sync::Mutex::new(Vec::new());
-    if let Some((_, j)) = KEPT.lock().ok()?.iter().find(|(p, _)| p == aar) {
+    // by path and modification time: a rebuilt aar is read again
+    type Kept = (
+        PathBuf,
+        Option<std::time::SystemTime>,
+        std::sync::Arc<Vec<u8>>,
+    );
+    static KEPT: std::sync::Mutex<Vec<Kept>> = std::sync::Mutex::new(Vec::new());
+    let stamp = std::fs::metadata(aar).and_then(|m| m.modified()).ok();
+    if let Some((_, _, j)) = KEPT
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(p, s, _)| p == aar && *s == stamp)
+    {
         return Some(j.clone());
     }
     let mut z = zip::ZipArchive::new(std::fs::File::open(aar).ok()?).ok()?;
@@ -1060,7 +1115,8 @@ fn aar_classes(aar: &Path) -> Option<std::sync::Arc<Vec<u8>>> {
     if kept.len() >= 3 {
         kept.remove(0);
     }
-    kept.push((aar.to_path_buf(), j.clone()));
+    kept.retain(|(p, _, _)| p != aar);
+    kept.push((aar.to_path_buf(), stamp, j.clone()));
     Some(j)
 }
 
@@ -1108,6 +1164,15 @@ fn match_score(param: &str, arg: &[String], tparams: &[String]) -> Option<usize>
     // Kotlin converts only a number literal, and only between whole numbers; the argument's type
     // does not say it was a literal, so any Int may (a variable that does not fit would not
     // compile, so it is not in the code)
+    // a Kotlin type is its Java box (`Int` is an `Integer`): nearer than a widening
+    let twin = match own.as_str() {
+        "Int" => "Integer",
+        "Char" => "Character",
+        o => o,
+    };
+    if p == twin && java_primitive(own).is_some() {
+        return Some(60);
+    }
     let widen: &[&str] = match own.as_str() {
         "Int" => &["long", "short", "byte"],
         "String" => &["CharSequence"],
@@ -1116,13 +1181,12 @@ fn match_score(param: &str, arg: &[String], tparams: &[String]) -> Option<usize>
     if widen.contains(&p.as_str()) {
         return Some(50);
     }
+    // a Java caller widens an int to a float or a double too (after a long, like javac)
+    if own == "Int" && matches!(p.as_str(), "float" | "double") {
+        return Some(45);
+    }
     let boxed: &[&str] = match own.as_str() {
-        "Int" => &["Integer", "Long", "Short", "Byte"],
-        "Long" => &["Long"],
-        "Float" => &["Float"],
-        "Double" => &["Double"],
-        "Boolean" => &["Boolean"],
-        "Char" => &["Character"],
+        "Int" => &["Long", "Short", "Byte"],
         _ => &[],
     };
     if boxed.contains(&p.as_str()) {
@@ -1457,11 +1521,43 @@ mod tests {
     }
 
     #[test]
+    fn type_parameters_only_where_a_declaration_opens_them_and_whole_zips_only() {
+        let at = |s: &str| method_type_params(s, s.find(" get(").map_or(0, |i| i + 1));
+        assert_eq!(at("class A {\n    public static <T> T get(T t) {}"), ["T"]);
+        assert_eq!(at("class A {\n    fun <T> get(t: T) {}"), ["T"]);
+        assert!(at("class A {\n    public List<String> get(String s) {}").is_empty());
+        assert_eq!(
+            at("class A {\n    /** a <b>doc</b> */\n    public <K,\n            V> V get(K k) {}"),
+            ["K", "V"],
+            "over two lines, not the comment's <b>"
+        );
+        let d = std::env::temp_dir().join(format!("dl-zip-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        // the smallest whole zip: an empty central directory
+        let empty = [
+            b'P', b'K', 5, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        std::fs::write(d.join("ok.jar"), empty).unwrap();
+        std::fs::write(d.join("cut.jar"), b"PK\x03\x04 cut off here").unwrap();
+        assert!(whole_zip(&d.join("ok.jar"), 1000));
+        assert!(
+            !whole_zip(&d.join("cut.jar"), 1000),
+            "PK at the start is not enough"
+        );
+        assert!(!whole_zip(&d.join("ok.jar"), 10), "too big");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn a_kotlin_number_is_a_java_number() {
         let int = ["Int".to_string()];
         assert_eq!(match_score("Number", &int, &[]), Some(80));
         assert_eq!(match_score("Comparable", &int, &[]), Some(80));
         assert_eq!(match_score("String", &int, &[]), None);
+        assert!(
+            match_score("Integer", &int, &[]) > match_score("long", &int, &[]),
+            "Int is an Integer"
+        );
     }
 
     #[test]
@@ -1479,6 +1575,12 @@ mod tests {
         let saved = std::env::var_os("DROID_LITE_MAVEN_REPOS");
         unsafe { std::env::remove_var("DROID_LITE_MAVEN_REPOS") };
         let r = repos(&d);
+        std::fs::write(
+            d.join("settings.gradle.kts"),
+            "repositories { google() }\nval api = uri(\"https://api.example.com/v1\")\n",
+        )
+        .unwrap();
+        let one_line = repos(&d);
         if let Some(s) = saved {
             unsafe { std::env::set_var("DROID_LITE_MAVEN_REPOS", s) };
         }
@@ -1489,6 +1591,11 @@ mod tests {
                 "https://repo.example.com/maven"
             ],
             "not the API URL"
+        );
+        assert_eq!(
+            one_line,
+            ["https://dl.google.com/dl/android/maven2"],
+            "a one-line block ends on its line"
         );
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1586,7 +1693,9 @@ mod tests {
     fn types_and_literals() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         assert!(accepts_("long", &s(&["Int"])), "a number literal widens");
-        assert!(!accepts_("float", &s(&["Int"])));
+        // a Java caller widens an int to a float too, after a long (like javac)
+        assert!(match_score("float", &s(&["Int"]), &[]) < match_score("long", &s(&["Int"]), &[]));
+        assert!(!accepts_("boolean", &s(&["Int"])));
         assert!(accepts_(
             "@NonNull final java.lang.CharSequence",
             &s(&["String"])

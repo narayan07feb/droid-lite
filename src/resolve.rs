@@ -2492,7 +2492,12 @@ impl<'a> Resolver<'a> {
                 if (callee == 0 || f.t(callee - 1) != ".")
                     && name.starts_with(char::is_uppercase)
                     && f.t(open) == "("
-                    && (f.imports.named.contains_key(&name) || java_twin(&name).is_some())
+                    // not a Compose function, the one common imported upper-case call
+                    && (java_twin(&name).is_some()
+                        || f.imports
+                            .named
+                            .get(&name)
+                            .is_some_and(|q| !q.join(".").starts_with("androidx.compose.")))
                 {
                     return Some(Ty::Lib(name.clone(), Vec::new()));
                 }
@@ -2633,7 +2638,10 @@ impl<'a> Resolver<'a> {
         } else {
             open
         };
-        let lambda = f.t(after) == "{";
+        // on the next line, a `{` is a block of its own, not this call's lambda
+        let lambda = f.t(after) == "{"
+            && after > 0
+            && !f.text[f.start(after - 1)..f.start(after)].contains('\n');
         let args = (f.t(open) == "(" || lambda).then(|| {
             let parens = if f.t(open) == "(" {
                 split_args_tokens(f, open)
@@ -3440,7 +3448,7 @@ impl<'a> Resolver<'a> {
     }
 
     /// What every name in the file between bytes `from` and `to` means: `(start, end,
-    /// meaning)` for the ones that are project declarations or locals.
+    /// meaning)` for the ones that are project declarations, locals or library members.
     pub fn refs_between(&self, p: &Path, from: usize, to: usize) -> Vec<(usize, usize, Res)> {
         let Some(f) = self.file(p) else {
             return Vec::new();
@@ -4330,16 +4338,25 @@ fn java_twin(t: &str) -> Option<&'static str> {
 }
 
 /// The type of a number literal: `0f` Float, `0L` Long, `1.5` / `1e3` Double, else Int.
+/// A whole-number literal (decimal, `0x…` or `0b…`) too big for an `Int`: kotlinc types it
+/// `Long`.
+fn past_int(l: &str) -> bool {
+    let (digits, radix) = match l.get(..2) {
+        Some("0x") => (&l[2..], 16),
+        Some("0b") => (&l[2..], 2),
+        _ => (l, 10),
+    };
+    let digits = digits.replace('_', "");
+    u64::from_str_radix(&digits, radix).is_ok_and(|n| n > i32::MAX as u64)
+        || radix == 10 && !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) && digits.len() > 19
+}
+
 fn num_type(lit: &str) -> &'static str {
     let l = lit.to_ascii_lowercase();
     let hex = l.starts_with("0x") || l.starts_with("0b");
     if !hex && l.ends_with('f') {
         "Float"
-    } else if l.ends_with('l')
-        || !hex
-            && l.chars().all(|c| c.is_ascii_digit() || c == '_')
-            && l.replace('_', "").parse::<i64>().is_ok_and(|n| n > i64::from(i32::MAX))
-    {
+    } else if l.ends_with('l') || past_int(&l) {
         "Long"
     } else if !hex && (l.contains('.') || l.contains('e') || l.ends_with('d')) {
         "Double"
@@ -5005,7 +5022,9 @@ mod tests {
         assert_eq!(num_type("3000000000"), "Long");
         assert_eq!(num_type("3_000_000_000"), "Long");
         assert_eq!(num_type("2147483647"), "Int");
-        assert_eq!(num_type("0xFFFFFFFFF"), "Int", "hex is not read here");
+        assert_eq!(num_type("0xFFFFFFFF"), "Long", "past Int in hex too");
+        assert_eq!(num_type("0x7FFFFFFF"), "Int");
+        assert_eq!(num_type("0b101"), "Int");
     }
 
     #[test]
